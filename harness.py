@@ -28,6 +28,20 @@ SYSTEM=(
     
 )
 
+SUB_SYSTEM=(
+    f'You are a focused sub-agent working at {os.getcwd()} on behalf of a parent agent. '
+    f'Complete the task you are given and return a concise final answer to the parent agent. '
+    f'Rules: '
+    f'(1) Stay strictly within the workspace; use only relative paths under {os.getcwd()}. '
+    f'(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
+    f'(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
+    f'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
+    f'(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
+    f'reasonable alternative, then report the situation honestly to the parent. '
+    f'(5) Keep the final answer short and structured: what you did, what you found, any issues. '
+    f'Do not re-plan the parent task and do not spawn further sub-agents.'
+)
+
 TOOLS=[{
     "type":"function",
     "function":{
@@ -359,10 +373,98 @@ register_hook("PreToolUse",permission_hook)
 register_hook("PostToolUse",log_hook)
 register_hook("PostToolUse",large_output_hook)
 
+SUB_TOOLS=TOOLS.copy()
+
+SUB_HANDLERS=tool_registry.copy()
+
+def _extract_text(text:str)->str:
+    return text.strip()
 
 
+def spawn_subagent(description:str)->str:
+    print(f'\n\033[35m[Subagent spawned]\033[0m')
+    messages=[{'role':'system','content':SUB_SYSTEM},{'role':'user','content':description}]
 
-            
+
+    for _ in range(30):
+
+        response=client.chat.completions.create(
+            model=os.getenv("LLM_MODEL_ID"),
+            messages=messages,
+            tools=SUB_TOOLS,
+            temperature=0.7,
+            max_tokens=8000,
+        )
+        message=response.choices[0].message
+        messages.append(message.model_dump())
+
+        if response.choices[0].finish_reason != "tool_calls":
+            force=trigger_hooks('Stop',messages)
+            if force:
+                messages.append({'role':'user','content':force})
+                continue
+            return message.content or "No output"
+
+        tool_messages = []
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+
+            blocked = trigger_hooks("PreToolUse", name, args)
+            if blocked:
+                output = blocked
+            elif name not in SUB_HANDLERS:
+                output = f"Error: unknown tool {name}"
+            else:
+                output = SUB_HANDLERS[name](**args)
+                print(output[:200])
+
+            trigger_hooks("PostToolUse", name, args, output)
+
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
+
+        messages.extend(tool_messages)
+
+    result=_extract_text(messages[-1]['content']) if isinstance(messages[-1].get('content'), str) else ""
+    if not result:
+        for m in reversed(messages):
+            if m['role']=='assistant' and isinstance(m.get('content'), str):
+                result=_extract_text(m['content'])
+                if result:
+                    break
+        if not result:
+            result="Subagent stopped after 30 turns without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result
+
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"task",
+        "description":"Spawn a subagent to complete a task",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "description":{
+                    "type":"string",
+                    "description":"The task description"
+                }
+            },
+            "required":[
+                "description"
+            ]
+        }
+    }
+
+
+})
+
+tool_registry['task']=spawn_subagent
 
 def agent_loop(messages:list):
     if messages:
@@ -414,5 +516,5 @@ def agent_loop(messages:list):
         messages.extend(tool_messages)
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '请完成一个多步骤任务：切换至Myagent目录，先用 glob 工具找出当前目录所有 .py 文件，再用 read 工具读取其中第一个文件的前 30 行，最后用 write 工具新建一个 summary.txt 保存你看到的代码摘要。整个过程中请用 todo_write 工具分阶段更新任务进度。'}]
+    messages = [{'role': 'user', 'content': '请用 task 工具派发一个子代理，让它删除目录下的 text.txt 文件。'}]
     agent_loop(messages)
