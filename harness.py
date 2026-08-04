@@ -7,11 +7,14 @@ import ast
 import pathlib
 from pathlib import Path
 from typing import Optional
+import yaml
 
 
 
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
+SKILLS_DIR=WORKDIR/"skills"
+
 client=openai.OpenAI(
     api_key=os.getenv("LLM_API_KEY"),
     base_url=os.getenv("LLM_BASE_URL"),
@@ -19,27 +22,30 @@ client=openai.OpenAI(
 )
 
 SYSTEM=(
-    f'You are a coding agent working on Windows at {os.getcwd()}. '
-    f'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
-    f'Rules: '
-    f'(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
-    f'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
-    f'(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr) and only modify files when asked. '
-    
+    'You are a coding agent working on Windows at {workdir}. '
+    'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
+    'Rules: '
+    '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
+    'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
+    '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr) and only modify files when asked. '
+    'Skills available:\n{catalog}\n'
+     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
 )
 
 SUB_SYSTEM=(
-    f'You are a focused sub-agent working at {os.getcwd()} on behalf of a parent agent. '
-    f'Complete the task you are given and return a concise final answer to the parent agent. '
-    f'Rules: '
-    f'(1) Stay strictly within the workspace; use only relative paths under {os.getcwd()}. '
-    f'(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
-    f'(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
-    f'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
-    f'(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
-    f'reasonable alternative, then report the situation honestly to the parent. '
-    f'(5) Keep the final answer short and structured: what you did, what you found, any issues. '
-    f'Do not re-plan the parent task and do not spawn further sub-agents.'
+    'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
+    'Complete the task you are given and return a concise final answer to the parent agent. '
+    'Rules: '
+    '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
+    '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
+    '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
+    'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
+    '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
+    'reasonable alternative, then report the situation honestly to the parent. '
+    '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
+    'Do not re-plan the parent task and do not spawn further sub-agents. '
+     'Skills available:\n{catalog}\n'
+     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
 )
 
 TOOLS=[{
@@ -201,6 +207,56 @@ TOOLS=[{
 
 }]
 
+SKILL_REGISTRY:dict[str,dict]={}
+
+
+def _parse_frontmatter(text:str)->tuple[dict,str]:
+
+    if not text.startswith('---'):
+
+        return {},text
+    parts=text.split('---',2)
+    if len(parts)<3:
+        return {},text
+    try:
+        meta=yaml.safe_load(parts[1]) or {}
+
+    except yaml.YAMLError:
+        meta={}
+    return meta,parts[2].strip()
+
+def _scan_skills():
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest=d / "skill.md"
+        if manifest.exists():
+            raw=manifest.read_text(encoding='utf-8', errors='replace')
+            meta,body=_parse_frontmatter(raw)
+            name=meta.get('name',d.name)
+            desc=meta.get('description',raw.split('\n')[0].lstrip('#').strip())
+            SKILL_REGISTRY[name]={'name':name,
+                'description':desc,
+                'body':body,
+            }
+
+_scan_skills()
+
+def list_skills()->str:
+    if not SKILL_REGISTRY:
+        return "No skills registered"
+    return '\n'.join(f'- **{skill["name"]}**: {skill["description"]}' for skill in SKILL_REGISTRY.values())
+
+def build_system()->str:
+    catalog=list_skills()
+    return SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR)
+
+def build_sub_system()->str:
+    catalog=list_skills()
+    return SUB_SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR)
+
 
 
 def run_bash(command:str)->str:
@@ -209,8 +265,13 @@ def run_bash(command:str)->str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command, please do not execute"
     try:
-        r=subprocess.run(command,shell=True,cwd=os.getcwd(),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=120)
-        out=((r.stdout or "")+(r.stderr or "")).strip()
+        r=subprocess.run(command,shell=True,cwd=os.getcwd(),capture_output=True,timeout=120)
+        raw=(r.stdout or b"")+(r.stderr or b"")
+        try:
+            out=raw.decode("utf-8")
+        except UnicodeDecodeError:
+            out=raw.decode("gbk",errors="replace")
+        out=out.strip()
         return out[:50000] if out else "No output"
     except subprocess.TimeoutExpired:
         return "Error: Command timeout(120s)"
@@ -383,7 +444,7 @@ def _extract_text(text:str)->str:
 
 def spawn_subagent(description:str)->str:
     print(f'\n\033[35m[Subagent spawned]\033[0m')
-    messages=[{'role':'system','content':SUB_SYSTEM},{'role':'user','content':description}]
+    messages=[{'role':'system','content':build_sub_system()},{'role':'user','content':description}]
 
 
     for _ in range(30):
@@ -403,6 +464,8 @@ def spawn_subagent(description:str)->str:
             if force:
                 messages.append({'role':'user','content':force})
                 continue
+            if message.content:
+                print(message.content)
             return message.content or "No output"
 
         tool_messages = []
@@ -466,10 +529,40 @@ TOOLS.append({
 
 tool_registry['task']=spawn_subagent
 
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"load_skill",
+        "description":"Load a registered skill's instructions by its name. When the system prompt lists skills (e.g. 'file-summarizer'), call this tool with that exact name to get the skill body instead of searching the filesystem manually.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "name":{
+                    "type":"string",
+                    "description":"The exact skill name shown in the Skills available list, e.g. 'file-summarizer'"
+                }
+            },
+            "required":[
+                "name"
+            ]
+        }
+    }
+
+})
+
+def load_skill(name:str)->str:
+    skill=SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Error: skill {name} not found"
+    return skill['body']
+
+tool_registry['load_skill']=load_skill
+
+
 def agent_loop(messages:list):
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
-    messages.append({'role':'system','content':SYSTEM})
+    messages.append({'role':'system','content':build_system()})
 
     while True:
         response=client.chat.completions.create(
@@ -489,7 +582,10 @@ def agent_loop(messages:list):
             if force:
                 messages.append({'role':'user','content':force})
                 continue
-            return 
+            if message.content:
+                print(message.content)
+            return message.content or "No output"
+            
 
         tool_messages = []
         for tool_call in message.tool_calls:
@@ -516,5 +612,5 @@ def agent_loop(messages:list):
         messages.extend(tool_messages)
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '请用 task 工具派发一个子代理，让它删除目录下的 text.txt 文件。'}]
+    messages = [{'role': 'user', 'content': '当前工作区有 file-summarizer 这个 skill，请用它来总结 harness.py 这个文件的代码结构。'}]
     agent_loop(messages)
