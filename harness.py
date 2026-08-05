@@ -217,17 +217,17 @@ TOOLS=[{
 
 }]
 
-def write_memory_file(name:str,mem_type:str,description:str,body:str):
+def write_memory_file(name:str,mem_type:str,description:str,body:str): #保存记忆文件
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     slug=name.lower().replace(' ','-').replace('/','-')
 
     filename=f'{slug}.md'
     filepath=MEMORY_DIR/filename
     filepath.write_text(
-        f'---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n'
-
+        f'---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n',
+        encoding='utf-8',
     )
-    _rebuild_index()
+    _rebuild_index() #重建记忆索引
 
     return filepath
 
@@ -236,33 +236,33 @@ def _rebuild_index():
     for f in sorted(MEMORY_DIR.glob('*.md')):
         if f.name=='MEMORY.md':
             continue
-        raw=f.read_text()
+        raw=f.read_text(encoding='utf-8', errors='replace')
         meta,body=_parse_frontmatter(raw)
         name=meta.get('name',f.name)
         desc=meta.get('description',raw.split('\n')[0][:80])
-        lines.append(f'- [{name}({f.name}) - {desc}]')
-    MEMORY_INDEX.write_text('\n'.join(lines)+'\n' if lines else '')
+        lines.append(f'- [{name}({f.name}) - {desc}]') #索引的结构是：[名称](文件名) - �描述
+    MEMORY_INDEX.write_text('\n'.join(lines)+'\n' if lines else '', encoding='utf-8')
 
-def read_memory_index()->str:
+def read_memory_index()->str: #读取记忆索引
     if not MEMORY_INDEX.exists():
         return ''
 
-    text=MEMORY_INDEX.read_text().strip()
+    text=MEMORY_INDEX.read_text(encoding='utf-8', errors='replace').strip()
     return text if text else ''
 
-def read_memory_file(filename:str):
+def read_memory_file(filename:str): #读取记忆文件
     path=MEMORY_DIR /filename
     if not path.exists():
         return None
 
-    return path.read_text()
+    return path.read_text(encoding='utf-8', errors='replace')
 
-def list_memory_files()->list[dict]:
+def list_memory_files()->list[dict]: #列出所有记忆文件
     results=[]
     for f in sorted(MEMORY_DIR.glob('*.md')):
         if f.name=='MEMORY.md':
             continue
-        raw=f.read_text()
+        raw=f.read_text(encoding='utf-8', errors='replace')
         meta,body=_parse_frontmatter(raw)
         results.append({
             'filename':f.name,
@@ -279,18 +279,18 @@ def select_relevant_memories(messages:list,max_items:int=5)->list[str]:
         return []
     recent_texts=[]
     for msg in reversed(messages):
-        if msg.get('role')=='user':
+        if msg.get('role')=='user': #只考虑用户消息，因为只有用户消息才会包含记忆
             content=msg.get('content','')
-            if isinstance(content,list):
+            if isinstance(content,list): #处理包含多个文本的消息，示例：[{'type':'text','text':'你好'},{'type':'text','text':'我是张三'}]
                 content = " ".join(
                     str(getattr(b, "text", "")) for b in content
                     if getattr(b, "type", None) == "text"
                 )
             if isinstance(content, str):
                 recent_texts.append(content)
-            if len(recent_texts) >= 3:
+            if len(recent_texts) >= 3: #最多考虑最近3条消息
                 break
-    recent=' '.join(reversed(recent_texts))[:2000]
+    recent=' '.join(reversed(recent_texts))[:2000] #最近3条消息，最多2000个字符
 
     if not recent.strip():
         return []
@@ -318,30 +318,30 @@ def select_relevant_memories(messages:list,max_items:int=5)->list[str]:
 
         )
         text=_extract_text(response.choices[0].message.content).strip()
-        match=re.search(r'\[.*?\]', text, re.DOTALL)
+        match=re.search(r'\[.*?\]', text, re.DOTALL) #解析JSON数组，如[0, 3]
         if match:
             indices=json.loads(match.group())
             selected=[]
             for idx in indices:
                 if isinstance(idx,int) and 0<=idx<len(files):
                     selected.append(files[idx]['filename'])
-                    if len(selected)>=max_items:
+                    if len(selected)>=max_items: #最多选择max_items个记忆文件
                         break
             return selected
     except Exception:
         pass
 
-    keywords=[w.lower() for w in recent.split() if len(w)>=3]
+    keywords=[w.lower() for w in recent.split() if len(w)>=3] #fallback，根据最近消息中的关键词筛选记忆文件,关键词长度至少为3
     selected=[]
     for f in files:
         text=(f['name']+' '+f['description']).lower()
-        if any(kw in text for kw in keywords):
+        if any(kw in text for kw in keywords): #如果记忆文件的名称或描述包含关键词
             selected.append(f['filename'])
             if len(selected)>=max_items:
                 break
     return selected
 
-def load_memories(messages:list)->str:
+def load_memories(messages:list)->str: #加载相关记忆文件内容
     selected_files=select_relevant_memories(messages)
     if not selected_files:
         return ''
@@ -354,9 +354,15 @@ def load_memories(messages:list)->str:
     parts.append('</relevant_memories>')
     return '\n\n'.join(parts)
 
-def extract_memories(messages:list):
+def extract_memories(messages:list): #提取用户偏好、约束、项目事实等记忆
+    # 记忆窗口：会话开头前 10 条（用户偏好通常最先说）+ 结尾最后 10 条
+    if len(messages) <= 20:
+        window=messages
+    else:
+        window=messages[:10]+messages[-10:]
+        
     dialogue_parts=[]
-    for msg in messages[-10:]:
+    for msg in window:
         role=msg.get('role','?')
         content=msg.get('content','')
         if isinstance(content,list):
@@ -366,10 +372,11 @@ def extract_memories(messages:list):
             )
         if isinstance(content, str) and content.strip():
             dialogue_parts.append(f"{role}: {content}")
-    dialogue = "\n".join(dialogue_parts)
+    dialogue = "\n".join(dialogue_parts) #合并所有消息，最多4000个字符，生成对话记录
 
     if not dialogue.strip():
-        return 
+        print("[Memory: extract skipped - no text content in recent messages]")
+        return
     
     existing=list_memory_files()
     existing_desc='\n'.join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
@@ -382,7 +389,10 @@ def extract_memories(messages:list):
         "'project' (project fact), 'reference' (external pointer)\n"
         "- description: one-line summary for index lookup\n"
         "- body: full detail in markdown\n"
-        "If nothing new or already covered by existing memories, return [].\n\n"
+        "If nothing new or already covered by existing memories, return [].\n"
+        "OUTPUT FORMAT (STRICT): reply with ONLY a plain JSON array. "
+        "Do NOT think out loud, do NOT explain, do NOT wrap it in markdown code "
+        "fences (```json), do NOT add any text before or after the array.\n\n"
         f"Existing memories:\n{existing_desc}\n\n"
         f"Dialogue:\n{dialogue[:4000]}"
     )
@@ -392,14 +402,37 @@ def extract_memories(messages:list):
             model=os.getenv('LLM_MODEL_ID'),
             messages=[{'role':'user','content':prompt}],
             temperature=0.7,
-            max_tokens=800,
+            max_tokens=4000,
         )
-        text=_extract_text(response.choices[0].message.content).strip()
+        msg=response.choices[0].message
+        text=_extract_text(msg.content or '').strip()
+        if not text:
+            # 推理模型可能把 max_tokens 预算全花在 reasoning_content 上导致 content 为空，
+            # 退而从 reasoning_content 里找 JSON 数组
+            text=_extract_text(getattr(msg,'reasoning_content','') or '').strip()
         match=re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            return 
-        items=json.loads(match.group())
+        # 解析 JSON 数组：LLM 回复里可能混有自然语言方括号或多个数组段（Extra data），
+        # 先试贪婪匹配，失败再逐个尝试最短数组段，取第一个能解析成 list 的
+        items=None
+        if match:
+            try:
+                items=json.loads(match.group())
+            except Exception:
+                items=None
+        if not isinstance(items,list):
+            for m in re.finditer(r'\[.*?\]', text, re.DOTALL):
+                try:
+                    cand=json.loads(m.group())
+                    if isinstance(cand,list):
+                        items=cand
+                        break
+                except Exception:
+                    continue
+        if not isinstance(items,list):
+            print(f"[Memory: extract failed - no valid JSON array in LLM reply: {text[:200]!r}]")
+            return
         if not items:
+            print("[Memory: extract returned empty (LLM judged nothing worth remembering)]")
             return
         count=0
         for mem in items:
@@ -408,12 +441,14 @@ def extract_memories(messages:list):
             desc=mem.get('description','')
             body=mem.get('body','')
             if desc and body:
-                write_memory_file(name,mem_type,desc,body)
+                write_memory_file(name,mem_type,desc,body) #写入新记忆文件，格式为name.md，内容为description\nbody
                 count+=1
         if count:
             print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
-    except Exception:
-        pass
+        else:
+            print(f"[Memory: extract returned {len(items)} items but none had desc+body]")
+    except Exception as e:
+        print(f"[Memory: extract error: {e}]")
 
 CONSOLIDATE_THRESHOLD = 10
 
@@ -446,8 +481,13 @@ def consolidate_memories():
         text = _extract_text(response.choices[0].message.content).strip()
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
+            print(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
             return
         items = json.loads(match.group())
+        if not items:
+            # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
+            print("[Memory: consolidate returned empty - aborting (would delete all memories)]")
+            return
 
         # Remove old memory files (keep MEMORY.md)
         for f in MEMORY_DIR.glob("*.md"):
@@ -460,11 +500,12 @@ def consolidate_memories():
             desc = mem.get("description", "")
             body = mem.get("body", "")
             if desc and body:
-                write_memory_file(name, mem_type, desc, body)
+                write_memory_file(name, mem_type, desc, body) #边写边更新索引
+
 
         print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Memory: consolidate error: {e}]")
 
 
 
@@ -1002,18 +1043,21 @@ MAX_REACTIVE_RETRIES=1
 def agent_loop(messages:list):
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
-    messages.append({'role':'system','content':build_system()})
-    reactive_retries=0
-    skip_micro_rounds=0
-    rounds_since_todo=0
+    messages.append({'role':'system','content':build_system()}) #循环开始前，添加系统提示词
+    reactive_retries=0 #响应重试次数
+    skip_micro_rounds=0 #跳过 micro_compact 轮数
+    rounds_since_todo=0 #距离上次 todo 提醒的轮数
+    # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
+    # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
+    #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
 
     while True:
-        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages]
+        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的消息，保留所有消息类型
         
 
-        messages[:]=tool_result_budget(messages)
-        messages[:]=snip_compact(messages)
+        messages[:]=tool_result_budget(messages) #具体压缩方式：大的工具结果优先压缩
+        messages[:]=snip_compact(messages) #保留头尾消息，切除中间部分
         if skip_micro_rounds>0:
             skip_micro_rounds-=1  # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
         else:
@@ -1021,7 +1065,7 @@ def agent_loop(messages:list):
 
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
-            messages[:]=compact_history(messages)
+            messages[:]=compact_history(messages) #调用Llm进行压缩
             skip_micro_rounds=3
 
         if rounds_since_todo >=8 and messages:
@@ -1037,7 +1081,8 @@ def agent_loop(messages:list):
 
         request_messages = messages
         if memories_content:
-            # 记忆只注入请求副本，不污染 messages（压缩/转录/tool 配对保持干净）
+            # 记忆注入：只往「第一条用户消息」追加（break 后即停），不是每条消息都追加；
+            # 注入的是 request_messages 副本，不污染 messages，压缩/转录/tool 配对保持干净。
             request_messages = messages.copy()
             for i, m in enumerate(request_messages):
                 if m.get('role') == 'user' and isinstance(m.get('content'), str):
@@ -1058,14 +1103,15 @@ def agent_loop(messages:list):
 
                 reactive_retries+=1
                 print('[reactive compact]')
-                messages[:]=reactive_compact(messages)
+                messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
                 skip_micro_rounds=3
                 continue
             raise
 
 
         message=response.choices[0].message
-        messages.append(message.model_dump())
+        messages.append(message.model_dump()) #添加模型回复到上下文
+
 
         if response.choices[0].finish_reason != "tool_calls":
             force=trigger_hooks('Stop',messages)
@@ -1075,7 +1121,13 @@ def agent_loop(messages:list):
             if message.content:
                 print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
+            # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
+            # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
+            # ⚠️ 提醒：只负责落盘到 .cache/memories/*.md，不会反馈回当前 Loop ——
+            #    本会话的新记忆要等下一次会话 load_memories 才会被召回。
             extract_memories(pre_compress)   # 从压缩前快照提炼记忆，压缩不丢信息
+            # consolidate_memories()：仅当记忆文件数 ≥ CONSOLIDATE_THRESHOLD(10) 时触发，
+            #    合并重复/过期记忆；LLM 返回空数组时会中止，防止删光所有记忆。
             consolidate_memories()
             return message.content or "No output"
             

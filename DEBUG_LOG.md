@@ -607,11 +607,11 @@ while True:
         messages[:] = compact_history(messages)
 ```
 
-| 工序 | 触发条件 | 动作 |
-|------|----------|------|
-| `tool_result_budget` | 所有工具结果合计 > 200KB | 把最大的 >30KB 结果写入 `.cache/tool_results/<id>.txt`，原位替换为 `<persisted-output>` 引用 + 2000 字预览 |
-| `snip_compact` | 消息数 > 50 条 | 保留头 3 条 + 尾部 47 条，中间替换为一条 `[snipped N messages]` |
-| `micro_compact` | 工具结果 > `KEEP_RECENT`(3) 条 | 更早的 >120 字符结果原地替换为占位符（**原地修改**，省掉重建列表） |
+| 工序                 | 触发条件                       | 动作                                                                                                       |
+| -------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `tool_result_budget` | 所有工具结果合计 > 200KB       | 把最大的 >30KB 结果写入 `.cache/tool_results/<id>.txt`，原位替换为 `<persisted-output>` 引用 + 2000 字预览 |
+| `snip_compact`       | 消息数 > 50 条                 | 保留头 3 条 + 尾部 47 条，中间替换为一条 `[snipped N messages]`                                            |
+| `micro_compact`      | 工具结果 > `KEEP_RECENT`(3) 条 | 更早的 >120 字符结果原地替换为占位符（**原地修改**，省掉重建列表）                                         |
 
 **踩坑：裁剪不能制造孤儿 tool 消息。** OpenAI 硬约束：`role:"tool"` 必须对上一条 assistant 的 `tool_calls`。因此：
 
@@ -736,13 +736,13 @@ except Exception as e:
 
 **修复（最小改动）：**
 
-| 位置 | 改动 |
-|------|------|
-| `tool_result_budget` | 默认 `max_bytes=int(CONTEXT_LIMIT*0.8)`，免费层先于自动压缩 |
-| `PERSIST_THERSHOLD` | 30000 → 10000，大输出第二轮回合就落盘换引用 |
-| `run_read` | 无 `limit` 且 >500 行 → 自动截 200 行 + 提示分块读 |
-| `summarize_history` | `max_tokens=4000`、`[-80000:]`（保留尾部）、模板强制"写完全部 5 节" |
-| `agent_loop` | `just_compacted` 标志：压缩后第一轮跳过 `micro_compact`，保留刚拿到的工具结果 |
+| 位置                 | 改动                                                                          |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `tool_result_budget` | 默认 `max_bytes=int(CONTEXT_LIMIT*0.8)`，免费层先于自动压缩                   |
+| `PERSIST_THERSHOLD`  | 30000 → 10000，大输出第二轮回合就落盘换引用                                   |
+| `run_read`           | 无 `limit` 且 >500 行 → 自动截 200 行 + 提示分块读                            |
+| `summarize_history`  | `max_tokens=4000`、`[-80000:]`（保留尾部）、模板强制"写完全部 5 节"           |
+| `agent_loop`         | `just_compacted` 标志：压缩后第一轮跳过 `micro_compact`，保留刚拿到的工具结果 |
 
 ## 第 21 步：snip_compact 制造孤儿 tool 消息（400 崩溃）
 
@@ -787,11 +787,11 @@ rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
 **修复：**
 
-| 位置 | 改动 |
-|------|------|
-| `run_bash` | 解码后 `out.replace('\ufffd','?')`，杜绝 GBK 控制台打印崩溃 |
-| agent_loop / spawn_subagent | 删掉重复的 `print(output[:200])`，只留 `log_hook` |
-| SYSTEM | 明确"读文件用 read 工具（支持 limit），避免 PowerShell Get-Content" |
+| 位置                        | 改动                                                                |
+| --------------------------- | ------------------------------------------------------------------- |
+| `run_bash`                  | 解码后 `out.replace('\ufffd','?')`，杜绝 GBK 控制台打印崩溃         |
+| agent_loop / spawn_subagent | 删掉重复的 `print(output[:200])`，只留 `log_hook`                   |
+| SYSTEM                      | 明确"读文件用 read 工具（支持 limit），避免 PowerShell Get-Content" |
 
 **教训：** Windows 上"文件编码对"不代表"显示对"——工具链默认码页才是隐形杀手。提示词要从源头约束模型命令选择。
 
@@ -803,3 +803,358 @@ rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 4. **模型是系统边界** —— 参数要兜底、命令选择要靠提示词约束，代码和提示词双保险。
 5. **计数器要能一眼看到自增点** —— 只有初始化/判断/重置的计数器，多半是忘了 `+=1`。
 
+---
+
+# 第六部分：系统全貌与流程图（当前状态）
+
+## 当前项目结构
+
+```
+d:\harness-agent
+├── harness.py            # 核心框架（~1100 行）：主循环 / 工具 / Hook / 压缩 / 记忆 / 子代理
+├── cc_ui.py              # Claude Code 风格终端 UI（feature/ui 分支）
+├── agent_loop.py         # 最早期原型（仅 bash + 死循环）
+├── test_compress.py      # 压缩逻辑测试（9 例）
+├── test_context_manage.py# 上下文管理端到端测试（8 例）
+├── test_memory.py        # 记忆系统端到端测试（2 例）
+├── skills/               # skill 目录（file-summarizer/）
+├── .env                  # LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_ID（已 gitignore）
+├── .gitignore
+└── .cache/               # transcript / tool_results / memories（已 gitignore）
+```
+
+**分支现状**（Git）：
+
+- `main`：纯逻辑主线（压缩/记忆/todo 修复，无 UI 依赖）
+- `feature/ui`：UI 增强线（cc_ui.py + harness 的 UI 接线，已合并 main 逻辑）
+- `feature/cd-support`：持久化 cd 支持（CURRENT_DIR 状态）
+
+## 一、主循环（agent_loop）流程图
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  agent_loop(messages) 入口                                    │
+│  1. trigger_hooks('UserPromptSubmit', 用户输入)                │
+│  2. messages += system(build_system())                        │
+│  3. memories_content = load_memories()   ← 记忆召回            │
+│  4. reactive_retries=0 / skip_micro_rounds=0 / rounds_since_todo=0 │
+└──────────────────────────┬────────────────────────────────────┘
+                           ▼
+                        ┌──────────────────────────────┐
+              ┌────────►│  while True: 每轮循环开始     │
+              │         └──────────────┬───────────────┘
+              │                        ▼
+              │         pre_compress = 深拷贝(messages)   ← 供记忆提炼
+              │                        ▼
+              │         ┌─ 免费层 ① tool_result_budget（大输出落盘）
+              │         │   ② snip_compact（>50 条裁剪，头/尾保护分组）
+              │         │   ③ micro_compact（旧工具结果占位）── 压缩后跳过 3 轮
+              │         └─ 若 estimate_size > CONTEXT_LIMIT
+              │                        ▼  [auto compact]
+              │         messages = compact_history()  （LLM 摘要 + 保留 system）
+              │         skip_micro_rounds = 3
+              │                        ▼
+              │         rounds_since_todo >= 8 ？── 是 → 注入 <reminder>，归零
+              │                        ▼
+              │         记忆注入（仅请求副本，不污染 messages）
+              │                        ▼
+              │         try: client.chat.completions.create(request_messages)
+              │              │ 成功 → reactive_retries=0
+              │              │ 报 prompt_too_long 且 retries<1？
+              │              │    ├─ 是 → reactive_compact() + skip_micro=3 + continue
+              │              ▼    └─ 否 → raise
+              │         messages += assistant(model_dump)
+              │                        ▼
+              │         finish_reason != "tool_calls" ?
+              │            ├─ 是 ──► trigger_hooks('Stop')
+              │            │         │ force？──是→注入 force + continue
+              │            │         ▼
+              │            │         print(markdown 渲染) / write_transcript
+              │            │         extract_memories(pre_compress) → consolidate
+              │            │         return content    ← 会话结束
+              │            ▼
+              │         遍历每个 tool_call（顺序执行）：
+              │           ├─ todo_write → used_todo=True
+              │           ├─ compact    → compact_history + 文本化已执行结果 + break
+              │           ├─ PreToolUse hook（is_tool_hook / permission_hook）
+              │           │    └─ blocked → output=拒绝信息；否则 tool_registry[name](**args)
+              │           ├─ PostToolUse hook（log_hook / large_output_hook）
+              │           └─ tool_messages += {role:tool, tool_call_id, content}
+              │                        ▼
+              │         messages.extend(tool_messages)
+              │         rounds_since_todo = used_todo ? 0 : +1
+              └───────── 回到 while True
+```
+
+## 二、工具分发与 Hook 链流程图
+
+```
+模型输出 tool_calls
+        │
+        ▼
+┌─ for tool_call in message.tool_calls ─────────────────────┐
+│  name = function.name / args = json.loads(arguments)      │
+│                                                           │
+│  ① todo_write → 标记 used_todo（不计入"绕圈"计数）         │
+│  ② compact    → compact_history 替换上下文，            │
+│                 已执行工具结果转文本附入（防 orphan）→ break │
+│                                                           │
+│  ③ PreToolUse hooks（按注册顺序）                          │
+│     ├─ is_tool_hook      → 未知工具直接拒绝                │
+│     └─ permission_hook   → 黑名单拒绝 / 危险命令询问 /      │
+│                            越界访问询问                     │
+│        └─ blocked ? ──是──► output = 拒绝信息              │
+│              │否                                           │
+│              ▼                                            │
+│  ④ tool_registry[name](**args)                            │
+│     （run_bash / run_read / run_write / run_edit / run_glob│
+│       / run_todo_write / spawn_subagent / load_skill）      │
+│        │                                                  │
+│  ⑤ PostToolUse hooks                                      │
+│     ├─ log_hook           → UI 工具行 / bash 粉色边框       │
+│     └─ large_output_hook  → 超 10 万字符警告                │
+│                                                           │
+│  ⑥ tool_messages.append({role:'tool', tool_call_id,        │
+│                           content: output})  ← 必须有！     │
+└──────────────┬────────────────────────────────────────────┘
+               ▼
+      messages.extend(tool_messages)
+```
+
+## 三、上下文压缩流水线（四级成本）流程图
+
+```
+每轮循环开头
+     │
+     ▼
+┌─ ① tool_result_budget（免费）─────────────────────────┐
+│  单条工具结果 > PERSIST_THERSHOLD(10KB)               │
+│  → 写入 .cache/tool_results/<id>.txt                   │
+│  → 消息里替换成"引用 + 2000 字预览"                    │
+└────────────────────┬──────────────────────────────────┘
+                     ▼
+┌─ ② snip_compact（免费）───────────────────────────────┐
+│  > 50 条：保留头 3 + marker + 尾 47                    │
+│  头/尾边界不得切断多工具分组（防 dangling/orphan）       │
+└────────────────────┬──────────────────────────────────┘
+                     ▼
+┌─ ③ micro_compact（免费）───────────────────────────────┐
+│  > KEEP_RECENT(6) 条旧工具结果 → "[Earlier tool result │
+│  compacted]" 占位；压缩后跳过 3 轮                     │
+└────────────────────┬──────────────────────────────────┘
+                     ▼
+   estimate_size > CONTEXT_LIMIT ?（token 启发式估算）
+        │ 是                                   │ 否
+        ▼                                      ▼
+┌─ ④ compact_history（花钱：1 次 LLM）       直接调 API
+│  write_transcript 落盘                      │
+│  summarize_history 摘要（5 节）             │
+│  返回 [system(build_system), user[Compacted]]│
+└────────────────────┬────────────────────────┘
+                     ▼
+              API 仍报 prompt_too_long ?
+                   │ 是
+                   ▼
+        ┌─ reactive_compact（花钱：1 次 LLM）────────┐
+        │  落盘 + 摘要(前段) + 保留最近 5 条(防孤儿)  │
+        │  + system，retry 上限 1 次                │
+        └──────────────────┬────────────────────────┘
+                           ▼
+                      重试 API
+```
+
+## 四、记忆系统流程图
+
+```
+┌─ 召回（会话开始）────────────────────────────────────┐
+│  load_memories(messages)                            │
+│   ├─ .cache/memories/*.md + MEMORY.md 索引          │
+│   ├─ LLM 选相关（失败 fallback 关键词相关度）          │
+│   └─ 注入 request_messages 第一条 user 消息顶部        │
+└──────────────────────┬──────────────────────────────┘
+                       ▼
+┌─ 提炼（会话结束）────────────────────────────────────┐
+│  extract_memories(pre_compress)                     │
+│   ├─ 用压缩前快照（压缩不丢信息）                     │
+│   ├─ LLM 提炼 4 类：user/feedback/project/reference │
+│   └─ 每类 write_memory_file → *.md + 重建索引         │
+└──────────────────────┬──────────────────────────────┘
+                       ▼
+┌─ 合并（超阈值）─────────────────────────────────────┐
+│  consolidate_memories()                             │
+│   文件数 >= 10 → LLM 合并旧记忆 → 删旧写新            │
+│   单文件超 4000 字 → LLM 精简                         │
+└─────────────────────────────────────────────────────┘
+```
+
+## 五、权限决策流程图（permission_hook）
+
+```
+模型请求 bash/read/write/edit
+        │
+        ▼
+  bash ? ──是──► DENY_LIST 命中 ? ──是──► 直接拒绝（红⛔）
+        │            │否
+        │            ▼
+        │     DESTRUCTIVE 命中 ? ──是──► 权限框询问（y/n）
+        │            │否                     └─ 拒绝 → "Permission denied"
+        │            ▼
+        │     放行
+        ▼
+  read/write/edit ? ──是──► 路径逃出 WORKDIR ?
+                                 ├─ 是 → 权限框询问
+                                 └─ 否 → 放行
+        ▼
+  PreToolUse 链通过 → 执行工具
+```
+
+## 六、UI 渲染管线（cc_ui.py，feature/ui）流程图
+
+```
+LLM 输出 / 工具输出
+        │
+        ▼
+┌─ 编码自适应 ──────────────────────────────┐
+│  _is_unicode：UTF-8 终端 → 图形符号（▸•┌─） │
+│              GBK 终端 → ASCII 降级（>-|）  │
+│  safe_print：不可编码字符自动替换，绝不崩溃 │
+└──────────────┬────────────────────────────┘
+               ▼
+┌─ 色级降级 ────────────────────────────────┐
+│  NO_COLOR → 无色                          │
+│  COLORTERM=truecolor → 24bit RGB          │
+│  TERM=256color → 256 色表（_rgb_to_256）  │
+│  默认 → ANSI16（_ansi_16_code）           │
+└──────────────┬────────────────────────────┘
+               ▼
+┌─ 组件渲染 ────────────────────────────────┐
+│  markdown()   → 标题/列表/表格/代码块/引用  │
+│  diff()       → 暗绿/暗红背景 + 元信息      │
+│  bash_box()   → bash 粉色边框              │
+│  permission_banner() → 紫色权限框          │
+│  tool_line()  → > bash command=xxx        │
+│  statusline() → 模型tier色 + 进度条 + 分支  │
+│  Spinner()    → 动词池/两档速度/停滞渐变红  │
+└────────────────────────────────────────────┘
+```
+
+## 七、子代理流程图（spawn_subagent）
+
+```
+主代理调用 task/子代理
+        │
+        ▼
+  子代理消息 = [system(build_sub_system), user(描述)]
+        │
+        ▼
+  for _ in range(30):              ← 上限 30 轮
+        │
+        ▼
+  client.chat.completions.create(SUB_TOOLS)
+        │
+        ▼
+  finish_reason != tool_calls ?
+     ├─ 是 ──► Stop hook force ? ──是──► 注入 force，continue
+     │              │否
+     │              ▼
+     │        返回 markdown 渲染的回答
+     ▼
+  执行每个 tool_call（SUB_HANDLERS，复用 Pre/PostToolUse hook）
+        │
+        ▼
+  messages.extend(tool_messages) → 回到循环
+        │
+        ▼
+  30 轮未结束 → 取最后 assistant 文本兜底返回
+```
+
+## 第六部分核心结论
+
+1. **一条主循环串起全部子系统** —— 压缩（免费层→LLM 层→reactive）在前，记忆（召回→注入→提炼）围在两侧，Hook（Pre/Post/Stop）嵌入工具执行点，新增能力只需加 hook 或注册工具，主循环结构稳定。
+2. **"只留请求副本"原则** —— 记忆注入用 `request_messages` 副本、压缩用 `messages` 原地替换，两者解耦，transcript/tool 配对不被 UI 或记忆污染。
+3. **每条链路都有兜底** —— 压缩链 reactive 兜底、记忆链 fallback 关键词、UI 链 GBK 降级、工具链异常转文本——模型的不可控性是常态，分层防御是唯一解。
+
+---
+
+# 第七部分：记忆管线真机排障实录
+
+记录让记忆功能从"看不见、存不下"到可诊断、可落盘的 5 个真机问题（均在本轮修复）。
+
+## 问题 1：记忆文件不存在 / 提取为空
+
+**现象**：`.cache/memories/` 下只有空的 `MEMORY.md` 索引，没有任何 `*.md` 记忆文件。
+
+**根因**：`extract_memories` 只扫描 `messages[-10:]`（结尾 10 条），而用户偏好通常在**开头第一条**——整段会话"值得记的东西"全在窗口外，LLM 正确判定"无可记忆内容"→ 返回 `[]` → 不落盘。
+
+**修复**：
+
+- 窗口改为 `messages[:10] + messages[-10:]`（开头 10 条 + 结尾 10 条；消息 ≤10 条时用全部）。
+- `extract_memories` / `consolidate_memories` 加可见性诊断：无 JSON 数组 / 数组为空 / 条目缺 desc+body / 异常，每种失败路径都打印 `[Memory: ...]`，不再静默。
+- `consolidate_memories` 加防删光守卫：LLM 返回空数组时先打印并 return，**删除旧记忆的代码永远执行不到**。
+
+## 问题 2：UnicodeDecodeError（'gbk' codec can't decode byte 0xa6）
+
+**现象**：`list_memory_files` 崩在 `f.read_text()`。
+
+**根因**：记忆文件以 UTF-8 写入，但用户运行环境（`D:/Anaconda_envs/envs/aitest01/python.exe`，无 `-X utf8`）默认按 GBK 解码 → 读写编码不一致。
+
+**修复**：记忆系统所有文件读写显式指定 `encoding='utf-8'`：
+
+- `write_memory_file`：写文件 + `_rebuild_index` 写索引
+- `_rebuild_index` / `read_memory_index` / `read_memory_file` / `list_memory_files`：读文件（`errors='replace'` 兜底）
+
+**教训**：工具链默认码页（GBK）是 Windows 的隐形杀手，跨环境运行必须显式声明编码。
+
+## 问题 3：extract failed - no JSON array in LLM reply: ''
+
+**现象**：提取时 LLM 返回空 content。
+
+**根因**：`deepseek-v4-flash` 是**带推理的模型**（返回 `reasoning_content`）。extract 提示词含最长 4000 字符对话后，`max_tokens=800` 预算被思考链吃满 → `finish_reason=length`，`content=''`。
+
+**实测对照**：
+
+| max_tokens | finish_reason | content                          |
+| ---------- | ------------- | -------------------------------- |
+| 800        | `length`      | `''`（思考链 3182 字符吃满预算） |
+| 4000       | `stop`        | 正常 JSON 数组                   |
+
+**修复**：
+
+- `max_tokens` 800 → 4000，给思考链留足预算，保证 content 有输出。
+- content 为空时退而从 `reasoning_content` 里找 JSON 数组（双保险）。
+
+## 问题 4：extract error（Expecting value / Extra data）
+
+**现象**：`json.loads` 抛 `JSONDecodeError`：
+
+- `Expecting value: line 1 column 2 (char 1)` —— 方括号里不是合法 JSON
+- `Extra data: line 1 column 4 (char 3)` —— 解析完第一个数组后还有多余数据
+
+**根因**：正则 `\[.*\]` 太宽松——"匹配到方括号" ≠ "合法 JSON"：
+
+- 自然语言方括号（尤其 reasoning 兜底文本里的 `[用户偏好, 项目事实]`）→ `Expecting value`
+- 回复含多个数组段（`["a"] ["b"]`）或数组+尾随文本 → `Extra data`
+
+**修复（提示词 + 解析双层）**：
+
+- **提示词层**：extract 提示词加 STRICT 约束——"只输出一个纯 JSON 数组，不思考、不解释、不用 ```json 围栏、前后无任何文字"。实测：content 从空变非空，思考链从 3182/11733 字符降到 799/2131，返回格式干净。
+- **解析层**：两级尝试——先贪婪匹配整体 `json.loads`；失败则用 `\[.*?\]` 逐个尝试最短方括号段，取第一个能解析成 list 的；全部失败才报诊断。
+
+**取舍**：STRICT 提示词会让模型偏向保守（不确定就 `[]`），对"已覆盖的记忆"会正确跳过，但也可能漏掉边缘新记忆——这是提示词路线的固有代价，故保留解析层兜底。
+
+## 问题 5：端到端验证产物污染测试
+
+**现象**：真机验证后 `.cache/memories/` 残留 4 个真实记忆文件 → `test_context_manage` 的 `FakeCompletions` 队列被 `select_relevant_memories`（文件非空时会先调一次 LLM）提前消费，8 个用例失败。
+
+**根因**：测试按"空记忆库"前提脚本化了 API 调用次数，真实记忆文件破坏了队列对齐。
+
+**处理**：验证产物用后即清；测试依赖空记忆库前提。教训：mock 队列类测试对环境残留极其敏感，真机产物勿留。
+
+## 第七部分核心结论
+
+1. **推理模型是"会思考"的系统边界** —— `max_tokens` 必须给思考链留预算，`content` 可能为空，必须兜底（reasoning_content）。
+2. **解析要"能解析才算数"** —— 先宽（贪婪）后严（最短候选）两级试，`json.loads` 成功才收下，杜绝 Expecting value / Extra data。
+3. **提示词与代码是双保险** —— STRICT 提示词从源头减少异常回复，健壮解析兜底剩余异常，缺一不可。
+4. **记忆窗口要覆盖会话两端** —— 用户偏好通常在开头，只看结尾 10 条等于盲人摸象。
+5. **跨环境编码必须显式声明** —— 记忆文件读写统一 UTF-8，否则换台机器就崩。
+6. **真机产物会污染测试** —— 端到端验证生成的数据用后即清，否则 mock 队列/计数断言全崩。
