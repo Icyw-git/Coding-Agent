@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Optional
 import yaml
+import cc_ui as ui
 
 
 
@@ -626,7 +627,9 @@ def run_todo_write(todos: list) -> str:
     CURRENT_TODOS = todos
     lines = ["\n\033[33m## Current Tasks\033[0m"]
     for t in CURRENT_TODOS:
-        icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
+        icon = {"pending": " ",
+                "in_progress": "\033[36m" + ui.G['tri'] + "\033[0m",
+                "completed": "\033[32m" + ui.G['check'] + "\033[0m"}[t["status"]]
         lines.append(f"  [{icon}] {t['content']}")
     print("\n".join(lines))
     return f"Updated {len(CURRENT_TODOS)} tasks"
@@ -658,20 +661,24 @@ def permission_hook(tool:str,args:dict):
     if tool=='bash':
         for pattern in DENY_LIST:
             if pattern in args.get("command", ""):
-                print(f'\n\033[31m⛔ Blocked: {pattern}\033[0m')
+                ui.safe_print(ui.c('error', ui.G['deny'] + ' Blocked: {0}'.format(pattern)))
                 return f"Error: Dangerous command {pattern}, please do not execute"
         for pattern in DESTRUCTIVE:
             if pattern in args.get("command", ""):
-                print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
-                print(f"   Tool: {tool}({args})")
+                ui.safe_print(ui.permission_banner('Permission needed', [
+                    ui.c('warning', 'Potentially destructive command'),
+                    ui.tool_line('bash', args),
+                ]))
                 choice=input("Allow? (y/n) ").strip().lower()
                 if choice not in ('y','yes'):
                     return "Permission denied by user"
     elif tool in ["read", "write", "edit"]:
         path=args.get('path','')
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            print(f"\n\033[33m⚠  Access outside workspace\033[0m")
-            print(f"   Tool: {tool}({path})")
+            ui.safe_print(ui.permission_banner('Permission needed', [
+                ui.c('warning', 'Access outside workspace'),
+                ui.tool_line(tool, {'path': path}),
+            ]))
             choice=input("Allow? (y/n) ").strip().lower()
             if choice not in ('y','yes'):
                 return "Permission denied by user"
@@ -679,21 +686,28 @@ def permission_hook(tool:str,args:dict):
     return None
 
 def log_hook(tool:str,args:dict,output:str):
-    print(f"\033[90m[HOOK] {tool}({args}) -> {output[:100]}\033[0m")
+    if tool == 'bash':
+        # bash 输出用 Claude Code 风格粉色边框框
+        ui.safe_print(ui.bash_box(args.get('command', ''), output))
+    else:
+        ui.safe_print(ui.tool_line(tool, args, output))
     return None
 
 def large_output_hook(tool:str,args:dict,output:str):
     if len(str(output))>100000:
-        print(f"\033[33m[HOOK] ⚠ Large output from {tool}: {len(str(output))} chars\033[0m")
+        ui.safe_print(ui.c('warning', ui.G['warn'] + ' Large output from {0}: {1} chars'.format(tool, len(str(output)))))
     return None
 
 def context_injection_hook(query:str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    ui.safe_print(ui.status('working in {0}'.format(WORKDIR)))
     return None
 
 def summary_hook(messages:list):
     tool_count=sum(1 for m in messages if m.get('role')=='tool')
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    line = ui.statusline(model=os.getenv('LLM_MODEL_ID', ''), tools=tool_count,
+                         ctx_pct=None)
+    if line:
+        ui.safe_print(line)
     return None
 
 register_hook("UserPromptSubmit",context_injection_hook)
@@ -712,19 +726,20 @@ def _extract_text(text:str)->str:
 
 
 def spawn_subagent(description:str)->str:
-    print(f'\n\033[35m[Subagent spawned]\033[0m')
+    ui.safe_print('\n' + ui.c('info', ui.G['play'] + ' Subagent spawned'))
     messages=[{'role':'system','content':build_sub_system()},{'role':'user','content':description}]
 
 
     for _ in range(30):
 
-        response=client.chat.completions.create(
-            model=os.getenv("LLM_MODEL_ID"),
-            messages=messages,
-            tools=SUB_TOOLS,
-            temperature=0.7,
-            max_tokens=8000,
-        )
+        with ui.Spinner('Subagent thinking'):
+            response=client.chat.completions.create(
+                model=os.getenv("LLM_MODEL_ID"),
+                messages=messages,
+                tools=SUB_TOOLS,
+                temperature=0.7,
+                max_tokens=8000,
+            )
         message=response.choices[0].message
         messages.append(message.model_dump())
 
@@ -734,7 +749,7 @@ def spawn_subagent(description:str)->str:
                 messages.append({'role':'user','content':force})
                 continue
             if message.content:
-                print(message.content)
+                ui.safe_print(ui.markdown(message.content))
             return message.content or "No output"
 
         tool_messages = []
@@ -769,7 +784,7 @@ def spawn_subagent(description:str)->str:
                     break
         if not result:
             result="Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent done]\033[0m")
+    ui.safe_print(ui.c('info', ui.G['square'] + ' Subagent done'))
     return result
 
 
@@ -1017,14 +1032,14 @@ def agent_loop(messages:list):
                     break
 
         try:
-            response=client.chat.completions.create(
-
-                model=os.getenv("LLM_MODEL_ID"),
-                messages=request_messages,
-                tools=TOOLS,
-                temperature=0.7,
-                max_tokens=8000,
-            )
+            with ui.Spinner('Thinking'):
+                response=client.chat.completions.create(
+                    model=os.getenv("LLM_MODEL_ID"),
+                    messages=request_messages,
+                    tools=TOOLS,
+                    temperature=0.7,
+                    max_tokens=8000,
+                )
             reactive_retries=0
         except Exception as e:
             if ('prompt_too_long' in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries<MAX_REACTIVE_RETRIES:
@@ -1046,7 +1061,7 @@ def agent_loop(messages:list):
                 messages.append({'role':'user','content':force})
                 continue
             if message.content:
-                print(message.content)
+                ui.safe_print(ui.markdown(message.content))
             extract_memories(pre_compress)   # 从压缩前快照提炼记忆，压缩不丢信息
             consolidate_memories()
             return message.content or "No output"
