@@ -840,14 +840,32 @@ TOOLS.append({
     }
 })
 
-CONTEXT_LIMIT=50000
-KEEP_RECENT=3
+# 模型上下文窗口（token），可用环境变量 LLM_CONTEXT_WINDOW 覆盖
+MODEL_WINDOWS = {
+    'deepseek-v4-flash': 131072,
+    'deepseek-chat': 65536,
+    'deepseek-reasoner': 65536,
+}
+OUTPUT_RESERVE = 8192        # 给 max_tokens=8000 输出预留
+CTX_SAFETY = 0.8             # 留余量，防 prompt_too_long
+
+def _default_context_limit() -> int:
+    window = int(os.getenv('LLM_CONTEXT_WINDOW') or
+                 MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID', ''), 65536))
+    return max(4000, int((window - OUTPUT_RESERVE) * CTX_SAFETY))
+
+CONTEXT_LIMIT=_default_context_limit()
+KEEP_RECENT=6
 PERSIST_THERSHOLD=10000
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
 TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 
 def estimate_size(msgs):
-    return len(str(msgs))
+    # token 启发式：英文约 3.5 字符/token，中文约 1.3 字符/token（与 CONTEXT_LIMIT 同单位）
+    text=str(msgs)
+    ascii_chars=sum(1 for ch in text if ord(ch) < 128)
+    cjk=len(text)-ascii_chars
+    return max(1, int(ascii_chars/3.5 + cjk*1.3))
 
 
 
@@ -862,10 +880,15 @@ def _is_tool_result_message(msg): #判断是否工具结果
 def snip_compact(messages,max_messages=50): #保留头 3 条，尾部47 条，中间按 tool_calls 分组
     if len(messages)<=max_messages:
         return messages
-    # 头部：保留前 3 条；若最后一条 assistant 带 tool_calls，则连同其工具结果一起保留
+    # 头部：保留前 3 条；不能切断"assistant 带多个工具"的分组（否则 dangling）
     head_end=3
-    if head_end>0 and _message_has_tool_use(messages[head_end-1]):
-        while head_end <len(messages) and _is_tool_result_message(messages[head_end]):
+    if head_end>0 and head_end<len(messages):
+        # 情况 A：头部以 assistant-with-tool_calls 结尾 → 并入其工具结果
+        if _message_has_tool_use(messages[head_end-1]):
+            while head_end<len(messages) and _is_tool_result_message(messages[head_end]):
+                head_end+=1
+        # 情况 B：头部切断在分组中间（前后都是工具结果）→ 并入剩余工具结果
+        while head_end<len(messages) and _is_tool_result_message(messages[head_end-1]) and _is_tool_result_message(messages[head_end]):
             head_end+=1
     # 尾部预算：head + 1 条 marker + tail <= max_messages
     keep_tail=max_messages-head_end-1
@@ -959,15 +982,20 @@ def compact_history(messages): #使用llm进行对话记录压缩，返回压缩
     transcript_path=write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
     summary=summarize_history(messages)
-    return [{'role':'user','content':f'[Compacted]\n\n{summary}'}]
+    return [{'role':'system','content':build_system()},
+            {'role':'user','content':f'[Compacted]\n\n{summary}'}]
 
 def reactive_compact(messages): #保存完整对话记录，保留最近五条消息，返回压缩后的消息
     transcript=write_transcript(messages)
     tail_start=max(0,len(messages)-5)
-    if (tail_start>0 and tail_start<len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start-1]):
-        tail_start-=1
+    # 尾部起点不能是孤儿工具结果（其 assistant 已被裁掉）
+    while tail_start<len(messages) and _is_tool_result_message(messages[tail_start]):
+        tail_start+=1
     summary=summarize_history(messages[:tail_start])
-    return [{'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
+    result=[{'role':'system','content':build_system()},
+            {'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
+    result.extend(messages[tail_start:])   # 保留最近工作现场
+    return result
     
 MAX_REACTIVE_RETRIES=1
 
@@ -976,7 +1004,7 @@ def agent_loop(messages:list):
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
     messages.append({'role':'system','content':build_system()})
     reactive_retries=0
-    just_compacted=False
+    skip_micro_rounds=0
     rounds_since_todo=0
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
 
@@ -986,17 +1014,17 @@ def agent_loop(messages:list):
 
         messages[:]=tool_result_budget(messages)
         messages[:]=snip_compact(messages)
-        if just_compacted:
-            just_compacted=False  # 压缩后第一轮跳过 micro_compact，保留刚拿到的工具结果
+        if skip_micro_rounds>0:
+            skip_micro_rounds-=1  # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
         else:
             messages[:]=micro_compact(messages)
 
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
             messages[:]=compact_history(messages)
-            just_compacted=True
+            skip_micro_rounds=3
 
-        if rounds_since_todo >=3 and messages:
+        if rounds_since_todo >=8 and messages:
             messages.append({
                 'role':'user',
                 'content':"<reminder>Update your todos.</reminder>",
@@ -1018,7 +1046,6 @@ def agent_loop(messages:list):
 
         try:
             response=client.chat.completions.create(
-
                 model=os.getenv("LLM_MODEL_ID"),
                 messages=request_messages,
                 tools=TOOLS,
@@ -1032,7 +1059,7 @@ def agent_loop(messages:list):
                 reactive_retries+=1
                 print('[reactive compact]')
                 messages[:]=reactive_compact(messages)
-                just_compacted=True
+                skip_micro_rounds=3
                 continue
             raise
 
@@ -1047,6 +1074,7 @@ def agent_loop(messages:list):
                 continue
             if message.content:
                 print(message.content)
+            write_transcript(messages)   # 正常结束也落盘，便于复盘
             extract_memories(pre_compress)   # 从压缩前快照提炼记忆，压缩不丢信息
             consolidate_memories()
             return message.content or "No output"
@@ -1067,7 +1095,7 @@ def agent_loop(messages:list):
                 # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
                 # 改为文本附到新上下文里，避免执行结果丢失。
                 messages[:] = compact_history(messages)
-                just_compacted=True
+                skip_micro_rounds=3
                 note = '[Compacted] Conversation history has been summarized.'
                 if tool_messages:
                     done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)

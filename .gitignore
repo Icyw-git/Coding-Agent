@@ -1,0 +1,14 @@
+# Env / secrets
+.env
+
+# Caches
+__pycache__/
+.cache/
+
+# Scratch / temp
+_check_log.py
+_logtail_utf8.txt
+_harness_lines.txt
+_tmp_analyze.py
+_tmp_struct.txt
+text.txt
