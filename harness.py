@@ -583,31 +583,47 @@ def _block_type(message)->str:
 
 # OpenAI 格式：assistant 的 tool_calls 是顶层字段（content 为 null/字符串），
 # 工具结果是独立的 role='tool' 消息（tool_call_id + content 字符串）
-def _message_has_tool_use(msg):
+def _message_has_tool_use(msg): #判断是否工具调用
     return msg.get('role')=='assistant' and bool(msg.get('tool_calls'))
 
-def _is_tool_result_message(msg):
+def _is_tool_result_message(msg): #判断是否工具结果
     return msg.get('role')=='tool'
 
-def snip_compact(messages,max_messages=50):
+def snip_compact(messages,max_messages=50): #保留头 3 条，尾部47 条，中间按 tool_calls 分组
     if len(messages)<=max_messages:
         return messages
-    keep_head,keep_tail=3,max_messages-3
-    head_end,tail_start=keep_head,len(messages)-keep_tail
-    if head_end >0 and _message_has_tool_use(messages[head_end-1]):
+    # 头部：保留前 3 条；若最后一条 assistant 带 tool_calls，则连同其工具结果一起保留
+    head_end=3
+    if head_end>0 and _message_has_tool_use(messages[head_end-1]):
         while head_end <len(messages) and _is_tool_result_message(messages[head_end]):
             head_end+=1
-    if (tail_start >0 and tail_start <len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start-1]):
+    # 尾部预算：head + 1 条 marker + tail <= max_messages
+    keep_tail=max_messages-head_end-1
+    if keep_tail<=1:
+        return messages[:head_end]
+    tail_start=len(messages)-keep_tail
+    # 若裁剪点落在工具结果上且其 assistant 在保留区内，成对保留（多占 1 条配额）
+    if (tail_start>0 and tail_start<len(messages) and _is_tool_result_message(messages[tail_start])
+            and _message_has_tool_use(messages[tail_start-1])):
         tail_start-=1
     if head_end>=tail_start:
         return messages
-    snipped=tail_start-head_end
-    return messages[:head_end]+[{'role':'user','content':f"[snipped {snipped} messages]"}]+messages[tail_start:]
+    result=messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
+    # 若配对调整导致超出预算，从尾部再裁掉超出的条数，并避免以"孤儿"工具结果开头
+    over=len(result)-max_messages
+    while over>0 and tail_start<len(messages):
+        tail_start+=1
+        over-=1
+        while (tail_start<len(messages) and _is_tool_result_message(messages[tail_start])
+                and not _message_has_tool_use(messages[tail_start-1])):
+            tail_start+=1
+            over-=1
+    return messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
 
-def collect_tool_results(messages):
+def collect_tool_results(messages): #收集所有工具结果
     return [msg for msg in messages if msg.get('role')=='tool']
 
-def micro_compact(messages):
+def micro_compact(messages): #旧工具结果占位，只保留最近 KEEP_RECENT 条工具结果
     tool_results=collect_tool_results(messages)
     if len(tool_results)<KEEP_RECENT:
         return messages
@@ -616,16 +632,16 @@ def micro_compact(messages):
             msg['content']="[Earlier tool result compacted. Re-run if needed.]"
     return messages
 
-def persist_large_output(tool_use_id,output):
+def persist_large_output(tool_use_id,output): #持久化大输出
     if len(output)<=PERSIST_THERSHOLD:
         return output
     TOOL_RESULTS_DIR.mkdir(parents=True,exist_ok=True)
     path=TOOL_RESULTS_DIR / f'{tool_use_id}.txt'
     if not path.exists():
-        path.write_text(output)
+        path.write_text(output,encoding='utf-8')
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
-def tool_result_budget(messages,max_bytes=200000):
+def tool_result_budget(messages,max_bytes=200000):  #将工具结果压缩到 max_bytes 内存
     tool_msgs=[m for m in messages if m.get('role')=='tool']
     total=sum(len(str(m.get('content',''))) for m in tool_msgs)
     if total<=max_bytes:
@@ -638,11 +654,11 @@ def tool_result_budget(messages,max_bytes=200000):
         if len(content)<=PERSIST_THERSHOLD:
             continue
         tid=m.get('tool_call_id','unknown')
-        m['content']=persist_large_output(tid,content)
+        m['content']=persist_large_output(tid,content) #持久化大输出，返回引用路径和预览内容
         total=sum(len(str(x.get('content',''))) for x in tool_msgs)
     return messages
 
-def write_transcript(messages):
+def write_transcript(messages): #写入对话记录，返回路径
     TRANSCRIPT_DIR.mkdir(parents=True,exist_ok=True)
 
     path=TRANSCRIPT_DIR /f'transcript_{int(time.time())}.jsonl'
@@ -652,7 +668,9 @@ def write_transcript(messages):
             f.write(json.dumps(msg,default=str)+'\n')
     return path
 
-def summarize_history(messages):
+def summarize_history(messages): #总结对话记录，返回总结内容
+    if not messages:
+        return "(empty summary)"
     conversation=json.dumps(messages,default=str)[:80000]
     prompt= ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
@@ -665,13 +683,13 @@ def summarize_history(messages):
     )
     return (response.choices[0].message.content or "(empty summary)").strip()
 
-def compact_history(messages):
+def compact_history(messages): #使用llm进行对话记录压缩，返回压缩后的消息
     transcript_path=write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
     summary=summarize_history(messages)
     return [{'role':'user','content':f'[Compacted]\n\n{summary}'}]
 
-def reactive_compact(messages):
+def reactive_compact(messages): #保存完整对话记录，保留最近五条消息，返回压缩后的消息
     transcript=write_transcript(messages)
     tail_start=max(0,len(messages)-5)
     if (tail_start>0 and tail_start<len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start-1]):
