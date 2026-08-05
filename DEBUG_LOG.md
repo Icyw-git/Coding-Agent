@@ -607,11 +607,11 @@ while True:
         messages[:] = compact_history(messages)
 ```
 
-| 工序 | 触发条件 | 动作 |
-|------|----------|------|
-| `tool_result_budget` | 所有工具结果合计 > 200KB | 把最大的 >30KB 结果写入 `.cache/tool_results/<id>.txt`，原位替换为 `<persisted-output>` 引用 + 2000 字预览 |
-| `snip_compact` | 消息数 > 50 条 | 保留头 3 条 + 尾部 47 条，中间替换为一条 `[snipped N messages]` |
-| `micro_compact` | 工具结果 > `KEEP_RECENT`(3) 条 | 更早的 >120 字符结果原地替换为占位符（**原地修改**，省掉重建列表） |
+| 工序                 | 触发条件                       | 动作                                                                                                       |
+| -------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `tool_result_budget` | 所有工具结果合计 > 200KB       | 把最大的 >30KB 结果写入 `.cache/tool_results/<id>.txt`，原位替换为 `<persisted-output>` 引用 + 2000 字预览 |
+| `snip_compact`       | 消息数 > 50 条                 | 保留头 3 条 + 尾部 47 条，中间替换为一条 `[snipped N messages]`                                            |
+| `micro_compact`      | 工具结果 > `KEEP_RECENT`(3) 条 | 更早的 >120 字符结果原地替换为占位符（**原地修改**，省掉重建列表）                                         |
 
 **踩坑：裁剪不能制造孤儿 tool 消息。** OpenAI 硬约束：`role:"tool"` 必须对上一条 assistant 的 `tool_calls`。因此：
 
@@ -736,13 +736,13 @@ except Exception as e:
 
 **修复（最小改动）：**
 
-| 位置 | 改动 |
-|------|------|
-| `tool_result_budget` | 默认 `max_bytes=int(CONTEXT_LIMIT*0.8)`，免费层先于自动压缩 |
-| `PERSIST_THERSHOLD` | 30000 → 10000，大输出第二轮回合就落盘换引用 |
-| `run_read` | 无 `limit` 且 >500 行 → 自动截 200 行 + 提示分块读 |
-| `summarize_history` | `max_tokens=4000`、`[-80000:]`（保留尾部）、模板强制"写完全部 5 节" |
-| `agent_loop` | `just_compacted` 标志：压缩后第一轮跳过 `micro_compact`，保留刚拿到的工具结果 |
+| 位置                 | 改动                                                                          |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `tool_result_budget` | 默认 `max_bytes=int(CONTEXT_LIMIT*0.8)`，免费层先于自动压缩                   |
+| `PERSIST_THERSHOLD`  | 30000 → 10000，大输出第二轮回合就落盘换引用                                   |
+| `run_read`           | 无 `limit` 且 >500 行 → 自动截 200 行 + 提示分块读                            |
+| `summarize_history`  | `max_tokens=4000`、`[-80000:]`（保留尾部）、模板强制"写完全部 5 节"           |
+| `agent_loop`         | `just_compacted` 标志：压缩后第一轮跳过 `micro_compact`，保留刚拿到的工具结果 |
 
 ## 第 21 步：snip_compact 制造孤儿 tool 消息（400 崩溃）
 
@@ -787,11 +787,11 @@ rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
 **修复：**
 
-| 位置 | 改动 |
-|------|------|
-| `run_bash` | 解码后 `out.replace('\ufffd','?')`，杜绝 GBK 控制台打印崩溃 |
-| agent_loop / spawn_subagent | 删掉重复的 `print(output[:200])`，只留 `log_hook` |
-| SYSTEM | 明确"读文件用 read 工具（支持 limit），避免 PowerShell Get-Content" |
+| 位置                        | 改动                                                                |
+| --------------------------- | ------------------------------------------------------------------- |
+| `run_bash`                  | 解码后 `out.replace('\ufffd','?')`，杜绝 GBK 控制台打印崩溃         |
+| agent_loop / spawn_subagent | 删掉重复的 `print(output[:200])`，只留 `log_hook`                   |
+| SYSTEM                      | 明确"读文件用 read 工具（支持 limit），避免 PowerShell Get-Content" |
 
 **教训：** Windows 上"文件编码对"不代表"显示对"——工具链默认码页才是隐形杀手。提示词要从源头约束模型命令选择。
 
@@ -824,6 +824,7 @@ d:\harness-agent
 ```
 
 **分支现状**（Git）：
+
 - `main`：纯逻辑主线（压缩/记忆/todo 修复，无 UI 依赖）
 - `feature/ui`：UI 增强线（cc_ui.py + harness 的 UI 接线，已合并 main 逻辑）
 - `feature/cd-support`：持久化 cd 支持（CURRENT_DIR 状态）
@@ -1073,3 +1074,87 @@ LLM 输出 / 工具输出
 2. **"只留请求副本"原则** —— 记忆注入用 `request_messages` 副本、压缩用 `messages` 原地替换，两者解耦，transcript/tool 配对不被 UI 或记忆污染。
 3. **每条链路都有兜底** —— 压缩链 reactive 兜底、记忆链 fallback 关键词、UI 链 GBK 降级、工具链异常转文本——模型的不可控性是常态，分层防御是唯一解。
 
+---
+
+# 第七部分：记忆管线真机排障实录
+
+记录让记忆功能从"看不见、存不下"到可诊断、可落盘的 5 个真机问题（均在本轮修复）。
+
+## 问题 1：记忆文件不存在 / 提取为空
+
+**现象**：`.cache/memories/` 下只有空的 `MEMORY.md` 索引，没有任何 `*.md` 记忆文件。
+
+**根因**：`extract_memories` 只扫描 `messages[-10:]`（结尾 10 条），而用户偏好通常在**开头第一条**——整段会话"值得记的东西"全在窗口外，LLM 正确判定"无可记忆内容"→ 返回 `[]` → 不落盘。
+
+**修复**：
+
+- 窗口改为 `messages[:10] + messages[-10:]`（开头 10 条 + 结尾 10 条；消息 ≤10 条时用全部）。
+- `extract_memories` / `consolidate_memories` 加可见性诊断：无 JSON 数组 / 数组为空 / 条目缺 desc+body / 异常，每种失败路径都打印 `[Memory: ...]`，不再静默。
+- `consolidate_memories` 加防删光守卫：LLM 返回空数组时先打印并 return，**删除旧记忆的代码永远执行不到**。
+
+## 问题 2：UnicodeDecodeError（'gbk' codec can't decode byte 0xa6）
+
+**现象**：`list_memory_files` 崩在 `f.read_text()`。
+
+**根因**：记忆文件以 UTF-8 写入，但用户运行环境（`D:/Anaconda_envs/envs/aitest01/python.exe`，无 `-X utf8`）默认按 GBK 解码 → 读写编码不一致。
+
+**修复**：记忆系统所有文件读写显式指定 `encoding='utf-8'`：
+
+- `write_memory_file`：写文件 + `_rebuild_index` 写索引
+- `_rebuild_index` / `read_memory_index` / `read_memory_file` / `list_memory_files`：读文件（`errors='replace'` 兜底）
+
+**教训**：工具链默认码页（GBK）是 Windows 的隐形杀手，跨环境运行必须显式声明编码。
+
+## 问题 3：extract failed - no JSON array in LLM reply: ''
+
+**现象**：提取时 LLM 返回空 content。
+
+**根因**：`deepseek-v4-flash` 是**带推理的模型**（返回 `reasoning_content`）。extract 提示词含最长 4000 字符对话后，`max_tokens=800` 预算被思考链吃满 → `finish_reason=length`，`content=''`。
+
+**实测对照**：
+
+| max_tokens | finish_reason | content                          |
+| ---------- | ------------- | -------------------------------- |
+| 800        | `length`      | `''`（思考链 3182 字符吃满预算） |
+| 4000       | `stop`        | 正常 JSON 数组                   |
+
+**修复**：
+
+- `max_tokens` 800 → 4000，给思考链留足预算，保证 content 有输出。
+- content 为空时退而从 `reasoning_content` 里找 JSON 数组（双保险）。
+
+## 问题 4：extract error（Expecting value / Extra data）
+
+**现象**：`json.loads` 抛 `JSONDecodeError`：
+
+- `Expecting value: line 1 column 2 (char 1)` —— 方括号里不是合法 JSON
+- `Extra data: line 1 column 4 (char 3)` —— 解析完第一个数组后还有多余数据
+
+**根因**：正则 `\[.*\]` 太宽松——"匹配到方括号" ≠ "合法 JSON"：
+
+- 自然语言方括号（尤其 reasoning 兜底文本里的 `[用户偏好, 项目事实]`）→ `Expecting value`
+- 回复含多个数组段（`["a"] ["b"]`）或数组+尾随文本 → `Extra data`
+
+**修复（提示词 + 解析双层）**：
+
+- **提示词层**：extract 提示词加 STRICT 约束——"只输出一个纯 JSON 数组，不思考、不解释、不用 ```json 围栏、前后无任何文字"。实测：content 从空变非空，思考链从 3182/11733 字符降到 799/2131，返回格式干净。
+- **解析层**：两级尝试——先贪婪匹配整体 `json.loads`；失败则用 `\[.*?\]` 逐个尝试最短方括号段，取第一个能解析成 list 的；全部失败才报诊断。
+
+**取舍**：STRICT 提示词会让模型偏向保守（不确定就 `[]`），对"已覆盖的记忆"会正确跳过，但也可能漏掉边缘新记忆——这是提示词路线的固有代价，故保留解析层兜底。
+
+## 问题 5：端到端验证产物污染测试
+
+**现象**：真机验证后 `.cache/memories/` 残留 4 个真实记忆文件 → `test_context_manage` 的 `FakeCompletions` 队列被 `select_relevant_memories`（文件非空时会先调一次 LLM）提前消费，8 个用例失败。
+
+**根因**：测试按"空记忆库"前提脚本化了 API 调用次数，真实记忆文件破坏了队列对齐。
+
+**处理**：验证产物用后即清；测试依赖空记忆库前提。教训：mock 队列类测试对环境残留极其敏感，真机产物勿留。
+
+## 第七部分核心结论
+
+1. **推理模型是"会思考"的系统边界** —— `max_tokens` 必须给思考链留预算，`content` 可能为空，必须兜底（reasoning_content）。
+2. **解析要"能解析才算数"** —— 先宽（贪婪）后严（最短候选）两级试，`json.loads` 成功才收下，杜绝 Expecting value / Extra data。
+3. **提示词与代码是双保险** —— STRICT 提示词从源头减少异常回复，健壮解析兜底剩余异常，缺一不可。
+4. **记忆窗口要覆盖会话两端** —— 用户偏好通常在开头，只看结尾 10 条等于盲人摸象。
+5. **跨环境编码必须显式声明** —— 记忆文件读写统一 UTF-8，否则换台机器就崩。
+6. **真机产物会污染测试** —— 端到端验证生成的数据用后即清，否则 mock 队列/计数断言全崩。
