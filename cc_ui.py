@@ -21,6 +21,7 @@
     print(ui.diff(git_diff_text))
     print(ui.statusline(model='x', git_branch='main', ctx_pct=42))
 """
+import os
 import random
 import re
 import shutil
@@ -28,17 +29,79 @@ import sys
 import threading
 import time
 
-# ---------- ANSI 原语 ----------
+# ---------- ANSI 原语（含 NO_COLOR / 色级降级） ----------
 
 _RESET = '\x1b[0m'
 
 
+def _detect_color_level():
+    """按环境决定色彩深度：NO_COLOR 优先，其次 COLORTERM/TERM。"""
+    if os.environ.get('NO_COLOR') is not None:
+        return 0
+    ct = os.environ.get('COLORTERM', '').lower()
+    if 'truecolor' in ct or '24bit' in ct:
+        return 16777216
+    term = os.environ.get('TERM', '')
+    if '256color' in term:
+        return 256
+    return 16
+
+
+_COLOR_LEVEL = _detect_color_level()
+
+
+def _rgb_to_256(r, g, b):
+    """24bit RGB → 256 色表索引（6x6x6 立方体 + 灰阶）。"""
+    if abs(r - g) < 8 and abs(g - b) < 8:
+        gray = round((r + g + b) / 30.69)
+        return 232 + min(23, gray)
+    def cube(v):
+        return 0 if v < 48 else 1 if v < 115 else 2 if v < 155 else \
+               3 if v < 195 else 4 if v < 235 else 5
+    return 16 + 36 * cube(r) + 6 * cube(g) + cube(b)
+
+
+def _ansi_16_code(rgb):
+    """24bit RGB → ANSI16 前景码（30-37 / 90-97）。"""
+    r, g, b = rgb
+    luma = (r * 299 + g * 587 + b * 114) // 1000
+    sat = max(r, g, b) - min(r, g, b)
+    if sat < 30:  # 灰阶
+        if luma < 60:
+            return 30
+        if luma < 140:
+            return 90
+        if luma < 210:
+            return 37
+        return 97
+    base = 31 if max(r, g, b) == r else 32 if max(r, g, b) == g else 34
+    return base + 60 if luma >= 128 else base
+
+
+def _ansi_16_bg_code(rgb):
+    """24bit RGB → ANSI16 背景码（40-47 / 100-107）。"""
+    fg = _ansi_16_code(rgb)
+    return fg - 30 + 40 + (60 if fg >= 90 else 0)
+
+
 def _fg(rgb):
-    return '\x1b[38;2;{};{};{}m'.format(*rgb)
+    if _COLOR_LEVEL >= 16777216:
+        return '\x1b[38;2;{};{};{}m'.format(*rgb)
+    if _COLOR_LEVEL >= 256:
+        return '\x1b[38;5;{}m'.format(_rgb_to_256(*rgb))
+    if _COLOR_LEVEL >= 16:
+        return '\x1b[{}m'.format(_ansi_16_code(rgb))
+    return ''
 
 
 def _bg(rgb):
-    return '\x1b[48;2;{};{};{}m'.format(*rgb)
+    if _COLOR_LEVEL >= 16777216:
+        return '\x1b[48;2;{};{};{}m'.format(*rgb)
+    if _COLOR_LEVEL >= 256:
+        return '\x1b[48;5;{}m'.format(_rgb_to_256(*rgb))
+    if _COLOR_LEVEL >= 16:
+        return '\x1b[{}m'.format(_ansi_16_bg_code(rgb))
+    return ''
 
 
 def _bold():
@@ -84,6 +147,8 @@ G = {
     'play':    '\u25b6' if _is_unicode else '>',
     'square':  '\u25a0' if _is_unicode else '#',
     'check':   '\u2713' if _is_unicode else 'v',
+    'block':   '\u2588' if _is_unicode else '#',   # 进度条已用
+    'hollow':  '\u2591' if _is_unicode else '.',   # 进度条未用
     'spinner': ('\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2827\u280f'
                 if _is_unicode else '|/-\\'),
 }
@@ -429,22 +494,46 @@ def bash_box(command, output, max_lines=14, width=None):
 
 # ---------- 状态行（claude-statusline 风格） ----------
 
+MODEL_TIERS = {
+    'flash':     'success',    # 快模型（Haiku 档）：绿
+    'chat':      'info',       # 标准（Sonnet 档）：蓝
+    'reasoner':  'permission', # 深度推理（Opus 档）：紫
+}
+
+
+def model_color(model):
+    """按模型档位返回语义色名（Claude Code 按 tier 着色的约定）。"""
+    m = (model or '').lower()
+    for key, color in MODEL_TIERS.items():
+        if key in m:
+            return color
+    return 'info'
+
+
+def ctx_bar(pct, width=10):
+    """上下文使用率填充条：███████░░░ 42%（claude-statusline 风格）。"""
+    pct = max(0.0, min(100.0, float(pct or 0)))
+    filled = int(round(pct / 100.0 * width))
+    color = 'error' if pct > 75 else ('warning' if pct > 50 else 'success')
+    bar = G['block'] * filled + G['hollow'] * (width - filled)
+    return c(color, '[' + bar + ']') + ' ' + c(color, '{0}%'.format(int(pct)))
+
+
 def statusline(model='', tools=0, ctx_pct=None, tokens='', workdir='',
                git_branch='', cost=None):
-    """会话状态行：model / git 分支 / 工具数 / 上下文占比 / 成本 / token / 工作目录。
+    """会话状态行：model(tier 色) / git 分支 / 工具数 / 上下文进度条 / 成本 / token。
 
     上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
     """
     parts = []
     if model:
-        parts.append(bold_c('info', model))
+        parts.append(bold_c(model_color(model), model))
     if git_branch:
         parts.append(t('subtle') + git_branch + _RESET)
     if tools:
         parts.append(t('subtle') + '{0} tools'.format(tools) + _RESET)
     if ctx_pct is not None:
-        color = 'error' if ctx_pct > 75 else ('warning' if ctx_pct > 50 else 'success')
-        parts.append(c(color, 'ctx {0}%'.format(int(ctx_pct))))
+        parts.append(ctx_bar(ctx_pct))
     if cost is not None:
         parts.append(c('success', '${0:.2f}'.format(cost)))
     if tokens:
