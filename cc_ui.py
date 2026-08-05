@@ -1,10 +1,11 @@
 """Claude Code 风格终端 UI（Python 3.9 兼容）。
 
-复刻 CC 的一整套视觉语言（Visual Theme 层）：
-- 语义化颜色 token：品牌色 / 文本色 / 语义色 / 权限色 / Diff 色 / 子代理色板
-- Markdown 终端渲染：标题 / 粗斜体 / 行内代码 / 代码块 / 列表 / 引用 / 链接 / 分隔线
-- Spinner 动效（仅 TTY 生效，非 TTY 自动静默）
-- 工具状态行 / 权限横幅 / Diff 高亮 / 分隔规则
+复刻 CC 的完整视觉语言（Visual Theme 层）：
+- 语义化颜色 token：品牌橙 / 文本色 / 语义色 / 权限色 / Diff 背景色 / 子代理 8 色板
+- Markdown 终端渲染：标题 / 粗斜体 / 行内代码 / 代码块 / 列表 / 引用 / 链接 / 表格
+- Spinner 信息通道：随机动词池 / 两档速度（thinking 200ms / requesting 50ms）/
+  停滞检测（>8s 颜色渐变到错误红）
+- 工具状态行 / 权限横幅 / bash 粉色边框 / Diff 背景高亮 / 会话状态行
 
 编码自适应：UTF-8 终端用图形符号（• ▸ ┌─┐），GBK/管道环境自动降级为 ASCII，
 避免 UnicodeEncodeError 崩掉整个会话。任意文本请用 ui.safe_print() 兜底。
@@ -13,11 +14,14 @@
     import cc_ui as ui
     ui.safe_print(ui.c('success', 'ok'))
     ui.safe_print(ui.markdown(response_text))
-    with ui.Spinner('Thinking'): ...
+    with ui.Spinner('Thinking'): ...            # override → thinking 慢速
+    with ui.Spinner(): ...                      # 无 label → 随机动词，requesting 快速
     print(ui.tool_line('bash', {'command': 'dir'}))
     print(ui.permission_banner('Permission needed', ['删除文件？']))
     print(ui.diff(git_diff_text))
+    print(ui.statusline(model='x', git_branch='main', ctx_pct=42))
 """
+import random
 import re
 import shutil
 import sys
@@ -84,34 +88,34 @@ G = {
                 if _is_unicode else '|/-\\'),
 }
 
-# ---------- 语义化颜色 token（Claude Code 调色板子集） ----------
+# ---------- 语义化颜色 token（Claude Code Dark 主题实际 RGB） ----------
 
 TOKENS = {
-    'claude':      (167, 139, 250),   # 品牌紫
-    'text':        (231, 229, 228),
-    'subtle':      (167, 163, 162),
-    'inactive':    (110, 106, 106),
+    'claude':      (215, 119, 87),    # 品牌橙
+    'text':        (255, 255, 255),   # 主文本
+    'subtle':      (167, 163, 162),   # 微弱提示/边框
+    'inactive':    (110, 106, 106),   # 非活跃/禁用
     'suggestion':  (120, 110, 170),
-    'success':     (62, 200, 139),
-    'error':       (255, 107, 100),
-    'warning':     (240, 200, 110),
+    'success':     (78, 186, 101),    # 成功绿
+    'error':       (255, 107, 128),   # 错误红（暗红）
+    'warning':     (255, 193, 7),     # 警告黄
     'info':        (106, 176, 255),
-    'permission':  (129, 140, 248),
-    'planMode':    (96, 165, 250),
+    'permission':  (177, 185, 249),   # 权限蓝紫
+    'planMode':    (96, 165, 250),    # Plan 模式蓝
     'header':      (255, 220, 150),
     'code':        (255, 200, 130),
     'link':        (106, 176, 255),
     'quote':       (160, 160, 170),
-    'diffAdded':   (58, 160, 90),
-    'diffRemoved': (220, 90, 80),
+    'diffAdded':   (34, 92, 43),      # 新增行背景（暗绿）
+    'diffRemoved': (122, 41, 54),     # 删除行背景（暗红）
     'diffMeta':    (150, 150, 180),
     'diffInfo':    (120, 190, 250),
     'bashBorder':  (236, 183, 190),   # bash 输出边框（Claude Code 粉色）
     'gridHeader':  (255, 220, 150),
-    # 子代理色板：8 色，用于并行子代理区分
+    # 子代理 8 色板（仅限子 Agent 使用，区分并行 Agent）
     'subagent': [
-        (255, 107, 100), (255, 170, 60), (106, 176, 255), (129, 140, 248),
-        (62, 200, 139), (240, 120, 180), (80, 200, 220), (200, 180, 120),
+        (239, 68, 68), (249, 115, 22), (234, 179, 8), (34, 197, 94),
+        (59, 130, 246), (99, 102, 241), (168, 85, 247), (236, 72, 153),
     ],
 }
 
@@ -425,18 +429,28 @@ def bash_box(command, output, max_lines=14, width=None):
 
 # ---------- 状态行（claude-statusline 风格） ----------
 
-def statusline(model='', tools=0, ctx_pct=None, tokens=''):
-    """会话状态行：model / 工具数 / 上下文占比 / token。"""
+def statusline(model='', tools=0, ctx_pct=None, tokens='', workdir='',
+               git_branch='', cost=None):
+    """会话状态行：model / git 分支 / 工具数 / 上下文占比 / 成本 / token / 工作目录。
+
+    上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
+    """
     parts = []
     if model:
         parts.append(bold_c('info', model))
+    if git_branch:
+        parts.append(t('subtle') + git_branch + _RESET)
     if tools:
         parts.append(t('subtle') + '{0} tools'.format(tools) + _RESET)
     if ctx_pct is not None:
-        color = 'success' if ctx_pct < 70 else ('warning' if ctx_pct < 90 else 'error')
+        color = 'error' if ctx_pct > 75 else ('warning' if ctx_pct > 50 else 'success')
         parts.append(c(color, 'ctx {0}%'.format(int(ctx_pct))))
+    if cost is not None:
+        parts.append(c('success', '${0:.2f}'.format(cost)))
     if tokens:
         parts.append(t('subtle') + tokens + _RESET)
+    if workdir:
+        parts.append(t('inactive') + workdir + _RESET)
     if not parts:
         return ''
     return t('claude') + '│' + _RESET + ' ' + '  '.join(parts)
@@ -445,7 +459,7 @@ def statusline(model='', tools=0, ctx_pct=None, tokens=''):
 # ---------- Diff 高亮 ----------
 
 def diff(text):
-    """git diff 高亮：+++/--- 标题、@@ 元信息、+/ - 行。"""
+    """git diff 高亮：+++/--- 标题、@@ 元信息、+/- 行用暗绿/暗红背景（CC 官方色）。"""
     out = []
     for line in str(text).splitlines():
         if line.startswith('+++') or line.startswith('---'):
@@ -453,9 +467,9 @@ def diff(text):
         elif line.startswith('@@'):
             out.append(t('diffInfo') + line + _RESET)
         elif line.startswith('+'):
-            out.append(t('diffAdded') + line + _RESET)
+            out.append(bg('diffAdded') + line + _RESET)
         elif line.startswith('-'):
-            out.append(t('diffRemoved') + line + _RESET)
+            out.append(bg('diffRemoved') + line + _RESET)
         elif line.startswith('diff --git') or line.startswith('index '):
             out.append(t('diffMeta') + line + _RESET)
         else:
@@ -463,14 +477,29 @@ def diff(text):
     return '\n'.join(out)
 
 
-# ---------- Spinner（仅 TTY） ----------
+# ---------- Spinner（仅 TTY，编码信息通道） ----------
+
+def _interp(a, b, t):
+    """两个 RGB 之间线性插值（用于停滞渐变）。"""
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
 
 class Spinner:
-    """API 调用时的加载动画。非 TTY（管道/测试）环境自动静默。"""
+    """API 调用加载动画（仅 TTY；管道/测试环境自动静默）。
 
-    def __init__(self, label, token='claude'):
+    - 两档速度：有 label（系统准确文案）→ thinking 200ms 慢速；
+      无 label → 从动词池随机取（requesting 50ms 快速闪烁）。
+    - 停滞检测：超过 stall_after 秒未产出 → 颜色从主题色渐变到错误红。
+    """
+
+    VERBS = ['Pondering', 'Cooking', 'Thinking', 'Processing', 'Reticulating',
+             'Gathering', 'Weighing', 'Synthesizing']
+
+    def __init__(self, label=None, token='claude', stall_after=8.0, speed='auto'):
         self.label = label
         self.token = token
+        self.stall_after = stall_after
+        self.speed = speed  # 'auto' | 'thinking'(200ms) | 'requesting'(50ms)
         self._stop = threading.Event()
         self._thread = None
 
@@ -481,15 +510,31 @@ class Spinner:
         self._thread.start()
         return self
 
+    def _interval(self):
+        if self.speed == 'thinking':
+            return 0.2
+        if self.speed == 'requesting':
+            return 0.05
+        return 0.2 if self.label else 0.05
+
     def _run(self):
         frames = G['spinner']
         i = 0
+        start = time.time()
+        label = self.label or random.choice(self.VERBS) + '...'
         while not self._stop.is_set():
+            elapsed = time.time() - start
+            if elapsed > self.stall_after:
+                # 停滞：超过阈值后随时间渐变到错误红
+                ratio = min((elapsed - self.stall_after) / 20.0, 1.0)
+                color = _fg(_interp(TOKENS.get(self.token, TOKENS['claude']),
+                                    TOKENS['error'], ratio))
+            else:
+                color = t(self.token)
             frame = frames[i % len(frames)]
-            sys.stdout.write('\r\x1b[2K' + t(self.token) + frame + _RESET +
-                             ' ' + self.label)
+            sys.stdout.write('\r\x1b[2K' + color + frame + _RESET + ' ' + label)
             sys.stdout.flush()
-            time.sleep(0.08)
+            time.sleep(self._interval())
             i += 1
 
     def __exit__(self, *exc):
