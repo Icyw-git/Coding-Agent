@@ -6,6 +6,7 @@ import json
 import time
 import ast
 import pathlib
+import re
 from pathlib import Path
 from typing import Optional
 import yaml
@@ -15,6 +16,11 @@ import yaml
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
 SKILLS_DIR=WORKDIR/"skills"
+MEMORY_TYPES=['user','feedback','project','reference']
+MEMORY_DIR=WORKDIR/'.cache'/'memories'
+MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
+
+
 
 client=openai.OpenAI(
     api_key=os.getenv("LLM_API_KEY"),
@@ -25,10 +31,13 @@ client=openai.OpenAI(
 SYSTEM=(
     'You are a coding agent working on Windows at {workdir}. '
     'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
+    '{memories_section}'
     'Rules: '
     '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
     'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
-    '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr) and only modify files when asked. '
+    '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
+    'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
+    'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
     'Skills available:\n{catalog}\n'
      'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
 )
@@ -208,6 +217,257 @@ TOOLS=[{
 
 }]
 
+def write_memory_file(name:str,mem_type:str,description:str,body:str):
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    slug=name.lower().replace(' ','-').replace('/','-')
+
+    filename=f'{slug}.md'
+    filepath=MEMORY_DIR/filename
+    filepath.write_text(
+        f'---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n'
+
+    )
+    _rebuild_index()
+
+    return filepath
+
+def _rebuild_index():
+    lines=[]
+    for f in sorted(MEMORY_DIR.glob('*.md')):
+        if f.name=='MEMORY.md':
+            continue
+        raw=f.read_text()
+        meta,body=_parse_frontmatter(raw)
+        name=meta.get('name',f.name)
+        desc=meta.get('description',raw.split('\n')[0][:80])
+        lines.append(f'- [{name}({f.name}) - {desc}]')
+    MEMORY_INDEX.write_text('\n'.join(lines)+'\n' if lines else '')
+
+def read_memory_index()->str:
+    if not MEMORY_INDEX.exists():
+        return ''
+
+    text=MEMORY_INDEX.read_text().strip()
+    return text if text else ''
+
+def read_memory_file(filename:str):
+    path=MEMORY_DIR /filename
+    if not path.exists():
+        return None
+
+    return path.read_text()
+
+def list_memory_files()->list[dict]:
+    results=[]
+    for f in sorted(MEMORY_DIR.glob('*.md')):
+        if f.name=='MEMORY.md':
+            continue
+        raw=f.read_text()
+        meta,body=_parse_frontmatter(raw)
+        results.append({
+            'filename':f.name,
+            'name':meta.get('name',f.stem),
+            'description':meta.get('description',''),
+            'type':meta.get('type','user'),
+            'body':body
+        })
+    return results
+
+def select_relevant_memories(messages:list,max_items:int=5)->list[str]:
+    files=list_memory_files()
+    if not files:
+        return []
+    recent_texts=[]
+    for msg in reversed(messages):
+        if msg.get('role')=='user':
+            content=msg.get('content','')
+            if isinstance(content,list):
+                content = " ".join(
+                    str(getattr(b, "text", "")) for b in content
+                    if getattr(b, "type", None) == "text"
+                )
+            if isinstance(content, str):
+                recent_texts.append(content)
+            if len(recent_texts) >= 3:
+                break
+    recent=' '.join(reversed(recent_texts))[:2000]
+
+    if not recent.strip():
+        return []
+
+    catalog_lines=[]
+    for i ,f in enumerate(files):
+        catalog_lines.append(f"{i}:{f['name']} - {f['description']}")
+    catalog='\n'.join(catalog_lines)
+
+    prompt = (
+        "Given the recent conversation and the memory catalog below, "
+        "select the indices of memories that are clearly relevant. "
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
+        "If none are relevant, return [].\n\n"
+        f"Recent conversation:\n{recent}\n\n"
+        f"Memory catalog:\n{catalog}"
+    )
+
+    try:
+        response=client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[{'role':'user','content':prompt}],
+            temperature=0.7,
+            max_tokens=200,
+
+        )
+        text=_extract_text(response.choices[0].message.content).strip()
+        match=re.search(r'\[.*?\]', text, re.DOTALL)
+        if match:
+            indices=json.loads(match.group())
+            selected=[]
+            for idx in indices:
+                if isinstance(idx,int) and 0<=idx<len(files):
+                    selected.append(files[idx]['filename'])
+                    if len(selected)>=max_items:
+                        break
+            return selected
+    except Exception:
+        pass
+
+    keywords=[w.lower() for w in recent.split() if len(w)>=3]
+    selected=[]
+    for f in files:
+        text=(f['name']+' '+f['description']).lower()
+        if any(kw in text for kw in keywords):
+            selected.append(f['filename'])
+            if len(selected)>=max_items:
+                break
+    return selected
+
+def load_memories(messages:list)->str:
+    selected_files=select_relevant_memories(messages)
+    if not selected_files:
+        return ''
+    
+    parts=["<relevant_memories>"]
+    for f in selected_files:
+        content=read_memory_file(f)
+        if content:
+            parts.append(content)
+    parts.append('</relevant_memories>')
+    return '\n\n'.join(parts)
+
+def extract_memories(messages:list):
+    dialogue_parts=[]
+    for msg in messages[-10:]:
+        role=msg.get('role','?')
+        content=msg.get('content','')
+        if isinstance(content,list):
+            content = " ".join(
+                str(getattr(b, "text", "")) for b in content
+                if getattr(b, "type", None) == "text"
+            )
+        if isinstance(content, str) and content.strip():
+            dialogue_parts.append(f"{role}: {content}")
+    dialogue = "\n".join(dialogue_parts)
+
+    if not dialogue.strip():
+        return 
+    
+    existing=list_memory_files()
+    existing_desc='\n'.join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
+
+    prompt=(
+        "Extract user preferences, constraints, or project facts from this dialogue.\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
+        "- type: one of 'user' (user preference), 'feedback' (guidance), "
+        "'project' (project fact), 'reference' (external pointer)\n"
+        "- description: one-line summary for index lookup\n"
+        "- body: full detail in markdown\n"
+        "If nothing new or already covered by existing memories, return [].\n\n"
+        f"Existing memories:\n{existing_desc}\n\n"
+        f"Dialogue:\n{dialogue[:4000]}"
+    )
+
+    try:
+        response=client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[{'role':'user','content':prompt}],
+            temperature=0.7,
+            max_tokens=800,
+        )
+        text=_extract_text(response.choices[0].message.content).strip()
+        match=re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return 
+        items=json.loads(match.group())
+        if not items:
+            return
+        count=0
+        for mem in items:
+            name=mem.get('name',f'memory_{int(time.time())}')
+            mem_type=mem.get('type','user')
+            desc=mem.get('description','')
+            body=mem.get('body','')
+            if desc and body:
+                write_memory_file(name,mem_type,desc,body)
+                count+=1
+        if count:
+            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+    except Exception:
+        pass
+
+CONSOLIDATE_THRESHOLD = 10
+
+def consolidate_memories():
+    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
+    files = list_memory_files()
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+
+    catalog = "\n\n".join(
+        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        for f in files
+    )
+
+    prompt = (
+        "Consolidate the following memory files. Rules:\n"
+        "1. Merge duplicates into one\n"
+        "2. Remove outdated/contradicted memories\n"
+        "3. Keep the total under 30 memories\n"
+        "4. Preserve important user preferences above all\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
+        f"{catalog[:16000]}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[{'role':'user','content':prompt}], max_tokens=3000
+        )
+        text = _extract_text(response.choices[0].message.content).strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+
+        # Remove old memory files (keep MEMORY.md)
+        for f in MEMORY_DIR.glob("*.md"):
+            if f.name != "MEMORY.md":
+                f.unlink()
+
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body)
+
+        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+    except Exception:
+        pass
+
+
+
 SKILL_REGISTRY:dict[str,dict]={}
 
 
@@ -224,6 +484,8 @@ def _parse_frontmatter(text:str)->tuple[dict,str]:
 
     except yaml.YAMLError:
         meta={}
+    if not isinstance(meta, dict):
+        meta={}   # frontmatter 非映射（如缺空格被当纯标量）时按空处理
     return meta,parts[2].strip()
 
 def _scan_skills():
@@ -251,8 +513,10 @@ def list_skills()->str:
     return '\n'.join(f'- **{skill["name"]}**: {skill["description"]}' for skill in SKILL_REGISTRY.values())
 
 def build_system()->str:
+    index=read_memory_index()
+    memories_section = f"\n\nMemories available:\n{index}" if index else ""
     catalog=list_skills()
-    return SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR)
+    return SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR, memories_section=memories_section)
 
 def build_sub_system()->str:
     catalog=list_skills()
@@ -273,6 +537,7 @@ def run_bash(command:str)->str:
         except UnicodeDecodeError:
             out=raw.decode("gbk",errors="replace")
         out=out.strip()
+        out=out.replace('\ufffd','?')  # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
         return out[:50000] if out else "No output"
     except subprocess.TimeoutExpired:
         return "Error: Command timeout(120s)"
@@ -289,7 +554,10 @@ def safe_path(p: str) -> Path:
 def run_read(path: str, limit: Optional[int] = None) -> str:
     try:
         lines = safe_path(path).read_text(encoding='utf-8', errors='replace').splitlines()
-        if limit and limit < len(lines):
+        if limit is None and len(lines) > 500:
+            # 大文件没传 limit：自动截断，防止整文件灌进上下文
+            lines = lines[:200] + [f"... ({len(lines) - 200} more lines; use limit to read in chunks)"]
+        elif limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as e:
@@ -481,7 +749,6 @@ def spawn_subagent(description:str)->str:
                 output = f"Error: unknown tool {name}"
             else:
                 output = SUB_HANDLERS[name](**args)
-                print(output[:200])
 
             trigger_hooks("PostToolUse", name, args, output)
 
@@ -575,7 +842,7 @@ TOOLS.append({
 
 CONTEXT_LIMIT=50000
 KEEP_RECENT=3
-PERSIST_THERSHOLD=30000
+PERSIST_THERSHOLD=10000
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
 TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 
@@ -605,10 +872,9 @@ def snip_compact(messages,max_messages=50): #保留头 3 条，尾部47 条，�
     if keep_tail<=1:
         return messages[:head_end]
     tail_start=len(messages)-keep_tail
-    # 若裁剪点落在工具结果上且其 assistant 在保留区内，成对保留（多占 1 条配额）
-    if (tail_start>0 and tail_start<len(messages) and _is_tool_result_message(messages[tail_start])
-            and _message_has_tool_use(messages[tail_start-1])):
-        tail_start-=1
+    # 裁剪点不能落在工具结果上（其 assistant 已被裁掉=孤儿），推进到非工具消息
+    while tail_start<len(messages) and _is_tool_result_message(messages[tail_start]):
+        tail_start+=1
     if head_end>=tail_start:
         return messages
     result=messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
@@ -617,8 +883,7 @@ def snip_compact(messages,max_messages=50): #保留头 3 条，尾部47 条，�
     while over>0 and tail_start<len(messages):
         tail_start+=1
         over-=1
-        while (tail_start<len(messages) and _is_tool_result_message(messages[tail_start])
-                and not _message_has_tool_use(messages[tail_start-1])):
+        while (tail_start<len(messages) and _is_tool_result_message(messages[tail_start])):
             tail_start+=1
             over-=1
     return messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
@@ -644,7 +909,10 @@ def persist_large_output(tool_use_id,output): #持久化大输出
         path.write_text(output,encoding='utf-8')
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
-def tool_result_budget(messages,max_bytes=200000):  #将工具结果压缩到 max_bytes 内存
+def tool_result_budget(messages,max_bytes=None):  #将工具结果压缩到 max_bytes 内存
+    if max_bytes is None:
+        # 默认预算取 CONTEXT_LIMIT 的 80%，保证 budget 先于自动压缩(LLM)触发
+        max_bytes=int(CONTEXT_LIMIT*0.8)
     tool_msgs=[m for m in messages if m.get('role')=='tool']
     total=sum(len(str(m.get('content',''))) for m in tool_msgs)
     if total<=max_bytes:
@@ -674,15 +942,16 @@ def write_transcript(messages): #写入对话记录，返回路径
 def summarize_history(messages): #总结对话记录，返回总结内容
     if not messages:
         return "(empty summary)"
-    conversation=json.dumps(messages,default=str)[:80000]
+    conversation=json.dumps(messages,default=str)[-80000:]
     prompt= ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
-              "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
+              "4. remaining work, 5. user constraints.\nBe compact but concrete, and MUST complete "
+              "all five sections - if tight on space, drop details rather than truncating.\n\n" + conversation)
     response=client.chat.completions.create(
         model=os.getenv("LLM_MODEL_ID"),
         messages=[{'role':'user','content':prompt}],
         temperature=0.7,
-        max_tokens=2000,
+        max_tokens=4000,
     )
     return (response.choices[0].message.content or "(empty summary)").strip()
 
@@ -707,26 +976,51 @@ def agent_loop(messages:list):
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
     messages.append({'role':'system','content':build_system()})
     reactive_retries=0
+    just_compacted=False
+    rounds_since_todo=0
+    memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
 
     while True:
+        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages]
+        
+
         messages[:]=tool_result_budget(messages)
         messages[:]=snip_compact(messages)
-        messages[:]=micro_compact(messages)
+        if just_compacted:
+            just_compacted=False  # 压缩后第一轮跳过 micro_compact，保留刚拿到的工具结果
+        else:
+            messages[:]=micro_compact(messages)
 
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
             messages[:]=compact_history(messages)
+            just_compacted=True
+
+        if rounds_since_todo >=3 and messages:
+            messages.append({
+                'role':'user',
+                'content':"<reminder>Update your todos.</reminder>",
+            })
+            rounds_since_todo=0
+        
 
 
 
 
-
+        request_messages = messages
+        if memories_content:
+            # 记忆只注入请求副本，不污染 messages（压缩/转录/tool 配对保持干净）
+            request_messages = messages.copy()
+            for i, m in enumerate(request_messages):
+                if m.get('role') == 'user' and isinstance(m.get('content'), str):
+                    request_messages[i] = {**m, 'content': memories_content + '\n\n' + m['content']}
+                    break
 
         try:
             response=client.chat.completions.create(
 
                 model=os.getenv("LLM_MODEL_ID"),
-                messages=messages,
+                messages=request_messages,
                 tools=TOOLS,
                 temperature=0.7,
                 max_tokens=8000,
@@ -738,6 +1032,7 @@ def agent_loop(messages:list):
                 reactive_retries+=1
                 print('[reactive compact]')
                 messages[:]=reactive_compact(messages)
+                just_compacted=True
                 continue
             raise
 
@@ -752,6 +1047,8 @@ def agent_loop(messages:list):
                 continue
             if message.content:
                 print(message.content)
+            extract_memories(pre_compress)   # 从压缩前快照提炼记忆，压缩不丢信息
+            consolidate_memories()
             return message.content or "No output"
             
 
@@ -759,15 +1056,18 @@ def agent_loop(messages:list):
         # 遇到 compact 时压缩历史并重开一轮。
         tool_messages = []
         compacted = False
+        used_todo = False
         for tool_call in message.tool_calls:
             name = tool_call.function.name
             args = json.loads(tool_call.function.arguments)
-
+            if name=='todo_write':
+                used_todo = True
             if name == 'compact':
                 # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
                 # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
                 # 改为文本附到新上下文里，避免执行结果丢失。
                 messages[:] = compact_history(messages)
+                just_compacted=True
                 note = '[Compacted] Conversation history has been summarized.'
                 if tool_messages:
                     done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
@@ -782,8 +1082,11 @@ def agent_loop(messages:list):
             elif name not in tool_registry:
                 output = f"Error: unknown tool {name}"
             else:
-                output = tool_registry[name](**args)
-                print(output[:200])
+                try:
+                    output = tool_registry[name](**args)
+                except Exception as e:
+                    # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
+                    output = f"Error: {e}"
 
             trigger_hooks("PostToolUse", name, args, output)
 
@@ -793,11 +1096,14 @@ def agent_loop(messages:list):
                 "content": output,
             })
 
-        if compacted:
+        if compacted: #压缩后工具丢失，需要重新执行
             continue
 
         messages.extend(tool_messages)
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '当前工作区有 file-summarizer 这个 skill，请用它来总结 harness.py 这个文件的代码结构。'}]
+    messages = [{'role': 'user', 'content': '请用中文总结当前工作区所有 .py 文件的代码结构。'
+    '注意：以后输出报告一律用中文；'
+    '并且永远不要用 PowerShell Get-Content 读文件（会乱码），改用 read 工具。'}]
     agent_loop(messages)
