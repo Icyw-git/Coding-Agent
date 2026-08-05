@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 import subprocess
 import openai
 import json
+import time
 import ast
 import pathlib
 from pathlib import Path
@@ -557,6 +558,127 @@ def load_skill(name:str)->str:
     return skill['body']
 
 tool_registry['load_skill']=load_skill
+
+CONTEXT_LIMIT=50000
+KEEP_RECENT=3
+PERSIST_THERSHOLD=30000
+TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
+TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
+
+def estimate_size(msgs):
+    return len(str(msgs))
+
+def _block_type(message)->str:
+    if isinstance(message,dict):
+        if message.get('tool_calls'):
+            return 'tool_calls'
+        if message.get('content'):
+            return 'text'
+        return 'empty'
+    if getattr(message,'tool_calls',None):
+        return 'tool_calls'
+    if getattr(message,'content',None):
+        return 'text'
+    return 'empty'
+
+# OpenAI 格式：assistant 的 tool_calls 是顶层字段（content 为 null/字符串），
+# 工具结果是独立的 role='tool' 消息（tool_call_id + content 字符串）
+def _message_has_tool_use(msg):
+    return msg.get('role')=='assistant' and bool(msg.get('tool_calls'))
+
+def _is_tool_result_message(msg):
+    return msg.get('role')=='tool'
+
+def snip_compact(messages,max_messages=50):
+    if len(messages)<=max_messages:
+        return messages
+    keep_head,keep_tail=3,max_messages-3
+    head_end,tail_start=keep_head,len(messages)-keep_tail
+    if head_end >0 and _message_has_tool_use(messages[head_end-1]):
+        while head_end <len(messages) and _is_tool_result_message(messages[head_end]):
+            head_end+=1
+    if (tail_start >0 and tail_start <len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start-1]):
+        tail_start-=1
+    if head_end>=tail_start:
+        return messages
+    snipped=tail_start-head_end
+    return messages[:head_end]+[{'role':'user','content':f"[snipped {snipped} messages]"}]+messages[tail_start:]
+
+def collect_tool_results(messages):
+    return [msg for msg in messages if msg.get('role')=='tool']
+
+def micro_compact(messages):
+    tool_results=collect_tool_results(messages)
+    if len(tool_results)<KEEP_RECENT:
+        return messages
+    for msg in tool_results[:-KEEP_RECENT]:
+        if len(str(msg.get('content','')))>120:
+            msg['content']="[Earlier tool result compacted. Re-run if needed.]"
+    return messages
+
+def persist_large_output(tool_use_id,output):
+    if len(output)<=PERSIST_THERSHOLD:
+        return output
+    TOOL_RESULTS_DIR.mkdir(parents=True,exist_ok=True)
+    path=TOOL_RESULTS_DIR / f'{tool_use_id}.txt'
+    if not path.exists():
+        path.write_text(output)
+    return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
+
+def tool_result_budget(messages,max_bytes=200000):
+    tool_msgs=[m for m in messages if m.get('role')=='tool']
+    total=sum(len(str(m.get('content',''))) for m in tool_msgs)
+    if total<=max_bytes:
+        return messages
+    ranked=sorted(tool_msgs,key=lambda m:len(str(m.get('content',''))),reverse=True)
+    for m in ranked:
+        if total<=max_bytes:
+            break
+        content=str(m.get('content',''))
+        if len(content)<=PERSIST_THERSHOLD:
+            continue
+        tid=m.get('tool_call_id','unknown')
+        m['content']=persist_large_output(tid,content)
+        total=sum(len(str(x.get('content',''))) for x in tool_msgs)
+    return messages
+
+def write_transcript(messages):
+    TRANSCRIPT_DIR.mkdir(parents=True,exist_ok=True)
+
+    path=TRANSCRIPT_DIR /f'transcript_{int(time.time())}.jsonl'
+
+    with open(path,'w',encoding='utf-8') as f:
+        for msg in messages:
+            f.write(json.dumps(msg,default=str)+'\n')
+    return path
+
+def summarize_history(messages):
+    conversation=json.dumps(messages,default=str)[:80000]
+    prompt= ("Summarize this coding-agent conversation so work can continue.\n"
+              "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
+              "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
+    response=client.chat.completions.create(
+        model=os.getenv("LLM_MODEL_ID"),
+        messages=[{'role':'user','content':prompt}],
+        temperature=0.7,
+        max_tokens=2000,
+    )
+    return (response.choices[0].message.content or "(empty summary)").strip()
+
+def compact_history(messages):
+    transcript_path=write_transcript(messages)
+    print(f'[transcript saved:{transcript_path}]')
+    summary=summarize_history(messages)
+    return [{'role':'user','content':f'[Compacted]\n\n{summary}'}]
+
+def reactive_compact(messages):
+    transcript=write_transcript(messages)
+    tail_start=max(0,len(messages)-5)
+    if (tail_start>0 and tail_start<len(messages)) and _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start-1]):
+        tail_start-=1
+    summary=summarize_history(messages[:tail_start])
+    return [{'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
+    
 
 
 def agent_loop(messages:list):
