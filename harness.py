@@ -559,6 +559,20 @@ def load_skill(name:str)->str:
 
 tool_registry['load_skill']=load_skill
 
+# compact 工具：让模型在上下文过长时主动触发历史摘要
+# （不注册进 tool_registry，由 agent_loop 特殊处理）
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"compact",
+        "description":"Summarize the conversation history to free up context. Call this when the conversation is getting too long or you want to clear old tool outputs.",
+        "parameters":{
+            "type":"object",
+            "properties":{}
+        }
+    }
+})
+
 CONTEXT_LIMIT=50000
 KEEP_RECENT=3
 PERSIST_THERSHOLD=30000
@@ -568,18 +582,7 @@ TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 def estimate_size(msgs):
     return len(str(msgs))
 
-def _block_type(message)->str:
-    if isinstance(message,dict):
-        if message.get('tool_calls'):
-            return 'tool_calls'
-        if message.get('content'):
-            return 'text'
-        return 'empty'
-    if getattr(message,'tool_calls',None):
-        return 'tool_calls'
-    if getattr(message,'content',None):
-        return 'text'
-    return 'empty'
+
 
 # OpenAI 格式：assistant 的 tool_calls 是顶层字段（content 为 null/字符串），
 # 工具结果是独立的 role='tool' 消息（tool_call_id + content 字符串）
@@ -697,22 +700,47 @@ def reactive_compact(messages): #保存完整对话记录，保留最近五条�
     summary=summarize_history(messages[:tail_start])
     return [{'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
     
-
+MAX_REACTIVE_RETRIES=1
 
 def agent_loop(messages:list):
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
     messages.append({'role':'system','content':build_system()})
+    reactive_retries=0
 
     while True:
-        response=client.chat.completions.create(
+        messages[:]=tool_result_budget(messages)
+        messages[:]=snip_compact(messages)
+        messages[:]=micro_compact(messages)
 
-            model=os.getenv("LLM_MODEL_ID"),
-            messages=messages,
-            tools=TOOLS,
-            temperature=0.7,
-            max_tokens=8000,
-        )
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:]=compact_history(messages)
+
+
+
+
+
+
+        try:
+            response=client.chat.completions.create(
+
+                model=os.getenv("LLM_MODEL_ID"),
+                messages=messages,
+                tools=TOOLS,
+                temperature=0.7,
+                max_tokens=8000,
+            )
+            reactive_retries=0
+        except Exception as e:
+            if ('prompt_too_long' in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries<MAX_REACTIVE_RETRIES:
+
+                reactive_retries+=1
+                print('[reactive compact]')
+                messages[:]=reactive_compact(messages)
+                continue
+            raise
+
 
         message=response.choices[0].message
         messages.append(message.model_dump())
@@ -727,10 +755,26 @@ def agent_loop(messages:list):
             return message.content or "No output"
             
 
+        # compact 工具：在 for 循环内按顺序处理——compact 之前的 tool_call 先正常执行，
+        # 遇到 compact 时压缩历史并重开一轮。
         tool_messages = []
+        compacted = False
         for tool_call in message.tool_calls:
             name = tool_call.function.name
             args = json.loads(tool_call.function.arguments)
+
+            if name == 'compact':
+                # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
+                # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
+                # 改为文本附到新上下文里，避免执行结果丢失。
+                messages[:] = compact_history(messages)
+                note = '[Compacted] Conversation history has been summarized.'
+                if tool_messages:
+                    done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
+                    note += '\n\nTool results executed before compaction:\n' + done
+                messages.append({'role': 'user', 'content': note})
+                compacted = True
+                break
 
             blocked = trigger_hooks("PreToolUse", name, args)
             if blocked:
@@ -748,6 +792,9 @@ def agent_loop(messages:list):
                 "tool_call_id": tool_call.id,
                 "content": output,
             })
+
+        if compacted:
+            continue
 
         messages.extend(tool_messages)
 
