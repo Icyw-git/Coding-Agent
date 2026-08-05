@@ -730,8 +730,12 @@ def log_hook(tool:str,args:dict,output:str):
     if tool == 'bash':
         # bash 输出用 Claude Code 风格粉色边框框
         ui.safe_print(ui.bash_box(args.get('command', ''), output))
+    elif tool == 'read':
+        # read 输出用代码块背景展示，避免整文件被压平成一行 preview
+        ui.safe_print(ui.code_box(args.get('path', ''), output))
     else:
         ui.safe_print(ui.tool_line(tool, args, output))
+    ui.safe_print('')  # 工具行后空一行，避免输出拥挤
     return None
 
 def large_output_hook(tool:str,args:dict,output:str):
@@ -750,8 +754,21 @@ def summary_hook(messages:list):
         ctx_pct = min(100, 100.0 * estimate_size(messages) / max(1, CONTEXT_LIMIT))
     except Exception:
         ctx_pct = None
+    branch = ''
+    try:
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        branch = ''
+    tokens_est = ''
+    try:
+        tokens_est = '{0}k'.format(round(estimate_size(messages) / 1000.0))
+    except Exception:
+        tokens_est = ''
     line = ui.statusline(model=os.getenv('LLM_MODEL_ID', ''), tools=tool_count,
-                         ctx_pct=ctx_pct)
+                         ctx_pct=ctx_pct, tokens=tokens_est,
+                         workdir=str(WORKDIR), git_branch=branch)
     if line:
         ui.safe_print(line)
     return None

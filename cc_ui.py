@@ -20,6 +20,15 @@
     print(ui.permission_banner('Permission needed', ['删除文件？']))
     print(ui.diff(git_diff_text))
     print(ui.statusline(model='x', git_branch='main', ctx_pct=42))
+    ui.say('success', 'done')                   # 便捷打印一行
+
+与 agent_loop 的集成时机（对应 hook 调用点）：
+    - 调 API 前：with ui.Spinner(label='Thinking'): response = ...   # 覆盖慢速
+    - 工具执行：ui.safe_print(ui.tool_line(name, args, preview=output[:120]))
+    - 权限询问：ui.safe_print(ui.permission_banner('Permission needed', [tool, str(args)]))
+    - 大段输出：ui.safe_print(ui.bash_box(command, output)) 或 ui.safe_print(ui.diff(diff_text))
+    - 会话状态：ui.safe_print(ui.statusline(model=..., git_branch=..., ctx_pct=..., tokens=...))
+    - 长任务：bar = ui.ProgressBar(); bar.update(40); ...; bar.finish()
 """
 import os
 import random
@@ -28,6 +37,7 @@ import shutil
 import sys
 import threading
 import time
+from typing import List, Optional
 
 # ---------- ANSI 原语（含 NO_COLOR / 色级降级） ----------
 
@@ -35,11 +45,16 @@ _RESET = '\x1b[0m'
 
 
 def _detect_color_level():
-    """按环境决定色彩深度：NO_COLOR 优先，其次 COLORTERM/TERM。"""
+    """按环境决定色彩深度：NO_COLOR 优先，其次 FORCE_COLOR / COLORTERM / WT_SESSION / TERM。"""
     if os.environ.get('NO_COLOR') is not None:
         return 0
+    if os.environ.get('FORCE_COLOR'):  # CI 强制启用彩色
+        return 16777216
     ct = os.environ.get('COLORTERM', '').lower()
     if 'truecolor' in ct or '24bit' in ct:
+        return 16777216
+    # Windows Terminal / ConEmu 默认支持真彩色，但通常不设 COLORTERM
+    if os.environ.get('WT_SESSION') or os.environ.get('ConEmuANSI'):
         return 16777216
     term = os.environ.get('TERM', '')
     if '256color' in term:
@@ -48,6 +63,12 @@ def _detect_color_level():
 
 
 _COLOR_LEVEL = _detect_color_level()
+
+
+def reload_color_level() -> None:
+    """运行时重新检测色彩深度：修改 NO_COLOR / FORCE_COLOR / TERM 后调用生效。"""
+    global _COLOR_LEVEL
+    _COLOR_LEVEL = _detect_color_level()
 
 
 def _rgb_to_256(r, g, b):
@@ -81,7 +102,7 @@ def _ansi_16_code(rgb):
 def _ansi_16_bg_code(rgb):
     """24bit RGB → ANSI16 背景码（40-47 / 100-107）。"""
     fg = _ansi_16_code(rgb)
-    return fg - 30 + 40 + (60 if fg >= 90 else 0)
+    return (fg % 10) + 40 + (60 if fg >= 90 else 0)
 
 
 def _fg(rgb):
@@ -105,19 +126,24 @@ def _bg(rgb):
 
 
 def _bold():
-    return '\x1b[1m'
+    return '' if _COLOR_LEVEL == 0 else '\x1b[1m'
 
 
 def _italic():
-    return '\x1b[3m'
+    return '' if _COLOR_LEVEL == 0 else '\x1b[3m'
 
 
 def _dim():
-    return '\x1b[2m'
+    return '' if _COLOR_LEVEL == 0 else '\x1b[2m'
 
 
 def _underline():
-    return '\x1b[4m'
+    return '' if _COLOR_LEVEL == 0 else '\x1b[4m'
+
+
+def _black():
+    """黑字（用于 pill 背景上的前景，NO_COLOR 下禁用）。"""
+    return '' if _COLOR_LEVEL == 0 else '\x1b[30m'
 
 
 # ---------- 编码自适应图形符号 ----------
@@ -149,6 +175,8 @@ G = {
     'check':   '\u2713' if _is_unicode else 'v',
     'block':   '\u2588' if _is_unicode else '#',   # 进度条已用
     'hollow':  '\u2591' if _is_unicode else '.',   # 进度条未用
+    'box_on':  '\u2611' if _is_unicode else '[x]', # 任务列表已勾选 ☑
+    'box_off': '\u2610' if _is_unicode else '[ ]', # 任务列表未勾选 ☐
     'spinner': ('\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2827\u280f'
                 if _is_unicode else '|/-\\'),
 }
@@ -169,6 +197,7 @@ TOKENS = {
     'planMode':    (96, 165, 250),    # Plan 模式蓝
     'header':      (255, 220, 150),
     'code':        (255, 200, 130),
+    'codeBg':      (60, 60, 66),      # 代码块背景：真彩为暗灰；16 色映射到 bright-black(100) 可见
     'link':        (106, 176, 255),
     'quote':       (160, 160, 170),
     'diffAdded':   (34, 92, 43),      # 新增行背景（暗绿）
@@ -187,48 +216,48 @@ TOKENS = {
 _is_tty = sys.stdout.isatty()
 
 
-def t(name):
+def t(name: str) -> str:
     """取命名 token 的前景色转义码。"""
     rgb = TOKENS.get(name, TOKENS['text'])
     return _fg(rgb)
 
 
-def bg(name):
+def bg(name: str) -> str:
     """取命名 token 的背景色转义码。"""
     rgb = TOKENS.get(name, TOKENS['subtle'])
     return _bg(rgb)
 
 
-def c(name, text):
+def c(name: str, text: str) -> str:
     """给文本上命名颜色。"""
     return t(name) + str(text) + _RESET
 
 
-def b(text):
+def b(text: str) -> str:
     """加粗。"""
     return _bold() + str(text) + _RESET
 
 
-def dim(text):
+def dim(text: str) -> str:
     """置灰。"""
     return _dim() + str(text) + _RESET
 
 
-def bold_c(name, text):
+def bold_c(name: str, text: str) -> str:
     """加粗 + 命名颜色。"""
     return _bold() + t(name) + str(text) + _RESET
 
 
-def rule(char=None, width=80):
+def rule(char: Optional[str] = None, width: int = 80) -> str:
     return t('inactive') + (char or G['th']) * width + _RESET
 
 
-def status(text):
+def status(text: str) -> str:
     """Claude 风格的次要状态行（▸ 前缀 + 灰字）。"""
     return t('claude') + G['tri'] + ' ' + _RESET + t('subtle') + text + _RESET
 
 
-def safe_print(text):
+def safe_print(text) -> None:
     """打印任意文本，GBK 等窄编码环境不崩溃（替换不可编码字符）。"""
     enc = sys.stdout.encoding or 'utf-8'
     try:
@@ -240,6 +269,11 @@ def safe_print(text):
             print(str(text).encode('ascii', errors='replace').decode('ascii', errors='replace'))
 
 
+def say(name: str, text: str) -> None:
+    """按命名颜色打印一行（safe_print 兜底）：`ui.say('success', 'ok')`。"""
+    safe_print(c(name, text))
+
+
 # ---------- Markdown 渲染 ----------
 
 _INLINE_RE = re.compile(
@@ -247,7 +281,7 @@ _INLINE_RE = re.compile(
 )
 
 
-def _inline(text):
+def _inline(text: str) -> str:
     """渲染行内样式：加粗 / 斜体 / 代码 / 删除线 / 链接。"""
     out = []
     for tok in _INLINE_RE.split(text):
@@ -285,11 +319,11 @@ _PY_KEYWORDS = {
 }
 _PY_RE = re.compile(
     r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\n]*"|\'[^\'\n]*\'|#[^\n]*'
-    r'|\b\d+\b|\b[A-Za-z_]\w*\b)'
+    r'|(?<![.\w])\d+(?![.\w])|\b[A-Za-z_]\w*\b)'
 )
 
 
-def _py_highlight(line):
+def _py_highlight(line: str) -> str:
     """Python 行最小语法高亮：字符串/注释/关键字/数字。"""
     out = []
     for tok in _PY_RE.split(line):
@@ -306,39 +340,50 @@ def _py_highlight(line):
     return ''.join(out)
 
 
-def _code_block(lines, lang=''):
-    """代码块：左置灰竖线 + 代码色内容；python 代码启用最小语法高亮。"""
+def _code_block(lines, lang: str = '') -> str:
+    """代码块：整行暗灰背景色块（对齐 CC）；python 代码启用最小语法高亮。"""
     if not lines:
         return ''
     if lang in ('python', 'py'):
         return '\n'.join(
-            t('subtle') + G['pipe'] + ' ' + _RESET + _py_highlight(line) + _RESET
+            bg('codeBg') + _py_highlight(line) + _RESET
             for line in lines
         )
     return '\n'.join(
-        t('subtle') + G['pipe'] + ' ' + _RESET + t('code') + line + _RESET
+        bg('codeBg') + t('code') + line + _RESET
         for line in lines
     )
 
 
+def _disp_w(s) -> int:
+    """终端显示宽度：CJK/宽字符计 2，其余计 1（免 wcwidth 依赖的简化版）。"""
+    return sum(2 if ord(ch) > 127 else 1 for ch in str(s))
+
+
+def _ljust(s, w) -> str:
+    """按终端显示宽度左对齐（len() 对中文计 1 会错位）。"""
+    s = str(s)
+    return s + ' ' * max(0, w - _disp_w(s))
+
+
 def _table_grid(headers, rows):
     """宽屏表格：对齐网格，表头加粗 + 主题色，分隔线。"""
-    widths = [len(h) for h in headers]
+    widths = [_disp_w(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
             if i < len(widths):
-                widths[i] = max(widths[i], len(str(cell)))
+                widths[i] = max(widths[i], _disp_w(cell))
     out = [bold_c('gridHeader', '  '.join(
-        h.ljust(widths[i]) for i, h in enumerate(headers)))]
+        _ljust(h, widths[i]) for i, h in enumerate(headers)))]
     out.append(t('inactive') + '  ' + '  '.join('-' * w for w in widths) + _RESET)
     for r in rows:
         out.append('  ' + '  '.join(
-            (str(c).ljust(widths[i]) if i < len(widths) else str(c))
+            (_ljust(c, widths[i]) if i < len(widths) else str(c))
             for i, c in enumerate(r)))
     return '\n'.join(out)
 
 
-def _table_records(headers, rows):
+def _table_records(headers: List[str], rows) -> str:
     """窄屏表格：每行转成 label: value 记录（Codex/Claude 响应式布局）。"""
     out = []
     for r in rows:
@@ -349,20 +394,20 @@ def _table_records(headers, rows):
     return '\n'.join(out).rstrip('\n')
 
 
-def table(headers, rows, max_width=None):
+def table(headers: List[str], rows, max_width: Optional[int] = None) -> str:
     """响应式表格：终端够宽用网格，太窄自动转 label: value 记录。"""
     if max_width is None:
         try:
             max_width = shutil.get_terminal_size().columns
         except Exception:
             max_width = 80
-    grid_w = sum(len(h) + 2 for h in headers) + len(headers)
+    grid_w = sum(_disp_w(h) + 2 for h in headers) + len(headers)
     if grid_w > max_width - 4:
         return _table_records(headers, rows)
     return _table_grid(headers, rows)
 
 
-def _table_block(lines, width):
+def _table_block(lines, width: int) -> str:
     """把连续的 Markdown 表格行解析成响应式表格。lines[0]=表头, lines[1]=分隔线, 其余=行。"""
     def cells(line):
         return [c.strip() for c in line.strip().strip('|').split('|')]
@@ -373,7 +418,7 @@ def _table_block(lines, width):
     return table(headers, rows, max_width=width)
 
 
-def markdown(text, width=80):
+def markdown(text, width: int = 80) -> str:
     """整段 Markdown 渲染：标题 / 引用 / 列表 / 表格 / 分隔线 / 代码块。"""
     if not text:
         return ''
@@ -407,12 +452,22 @@ def markdown(text, width=80):
             out.append(bold_c('header', title))
         elif stripped.startswith('> '):
             out.append(t('quote') + G['quote'] + ' ' + _inline(stripped[2:]) + _RESET)
-        elif re.match(r'^[-*] ', stripped):
-            out.append('  ' + t('claude') + G['bullet'] + _RESET + ' ' + _inline(stripped[2:]))
-        elif re.match(r'^\d+\. ', stripped):
-            m = re.match(r'^(\d+)\. ', stripped)
-            out.append('  ' + t('subtle') + m.group(1) + '.' + _RESET + ' ' +
-                       _inline(stripped[m.end():]))
+        elif re.match(r'^(\s*)[-*] \[[ xX]\] ', line):
+            m = re.match(r'^(\s*)[-*] \[([ xX])\] (.*)$', line)
+            depth = len(m.group(1)) // 2
+            box = c('success', G['box_on']) if m.group(2).lower() == 'x' \
+                else c('inactive', G['box_off'])
+            out.append('  ' * (depth + 1) + box + ' ' + _inline(m.group(3)))
+        elif re.match(r'^(\s*)[-*] ', line):
+            m = re.match(r'^(\s*)[-*] (.*)$', line)
+            depth = len(m.group(1)) // 2
+            out.append('  ' * (depth + 1) + t('claude') + G['bullet'] + _RESET +
+                       ' ' + _inline(m.group(2)))
+        elif re.match(r'^(\s*)\d+\. ', line):
+            m = re.match(r'^(\s*)(\d+)\. (.*)$', line)
+            depth = len(m.group(1)) // 2
+            out.append('  ' * (depth + 1) + t('subtle') + m.group(2) + '.' +
+                       _RESET + ' ' + _inline(m.group(3)))
         elif stripped in ('---', '***', '___'):
             out.append(rule(width=width))
         elif stripped.startswith('|') and stripped.endswith('|'):
@@ -440,7 +495,8 @@ def markdown(text, width=80):
 
 # ---------- 工具状态行（Claude 风格） ----------
 
-def tool_line(name, args=None, preview='', preview_len=120):
+def tool_line(name: str, args: Optional[dict] = None, preview: str = '',
+              preview_len: int = 120) -> str:
     """工具执行行：`> bash  command=dir` + 灰字结果预览。"""
     args = args or {}
     arg_s = ' '.join('{}={}'.format(k, v) for k, v in args.items())
@@ -457,19 +513,26 @@ def tool_line(name, args=None, preview='', preview_len=120):
 
 # ---------- 权限横幅 ----------
 
-def permission_banner(title, lines):
-    """权限确认框：紫色边框 + 内容行。"""
+def permission_banner(title: str, lines: List[str]) -> str:
+    """权限确认框：紫色边框 + 内容行。宽度随终端自适应（30~70），长标题不溢出。"""
+    width = 50
+    try:
+        width = max(30, min(70, shutil.get_terminal_size().columns - 6))
+    except Exception:
+        pass
+    top_fill = max(2, width - len(title) - 4)
     out = [t('permission') + G['tl'] + G['th'] + ' ' + title + ' ' +
-           G['th'] * 30 + _RESET]
+           G['th'] * top_fill + _RESET]
     for ln in lines:
         out.append(t('permission') + G['pipe'] + ' ' + _RESET + ln)
-    out.append(t('permission') + G['bl'] + G['th'] * 50 + _RESET)
+    out.append(t('permission') + G['bl'] + G['th'] * width + _RESET)
     return '\n'.join(out)
 
 
 # ---------- Bash 输出框（Claude Code 粉色边框） ----------
 
-def bash_box(command, output, max_lines=14, width=None):
+def bash_box(command: str, output, max_lines: int = 14,
+             width: Optional[int] = None) -> str:
     """bash 命令 + 粉色边框输出框；超长输出只保留前几行并提示。"""
     if width is None:
         try:
@@ -486,9 +549,37 @@ def bash_box(command, output, max_lines=14, width=None):
     if truncated:
         body += '\n' + t('bashBorder') + G['pipe'] + _RESET + ' ' + \
             dim('... {0} more lines'.format(len(str(output).splitlines()) - max_lines))
-    head = t('bashBorder') + G['tl'] + G['th'] + ' bash: ' + \
-        command[:inner - 12] + _RESET
+    cmd = str(command)
+    if len(cmd) > inner - 12:
+        cmd = cmd[:inner - 15] + '...'
+    head = t('bashBorder') + G['tl'] + G['th'] + ' bash: ' + cmd + _RESET
     tail = t('bashBorder') + G['bl'] + G['th'] * inner + _RESET
+    return head + '\n' + body + '\n' + tail
+
+
+def code_box(path: str, content, max_lines: int = 14,
+             width: Optional[int] = None) -> str:
+    """文件内容代码块：暗灰背景（codeBg）+ 灰色路径头，超长截断并提示。
+
+    用于 read 工具输出——比塞进一行 preview 更接近 Claude Code 的展示。
+    """
+    if width is None:
+        try:
+            width = shutil.get_terminal_size().columns
+        except Exception:
+            width = 80
+    inner = max(20, width - 4)
+    lines = str(content).splitlines()
+    truncated = len(lines) > max_lines
+    if truncated:
+        lines = lines[:max_lines]
+    body = '\n'.join(bg('codeBg') + line + _RESET for line in lines)
+    if truncated:
+        body += '\n' + bg('codeBg') + dim(
+            '... {0} more lines'.format(len(str(content).splitlines()) - max_lines)) + _RESET
+    head = t('subtle') + G['tl'] + G['th'] + ' read: ' + \
+        str(path)[:inner - 10] + _RESET
+    tail = t('subtle') + G['bl'] + G['th'] * inner + _RESET
     return head + '\n' + body + '\n' + tail
 
 
@@ -501,7 +592,7 @@ MODEL_TIERS = {
 }
 
 
-def model_color(model):
+def model_color(model: str) -> str:
     """按模型档位返回语义色名（Claude Code 按 tier 着色的约定）。"""
     m = (model or '').lower()
     for key, color in MODEL_TIERS.items():
@@ -510,7 +601,22 @@ def model_color(model):
     return 'info'
 
 
-def ctx_bar(pct, width=10):
+def mode_indicator(mode: str = '') -> str:
+    """模式标签：Plan 蓝 / Review 紫 / 其他灰（对齐 CC 的 [Plan Mode] 指示）。"""
+    m = (mode or '').lower()
+    if 'plan' in m:
+        return bold_c('planMode', '[Plan Mode]')
+    if 'review' in m:
+        return bold_c('permission', '[Review Mode]')
+    return bold_c('inactive', '[Normal]')
+
+
+def _pill(color_name: str, text: str) -> str:
+    """状态行 pill：背景色块 + 黑字（NO_COLOR 下退化为纯文本）。"""
+    return bg(color_name) + _black() + ' ' + text + ' ' + _RESET
+
+
+def ctx_bar(pct, width: int = 10) -> str:
     """上下文使用率填充条：███████░░░ 42%（claude-statusline 风格）。"""
     pct = max(0.0, min(100.0, float(pct or 0)))
     filled = int(round(pct / 100.0 * width))
@@ -519,25 +625,28 @@ def ctx_bar(pct, width=10):
     return c(color, '[' + bar + ']') + ' ' + c(color, '{0}%'.format(int(pct)))
 
 
-def statusline(model='', tools=0, ctx_pct=None, tokens='', workdir='',
-               git_branch='', cost=None):
-    """会话状态行：model(tier 色) / git 分支 / 工具数 / 上下文进度条 / 成本 / token。
+def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
+               workdir: str = '', git_branch: str = '', cost=None, mode: str = '') -> str:
+    """会话状态行：模式标签 / model(tier 色 pill) / git 分支 / 工具数 / 进度条 / 成本 / token。
 
     上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
+    model / tools / cost / tokens 以带底色 pill 呈现，层次感对齐 CC。
     """
     parts = []
+    if mode:
+        parts.append(mode_indicator(mode))
     if model:
-        parts.append(bold_c(model_color(model), model))
+        parts.append(_pill(model_color(model), model))
     if git_branch:
         parts.append(t('subtle') + git_branch + _RESET)
     if tools:
-        parts.append(t('subtle') + '{0} tools'.format(tools) + _RESET)
+        parts.append(_pill('inactive', '{0} tools'.format(tools)))
     if ctx_pct is not None:
         parts.append(ctx_bar(ctx_pct))
     if cost is not None:
-        parts.append(c('success', '${0:.2f}'.format(cost)))
+        parts.append(_pill('success', '${0:.2f}'.format(cost)))
     if tokens:
-        parts.append(t('subtle') + tokens + _RESET)
+        parts.append(_pill('inactive', tokens))
     if workdir:
         parts.append(t('inactive') + workdir + _RESET)
     if not parts:
@@ -547,7 +656,7 @@ def statusline(model='', tools=0, ctx_pct=None, tokens='', workdir='',
 
 # ---------- Diff 高亮 ----------
 
-def diff(text):
+def diff(text) -> str:
     """git diff 高亮：+++/--- 标题、@@ 元信息、+/- 行用暗绿/暗红背景（CC 官方色）。"""
     out = []
     for line in str(text).splitlines():
@@ -584,7 +693,8 @@ class Spinner:
     VERBS = ['Pondering', 'Cooking', 'Thinking', 'Processing', 'Reticulating',
              'Gathering', 'Weighing', 'Synthesizing']
 
-    def __init__(self, label=None, token='claude', stall_after=8.0, speed='auto'):
+    def __init__(self, label: Optional[str] = None, token: str = 'claude',
+                 stall_after: float = 8.0, speed: str = 'auto'):
         self.label = label
         self.token = token
         self.stall_after = stall_after
@@ -592,21 +702,21 @@ class Spinner:
         self._stop = threading.Event()
         self._thread = None
 
-    def __enter__(self):
+    def __enter__(self) -> 'Spinner':
         if not _is_tty:
             return self
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
 
-    def _interval(self):
+    def _interval(self) -> float:
         if self.speed == 'thinking':
             return 0.2
         if self.speed == 'requesting':
             return 0.05
         return 0.2 if self.label else 0.05
 
-    def _run(self):
+    def _run(self) -> None:
         frames = G['spinner']
         i = 0
         start = time.time()
@@ -623,13 +733,121 @@ class Spinner:
             frame = frames[i % len(frames)]
             sys.stdout.write('\r\x1b[2K' + color + frame + _RESET + ' ' + label)
             sys.stdout.flush()
-            time.sleep(self._interval())
             i += 1
+            # Event.wait 替代 time.sleep：stop 信号一到立即醒来退出，不等满一个 interval
+            if self._stop.wait(self._interval()):
+                break
+
+    def _clear_line(self):
+        """清掉 Spinner 行（\r + 擦除到行尾），失败静默，避免阻塞传播。"""
+        try:
+            sys.stdout.write('\r\x1b[2K')
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     def __exit__(self, *exc):
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=0.5)
+            try:
+                self._thread.join(timeout=0.5)
+            finally:
+                # 无论正常退出还是 Ctrl+C（KeyboardInterrupt）都清行，避免光标残留
+                self._clear_line()
+        return False
+
+
+# ---------- 进度条（定长百分比 / 不定长滚动） ----------
+
+class ProgressBar:
+    """终端进度条：定长（update 手动刷新百分比）或不定长（start/stop 滚动动画）。
+
+    定长（耗时已知）：
+        bar = ProgressBar()
+        for pct in (10, 40, 90, 100):
+            bar.update(pct)
+            time.sleep(0.2)
+        bar.finish()
+
+    不定长（耗时未知，支持 with 语法自动清行）：
+        with ProgressBar(indeterminate=True):
+            do_slow_work()
+    """
+
+    def __init__(self, width: int = 20, indeterminate: bool = False,
+                 token: str = 'success', stall_after: float = 8.0):
+        self.width = width
+        self.indeterminate = indeterminate
+        self.token = token
+        self.stall_after = stall_after
+        self._stop = threading.Event()
+        self._thread = None
+
+    # ---------- 定长模式 ----------
+
+    def update(self, pct: float) -> None:
+        """渲染一帧定长进度条（\\r 原地刷新）。pct: 0~100，按阈值变色。"""
+        pct = max(0.0, min(100.0, float(pct)))
+        filled = int(round(pct / 100.0 * self.width))
+        color = 'error' if pct > 75 else ('warning' if pct > 50 else 'success')
+        bar = G['block'] * filled + G['hollow'] * (self.width - filled)
+        sys.stdout.write('\r\x1b[2K' + c(color, '[' + bar + ']') +
+                         ' ' + c(color, '{0}%'.format(int(pct))))
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        """定长模式结束：清掉进度条行。"""
+        self._clear()
+
+    # ---------- 不定长模式 ----------
+
+    def start(self) -> None:
+        """启动滚动动画线程（仅 TTY）。"""
+        if not _is_tty or self._thread:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """停止动画线程并清行。"""
+        self._stop.set()
+        if self._thread:
+            try:
+                self._thread.join(timeout=0.5)
+            finally:
+                self._clear()
+
+    def _run(self) -> None:
+        i = 0
+        start = time.time()
+        while not self._stop.wait(0.08):
+            elapsed = time.time() - start
+            if elapsed > self.stall_after:
+                # 停滞：超过阈值后随时间渐变到错误红（复用 _interp）
+                ratio = min((elapsed - self.stall_after) / 20.0, 1.0)
+                color = _fg(_interp(TOKENS.get(self.token, TOKENS['claude']),
+                                    TOKENS['error'], ratio))
+            else:
+                color = t(self.token)
+            pos = i % (self.width + 1)
+            bar = G['hollow'] * pos + G['block'] + G['hollow'] * (self.width - pos)
+            sys.stdout.write('\r\x1b[2K' + color + '[' + bar + ']' + _RESET)
+            sys.stdout.flush()
+            i += 1
+
+    def __enter__(self) -> 'ProgressBar':
+        if self.indeterminate:
+            self.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._thread:
+            self.stop()
+        return False
+
+    def _clear(self) -> None:
+        try:
             sys.stdout.write('\r\x1b[2K')
             sys.stdout.flush()
-        return False
+        except Exception:
+            pass
