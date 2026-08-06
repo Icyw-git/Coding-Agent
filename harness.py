@@ -28,35 +28,106 @@ client=openai.OpenAI(
     
 )
 
-SYSTEM=(
-    'You are a coding agent working on Windows at {workdir}. '
-    'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
-    '{memories_section}'
-    'Rules: '
-    '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
-    'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
-    '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
-    'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
-    'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
-    'Skills available:\n{catalog}\n'
-     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
-)
+PROMPT_SECTIONS={
+    'identity_main':(
+        'You are a coding agent working on Windows at {workdir}. '
+        'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
+    ),
+    'identity_sub':(
+        'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
+        'Complete the task you are given and return a concise final answer to the parent agent. '
+    ),
+    'rules_main':(
+        'Rules: '
+        '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
+        'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
+        '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
+        'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
+        'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
+    ),
+    'rules_sub':(
+        'Rules: '
+        '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
+        '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
+        '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
+        'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
+        '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
+        'reasonable alternative, then report the situation honestly to the parent. '
+        '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
+        'Do not re-plan the parent task and do not spawn further sub-agents. '
+    ),
+    'skills_usage':(
+        'Skills available:\n{catalog}\n'
+        'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
+    ),
+}
 
-SUB_SYSTEM=(
-    'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
-    'Complete the task you are given and return a concise final answer to the parent agent. '
-    'Rules: '
-    '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
-    '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
-    '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
-    'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
-    '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
-    'reasonable alternative, then report the situation honestly to the parent. '
-    '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
-    'Do not re-plan the parent task and do not spawn further sub-agents. '
-     'Skills available:\n{catalog}\n'
-     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
-)
+def assemble_system_prompt(context:dict)->str:
+    sections=[]
+    sections.append(PROMPT_SECTIONS['identity_main'].format(
+        workdir=context.get('workspace',WORKDIR)
+    ))
+    tools=','.join(context.get('enabled_tools',[]))
+    if tools:
+        sections.append(f'Available tools:{tools}.')
+    sections.append(f'Working directory:{context.get("workspace",WORKDIR)}.')
+
+    memories=context.get('memories','')
+    if memories:
+        sections.append(f'Relevant memories:\n{memories}')
+    skills=context.get('skills','')
+    if skills:
+        sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
+    sections.append(PROMPT_SECTIONS['rules_main'])
+    return '\n\n'.join(sections)
+
+_last_context_key=None
+_last_prompt=None
+
+def get_system_prompt(context:dict)->str:
+    global _last_context_key,_last_prompt
+    key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
+    if key==_last_context_key and _last_prompt:
+        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt
+    _last_context_key=key
+    _last_prompt=assemble_system_prompt(context)
+
+    loaded=['identity','tools','workspace','rules']
+    if context.get('memories'):
+        loaded.append('memory')
+    if context.get('skills'):
+        loaded.append('skills')
+    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    return _last_prompt
+
+def update_context(context:dict,messages:list)->dict:
+    memories=''
+    if MEMORY_INDEX.exists():
+        content=MEMORY_INDEX.read_text(encoding='utf-8',errors='replace').strip()
+        if content:
+            memories=content
+    skills=list_skills()
+    return {
+        'enabled_tools':list(tool_registry.keys()),
+        'workspace':str(WORKDIR),
+        'memories':memories,
+        'skills':skills,
+    }
+
+
+def build_system()->str:
+    return assemble_system_prompt(update_context({},[]))
+
+
+def build_sub_system()->str:
+    return (
+        PROMPT_SECTIONS['identity_sub'].format(workdir=WORKDIR) +
+        '\n\n' +
+        PROMPT_SECTIONS['rules_sub'].format(workdir=WORKDIR) +
+        '\n\n' +
+        PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills())
+    )
 
 TOOLS=[{
     "type":"function",
@@ -553,18 +624,6 @@ def list_skills()->str:
         return "No skills registered"
     return '\n'.join(f'- **{skill["name"]}**: {skill["description"]}' for skill in SKILL_REGISTRY.values())
 
-def build_system()->str:
-    index=read_memory_index()
-    memories_section = f"\n\nMemories available:\n{index}" if index else ""
-    catalog=list_skills()
-    return SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR, memories_section=memories_section)
-
-def build_sub_system()->str:
-    catalog=list_skills()
-    return SUB_SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR)
-
-
-
 def run_bash(command:str)->str:
 
     dangerous=["rm -rf /","sudo","shutdown","reboot","> /dev/"]
@@ -1041,9 +1100,10 @@ def reactive_compact(messages): #保存完整对话记录，保留最近五条�
 MAX_REACTIVE_RETRIES=1
 
 def agent_loop(messages:list):
+    context=update_context({},messages)
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
-    messages.append({'role':'system','content':build_system()}) #循环开始前，添加系统提示词
+    system=get_system_prompt(context)
     reactive_retries=0 #响应重试次数
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
@@ -1089,6 +1149,8 @@ def agent_loop(messages:list):
                     request_messages[i] = {**m, 'content': memories_content + '\n\n' + m['content']}
                     break
 
+        # system 提示通过 messages 传入（当前 SDK 不支持 system= 关键字参数）
+        request_messages=[{'role':'system','content':system}]+request_messages
         try:
             response=client.chat.completions.create(
                 model=os.getenv("LLM_MODEL_ID"),
@@ -1181,6 +1243,9 @@ def agent_loop(messages:list):
 
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        context=update_context(context,messages)
+        system=get_system_prompt(context)
+
 
 if __name__ == '__main__':
     messages = [{'role': 'user', 'content': '请用中文总结当前工作区所有 .py 文件的代码结构。'

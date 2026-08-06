@@ -1157,4 +1157,72 @@ LLM 输出 / 工具输出
 3. **提示词与代码是双保险** —— STRICT 提示词从源头减少异常回复，健壮解析兜底剩余异常，缺一不可。
 4. **记忆窗口要覆盖会话两端** —— 用户偏好通常在开头，只看结尾 10 条等于盲人摸象。
 5. **跨环境编码必须显式声明** —— 记忆文件读写统一 UTF-8，否则换台机器就崩。
-6. **真机产物会污染测试** —— 端到端验证生成的数据用后即清，否则 mock 队列/计数断言全崩。
+
+---
+
+# 第八部分：prompt_sections 重构与 system 参数兼容性
+
+记录把 identity/role/rules/skills 提取到 `PROMPT_SECTIONS`，以及不同 OpenAI SDK 版本对 system prompt 传参方式的不兼容问题。
+
+## 8.1 提取 identity 到 PROMPT_SECTIONS
+
+**背景**：`SYSTEM` / `SUB_SYSTEM` 两个全局模板硬编码了 agent 身份、规则、skills 说明，混在一起难以维护。
+
+**重构**：
+
+```python
+PROMPT_SECTIONS = {
+    'identity_main': 'You are a coding agent working on Windows at {workdir}. ...',
+    'identity_sub':  'You are a focused sub-agent working at {workdir}...',
+    'rules_main':    'Rules: (1) ... (2) ...',
+    'rules_sub':     'Rules: (1) ... (5) ...',
+    'skills_usage':  'Skills available:\n{catalog}\nUse load_skill...',
+}
+```
+
+并新增三个函数：
+
+- `update_context(context, messages)`：从 `MEMORY_INDEX`、`tool_registry`、`list_skills()` 收集当前上下文。
+- `assemble_system_prompt(context)`：按 context 动态拼接 identity、tools、workspace、memory、skills、rules。
+- `get_system_prompt(context)`：对组装结果做缓存，避免 context 未变时重复生成。
+
+`build_system()` / `build_sub_system()` 也改为复用上述结构，删除旧的 `SYSTEM` / `SUB_SYSTEM` 全局模板。
+
+## 8.2 OpenAI SDK `system=` 参数不兼容
+
+**现象**：运行脚本时抛出：
+
+```
+TypeError: create() got an unexpected keyword argument 'system'
+```
+
+**根因**：不同环境/不同 OpenAI SDK 版本对 system prompt 的传参方式支持不一致。某些版本支持 `client.chat.completions.create(system=..., messages=...)`，而当前运行环境（`D:/Anaconda_envs/envs/aitest01/python.exe`）的 SDK 只接受 system 作为 `messages` 列表中 `role='system'` 的消息。
+
+**修复**：不再传 `system=system`，而是在 `request_messages` 开头插入 system message：
+
+```python
+request_messages = [{'role': 'system', 'content': system}] + request_messages
+response = client.chat.completions.create(
+    model=...,
+    messages=request_messages,
+    tools=TOOLS,
+    ...
+)
+```
+
+这样既兼容新版也兼容旧版 SDK。
+
+## 8.3 为什么循环中一直 `[cache hit] system prompt unchanged`
+
+**现象**：真机运行时，第一轮显示 `[assembled] sections: identity, tools, workspace, rules, memory, skills`，之后每轮都是 `[cache hit] system prompt unchanged`。
+
+**根因**：`get_system_prompt` 用 `json.dumps(context, sort_keys=True, ...)` 做缓存 key。`update_context()` 收集的 `enabled_tools`、`workspace`、`memories`、`skills` 在单轮循环中通常不变，所以 key 不变 → 命中缓存。
+
+**是否正常**：正常。记忆写入（`extract_memories` / `consolidate_memories`）发生在会话结束返回最终回答之后，本轮循环内 context 确实不会刷新。本轮新记忆要等下一次 `agent_loop` 启动、第一次 `update_context()` 读取 `MEMORY_INDEX` 时才会被召回。
+
+## 8.4 本次重构的教训
+
+1. **SDK 版本差异是隐形坑**：`system=` 参数不是跨版本通用写法，最稳妥的方式是把 system 作为 `messages` 的第一条传入。
+2. **全局模板不利于动态扩展**：把 prompt 拆成 `identity` / `rules` / `skills_usage` 后，未来可以按场景（plan/review/sub-agent）灵活组合。
+3. **缓存 key 要稳定且可比较**：用 `json.dumps(context, sort_keys=True)` 可以稳定比较 dict，但注意列表顺序变化会导致 key 变化——当前 `enabled_tools` 来自 `tool_registry.keys()`，顺序稳定，无需额外排序。
+4. **真机产物会污染测试** —— 端到端验证生成的数据用后即清，否则 mock 队列/计数断言全崩。
