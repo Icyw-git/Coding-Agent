@@ -8,9 +8,10 @@ import ast
 import pathlib
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import yaml
 import recovery
+from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 
 
 
@@ -324,6 +325,104 @@ TOOLS=[{
                 "todos"
             ]
 
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"create_task",
+        "description":"Create a new task in the task system (persisted to .cache/tasks).",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "subject":{
+                    "type":"string",
+                    "description":"One-line task subject"
+                },
+                "description":{
+                    "type":"string",
+                    "description":"Detailed task description"
+                },
+                "blockedBy":{
+                    "type":"array",
+                    "description":"Task ids that must be completed before this task can start",
+                    "items":{
+                        "type":"string"
+                    }
+                }
+            },
+            "required":[
+                "subject"
+            ]
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"list_tasks",
+        "description":"List all tasks with id, subject, status, owner and dependencies.",
+        "parameters":{
+            "type":"object",
+            "properties":{}
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"get_task",
+        "description":"Get a task's full detail by id.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "task_id":{
+                    "type":"string",
+                    "description":"Task id, e.g. task_1700000000_abcd"
+                }
+            },
+            "required":[
+                "task_id"
+            ]
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"claim_task",
+        "description":"Claim a pending task (set to in_progress). Fails if its dependencies are not completed.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "task_id":{
+                    "type":"string",
+                    "description":"Task id to claim"
+                }
+            },
+            "required":[
+                "task_id"
+            ]
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"complete_task",
+        "description":"Mark a task as completed and report newly unblocked pending tasks.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "task_id":{
+                    "type":"string",
+                    "description":"Task id to complete"
+                }
+            },
+            "required":[
+                "task_id"
+            ]
         }
     }
 
@@ -770,8 +869,48 @@ def run_todo_write(todos: list) -> str:
     print("\n".join(lines))
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
+# Task tools
 
-tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write}
+def run_create_task(subject: str, description: str = "",
+                    blockedBy: Optional[List[str]] = None) -> str:
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●",
+                "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} "
+                     f"[{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+
+def run_get_task(task_id: str) -> str:
+    try:
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
+
+
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id)
+
+tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write,
+               'create_task':run_create_task,'list_tasks':run_list_tasks,'get_task':run_get_task,
+               'claim_task':run_claim_task,'complete_task':run_complete_task}
 
 def register_hook(event:str,callback):
     HOOKS[event].append(callback)
@@ -1274,7 +1413,5 @@ def agent_loop(messages:list):
 
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '请用中文总结当前工作区所有 .py 文件的代码结构。'
-    '注意：以后输出报告一律用中文；'
-    '并且永远不要用 PowerShell Get-Content 读文件（会乱码），改用 read 工具。'}]
+    messages = [{'role': 'user', 'content': '清空之前的测试任务和记忆等相关文件'}]
     agent_loop(messages)
