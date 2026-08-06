@@ -10,15 +10,13 @@ import re
 from pathlib import Path
 from typing import Optional
 import yaml
+import recovery
 
 
 
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
 SKILLS_DIR=WORKDIR/"skills"
-MEMORY_TYPES=['user','feedback','project','reference']
-MEMORY_DIR=WORKDIR/'.cache'/'memories'
-MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
 
 
 
@@ -62,7 +60,7 @@ PROMPT_SECTIONS={
     ),
 }
 
-def assemble_system_prompt(context:dict)->str:
+def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身份、工具、工作目录、记忆、技能、规则等
     sections=[]
     sections.append(PROMPT_SECTIONS['identity_main'].format(
         workdir=context.get('workspace',WORKDIR)
@@ -81,10 +79,53 @@ def assemble_system_prompt(context:dict)->str:
     sections.append(PROMPT_SECTIONS['rules_main'])
     return '\n\n'.join(sections)
 
-_last_context_key=None
-_last_prompt=None
+_last_context_key=None # 缓存键，用于判断是否需要重新组装系统提示
+_last_prompt=None # 缓存系统提示，用于判断是否需要重新组装系统提示
 
-def get_system_prompt(context:dict)->str:
+# ============================================================
+# 全局配置集中区
+# ============================================================
+
+# ---------- 记忆系统配置 ----------
+MEMORY_TYPES=['user','feedback','project','reference']
+MEMORY_DIR=WORKDIR/'.cache'/'memories'
+MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
+CONSOLIDATE_THRESHOLD=10
+
+# ---------- 安全策略 ----------
+DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
+DESTRUCTIVE=["rm ","del ","rmdir ","rd ","Remove-Item ","erase ","> /etc/","chmod 777"]
+
+# ---------- Hook 注册表 ----------
+HOOKS={"UserPromptSubmit":[],"PreToolUse":[],"PostToolUse":[],"Stop":[]}
+
+# ---------- 模型上下文配置 ----------
+MODEL_WINDOWS={
+    'deepseek-v4-flash':131072,
+    'deepseek-chat':65536,
+    'deepseek-reasoner':65536,
+}
+OUTPUT_RESERVE=8192        # 给 max_tokens=8000 输出预留
+CTX_SAFETY=0.8             # 留余量，防 prompt_too_long
+
+def _default_context_limit()->int:
+    window=int(os.getenv('LLM_CONTEXT_WINDOW') or
+               MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID',''),65536))
+    return max(4000,int((window-OUTPUT_RESERVE)*CTX_SAFETY))
+
+CONTEXT_LIMIT=_default_context_limit()
+KEEP_RECENT=6
+PERSIST_THERSHOLD=10000
+
+# ---------- 缓存目录 ----------
+TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
+TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
+
+# ---------- 重试配置 ----------
+MAX_REACTIVE_RETRIES=1
+
+
+def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没有改变，直接返回缓存的系统提示，否则重新组装系统提示
     global _last_context_key,_last_prompt
     key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
     if key==_last_context_key and _last_prompt:
@@ -101,7 +142,7 @@ def get_system_prompt(context:dict)->str:
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return _last_prompt
 
-def update_context(context:dict,messages:list)->dict:
+def update_context(context:dict,messages:list)->dict: # 更新上下文，包含工具、工作目录、记忆、技能等
     memories=''
     if MEMORY_INDEX.exists():
         content=MEMORY_INDEX.read_text(encoding='utf-8',errors='replace').strip()
@@ -521,8 +562,6 @@ def extract_memories(messages:list): #提取用户偏好、约束、项目事实
     except Exception as e:
         print(f"[Memory: extract error: {e}]")
 
-CONSOLIDATE_THRESHOLD = 10
-
 def consolidate_memories():
     """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
     files = list_memory_files()
@@ -734,11 +773,6 @@ def run_todo_write(todos: list) -> str:
 
 tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write}
 
-DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
-DESTRUCTIVE = ["rm ", "del ", "rmdir ", "rd ", "Remove-Item ", "erase ", "> /etc/", "chmod 777"]
-
-HOOKS={"UserPromptSubmit":[],"PreToolUse":[],"PostToolUse":[],"Stop":[]}
-
 def register_hook(event:str,callback):
     HOOKS[event].append(callback)
 
@@ -940,26 +974,6 @@ TOOLS.append({
     }
 })
 
-# 模型上下文窗口（token），可用环境变量 LLM_CONTEXT_WINDOW 覆盖
-MODEL_WINDOWS = {
-    'deepseek-v4-flash': 131072,
-    'deepseek-chat': 65536,
-    'deepseek-reasoner': 65536,
-}
-OUTPUT_RESERVE = 8192        # 给 max_tokens=8000 输出预留
-CTX_SAFETY = 0.8             # 留余量，防 prompt_too_long
-
-def _default_context_limit() -> int:
-    window = int(os.getenv('LLM_CONTEXT_WINDOW') or
-                 MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID', ''), 65536))
-    return max(4000, int((window - OUTPUT_RESERVE) * CTX_SAFETY))
-
-CONTEXT_LIMIT=_default_context_limit()
-KEEP_RECENT=6
-PERSIST_THERSHOLD=10000
-TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
-TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
-
 def estimate_size(msgs):
     # token 启发式：英文约 3.5 字符/token，中文约 1.3 字符/token（与 CONTEXT_LIMIT 同单位）
     text=str(msgs)
@@ -1096,11 +1110,10 @@ def reactive_compact(messages): #保存完整对话记录，保留最近五条�
             {'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
     result.extend(messages[tail_start:])   # 保留最近工作现场
     return result
-    
-MAX_REACTIVE_RETRIES=1
 
 def agent_loop(messages:list):
     context=update_context({},messages)
+    recovery_state=recovery.RecoveryState()
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
     system=get_system_prompt(context)
@@ -1151,18 +1164,24 @@ def agent_loop(messages:list):
 
         # system 提示通过 messages 传入（当前 SDK 不支持 system= 关键字参数）
         request_messages=[{'role':'system','content':system}]+request_messages
-        try:
-            response=client.chat.completions.create(
-                model=os.getenv("LLM_MODEL_ID"),
+
+        def _create():
+            max_tokens=(recovery.ESCALATED_MAX_TOKENS
+                        if recovery_state.has_escalated
+                        else recovery.DEFAULT_MAX_TOKENS)
+            return client.chat.completions.create(
+                model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
                 messages=request_messages,
                 tools=TOOLS,
                 temperature=0.7,
-                max_tokens=8000,
+                max_tokens=max_tokens,
             )
+
+        try:
+            response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
         except Exception as e:
-            if ('prompt_too_long' in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries<MAX_REACTIVE_RETRIES:
-
+            if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 reactive_retries+=1
                 print('[reactive compact]')
                 messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
@@ -1173,6 +1192,13 @@ def agent_loop(messages:list):
 
         message=response.choices[0].message
         messages.append(message.model_dump()) #添加模型回复到上下文
+
+        # 输出被截断：升级到加大 max_tokens 并提示续写
+        if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
+            recovery_state.has_escalated=True
+            print('  [length] escalating max_tokens and requesting continuation')
+            messages.append({'role':'user','content':recovery.CONTINUATION_PROMPT})
+            continue
 
 
         if response.choices[0].finish_reason != "tool_calls":
@@ -1243,8 +1269,8 @@ def agent_loop(messages:list):
 
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        context=update_context(context,messages)
-        system=get_system_prompt(context)
+        context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
+        system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等
 
 
 if __name__ == '__main__':
