@@ -7,6 +7,7 @@ import time
 import ast
 import pathlib
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 import yaml
@@ -376,7 +377,7 @@ def extract_memories(messages:list): #提取用户偏好、约束、项目事实
     dialogue = "\n".join(dialogue_parts) #合并所有消息，最多4000个字符，生成对话记录
 
     if not dialogue.strip():
-        print("[Memory: extract skipped - no text content in recent messages]")
+        _log("[Memory: extract skipped - no text content in recent messages]")
         return
     
     existing=list_memory_files()
@@ -430,10 +431,10 @@ def extract_memories(messages:list): #提取用户偏好、约束、项目事实
                 except Exception:
                     continue
         if not isinstance(items,list):
-            print(f"[Memory: extract failed - no valid JSON array in LLM reply: {text[:200]!r}]")
+            _log(f"[Memory: extract failed - no valid JSON array in LLM reply: {text[:200]!r}]")
             return
         if not items:
-            print("[Memory: extract returned empty (LLM judged nothing worth remembering)]")
+            _log("[Memory: extract returned empty (LLM judged nothing worth remembering)]")
             return
         count=0
         for mem in items:
@@ -445,11 +446,11 @@ def extract_memories(messages:list): #提取用户偏好、约束、项目事实
                 write_memory_file(name,mem_type,desc,body) #写入新记忆文件，格式为name.md，内容为description\nbody
                 count+=1
         if count:
-            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+            _log(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
         else:
-            print(f"[Memory: extract returned {len(items)} items but none had desc+body]")
+            _log(f"[Memory: extract returned {len(items)} items but none had desc+body]")
     except Exception as e:
-        print(f"[Memory: extract error: {e}]")
+        _log(f"[Memory: extract error: {e}]")
 
 CONSOLIDATE_THRESHOLD = 10
 
@@ -482,12 +483,12 @@ def consolidate_memories():
         text = _extract_text(response.choices[0].message.content).strip()
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
-            print(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
+            _log(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
             return
         items = json.loads(match.group())
         if not items:
             # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
-            print("[Memory: consolidate returned empty - aborting (would delete all memories)]")
+            _log("[Memory: consolidate returned empty - aborting (would delete all memories)]")
             return
 
         # Remove old memory files (keep MEMORY.md)
@@ -504,9 +505,9 @@ def consolidate_memories():
                 write_memory_file(name, mem_type, desc, body) #边写边更新索引
 
 
-        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+        _log(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
     except Exception as e:
-        print(f"[Memory: consolidate error: {e}]")
+        _log(f"[Memory: consolidate error: {e}]")
 
 
 
@@ -666,13 +667,8 @@ def run_todo_write(todos: list) -> str:
     if error:
         return error
     CURRENT_TODOS = todos
-    lines = ["\n\033[33m## Current Tasks\033[0m"]
-    for t in CURRENT_TODOS:
-        icon = {"pending": " ",
-                "in_progress": "\033[36m" + ui.G['tri'] + "\033[0m",
-                "completed": "\033[32m" + ui.G['check'] + "\033[0m"}[t["status"]]
-        lines.append(f"  [{icon}] {t['content']}")
-    print("\n".join(lines))
+    # TTY：todo 列表渲染到固定底部面板；非 TTY：退化为普通打印
+    ui.panel.set_todos(CURRENT_TODOS)
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 
@@ -682,6 +678,13 @@ DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
 DESTRUCTIVE = ["rm ", "del ", "rmdir ", "rd ", "Remove-Item ", "erase ", "> /etc/", "chmod 777"]
 
 HOOKS={"UserPromptSubmit":[],"PreToolUse":[],"PostToolUse":[],"Stop":[]}
+
+def _log(text=''):
+    """日志统一输出入口：TUI 模式下追加到固定面板缓冲并重绘；否则普通打印。
+
+    所有会与 todo/状态栏同时出现的日志都应走这里。
+    """
+    ui.panel.log(text)
 
 def register_hook(event:str,callback):
     HOOKS[event].append(callback)
@@ -702,24 +705,25 @@ def permission_hook(tool:str,args:dict):
     if tool=='bash':
         for pattern in DENY_LIST:
             if pattern in args.get("command", ""):
-                print(ui.c('error', ui.G['deny'] + ' Blocked: {0}'.format(pattern)))
+                _log(ui.c('error', ui.G['deny'] + ' Blocked: {0}'.format(pattern)))
                 return f"Error: Dangerous command {pattern}, please do not execute"
         for pattern in DESTRUCTIVE:
             if pattern in args.get("command", ""):
-                ui.safe_print(ui.permission_banner('Permission needed', [
+                _log(ui.permission_banner('Permission needed', [
                     ui.c('warning', 'Potentially destructive command'),
                     ui.tool_line('bash', args),
-                ]))
+                ], level='execute'))
                 choice=input("Allow? (y/n) ").strip().lower()
                 if choice not in ('y','yes'):
                     return "Permission denied by user"
     elif tool in ["read", "write", "edit"]:
         path=args.get('path','')
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            print(ui.permission_banner('Permission needed', [
+            level='write' if tool in ('write','edit') else 'read'
+            _log(ui.permission_banner('Permission needed', [
                 ui.c('warning', 'Access outside workspace'),
                 ui.tool_line(tool, {'path': path}),
-            ]))
+            ], level=level))
             choice=input("Allow? (y/n) ").strip().lower()
             if choice not in ('y','yes'):
                 return "Permission denied by user"
@@ -727,31 +731,45 @@ def permission_hook(tool:str,args:dict):
     return None
 
 def log_hook(tool:str,args:dict,output:str):
-    if tool == 'bash':
-        # bash 输出用 Claude Code 风格粉色边框框
-        ui.safe_print(ui.bash_box(args.get('command', ''), output))
-    elif tool == 'read':
-        # read 输出用代码块背景展示，避免整文件被压平成一行 preview
-        ui.safe_print(ui.code_box(args.get('path', ''), output))
-    else:
-        ui.safe_print(ui.tool_line(tool, args, output))
-    ui.safe_print('')  # 工具行后空一行，避免输出拥挤
+    # 批量模式：多次日志输出合并为一次重绘，减少 TUI 闪烁
+    with ui.panel.batch():
+        if tool == 'bash':
+            # bash 输出用 Claude Code 风格粉色边框框
+            _log(ui.bash_box(args.get('command', ''), output))
+        elif tool == 'read':
+            # read 输出用代码块背景展示，避免整文件被压平成一行 preview
+            _log(ui.code_box(args.get('path', ''), output))
+        else:
+            _log(ui.tool_line(tool, args, output))
+        _log('')  # 工具行后空一行，避免输出拥挤
     return None
 
 def large_output_hook(tool:str,args:dict,output:str):
     if len(str(output))>100000:
-        ui.safe_print(ui.c('warning', ui.G['warn'] + ' Large output from {0}: {1} chars'.format(tool, len(str(output)))))
+        _log(ui.c('warning', ui.G['warn'] + ' Large output from {0}: {1} chars'.format(tool, len(str(output)))))
     return None
 
 def context_injection_hook(query:str):
-    ui.safe_print(ui.status('working in {0}'.format(WORKDIR)))
+    _log(ui.status('working in {0}'.format(WORKDIR)))
     return None
 
-def summary_hook(messages:list):
-    tool_count=sum(1 for m in messages if m.get('role')=='tool')
+def _build_statusline(messages:list) -> str:
+    """生成会话状态行文本（供固定底部面板持续刷新）。
+
+    统计口径：
+    - tools: 会话内实际执行次数（累计，不随上下文压缩重置）
+    - ctx_pct: 优先用最近一次 API 的真实输入 token(usage.prompt_tokens)，
+      无 usage 时退回启发式 estimate_size
+    - tokens/cost: 真实 usage 累计；无 usage 时退回启发式估算
+    """
+    tool_count=_SESSION_METRICS['tools']
     ctx_pct = None
     try:
-        ctx_pct = min(100, 100.0 * estimate_size(messages) / max(1, CONTEXT_LIMIT))
+        if _SESSION_METRICS['ctx_tokens']:
+            # 真实输入量占窗口上限的百分比（比启发式 estimate_size 准）
+            ctx_pct = min(100, 100.0 * _SESSION_METRICS['ctx_tokens'] / max(1, CONTEXT_LIMIT))
+        else:
+            ctx_pct = min(100, 100.0 * estimate_size(messages) / max(1, CONTEXT_LIMIT))
     except Exception:
         ctx_pct = None
     branch = ''
@@ -761,16 +779,31 @@ def summary_hook(messages:list):
             capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         branch = ''
+    # 优先使用真实累计 token；API 未返回 usage 时回退到启发式估算
     tokens_est = ''
+    cost = None
     try:
-        tokens_est = '{0}k'.format(round(estimate_size(messages) / 1000.0))
+        if _SESSION_METRICS['tokens']:
+            tokens_est = '{0:.1f}k'.format(_SESSION_METRICS['tokens'] / 1000.0)
+            cost = _SESSION_METRICS['cost']
+        else:
+            tokens_est = '{0}k'.format(round(estimate_size(messages) / 1000.0))
     except Exception:
-        tokens_est = ''
-    line = ui.statusline(model=os.getenv('LLM_MODEL_ID', ''), tools=tool_count,
-                         ctx_pct=ctx_pct, tokens=tokens_est,
+        pass
+    return ui.statusline(model=os.getenv('LLM_MODEL_ID', ''), tools=tool_count,
+                         ctx_pct=ctx_pct, tokens=tokens_est, cost=cost,
                          workdir=str(WORKDIR), git_branch=branch)
-    if line:
-        ui.safe_print(line)
+
+def update_panel_status(messages:list) -> None:
+    """刷新固定底部面板的状态行（会话开始 / 每次工具执行后 / 会话结束）。"""
+    if not messages:
+        return
+    line=_build_statusline(messages)
+    # TTY：渲染进固定底部面板；非 TTY 下由 _log 的调用方按普通打印输出
+    ui.panel.set_status(line)
+
+def summary_hook(messages:list):
+    update_panel_status(messages)
     return None
 
 register_hook("UserPromptSubmit",context_injection_hook)
@@ -789,7 +822,7 @@ def _extract_text(text:str)->str:
 
 
 def spawn_subagent(description:str)->str:
-    ui.safe_print('\n' + ui.c('info', ui.G['play'] + ' Subagent spawned'))
+    _log('\n' + ui.c('info', ui.G['play'] + ' Subagent spawned'))
     messages=[{'role':'system','content':build_sub_system()},{'role':'user','content':description}]
 
 
@@ -812,7 +845,7 @@ def spawn_subagent(description:str)->str:
                 messages.append({'role':'user','content':force})
                 continue
             if message.content:
-                ui.safe_print(ui.markdown(message.content))
+                _log(ui.markdown(message.content))
             return message.content or "No output"
 
         tool_messages = []
@@ -847,7 +880,7 @@ def spawn_subagent(description:str)->str:
                     break
         if not result:
             result="Subagent stopped after 30 turns without final answer."
-    print(ui.c('info', ui.G['square'] + ' Subagent done'))
+    _log(ui.c('info', ui.G['square'] + ' Subagent done'))
     return result
 
 
@@ -1058,7 +1091,7 @@ def summarize_history(messages): #总结对话记录，返回总结内容
 
 def compact_history(messages): #使用llm进行对话记录压缩，返回压缩后的消息
     transcript_path=write_transcript(messages)
-    print(f'[transcript saved:{transcript_path}]')
+    _log(f'[transcript saved:{transcript_path}]')
     summary=summarize_history(messages)
     return [{'role':'system','content':build_system()},
             {'role':'user','content':f'[Compacted]\n\n{summary}'}]
@@ -1077,13 +1110,39 @@ def reactive_compact(messages): #保存完整对话记录，保留最近五条�
     
 MAX_REACTIVE_RETRIES=1
 
+# 当前会话累计指标（供 summary_hook / statusline 使用）
+# tokens: 真实 usage.total_tokens 累计；cost: 按单价估算累计（元）
+# tools: 会话内实际执行工具次数；ctx_tokens: 最近一次请求的真实输入 token（usage.prompt_tokens）
+_SESSION_METRICS={'tokens':0,'cost':0.0,'tools':0,'ctx_tokens':0}
+
+# 模型单价（人民币/1M tokens，可按实际价格调整或经环境变量覆盖），未配置模型返回 0
+_MODEL_COSTS={
+    'deepseek-v4-flash': {'input':0.50,'output':1.01},
+    'deepseek-chat':     {'input':1.01,'output':2.02},
+    'deepseek-reasoner': {'input':2.02,'output':7.92},
+}
+
+def _estimate_cost(prompt_tokens:int,completion_tokens:int,model:str)->float:
+    """根据 prompt/completion token 数和模型单价估算单次调用成本（人民币，估算值）。"""
+    cost=_MODEL_COSTS.get(model.lower(),{})
+    if not cost:
+        return 0.0
+    return (prompt_tokens*cost['input']+completion_tokens*cost['output'])/1_000_000
+
 def agent_loop(messages:list):
+    global _SESSION_METRICS
+    _SESSION_METRICS={'tokens':0,'cost':0.0,'tools':0,'ctx_tokens':0}
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
     messages.append({'role':'system','content':build_system()}) #循环开始前，添加系统提示词
     reactive_retries=0 #响应重试次数
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
+    # 会话开始即激活固定底部面板：状态栏常驻屏幕底部
+    if not ui.panel._enabled:
+        print(f"[ui] 固定面板未启用 (stdout.isatty()={sys.stdout.isatty()})"
+              f" —— 设置 HARNESS_FORCE_PANEL=1 可强制启用")
+    update_panel_status(messages)
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1101,7 +1160,7 @@ def agent_loop(messages:list):
             messages[:]=micro_compact(messages)
 
         if estimate_size(messages) > CONTEXT_LIMIT:
-            print("[auto compact]")
+            _log("[auto compact]")
             messages[:]=compact_history(messages) #调用Llm进行压缩
             skip_micro_rounds=3
 
@@ -1140,12 +1199,24 @@ def agent_loop(messages:list):
             if ('prompt_too_long' in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries<MAX_REACTIVE_RETRIES:
 
                 reactive_retries+=1
-                print('[reactive compact]')
+                _log('[reactive compact]')
                 messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
                 skip_micro_rounds=3
                 continue
             raise
 
+
+        # 累计真实 token / 成本（OpenAI 兼容 API 通常返回 usage）
+        usage=getattr(response,'usage',None)
+        if usage:
+            prompt_tokens=getattr(usage,'prompt_tokens',0)
+            completion_tokens=getattr(usage,'completion_tokens',0)
+            _SESSION_METRICS['tokens']+=getattr(usage,'total_tokens',prompt_tokens+completion_tokens)
+            _SESSION_METRICS['ctx_tokens']=prompt_tokens   # 真实输入量（当前上下文实际大小）
+            _SESSION_METRICS['cost']+=_estimate_cost(
+                prompt_tokens, completion_tokens,
+                os.getenv('LLM_MODEL_ID','')
+            )
 
         message=response.choices[0].message
         messages.append(message.model_dump()) #添加模型回复到上下文
@@ -1156,8 +1227,11 @@ def agent_loop(messages:list):
             if force:
                 messages.append({'role':'user','content':force})
                 continue
+            # 最终回复：先退出 TUI 固定面板（局部清除固定区），再普通打印。
+            # 大段回复不再触发全屏重绘 → 无闪烁，且可自由滚动回看。
+            ui.panel.close()
             if message.content:
-                ui.safe_print(ui.markdown(message.content))
+                _log(ui.markdown(message.content))
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
@@ -1172,56 +1246,68 @@ def agent_loop(messages:list):
 
         # compact 工具：在 for 循环内按顺序处理——compact 之前的 tool_call 先正常执行，
         # 遇到 compact 时压缩历史并重开一轮。
+        # 批量模式：整轮工具执行（输出 + 状态行刷新）合并为一次 TUI 重绘，减少闪烁。
         tool_messages = []
         compacted = False
         used_todo = False
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-            if name=='todo_write':
-                used_todo = True
-            if name == 'compact':
-                # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
-                # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
-                # 改为文本附到新上下文里，避免执行结果丢失。
-                messages[:] = compact_history(messages)
-                skip_micro_rounds=3
-                note = '[Compacted] Conversation history has been summarized.'
-                if tool_messages:
-                    done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
-                    note += '\n\nTool results executed before compaction:\n' + done
-                messages.append({'role': 'user', 'content': note})
-                compacted = True
-                break
+        with ui.panel.batch():
+            for tool_call in message.tool_calls:
+                name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+                if name=='todo_write':
+                    used_todo = True
+                if name == 'compact':
+                    # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
+                    # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
+                    # 改为文本附到新上下文里，避免执行结果丢失。
+                    messages[:] = compact_history(messages)
+                    skip_micro_rounds=3
+                    note = '[Compacted] Conversation history has been summarized.'
+                    if tool_messages:
+                        done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
+                        note += '\n\nTool results executed before compaction:\n' + done
+                    messages.append({'role': 'user', 'content': note})
+                    compacted = True
+                    break
 
-            blocked = trigger_hooks("PreToolUse", name, args)
-            if blocked:
-                output = blocked
-            elif name not in tool_registry:
-                output = f"Error: unknown tool {name}"
-            else:
-                try:
-                    output = tool_registry[name](**args)
-                except Exception as e:
-                    # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
-                    output = f"Error: {e}"
+                blocked = trigger_hooks("PreToolUse", name, args)
+                if blocked:
+                    output = blocked
+                elif name not in tool_registry:
+                    output = f"Error: unknown tool {name}"
+                else:
+                    try:
+                        output = tool_registry[name](**args)
+                    except Exception as e:
+                        # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
+                        output = f"Error: {e}"
+                _SESSION_METRICS['tools']+=1   # 会话内实际执行工具次数（含被 hook 拦截的）
 
-            trigger_hooks("PostToolUse", name, args, output)
+                trigger_hooks("PostToolUse", name, args, output)
 
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": output,
-            })
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": output,
+                })
 
         if compacted: #压缩后工具丢失，需要重新执行
             continue
 
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        # 工具执行后刷新固定底部面板的状态行（tool 数 / 上下文占用 / token / 成本）
+        update_panel_status(messages)
 
 if __name__ == '__main__':
     messages = [{'role': 'user', 'content': '请用中文总结当前工作区所有 .py 文件的代码结构。'
     '注意：以后输出报告一律用中文；'
     '并且永远不要用 PowerShell Get-Content 读文件（会乱码），改用 read 工具。'}]
-    agent_loop(messages)
+    try:
+        agent_loop(messages)
+    except KeyboardInterrupt:
+        # Ctrl+C（如 API 挂起时中断）：退出 TUI 后给出友好提示，不打原始 traceback
+        print('\n[会话已中断]')
+    finally:
+        # 异常兜底：确保退出 TUI（Rich Live / 面板固定区），不把用户留在备屏/半屏状态
+        ui.panel.close()

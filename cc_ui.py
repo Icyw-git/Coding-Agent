@@ -513,19 +513,61 @@ def tool_line(name: str, args: Optional[dict] = None, preview: str = '',
 
 # ---------- 权限横幅 ----------
 
-def permission_banner(title: str, lines: List[str]) -> str:
-    """权限确认框：紫色边框 + 内容行。宽度随终端自适应（30~70），长标题不溢出。"""
+_PERMISSION_LEVELS = {
+    'read':    ('info',    'Read'),       # 低危读取 → 蓝
+    'write':   ('warning', 'Write'),      # 文件写入/修改 → 黄
+    'execute': ('error',   'Execute'),    # 运行 shell → 红
+}
+
+def permission_banner(title: str, lines: List[str], level: str = 'read') -> str:
+    """权限确认框：按风险分级着色 + 内容行。宽度随终端自适应（30~70）。"""
+    color_name, label = _PERMISSION_LEVELS.get(level, _PERMISSION_LEVELS['read'])
     width = 50
     try:
         width = max(30, min(70, shutil.get_terminal_size().columns - 6))
     except Exception:
         pass
     top_fill = max(2, width - len(title) - 4)
-    out = [t('permission') + G['tl'] + G['th'] + ' ' + title + ' ' +
+    header = f"{label}: {title}" if title else f"{label} permission"
+    out = [t(color_name) + G['tl'] + G['th'] + ' ' + header + ' ' +
+           G['th'] * max(0, top_fill - len(label) - 2) + _RESET]
+    for ln in lines:
+        out.append(t(color_name) + G['pipe'] + ' ' + _RESET + ln)
+    out.append(t(color_name) + G['bl'] + G['th'] * width + _RESET)
+    return '\n'.join(out)
+
+
+# ---------- 错误卡片（红色边框 + 折叠详情） ----------
+
+def error_card(title: str, detail: str, max_lines: int = 3,
+               actions: Optional[List[str]] = None) -> str:
+    """错误卡片：红色粗边框 + 详情折叠（Claude Code / Codex 风格）。
+
+    比直接抛堆栈更可读：标题加粗，detail 只显示前 max_lines 行，
+    超出提示剩余行数，底部可选列出一组操作建议。
+    """
+    width = 50
+    try:
+        width = max(30, min(70, shutil.get_terminal_size().columns - 6))
+    except Exception:
+        pass
+    lines = str(detail).splitlines()
+    total = len(lines)
+    truncated = total > max_lines
+    if truncated:
+        lines = lines[:max_lines]
+    top_fill = max(2, width - len(title) - 4)
+    out = [t('error') + G['tl'] + G['th'] + ' ' + b(title) + ' ' +
            G['th'] * top_fill + _RESET]
     for ln in lines:
-        out.append(t('permission') + G['pipe'] + ' ' + _RESET + ln)
-    out.append(t('permission') + G['bl'] + G['th'] * width + _RESET)
+        out.append(t('error') + G['pipe'] + ' ' + _RESET + ln)
+    if truncated:
+        out.append(t('error') + G['pipe'] + ' ' + _RESET +
+                   dim('... {0} more lines'.format(total - max_lines)))
+    if actions:
+        out.append(t('error') + G['pipe'] + ' ' + _RESET +
+                   c('warning', ' / '.join(actions)))
+    out.append(t('error') + G['bl'] + G['th'] * width + _RESET)
     return '\n'.join(out)
 
 
@@ -644,7 +686,9 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
     if ctx_pct is not None:
         parts.append(ctx_bar(ctx_pct))
     if cost is not None:
-        parts.append(_pill('success', '${0:.2f}'.format(cost)))
+        # GBK 终端不支持半角 ¥(U+00A5)，退回全角 ￥(U+FFE5)，避免符号被替换成 ?
+        cny = '\u00a5' if _can_encode('\u00a5') else '\uffe5'
+        parts.append(_pill('success', cny + '{0:.3f}'.format(cost)))
     if tokens:
         parts.append(_pill('inactive', tokens))
     if workdir:
@@ -851,3 +895,249 @@ class ProgressBar:
             sys.stdout.flush()
         except Exception:
             pass
+
+
+class StreamRenderer:
+    """流式 Markdown 渲染（Codex CLI 风格）：逐 token feed，TTY 下原地刷新。
+
+    用法：
+        sr = ui.StreamRenderer()
+        for chunk in stream_chunks:      # 每次 feed 都原地重绘当前缓冲
+            sr.feed(chunk)
+        sr.finish()                      # 结束：返回最终渲染文本
+
+    TTY：feed 用 \\r + 向上清行重绘整个缓冲（增量输入 → 全量重渲染）。
+    非 TTY / 管道：feed 只积累不输出，finish 一次性 safe_print。
+    """
+    def __init__(self, width: int = 80):
+        self.buf = ''
+        self.width = width
+        self._lines = 0
+
+    def feed(self, text: str) -> None:
+        """追加一段增量文本并重绘（仅 TTY 原地刷新）。"""
+        if not text:
+            return
+        self.buf += text
+        if _is_tty:
+            self._redraw()
+
+    def finish(self) -> str:
+        """结束流式输出：TTY 清行重打最终渲染，非 TTY 一次性打印。"""
+        rendered = markdown(self.buf, width=self.width)
+        if _is_tty:
+            self._clear_lines()
+            sys.stdout.write(rendered + '\n')
+            sys.stdout.flush()
+        else:
+            safe_print(rendered)
+        self._lines = len(rendered.splitlines()) if rendered else 0
+        return rendered
+
+    def _redraw(self) -> None:
+        rendered = markdown(self.buf, width=self.width)
+        lines = rendered.splitlines() if rendered else ['']
+        self._clear_lines()
+        for line in lines:
+            sys.stdout.write(line + '\n')
+        sys.stdout.flush()
+        self._lines = len(lines)
+
+    def _clear_lines(self) -> None:
+        """清除此前渲染过的 self._lines 行，光标回到首行行首。"""
+        try:
+            sys.stdout.write('\r')
+            for _ in range(self._lines):
+                sys.stdout.write('\x1b[1A\x1b[2K')
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+class FixedPanel:
+    """固定底部面板（TUI）：todo 列表 + 状态行始终钉在屏幕底部。
+
+    纯 ANSI 覆盖式重绘：维护日志行缓冲（最近 N 行）+ 固定区（todo/状态行），
+    每次更新归位左上（\\x1b[H）、逐行 \\x1b[2K 清行尾后写入新内容。不用
+    \\x1b[2J 清全屏（conhost 上全清会闪白），新内容比旧内容短时用 \\x1b[2K
+    清掉多余旧行。Windows conhost / Windows Terminal / Linux / macOS 全部支持，
+    不依赖任何第三方库。完整对话由 write_transcript 落盘，屏幕只保留最近内容。
+
+    非 ANSI 环境（重定向到文件）自动退化为普通打印，不刷屏、不混入控制序列。
+
+    用法：
+        panel = ui.FixedPanel()
+        panel.set_todos([...])          # 更新 todo（重绘）
+        panel.set_status(line)          # 更新状态行（重绘）
+        panel.log('...')                # 所有日志统一入口（追加 + 重绘）
+        panel.close()                   # 会话结束：清固定区，保留日志画面
+    """
+    def __init__(self):
+        self._todos: List[dict] = []
+        self._status: str = ''
+        self._buffer: List[str] = []
+        self._batch_depth: int = 0      # >0 时只攒数据不重绘，退出 batch 再重绘一次
+        self._closed: bool = False      # close() 后 log/set_* 全部退化为普通打印
+        self._last_lines: int = 0       # 上次重绘的行数（覆盖式清残留用）
+        self._enabled = self._detect()
+
+    @staticmethod
+    def _detect() -> bool:
+        """启用判定：强制开关 > 显式关闭 > TTY > 已知 ANSI 终端环境标记。"""
+        if os.environ.get('HARNESS_NO_PANEL'):
+            return False
+        if os.environ.get('HARNESS_FORCE_PANEL'):
+            return True
+        if _is_tty:
+            return True
+        env = os.environ
+        return bool(env.get('WT_SESSION') or env.get('ConEmuANSI')
+                    or env.get('COLORTERM') or '256color' in env.get('TERM', ''))
+
+    # ---------- 统一输出入口 ----------
+
+    def batch(self):
+        """批量模式：with 块内多次 log/set_* 只攒数据，退出时重绘一次（减少闪烁）。
+
+        用法：
+            with panel.batch():
+                panel.log(bash_box)
+                panel.log('')
+                panel.set_status(line)
+        """
+        return self
+
+    def _maybe_redraw(self) -> None:
+        """batch 深度为 0 才重绘；否则由 batch 退出时的 finally 统一重绘。"""
+        if self._batch_depth == 0:
+            self._redraw()
+
+    def log(self, text='') -> None:
+        """所有日志的统一入口：TUI 下追加到缓冲并重绘，否则普通打印。"""
+        if not self._enabled or self._closed:
+            safe_print(text)
+            return
+        if text:
+            self._buffer.extend(str(text).split('\n'))
+        else:
+            self._buffer.append('')
+        self._trim()
+        self._maybe_redraw()
+
+    # ---------- 数据更新 ----------
+
+    def set_todos(self, todos: List[dict]) -> None:
+        """更新 todo 列表并立即重绘。"""
+        self._todos = todos or []
+        if self._enabled:
+            self._maybe_redraw()
+        else:
+            rendered = self._render_panel()
+            if rendered:
+                safe_print('\n'.join(rendered))
+
+    def set_status(self, line: str) -> None:
+        """更新底部状态行并立即重绘。"""
+        self._status = line or ''
+        if self._enabled:
+            self._maybe_redraw()
+        elif self._status:
+            safe_print(self._status)
+
+    def close(self) -> None:
+        """会话结束：退出 TUI 固定模式，局部清除固定区，回到普通滚动输出。
+
+        close 之后 log/set_* 全部退化为普通打印（_closed=True），
+        大段最终回复不再触发全屏重绘，避免闪烁且可自由回看。
+        """
+        if self._enabled and not self._closed:
+            self._closed = True
+            try:
+                # 只清除固定区所在行（不全屏重绘），光标回到日志末尾
+                rows = self._rows()
+                panel = self._render_panel()
+                if panel:
+                    sys.stdout.write(f'\x1b[{rows - len(panel) + 1};1H')
+                    for _ in range(len(panel)):
+                        sys.stdout.write('\x1b[2K\x1b[1A')
+                    sys.stdout.write('\x1b[2K')
+                    sys.stdout.write(f'\x1b[{rows - len(panel)};1H')
+                    sys.stdout.flush()
+            except Exception:
+                pass
+        self._todos = []
+        self._status = ''
+        self._buffer = []
+        self._batch_depth = 0
+
+    def __enter__(self) -> 'FixedPanel':
+        """支持 with ui.panel: ... —— 等价 with ui.panel.batch(): ..."""
+        self._batch_depth += 1
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._batch_depth -= 1
+        if self._batch_depth == 0 and self._enabled:
+            self._redraw()
+        return False
+
+    # ---------- 内部渲染 ----------
+
+    def _rows(self) -> int:
+        try:
+            return max(6, shutil.get_terminal_size().lines)
+        except Exception:
+            return 24
+
+    def _render_panel(self) -> List[str]:
+        lines = []
+        if self._todos:
+            lines.append(bold_c('warning', '## Current Tasks'))
+            for t in self._todos:
+                status = t.get('status', 'pending')
+                content = t.get('content', '')
+                if status == 'completed':
+                    icon = c('success', G['check'])
+                elif status == 'in_progress':
+                    icon = c('info', G['tri'])
+                else:
+                    icon = c('inactive', ' ')
+                lines.append('  [{0}] {1}'.format(icon, content))
+        if self._status:
+            lines.append(self._status)
+        return lines
+
+    def _trim(self) -> None:
+        """日志缓冲只保留「屏幕高度 - 固定区行数 - 1」行。"""
+        rows = self._rows()
+        panel = len(self._render_panel())
+        keep = max(1, rows - panel - 1)
+        if len(self._buffer) > keep:
+            del self._buffer[:-keep]
+
+    def _redraw(self) -> None:
+        """覆盖式重绘：归位到左上，逐行 \x1b[2K 清行尾后写入新内容。
+
+        不用 \x1b[2J 清全屏（conhost 上全清会闪白），而是覆盖重画：
+        新内容比旧内容短时，多余旧行用 \x1b[2K 清掉。
+        """
+        if not self._enabled or self._closed:
+            return
+        try:
+            self._trim()
+            lines = self._buffer + self._render_panel()
+            sys.stdout.write('\x1b[H')
+            for ln in lines:
+                sys.stdout.write('\x1b[2K' + ln + '\n')
+            extra = self._last_lines - len(lines)
+            if extra > 0:
+                for _ in range(extra):
+                    sys.stdout.write('\x1b[2K\n')
+            sys.stdout.flush()
+            self._last_lines = len(lines)
+        except Exception:
+            pass
+
+
+# 模块级单例：harness 直接 ui.panel.set_todos(...) / set_status(...) 使用
+panel = FixedPanel()

@@ -360,11 +360,16 @@ def test_full_session_scenario():
     orig_limit = harness.CONTEXT_LIMIT
     orig_create = harness.client.chat.completions.create
 
-    sizes = iter([50, 10000, 50, 50, 50])          # iteration 2 超过阈值触发自动压缩
     compact_calls = []
     reactive_calls = []
     harness.CONTEXT_LIMIT = 100
-    harness.estimate_size = lambda msgs: next(sizes)
+    # 会话开始的状态行 + 每轮工具后的状态行也会调用 estimate_size（无 usage 时），
+    # 用计数制 mock 而非耗尽式迭代器，避免 StopIteration；第 6 次调用 = 第 2 轮 pre-API 检查。
+    est_state = {'n': 0}
+    def fake_estimate(msgs):
+        est_state['n'] += 1
+        return 10000 if est_state['n'] == 6 else 50
+    harness.estimate_size = fake_estimate
     harness.compact_history = lambda msgs: (compact_calls.append(len(msgs))
                                             or logger.info("[scenario] compact_history called (auto/compact tool) on %d msgs", len(msgs))
                                             or [{'role': 'user', 'content': '[Compacted] summary'}])

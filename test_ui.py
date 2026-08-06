@@ -149,7 +149,7 @@ def test_statusline_pills():
     out = ui.statusline(model='deepseek-v4-flash', tools=3, ctx_pct=42,
                         cost=0.5, tokens='1k', mode='plan')
     assert '[Plan Mode]' in out
-    assert ui.bg('success') in out and '0.50' in out   # cost pill
+    assert ui.bg('success') in out and '\u00a5' in out   # cost pill 显示人民币
     assert ui.bg('inactive') in out                     # tools/tokens pill
     assert ui.b('deepseek-v4-flash') not in out         # 模型不再用纯加粗，走 pill
 
@@ -204,6 +204,146 @@ def test_say(capsys):
     ui.say('success', 'ok')
     captured = capsys.readouterr()
     assert 'ok' in captured.out
+
+
+# ---------- 权限横幅分级 ----------
+
+def test_permission_banner_level_colors():
+    read_banner = ui.permission_banner('Read file', ['path'], level='read')
+    write_banner = ui.permission_banner('Write file', ['path'], level='write')
+    exec_banner = ui.permission_banner('Run cmd', ['cmd'], level='execute')
+    assert 'Read: Read file' in read_banner
+    assert 'Write: Write file' in write_banner
+    assert 'Execute: Run cmd' in exec_banner
+    assert ui.t('info') in read_banner
+    assert ui.t('warning') in write_banner
+    assert ui.t('error') in exec_banner
+
+
+# ---------- 错误卡片 / 流式渲染 ----------
+
+def test_error_card_truncates_detail():
+    card = ui.error_card('API Error', 'a\nb\nc\nd')
+    assert 'API Error' in card
+    assert ui.t('error') in card
+    assert '... 1 more lines' in card
+
+
+def test_error_card_actions_and_no_truncation():
+    card = ui.error_card('x', 'only one', actions=['Retry', 'Skip'])
+    assert 'Retry / Skip' in card
+    assert 'more lines' not in card
+
+
+def test_stream_renderer_non_tty_buffers():
+    buf = io.StringIO()
+    old_stdout, old_tty = sys.stdout, ui._is_tty
+    sys.stdout, ui._is_tty = buf, False
+    try:
+        sr = ui.StreamRenderer()
+        sr.feed('# Hi')
+        assert buf.getvalue() == ''      # 非 TTY：feed 只积累不输出
+        rendered = sr.finish()
+        assert 'Hi' in rendered
+        assert 'Hi' in buf.getvalue()    # finish 一次性打印
+    finally:
+        sys.stdout, ui._is_tty = old_stdout, old_tty
+
+
+def test_stream_renderer_tty_redraws():
+    buf = io.StringIO()
+    old_stdout, old_tty = sys.stdout, ui._is_tty
+    sys.stdout, ui._is_tty = buf, True
+    try:
+        sr = ui.StreamRenderer()
+        sr.feed('line one\n')
+        assert '\x1b[1A' not in buf.getvalue()   # 第一帧无上行清行
+        sr.feed('line two\n')
+        assert '\x1b[1A' in buf.getvalue()       # 第二帧回退重绘
+        sr.finish()
+        assert 'line one' in buf.getvalue()
+        assert 'line two' in buf.getvalue()
+    finally:
+        sys.stdout, ui._is_tty = old_stdout, old_tty
+
+
+# ---------- 固定面板（TUI 全屏重绘） ----------
+
+def test_fixed_panel_tty_renders_todos_and_status(monkeypatch):
+    """ANSI 覆盖式重绘：归位 + 逐行清行尾渲染。"""
+    buf = io.StringIO()
+    monkeypatch.setattr(ui, '_is_tty', True)
+    monkeypatch.setattr(sys, 'stdout', buf)
+    ts = os.terminal_size((120, 10))
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda: ts)
+    panel = ui.FixedPanel()
+    assert panel._enabled is True
+    panel.log('line one')
+    panel.set_todos([
+        {'content': 'a', 'status': 'completed'},
+        {'content': 'b', 'status': 'in_progress'},
+    ])
+    panel.set_status(ui.statusline(model='m', cost=0.5))
+    out = buf.getvalue()
+    assert '\x1b[H' in out         # TUI 归位左上
+    assert '\x1b[2K' in out        # 覆盖式逐行清行尾（不清全屏，减少闪烁）
+    assert '\x1b[2J' not in out    # 不使用全屏清空
+    assert '## Current Tasks' in out
+    assert 'a' in out and 'b' in out
+    assert ui.statusline(model='m', cost=0.5) in out
+    panel.close()
+
+
+def test_fixed_panel_buffer_trim(monkeypatch):
+    """日志缓冲只保留屏幕能容纳的行数（10 行终端 - 固定区行数）。"""
+    buf = io.StringIO()
+    monkeypatch.setattr(ui, '_is_tty', True)
+    monkeypatch.setattr(sys, 'stdout', buf)
+    ts = os.terminal_size((120, 10))
+    monkeypatch.setattr(ui.shutil, 'get_terminal_size', lambda: ts)
+    panel = ui.FixedPanel()
+    for i in range(30):
+        panel.log('line {0}'.format(i))
+    assert len(panel._buffer) <= 10
+    # 最旧的日志被裁掉，最新的保留
+    assert 'line 0' not in panel._buffer
+    assert 'line 29' in panel._buffer
+
+
+def test_fixed_panel_non_tty_falls_back_to_print(monkeypatch):
+    buf = io.StringIO()
+    monkeypatch.setattr(ui, '_is_tty', False)
+    monkeypatch.setattr(sys, 'stdout', buf)
+    for var in ('HARNESS_FORCE_PANEL', 'WT_SESSION', 'ConEmuANSI', 'COLORTERM', 'TERM'):
+        monkeypatch.delenv(var, raising=False)
+    panel = ui.FixedPanel()
+    assert panel._enabled is False
+    panel.log('plain log')
+    panel.set_todos([{'content': 'x', 'status': 'pending'}])
+    panel.set_status('status line')
+    out = buf.getvalue()
+    assert 'plain log' in out
+    assert '## Current Tasks' in out and 'x' in out
+    assert 'status line' in out
+    assert '\x1b[2J' not in out   # 非 ANSI 环境不刷屏
+
+
+def test_fixed_panel_force_enable(monkeypatch):
+    """HARNESS_FORCE_PANEL=1 强制启用（即使非 TTY）。"""
+    buf = io.StringIO()
+    monkeypatch.setattr(ui, '_is_tty', False)
+    monkeypatch.setenv('HARNESS_FORCE_PANEL', '1')
+    monkeypatch.setattr(sys, 'stdout', buf)
+    panel = ui.FixedPanel()
+    assert panel._enabled is True
+
+
+def test_fixed_panel_no_panel_off(monkeypatch):
+    """HARNESS_NO_PANEL=1 显式关闭（即使 TTY）。"""
+    monkeypatch.setattr(ui, '_is_tty', True)
+    monkeypatch.setenv('HARNESS_NO_PANEL', '1')
+    panel = ui.FixedPanel()
+    assert panel._enabled is False
 
 
 # ---------- 运行 ----------
