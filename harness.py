@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Optional, List
 import yaml
+from background_task import should_run_background, start_background_task, collect_background_results
 import recovery
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 
@@ -1390,7 +1391,13 @@ def agent_loop(messages:list):
                 output = f"Error: unknown tool {name}"
             else:
                 try:
-                    output = tool_registry[name](**args)
+                    if should_run_background(name, args):
+                        bg_id = start_background_task(tool_call, tool_registry)
+                        output = (f"[Background task {bg_id} started] "
+                                  f"Command: {args.get('command', '')}. "
+                                  f"Result will be available when complete.")
+                    else:
+                        output = tool_registry[name](**args)
                 except Exception as e:
                     # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
                     output = f"Error: {e}"
@@ -1406,6 +1413,20 @@ def agent_loop(messages:list):
         if compacted: #压缩后工具丢失，需要重新执行
             continue
 
+        notifications=collect_background_results()
+        if notifications:
+            for notification in notifications:
+                # 后台任务完成通知：作为 user 消息注入（孤儿 role=tool 会触发 API 400）
+                tool_messages.append(
+                    {
+                        'role':'user',
+                        'content':notification,
+                        
+                    }
+                )
+            print(f"  \033[32m[inject] {len(notifications)} background "
+                  f"notification(s)\033[0m")
+
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
@@ -1413,5 +1434,5 @@ def agent_loop(messages:list):
 
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '清空之前的测试任务和记忆等相关文件'}]
+    messages = [{'role': 'user', 'content': '运行 pytest 并把结果总结给我'}]
     agent_loop(messages)
