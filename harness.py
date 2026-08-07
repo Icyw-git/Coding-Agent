@@ -7,12 +7,17 @@ import time
 import ast
 import pathlib
 import re
+import threading
 from pathlib import Path
 from typing import Optional, List
 import yaml
 from background_task import should_run_background, start_background_task, collect_background_results
 import recovery
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
+from cron_scheduler import (schedule_job, cancel_job, consume_cron_queue,
+                            cron_lock, scheduled_jobs, cron_scheduler_loop,
+                            load_durable_jobs, agent_lock,
+                            queue_processor_loop, wait_for_cron_idle)
 
 
 
@@ -423,6 +428,68 @@ TOOLS=[{
             },
             "required":[
                 "task_id"
+            ]
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"schedule_cron",
+        "description":"Schedule a cron job: at matching times the prompt is injected into the conversation as a scheduled task.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "cron":{
+                    "type":"string",
+                    "description":"5-field cron expression, e.g. '*/5 * * * *' (minute hour day-of-month month day-of-week)"
+                },
+                "prompt":{
+                    "type":"string",
+                    "description":"Instruction injected when the job fires"
+                },
+                "recurring":{
+                    "type":"boolean",
+                    "description":"Whether the job repeats every matching time (default true)"
+                },
+                "durable":{
+                    "type":"boolean",
+                    "description":"Whether the job survives restarts (default true)"
+                }
+            },
+            "required":[
+                "cron",
+                "prompt"
+            ]
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"list_crons",
+        "description":"List all scheduled cron jobs.",
+        "parameters":{
+            "type":"object",
+            "properties":{}
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"cancel_cron",
+        "description":"Cancel a scheduled cron job by id.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "job_id":{
+                    "type":"string",
+                    "description":"Cron job id, e.g. cron_123456"
+                }
+            },
+            "required":[
+                "job_id"
             ]
         }
     }
@@ -909,9 +976,39 @@ def run_claim_task(task_id: str) -> str:
 def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
+
+# ── Cron Tools ──
+
+def run_schedule_cron(cron: str, prompt: str,
+                      recurring: bool = True, durable: bool = True) -> str:
+    result = schedule_job(cron, prompt, recurring, durable)
+    if isinstance(result, str):
+        return f"Error: {result}"
+    return f"Scheduled {result.id}: '{cron}' → {prompt}"
+
+
+def run_list_crons() -> str:
+    with cron_lock:
+        jobs = list(scheduled_jobs.values())
+    if not jobs:
+        return "No cron jobs. Use schedule_cron to add one."
+    lines = []
+    for j in jobs:
+        tag = "recurring" if j.recurring else "one-shot"
+        dur = "durable" if j.durable else "session"
+        lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
+                     f"[{tag}, {dur}]")
+    return "\n".join(lines)
+
+
+def run_cancel_cron(job_id: str) -> str:
+    return cancel_job(job_id)
+
+
 tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write,
                'create_task':run_create_task,'list_tasks':run_list_tasks,'get_task':run_get_task,
-               'claim_task':run_claim_task,'complete_task':run_complete_task}
+               'claim_task':run_claim_task,'complete_task':run_complete_task,
+               'schedule_cron':run_schedule_cron,'list_crons':run_list_crons,'cancel_cron':run_cancel_cron}
 
 def register_hook(event:str,callback):
     HOOKS[event].append(callback)
@@ -1266,7 +1363,7 @@ def agent_loop(messages:list):
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
 
     while True:
-        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的消息，保留所有消息类型
+        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
         messages[:]=tool_result_budget(messages) #具体压缩方式：大的工具结果优先压缩
@@ -1287,6 +1384,15 @@ def agent_loop(messages:list):
                 'content':"<reminder>Update your todos.</reminder>",
             })
             rounds_since_todo=0
+
+        fired=consume_cron_queue()
+        for job in fired:
+            messages.append({
+                'role':'user',
+                'content':f'[Scheduled] {job.prompt}'
+            })
+            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+
         
 
 
@@ -1433,6 +1539,39 @@ def agent_loop(messages:list):
         system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等
 
 
+def run_agent_turn_locked():
+    """持锁状态下执行一轮对话（供 queue_processor_loop 调用）：
+    消费 cron 队列 → 构造 user 消息 → agent_loop。"""
+    fired = consume_cron_queue()
+    if not fired:
+        return
+    prompts = [f'[Scheduled] {job.prompt}' for job in fired]
+    print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+    try:
+        agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
+    except KeyboardInterrupt:
+        print('\n[会话已中断]')
+
+
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '运行 pytest 并把结果总结给我'}]
-    agent_loop(messages)
+    # 启动 cron 调度线程（生产队列）+ 队列处理器（推送执行）；测试直接调 agent_loop 不受影响
+    load_durable_jobs()
+    threading.Thread(target=cron_scheduler_loop, daemon=True).start()
+    threading.Thread(target=queue_processor_loop,
+                     args=(run_agent_turn_locked,), daemon=True).start()
+
+    def _run_session(msgs):
+        try:
+            agent_loop(msgs)
+        except KeyboardInterrupt:
+            print('\n[会话已中断]')
+
+    # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
+    with agent_lock:
+        _run_session([{'role': 'user', 'content': 'Create a one-shot reminder in 1 minute to check the build status'}])
+
+    # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
+    try:
+        wait_for_cron_idle()
+    except KeyboardInterrupt:
+        print('\n[会话已中断]')
