@@ -484,7 +484,7 @@ if __name__ == '__main__':
 
     # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
     with agent_lock:
-        _run_session([{'role': 'user', 'content': 'Create a one-shot reminder in 1 minute to check the build status'}])
+        _run_session([{'role': 'user', 'content': 'Spawn alice as a backend dev. Ask her to create a file. Then request her shutdown.'}])
 
     # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
     try:
