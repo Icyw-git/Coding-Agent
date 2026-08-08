@@ -14,14 +14,14 @@ class CronJob:
     recurring:bool
     durable:bool
 
-scheduled_jobs:dict[str,CronJob]={}
-cron_queue:list[CronJob]=[]
-cron_lock=threading.Lock()
-agent_lock=threading.Lock()
-_last_fired:dict[str,str]={}
+scheduled_jobs:dict[str,CronJob]={} # id -> job
+cron_queue:list[CronJob]=[] #任务队列
+cron_lock=threading.Lock() # 任务队列锁，用于保护任务队列
+agent_lock=threading.Lock() # 代理锁，用于保护代理状态
+_last_fired:dict[str,str]={} # id -> last fired time
 DURABLE_PATH=Path(__file__).resolve().parent/'.cache'/'crons.json'
 
-def _cron_field_matches(field:str,value:int)->bool:
+def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间
     if field=="*":
         return True
     if field.startswith("*/"):
@@ -34,7 +34,7 @@ def _cron_field_matches(field:str,value:int)->bool:
         return int(lo)<=value<=int(hi)
     return value==int(field)
 
-def cron_matches(cron_expr:str,dt:datetime)->bool:
+def cron_matches(cron_expr:str,dt:datetime)->bool: #对外接口，判断cron表达式是否匹配当前时间
     fields=cron_expr.strip().split()
     if len(fields)!=5:
         return False
@@ -96,7 +96,7 @@ def _validate_cron_field(field:str,lo:int,hi:int):
         return f'Value {val} out of bounds [{lo}-{hi}]'
     return None
 
-def validate_cron(cron_expr:str):
+def validate_cron(cron_expr:str): #验证cron表达式是否有效，返回错误信息或None
     fields=cron_expr.strip().split()
     if len(fields)!=5:
         return f'Expected 5 fields,got {len(fields)}'
@@ -109,12 +109,12 @@ def validate_cron(cron_expr:str):
     return None
 
 
-def save_durable_jobs():
+def save_durable_jobs(): #保存持久化任务
     DURABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
     durable=[asdict(j) for j in scheduled_jobs.values() if j.durable]
     DURABLE_PATH.write_text(json.dumps(durable,ensure_ascii=False,indent=2))
 
-def load_durable_jobs():
+def load_durable_jobs(): #加载持久化任务，将有效任务添加到scheduled_jobs中
     if not DURABLE_PATH.exists():
 
         return 
@@ -133,7 +133,11 @@ def load_durable_jobs():
     except Exception:
         pass
 
-def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True):
+def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #注册一个cron任务
+    """
+    Register a cron job with the scheduler.
+    """
+    
     err=validate_cron(cron)
     if err:
         return err
@@ -152,7 +156,10 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True):
     print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
     return job
 
-def cancel_job(job_id:str)->str:
+def cancel_job(job_id:str)->str: #取消一个cron任务
+    """
+    Cancel a cron job with the scheduler.
+    """
     with cron_lock:
         job=scheduled_jobs.pop(job_id,None)
     if not job:
@@ -162,7 +169,7 @@ def cancel_job(job_id:str)->str:
     print(f"  \033[31m[cron cancel] {job_id}\033[0m")
     return f'Cancelled {job_id}'
 
-def cron_scheduler_loop():
+def cron_scheduler_loop(): #cron任务调度循环，每秒检查一次是否有任务到点
     while True:
         time.sleep(1)
         now=datetime.now()
@@ -183,13 +190,16 @@ def cron_scheduler_loop():
                 except Exception as e:
                     print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
 
-def consume_cron_queue()->list[CronJob]:
+def consume_cron_queue()->list[CronJob]: #消费cron队列中的任务，返回已触发的任务列表，
+    """
+    Consume cron jobs from the queue.
+    """
     with cron_lock:
         fired=list(cron_queue)
         cron_queue.clear()
     return fired
 
-def _has_cron_queue()->bool:
+def _has_cron_queue()->bool: #检查cron队列是否为空
     with cron_lock:
         return bool(cron_queue)
 
