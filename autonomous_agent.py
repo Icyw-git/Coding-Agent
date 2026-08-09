@@ -2,8 +2,9 @@
 import json
 import time
 
-from task_system import TASKS_DIR, can_start, claim_task
+from task_system import TASKS_DIR, can_start, claim_task, load_task
 from team_protocols import handle_inbox_message
+from worktree import WORKTREES_DIR
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
@@ -25,10 +26,10 @@ def scan_unclaimed_tasks() -> list:
     return unclaimed
 
 
-def idle_poll(name: str, messages: list, role: str) -> str:
+def idle_poll(name: str, messages: list, role: str, wt_ctx: dict = None) -> str:
     """空闲轮询一轮：
     - 收 inbox：shutdown→'shutdown'；plan 决定/Lead 消息→'work'；
-    - 自动认领待办任务，成功→'work'；
+    - 自动认领待办任务，成功→'work'（任务绑定了 worktree 则切换 wt_ctx）；
     - IDLE_TIMEOUT 内无任何事→'timeout'。"""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
@@ -60,6 +61,12 @@ def idle_poll(name: str, messages: list, role: str) -> str:
             task = unclaimed[0]
             result = claim_task(task['id'], name)
             if 'Claimed' in result:
+                if wt_ctx is not None:
+                    try:
+                        claimed = load_task(task['id'])
+                        wt_ctx['path'] = str(WORKTREES_DIR / claimed.worktree) if claimed.worktree else None
+                    except Exception:
+                        wt_ctx['path'] = None
                 messages.append({
                     'role': 'user',
                     'content': f"<auto-claimed>Task {task['id']}: {task['subject']}</auto-claimed>",

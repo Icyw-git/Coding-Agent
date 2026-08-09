@@ -20,6 +20,7 @@ class Task:
     status:Literal['pending','in_progress','completed']
     owner:Optional[str] = None
     blockedBy:List[str] = field(default_factory=list)
+    worktree:str = ''   # 关联的 git worktree 名（空 = 无隔离目录）
 
 import time
 import random

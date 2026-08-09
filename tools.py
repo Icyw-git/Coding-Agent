@@ -12,6 +12,7 @@ from task_system import create_task, list_tasks, get_task, claim_task, complete_
 from cron_scheduler import schedule_job, cancel_job, cron_lock, scheduled_jobs
 from agent_teams import spawn_teammate_thread, BUS
 from team_protocols import new_request_id, ProtocolState, pending_requests, consume_lead_inbox
+from worktree import create_worktree, remove_worktree, keep_worktree
 
 
 def _h():
@@ -401,13 +402,13 @@ TOOLS=[{
 
 }]
 
-def run_bash(command:str)->str:
+def run_bash(command:str, cwd: str = None)->str:
 
     dangerous=["rm -rf /","sudo","shutdown","reboot","> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command, please do not execute"
     try:
-        r=subprocess.run(command,shell=True,cwd=os.getcwd(),capture_output=True,timeout=120)
+        r=subprocess.run(command,shell=True,cwd=cwd or os.getcwd(),capture_output=True,timeout=120)
         raw=(r.stdout or b"")+(r.stderr or b"")
         try:
             out=raw.decode("utf-8")
@@ -421,15 +422,16 @@ def run_bash(command:str)->str:
     except (FileNotFoundError,OSError) as e:
         return f'Error:{e}'
 
-def safe_path(p: str) -> Path:
-    path = (_h().WORKDIR / p).resolve()
+def safe_path(p: str, cwd: str = None) -> Path:
+    base = Path(cwd) if cwd else _h().WORKDIR
+    path = (base / p).resolve()
     if not path.is_relative_to(_h().WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-def run_read(path: str, limit: Optional[int] = None) -> str:
+def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
     try:
-        lines = safe_path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+        lines = safe_path(path, cwd).read_text(encoding='utf-8', errors='replace').splitlines()
         if limit is None and len(lines) > 500:
             # 大文件没传 limit：自动截断，防止整文件灌进上下文
             lines = lines[:200] + [f"... ({len(lines) - 200} more lines; use limit to read in chunks)"]
@@ -439,18 +441,18 @@ def run_read(path: str, limit: Optional[int] = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, cwd: str = None) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = safe_path(path, cwd)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding='utf-8')
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = safe_path(path, cwd)
         text = file_path.read_text(encoding='utf-8', errors='replace')
         if old_text not in text:
             return f"Error: text not found in {path}"
@@ -619,7 +621,8 @@ tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit
                'claim_task':run_claim_task,'complete_task':run_complete_task,
                'schedule_cron':run_schedule_cron,'list_crons':run_list_crons,'cancel_cron':run_cancel_cron,
                'spawn_teammate':run_spawn_teammate,'send_message':run_send_message,'check_inbox':run_check_inbox,
-               'request_shutdown':run_request_shutdown,'request_plan':run_request_plan,'review_plan':run_review_plan}
+               'request_shutdown':run_request_shutdown,'request_plan':run_request_plan,'review_plan':run_review_plan,
+               'create_worktree':create_worktree,'remove_worktree':remove_worktree,'keep_worktree':keep_worktree}
 
 TOOLS.append({
     "type":"function",
@@ -738,6 +741,66 @@ TOOLS.append({
                 }
             },
             "required":["request_id", "approve"]
+        }
+    }
+})
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"create_worktree",
+        "description":"Create a git worktree (isolated branch) for a task; optionally bind it to task_id.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "name":{
+                    "type":"string",
+                    "description":"Worktree name (letters/digits/._-, 1-64 chars)"
+                },
+                "task_id":{
+                    "type":"string",
+                    "description":"Optional task id to bind to this worktree"
+                }
+            },
+            "required":["name"]
+        }
+    }
+})
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"remove_worktree",
+        "description":"Remove a worktree; refuses if it has uncommitted/unpushed changes unless discard_changes=true.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "name":{
+                    "type":"string"
+                },
+                "discard_changes":{
+                    "type":"boolean",
+                    "description":"Force removal, discarding changes"
+                }
+            },
+            "required":["name"]
+        }
+    }
+})
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"keep_worktree",
+        "description":"Keep a worktree for review (logs the event).",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "name":{
+                    "type":"string"
+                }
+            },
+            "required":["name"]
         }
     }
 })
