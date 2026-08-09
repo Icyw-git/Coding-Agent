@@ -26,6 +26,7 @@ from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
 from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
+from mcp_bridge import register_mcp_tools
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
 
@@ -476,6 +477,9 @@ if __name__ == '__main__':
     threading.Thread(target=queue_processor_loop,
                      args=(run_agent_turn_locked,), daemon=True).start()
 
+    # 接入 MCP：连接配置的 server，工具动态注册进 tool_registry + TOOLS
+    TOOLS.extend(register_mcp_tools(tool_registry))
+
     def _run_session(msgs):
         try:
             agent_loop(msgs)
@@ -484,7 +488,7 @@ if __name__ == '__main__':
 
     # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
     with agent_lock:
-        _run_session([{'role': 'user', 'content': 'Create two tasks, then create worktrees for each (bind with task_id). Spawn alice and bob. Watch them auto-claim and work in isolated directories.'}])
+        _run_session([{'role': 'user', 'content': '用 echo 回显 hello，用 add 计算 3+4"即可'}])
 
     # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
     try:

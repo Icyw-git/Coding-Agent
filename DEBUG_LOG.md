@@ -1,7 +1,10 @@
 # Harness Agent 开发实录：问题驱动的功能演进（面试视角）
 
 一个自研的 Coding Agent 框架：`agent_loop` 主循环 + 工具注册表 + Hook 事件系统 +
-子代理 + Skill 按需加载 + 四级上下文压缩 + 跨会话记忆 + 任务系统 + 后台任务 + cron 定时任务。
+子代理 + Skill 按需加载 + 四级上下文压缩 + 跨会话记忆 + 任务系统 + 后台任务 + cron 定时任务
+
+- 团队协作（teammate 长驻 + 协议 + 自主认领）+ worktree 隔离（任务级沙箱）。harness 按
+  「基本 loop + 功能模块」拆分。
 
 > **阅读/面试方法**：每个功能都按「**遇到的问题 → 方案 → 踩过的坑 → 收获**」组织。
 > 面试讲项目时按这条主线走：为什么做（问题）→ 怎么做（方案）→ 难在哪（坑）→ 沉淀了什么（收获）。
@@ -24,7 +27,8 @@
 子系统位置：记忆（召回→注入请求副本→提炼→合并）、Skill（system 注入 + 按需 load_skill）、
 上下文压缩（落盘/裁剪/占位符 → LLM 摘要 → reactive 抢救）、任务系统（.cache/tasks 持久化）、
 后台任务（慢命令线程 + `<task_notification>` 注入）、cron（调度线程 + 队列 + 推/拉双消费）、
-团队（MessageBus 邮箱 + 协议状态机 shutdown/plan_approval + 自主认领任务）。
+团队（MessageBus 邮箱 + 协议状态机 shutdown/plan_approval + 自主认领任务）、
+worktree 隔离（.worktrees/<name> 独立分支 + teammate cwd 切换）。
 
 ---
 
@@ -393,9 +397,9 @@ sort_keys=True)`，单轮内 enabled_tools/workspace/memories/skills 都不变 �
 # 第 11 部分：面试速查（高频题 + 回答要点）
 
 **Q1：这个项目的架构是什么？**
-一条主循环（agent_loop）+ 工具注册表（分发）+ Hook 事件系统（扩展）+ 八大子系统（子代理 / Skill /
-压缩 / 记忆 / 任务 / 后台 / cron / 团队协作）。harness 已按「基本 loop + 功能模块」拆分
-（agent_core / tools / hooks / skill_system / subagent）。主循环稳定，新能力 = 加 hook 或注册工具。
+一条主循环（agent_loop）+ 工具注册表（分发）+ Hook 事件系统（扩展）+ 九大子系统（子代理 / Skill /
+压缩 / 记忆 / 任务 / 后台 / cron / 团队协作 / worktree 隔离）。harness 已按「基本 loop + 功能模块」
+拆分（agent_core / tools / hooks / skill_system / subagent）。主循环稳定，新能力 = 加 hook 或注册工具。
 
 **Q2：权限/安全怎么做的？**
 分层防御：黑名单（硬拒绝）→ 危险命令询问（y/n）→ 会话级拒绝记忆（同一目标被拒后硬拒绝）→
@@ -428,10 +432,11 @@ GBK/UTF-8：文件读写显式声明编码、bash 输出替换 U+FFFD、提示�
 图标字符在 GBK 控制台会崩（交互终端 UTF-8 无碍）。
 
 **Q10：最近在做什么？**
-（按第 6/7/8/12/13 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
+（按第 6/7/8/12/13/14 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
 cron 定时任务（推/拉双轨 + 锁与竞态）+ 模块拆分（无状态逻辑层 + `_h()` 可测试性）+
-团队协作（teammate 长驻 + 协议 + 自主认领），以及集成时踩的孤儿消息 / NameError / f-string 语法 /
-Python 3.9 兼容 / 模块拆分回归（`harness.run_bash`）等坑。
+团队协作（teammate 长驻 + 协议 + 自主认领）+ worktree 隔离（任务级沙箱 + cwd 切换），
+以及集成时踩的孤儿消息 / NameError / f-string 语法 / Python 3.9 兼容 / 模块拆分回归
+（`harness.run_bash`）等坑。
 
 ---
 
@@ -511,6 +516,45 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 
 ---
 
+# 第 14 部分：worktree 隔离——任务级沙箱（新增）
+
+## 问题：多个 teammate 在同一工作区干活，文件互相覆盖
+
+团队演示里 alice/bob 共用一个工作区，同一文件可能被对方覆盖——**靠提示词"别写错目录"约束不可靠**。
+
+**方案**：每个任务绑定一个 git worktree（`.worktrees/<name>`，独立分支 `wt-<name>`）：
+
+- `task_system.Task` 加 `worktree` 字段持久化绑定关系（默认 ''，向后兼容）；
+- teammate 认领任务后 `wt_ctx` 记录 worktree 路径，`bash/read/write/edit` 的 cwd 自动切进 worktree
+  （`run_bash/run_read/run_write/run_edit` 加可选 `cwd` 参数，`safe_path` 以 cwd 为基准且仍受
+  WORKDIR 越界保护）；
+- **Lead 侧工具**：`create_worktree`（可绑定 task_id）/ `remove_worktree`（有未提交/未推送改动时
+  拒绝，`discard_changes=true` 强制）/ `keep_worktree`；
+- 隔离验证：同一文件名（如 `greet.py`）在两个 worktree 里内容不同，工作区根目录无残留。
+
+## 踩过的坑
+
+1. **worktree.py 草稿无法导入**：缺 `json/os/re/subprocess/time/Path` 导入、
+   `validate_wortree_name`/`WORTREES_DIR` 拼写错、`f'@{push}..HEAD'` 是 f-string 语法错误
+   （`@{push}` 没转义成 `@{{push}}`）。
+2. **`task.worktree` 字段不存在** → dataclass 加默认值字段（默认值必须在无默认字段之后）。
+3. **工具函数没有 cwd 概念** → 加可选参数；越界校验以 WORKDIR 为界，worktree 在其内所以天然安全。
+4. **cwd 状态要跟 teammate 生命周期走**：`claim_task` 切换、`complete_task` 清空、`idle_poll`
+   自动认领也要同步（`wt_ctx` 传入 idle_poll）——漏一处，隔离就失效一半。
+
+## 测试（test_worktree.py）
+
+用**临时 git 仓库**（`git init` + 初始提交，worktree add 需要 HEAD）做真实操作，worktree/task
+目录全局重定向到临时目录（同 test_memory 的 patch 模式），`finally` 里还原 + `rmtree` 清理。
+覆盖：创建→绑定任务→未提交改动阻止删除→`discard_changes` 强制删除→keep 事件落盘。
+
+## 收获
+
+- **隔离优于约束**：与其提示模型"别写错目录"，不如让工具在物理上隔离——模型不可信，文件系统可信；
+- 会话级可变状态（当前 worktree）必须显式跟踪完整生命周期，否则状态泄漏到下一个任务。
+
+---
+
 ## 核心教训总纲
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。
@@ -525,3 +569,4 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 10. **模块拆分后全局搜被移走的引用**——run_bash 移到 tools.py 后，agent_teams 还在调 `harness.run_bash` → AttributeError 静默废掉 teammate 的 bash。搬代码 ≠ 改完，直接引用要全查。
 11. **"公平分工"是协调问题不是并发问题**——轮询认领无协调必然偏斜（相位领先者通吃）；多 agent 协作要显式分配或加抖动。
 12. **改返回值语义必须同步所有调用点**——返回码从布尔改字符串后，调用方真值判断把 'awake' 当成 shutdown，teammate 收到计划批准反而退出。
+13. **隔离优于约束**——与其提示模型"别写错目录"，不如用 git worktree 在物理上隔离；会话级可变状态（当前 cwd）必须显式跟踪完整生命周期，否则泄漏到下一个任务。

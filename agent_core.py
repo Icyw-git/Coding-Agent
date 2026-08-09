@@ -313,9 +313,14 @@ def consolidate_memories():
     try:
         response = h.client.chat.completions.create(
             model=os.getenv('LLM_MODEL_ID'),
-            messages=[{'role': 'user', 'content': prompt}], max_tokens=3000
+            messages=[{'role': 'user', 'content': prompt}], max_tokens=4000
         )
-        text = _extract_text(response.choices[0].message.content).strip()
+        msg = response.choices[0].message
+        text = _extract_text(msg.content or '').strip()
+        if not text:
+            # 推理模型可能把 max_tokens 预算全花在 reasoning_content 上导致 content 为空，
+            # 退而从 reasoning_content 里找 JSON 数组（与 extract_memories 一致）
+            text = _extract_text(getattr(msg, 'reasoning_content', '') or '').strip()
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if not match:
             print(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
