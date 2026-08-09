@@ -9,6 +9,7 @@ import openai
 
 from team_protocols import (ProtocolState, pending_requests, new_request_id,
                             handle_inbox_message)
+from autonomous_agent import idle_poll
 
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
@@ -116,7 +117,8 @@ def _build_team_tools(agent_name: str):
         for pattern in harness.DESTRUCTIVE:
             if pattern in command:
                 return f"Error: Destructive command {pattern} rejected (teammate cannot confirm)"
-        return harness.run_bash(command)
+        # run_bash 在 tools.py；经 tool_registry 取原实现（此处 safe_bash 已覆盖 handlers['bash']）
+        return harness.tool_registry['bash'](command)
 
     handlers['bash'] = safe_bash
 
@@ -191,33 +193,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             messages.append(message.model_dump())
 
             if response.choices[0].finish_reason != "tool_calls":
-                # 空闲：不退出，等 inbox（shutdown→退出；新消息/plan 决定→回 LLM turn）
+                # 空闲：自动认领任务 + 收 inbox；shutdown→退出；work→回 LLM turn
                 while not should_stop:
-                    time.sleep(1)
-                    inbox = BUS.read_inbox(name)
-                    if not inbox:
-                        continue
-                    new_content = False
-                    non_protocol = []
-                    for msg in inbox:
-                        result = handle_inbox_message(name, msg, messages)
-                        if result == 'shutdown':
-                            should_stop = True
-                            break
-                        elif result == 'awake':
-                            new_content = True   # plan 决定已注入 messages → 需回 LLM turn
-                        else:
-                            non_protocol.append(msg)
-                    if should_stop:
+                    status = idle_poll(name, messages, role)
+                    if status == 'shutdown':
+                        should_stop = True
                         break
-                    if non_protocol:
-                        messages.append({
-                            'role': 'user',
-                            'content': f"<inbox>{json.dumps(non_protocol, ensure_ascii=False)}</inbox>",
-                        })
-                        new_content = True
-                    if new_content:
-                        break   # 有新任务/plan 决定 → 回到 LLM turn
+                    if status == 'work':
+                        break
+                    # 'timeout' → 保持存活，继续下一轮空闲轮询
                 continue   # 关键：跳过工具执行段（本轮的 response 没有 tool_calls）
 
             results = []

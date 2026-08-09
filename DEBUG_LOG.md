@@ -23,7 +23,8 @@
 
 子系统位置：记忆（召回→注入请求副本→提炼→合并）、Skill（system 注入 + 按需 load_skill）、
 上下文压缩（落盘/裁剪/占位符 → LLM 摘要 → reactive 抢救）、任务系统（.cache/tasks 持久化）、
-后台任务（慢命令线程 + `<task_notification>` 注入）、cron（调度线程 + 队列 + 推/拉双消费）。
+后台任务（慢命令线程 + `<task_notification>` 注入）、cron（调度线程 + 队列 + 推/拉双消费）、
+团队（MessageBus 邮箱 + 协议状态机 shutdown/plan_approval + 自主认领任务）。
 
 ---
 
@@ -392,8 +393,9 @@ sort_keys=True)`，单轮内 enabled_tools/workspace/memories/skills 都不变 �
 # 第 11 部分：面试速查（高频题 + 回答要点）
 
 **Q1：这个项目的架构是什么？**
-一条主循环（agent_loop）+ 工具注册表（分发）+ Hook 事件系统（扩展）+ 七大子系统（子代理 / Skill /
-压缩 / 记忆 / 任务 / 后台 / cron）。主循环稳定，新能力 = 加 hook 或注册工具。
+一条主循环（agent_loop）+ 工具注册表（分发）+ Hook 事件系统（扩展）+ 八大子系统（子代理 / Skill /
+压缩 / 记忆 / 任务 / 后台 / cron / 团队协作）。harness 已按「基本 loop + 功能模块」拆分
+（agent_core / tools / hooks / skill_system / subagent）。主循环稳定，新能力 = 加 hook 或注册工具。
 
 **Q2：权限/安全怎么做的？**
 分层防御：黑名单（硬拒绝）→ 危险命令询问（y/n）→ 会话级拒绝记忆（同一目标被拒后硬拒绝）→
@@ -426,9 +428,86 @@ GBK/UTF-8：文件读写显式声明编码、bash 输出替换 U+FFFD、提示�
 图标字符在 GBK 控制台会崩（交互终端 UTF-8 无碍）。
 
 **Q10：最近在做什么？**
-（按第 6/7/8 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
-cron 定时任务（推/拉双轨 + 锁与竞态），以及集成时踩的孤儿消息 / NameError / f-string 语法 /
-Python 3.9 兼容等坑。
+（按第 6/7/8/12/13 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
+cron 定时任务（推/拉双轨 + 锁与竞态）+ 模块拆分（无状态逻辑层 + `_h()` 可测试性）+
+团队协作（teammate 长驻 + 协议 + 自主认领），以及集成时踩的孤儿消息 / NameError / f-string 语法 /
+Python 3.9 兼容 / 模块拆分回归（`harness.run_bash`）等坑。
+
+---
+
+# 第 12 部分：模块拆分——从"千行巨石"到"基本 loop + 功能模块"
+
+## 问题：harness.py 堆积到 ~1700 行，能力耦合，teammate 想复用压缩/记忆/hooks 只能复制代码
+
+**方案**：按"基本 loop + 可提取功能"拆分，纯搬移不改逻辑：
+
+| 文件              | 内容                                                           |
+| ----------------- | -------------------------------------------------------------- |
+| `agent_core.py`   | hooks 注册表 + 记忆系统 + 压缩原语（无状态逻辑层）             |
+| `tools.py`        | TOOLS schema + 全部 run\_\* handler + tool_registry            |
+| `hooks.py`        | 6 个 hook 回调 + 注册                                          |
+| `skill_system.py` | 技能扫描 / 列表 / 加载                                         |
+| `subagent.py`     | 子代理精简 loop                                                |
+| `harness.py`      | agent_loop + 编排（pre_compact/exec_tool_call）+ 提示词 + 配置 |
+
+**关键设计（可测试性）**：`agent_core` 不持有可变全局状态，通过 `_h()` 在运行时读 harness
+（`MEMORY_DIR`/`CONTEXT_LIMIT`/`client`）——所以测试的 `harness.MEMORY_DIR = tmp`、
+patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变状态留在 harness 是刻意为之。
+
+## 踩过的坑
+
+1. **`harness.run_bash` 回归（真 bug）**：run_bash 移到 tools.py 后，agent_teams 的 safe_bash
+   还在调 `harness.run_bash(...)` → AttributeError → **teammate 的 bash 全废**（真机演示时 bob
+   报告了这个错）。修复：经 `harness.tool_registry['bash']` 取原实现。教训：拆完模块要全局搜
+   "对被移走名字的直接引用"。
+2. **`_scan_skills()` 残留调用**：技能扫描移到 skill_system 后模块里还残留 `_scan_skills()` →
+   NameError；且扫描时机必须在 `SKILLS_DIR` 定义之后（改由 harness 调用）。
+3. **搬走的代码缺导入**：subagent.py 用了 `os.getenv`/`json.loads` 但没 import → 运行期
+   NameError（编译期 py_compile 查不出来，必须跑 import 冒烟）。
+4. **循环导入**：agent_teams ↔ team_protocols 互相需要对方符号 → 用 `_bus()` 延迟 import 打破。
+
+---
+
+# 第 13 部分：团队协作——teammate 长驻 + 协议 + 自主认领
+
+## 问题：单 agent 一次会话只做一轮；多个 agent 协作需要"活着的"teammate
+
+**方案**：
+
+- `MessageBus` 文件邮箱（`.mailbox/<agent>.jsonl`，UTF-8，读完即删）——agent 间异步通信；
+- `spawn_teammate_thread`：**长驻循环**（LLM turn ↔ idle_poll，daemon 线程），非工具轮不退出，
+  进 idle 等新任务，收到 `shutdown_request` 才退出；
+- **协议消息**（metadata 带 `request_id` 关联请求-响应）：`shutdown_request/response`、
+  `plan_approval_request/response`、`idle_notification`；`team_protocols.py` 状态机
+  （pending→approved/rejected）统一管理；
+- **自主认领**（`autonomous_agent.py`）：idle 时每 5s 扫描任务系统 `.cache/tasks`，
+  认领 pending 任务自动开工（`<auto-claimed>` 注入对话）；
+- **Lead 侧工具**：`spawn_teammate` / `send_message` / `check_inbox` / `request_shutdown` /
+  `request_plan` / `review_plan`。
+
+## 踩过的坑
+
+1. **`input()` 交互在 teammate 线程永久阻塞**：permission_hook 是主线程交互式询问，teammate
+   没人应答。safe_bash 改**非交互版**：DENY 硬拒 + DESTRUCTIVE 直接拒绝（拒绝比无人应答的询问安全）。
+2. **协议返回码从布尔改成字符串（'shutdown'/'awake'/'message'），调用方没同步**：`if should_stop:`
+   是真值判断，plan_approval 返回的 `'awake'` 也是 truthy → **teammate 收到计划批准反而退出**。
+   教训：改返回值语义必须全局搜所有调用点。
+3. **idle 循环里 plan_approval 不唤醒**：只 break 在 shutdown 或非协议消息，plan 决定注入
+   messages 后循环继续 sleep → 永远醒不来。修复：`'awake'` 也触发唤醒。
+4. **`BUS.send` 5 个位置参数 vs 4 参数签名 → TypeError**：加 metadata 只改了调用没改签名。
+5. **分工不均匀（认领竞态）**：两个 teammate 各自 5s 轮询认领，先 spawn 的相位一直领先 →
+   连续赢走所有任务（alice 包揽 3 个，bob 一个没抢到）。**无协调机制时"公平"靠运气**；
+   改进方向：认领加随机抖动 / 认领后 backoff / Lead 侧分配策略。
+6. **记忆污染测试再踩**：完整跑 harness 后 extract_memories 写入 alice 系列记忆文件 →
+   下次测试 select_relevant_memories 提前消费 mock → 8 个测试崩。真机产物用后即清（第 5 部分
+   教训的复现）。
+
+## 收获
+
+- 协作 vs 并发：**消息是协作的正确抽象**（文件邮箱天然可调试、可持久化）；
+  "公平分工"是协调问题不是并发问题——轮询竞态没有协调就必然偏斜；
+- 协议状态机 + request_id 让异步请求可关联可校验；
+- 面试可讲：多 agent 架构 = 邮箱通信 + 协议握手 + 任务板自主认领，各自独立可测。
 
 ---
 
@@ -443,3 +522,6 @@ Python 3.9 兼容等坑。
 7. **推理模型是"会思考"的边界**——max_tokens 要给思考链留预算，content 可能为空必须兜底。
 8. **Windows 编码是隐形杀手**——读写显式 UTF-8，提示词规避 Get-Content，图标字符慎用。
 9. **异步能力靠锁与保活兜底**——daemon 线程进程退出即消亡，"到点执行"必须进程保活；并发互斥用非阻塞抢锁 + 双重检查 + finally 释放（推/拉没有绝对优劣，按场景分工）。
+10. **模块拆分后全局搜被移走的引用**——run_bash 移到 tools.py 后，agent_teams 还在调 `harness.run_bash` → AttributeError 静默废掉 teammate 的 bash。搬代码 ≠ 改完，直接引用要全查。
+11. **"公平分工"是协调问题不是并发问题**——轮询认领无协调必然偏斜（相位领先者通吃）；多 agent 协作要显式分配或加抖动。
+12. **改返回值语义必须同步所有调用点**——返回码从布尔改字符串后，调用方真值判断把 'awake' 当成 shutdown，teammate 收到计划批准反而退出。
