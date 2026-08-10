@@ -1,1114 +1,316 @@
 import os 
 from dotenv import load_dotenv
-import subprocess
 import openai
 import json
 import time
-import ast
-import pathlib
-import re
-import sys
+import threading
 from pathlib import Path
-from typing import Optional
-import yaml
-import cc_ui as ui
+from typing import Optional, List
+from background_task import should_run_background, start_background_task, collect_background_results
+import recovery
+from task_system import create_task, list_tasks, get_task, claim_task, complete_task
+from cron_scheduler import (schedule_job, cancel_job, consume_cron_queue,
+                            cron_lock, scheduled_jobs, cron_scheduler_loop,
+                            load_durable_jobs, agent_lock,
+                            queue_processor_loop, wait_for_cron_idle)
+from agent_teams import spawn_teammate_thread, BUS
+from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
+                        _parse_frontmatter, write_memory_file, _rebuild_index,
+                        read_memory_index, read_memory_file, list_memory_files,
+                        select_relevant_memories, load_memories, extract_memories,
+                        consolidate_memories, estimate_size, _message_has_tool_use,
+                        _is_tool_result_message, collect_tool_results, snip_compact,
+                        micro_compact, persist_large_output, tool_result_budget,
+                        write_transcript, summarize_history, compact_history,
+                        reactive_compact, inject_memories)
+from tools import TOOLS, tool_registry, run_bash
+from skill_system import scan_skills, list_skills, load_skill
+from subagent import spawn_subagent
+from mcp_bridge import register_mcp_tools
+from ui_events import bus
+import renderer   # 副作用：attach 默认 AnsiRenderer（渲染后端由事件流驱动）
+import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
 
 
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
 SKILLS_DIR=WORKDIR/"skills"
-MEMORY_TYPES=['user','feedback','project','reference']
-MEMORY_DIR=WORKDIR/'.cache'/'memories'
-MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
+scan_skills()   # 扫描技能目录 → SKILL_REGISTRY（skill_system 内）
 
 
 
 client=openai.OpenAI(
     api_key=os.getenv("LLM_API_KEY"),
     base_url=os.getenv("LLM_BASE_URL"),
-    
+    timeout=120,   # API 挂起时最多等 120s 抛错，避免静默阻塞 600s（SDK 默认）
 )
 
-SYSTEM=(
-    'You are a coding agent working on Windows at {workdir}. '
-    'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
-    '{memories_section}'
-    'Rules: '
-    '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
-    'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
-    '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
-    'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
-    'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
-    'Skills available:\n{catalog}\n'
-     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
-)
+PROMPT_SECTIONS={
+    'identity_main':(
+        'You are a coding agent working on Windows at {workdir}. '
+        'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
+    ),
+    'identity_sub':(
+        'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
+        'Complete the task you are given and return a concise final answer to the parent agent. '
+    ),
+    'rules_main':(
+        'Rules: '
+        '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
+        'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
+        '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
+        'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
+        'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
+    ),
+    'rules_sub':(
+        'Rules: '
+        '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
+        '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
+        '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
+        'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
+        '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
+        'reasonable alternative, then report the situation honestly to the parent. '
+        '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
+        'Do not re-plan the parent task and do not spawn further sub-agents. '
+    ),
+    'skills_usage':(
+        'Skills available:\n{catalog}\n'
+        'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
+    ),
+}
 
-SUB_SYSTEM=(
-    'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
-    'Complete the task you are given and return a concise final answer to the parent agent. '
-    'Rules: '
-    '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
-    '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
-    '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
-    'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
-    '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
-    'reasonable alternative, then report the situation honestly to the parent. '
-    '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
-    'Do not re-plan the parent task and do not spawn further sub-agents. '
-     'Skills available:\n{catalog}\n'
-     'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
-)
+def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身份、工具、工作目录、记忆、技能、规则等
+    sections=[]
+    sections.append(PROMPT_SECTIONS['identity_main'].format(
+        workdir=context.get('workspace',WORKDIR)
+    ))
+    tools=','.join(context.get('enabled_tools',[]))
+    if tools:
+        sections.append(f'Available tools:{tools}.')
+    sections.append(f'Working directory:{context.get("workspace",WORKDIR)}.')
 
-TOOLS=[{
-    "type":"function",
-    "function":{
-        "name":"bash",
-        "description":"Execute shell commands",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "command":{
-                    "type":"string",
-                    "description":"The shell command to execute, e.g. 'ls'"
-                }
-            },
-            "required":[
-                "command"
-            ]
+    memories=context.get('memories','')
+    if memories:
+        sections.append(f'Relevant memories:\n{memories}')
+    skills=context.get('skills','')
+    if skills:
+        sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
+    sections.append(PROMPT_SECTIONS['rules_main'])
+    return '\n\n'.join(sections)
 
-        }
-    }
+_last_context_key=None # 缓存键，用于判断是否需要重新组装系统提示
+_last_prompt=None # 缓存系统提示，用于判断是否需要重新组装系统提示
 
-},{
-    "type":"function",
-    "function":{
-        "name":"read",
-        "description":"Read the contents of a file in the workspace",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "path":{
-                    "type":"string",
-                    "description":"Relative path to the file from the workspace root"
-                },
-                "limit":{
-                    "type":"integer",
-                    "description":"Optional maximum number of lines to read"
-                }
-            },
-            "required":[
-                "path"
-            ]
+# ============================================================
+# 全局配置集中区
+# ============================================================
 
-        }
-    }
+# ---------- 记忆系统配置 ----------
+MEMORY_TYPES=['user','feedback','project','reference']
+MEMORY_DIR=WORKDIR/'.cache'/'memories'
+MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
+CONSOLIDATE_THRESHOLD=10
 
-},{
-    "type":"function",
-    "function":{
-        "name":"write",
-        "description":"Write content to a file in the workspace",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "path":{
-                    "type":"string",
-                    "description":"Relative path to the file from the workspace root"
-                },
-                "content":{
-                    "type":"string",
-                    "description":"Content to write to the file"
-                }
-            },
-            "required":[
-                "path",
-                "content"
-            ]
+# ---------- 安全策略 ----------
+DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
+DESTRUCTIVE=["rm ","del ","rmdir ","rd ","Remove-Item ","erase ","> /etc/","chmod 777"]
 
-        }
-    }
+# ---------- 模型上下文配置 ----------
+MODEL_WINDOWS={
+    'deepseek-v4-flash':131072,
+    'deepseek-chat':65536,
+    'deepseek-reasoner':65536,
+}
+OUTPUT_RESERVE=8192        # 给 max_tokens=8000 输出预留
+CTX_SAFETY=0.8             # 留余量，防 prompt_too_long
 
-},{
-    "type":"function",
-    "function":{
-        "name":"edit",
-        "description":"Replace a unique text fragment in a workspace file",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "path":{
-                    "type":"string",
-                    "description":"Relative path to the file from the workspace root"
-                },
-                "old_text":{
-                    "type":"string",
-                    "description":"Exact text to replace"
-                },
-                "new_text":{
-                    "type":"string",
-                    "description":"Replacement text"
-                }
-            },
-            "required":[
-                "path",
-                "old_text",
-                "new_text"
-            ]
+def _default_context_limit()->int:
+    window=int(os.getenv('LLM_CONTEXT_WINDOW') or
+               MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID',''),65536))
+    return max(4000,int((window-OUTPUT_RESERVE)*CTX_SAFETY))
 
-        }
-    }
+CONTEXT_LIMIT=_default_context_limit()
+KEEP_RECENT=6
+PERSIST_THERSHOLD=10000
 
-},{
-    "type":"function",
-    "function":{
-        "name":"glob",
-        "description":"List files in the workspace matching a glob pattern",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "pattern":{
-                    "type":"string",
-                    "description":"Glob pattern, e.g. '*.py' or 'src/**/*.ts'"
-                }
-            },
-            "required":[
-                "pattern"
-            ]
+# ---------- 缓存目录 ----------
+TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
+TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 
-        }
-    }
+# ---------- 重试配置 ----------
+MAX_REACTIVE_RETRIES=1
 
-},{
-    "type":"function",
-    "function":{
-        "name":"todo_write",
-        "description":"Update the current task list shown to the user. Use for tracking multi-step work.",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "todos":{
-                    "type":"array",
-                    "description":"List of tasks, each with 'content' and 'status' (pending/in_progress/completed)",
-                    "items":{
-                        "type":"object",
-                        "properties":{
-                            "content":{
-                                "type":"string",
-                                "description":"Task description"
-                            },
-                            "status":{
-                                "type":"string",
-                                "enum":["pending","in_progress","completed"],
-                                "description":"Task status"
-                            }
-                        },
-                        "required":[
-                            "content",
-                            "status"
-                        ]
-                    }
-                }
-            },
-            "required":[
-                "todos"
-            ]
 
-        }
-    }
+def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没有改变，直接返回缓存的系统提示，否则重新组装系统提示
+    global _last_context_key,_last_prompt
+    key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
+    if key==_last_context_key and _last_prompt:
+        bus.emit('debug', msg="  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt
+    _last_context_key=key
+    _last_prompt=assemble_system_prompt(context)
 
-}]
+    loaded=['identity','tools','workspace','rules']
+    if context.get('memories'):
+        loaded.append('memory')
+    if context.get('skills'):
+        loaded.append('skills')
+    bus.emit('debug', msg=f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    return _last_prompt
 
-def write_memory_file(name:str,mem_type:str,description:str,body:str): #保存记忆文件
-    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    slug=name.lower().replace(' ','-').replace('/','-')
-
-    filename=f'{slug}.md'
-    filepath=MEMORY_DIR/filename
-    filepath.write_text(
-        f'---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n',
-        encoding='utf-8',
-    )
-    _rebuild_index() #重建记忆索引
-
-    return filepath
-
-def _rebuild_index():
-    lines=[]
-    for f in sorted(MEMORY_DIR.glob('*.md')):
-        if f.name=='MEMORY.md':
-            continue
-        raw=f.read_text(encoding='utf-8', errors='replace')
-        meta,body=_parse_frontmatter(raw)
-        name=meta.get('name',f.name)
-        desc=meta.get('description',raw.split('\n')[0][:80])
-        lines.append(f'- [{name}({f.name}) - {desc}]') #索引的结构是：[名称](文件名) - �描述
-    MEMORY_INDEX.write_text('\n'.join(lines)+'\n' if lines else '', encoding='utf-8')
-
-def read_memory_index()->str: #读取记忆索引
-    if not MEMORY_INDEX.exists():
-        return ''
-
-    text=MEMORY_INDEX.read_text(encoding='utf-8', errors='replace').strip()
-    return text if text else ''
-
-def read_memory_file(filename:str): #读取记忆文件
-    path=MEMORY_DIR /filename
-    if not path.exists():
-        return None
-
-    return path.read_text(encoding='utf-8', errors='replace')
-
-def list_memory_files()->list[dict]: #列出所有记忆文件
-    results=[]
-    for f in sorted(MEMORY_DIR.glob('*.md')):
-        if f.name=='MEMORY.md':
-            continue
-        raw=f.read_text(encoding='utf-8', errors='replace')
-        meta,body=_parse_frontmatter(raw)
-        results.append({
-            'filename':f.name,
-            'name':meta.get('name',f.stem),
-            'description':meta.get('description',''),
-            'type':meta.get('type','user'),
-            'body':body
-        })
-    return results
-
-def select_relevant_memories(messages:list,max_items:int=5)->list[str]:
-    files=list_memory_files()
-    if not files:
-        return []
-    recent_texts=[]
-    for msg in reversed(messages):
-        if msg.get('role')=='user': #只考虑用户消息，因为只有用户消息才会包含记忆
-            content=msg.get('content','')
-            if isinstance(content,list): #处理包含多个文本的消息，示例：[{'type':'text','text':'你好'},{'type':'text','text':'我是张三'}]
-                content = " ".join(
-                    str(getattr(b, "text", "")) for b in content
-                    if getattr(b, "type", None) == "text"
-                )
-            if isinstance(content, str):
-                recent_texts.append(content)
-            if len(recent_texts) >= 3: #最多考虑最近3条消息
-                break
-    recent=' '.join(reversed(recent_texts))[:2000] #最近3条消息，最多2000个字符
-
-    if not recent.strip():
-        return []
-
-    catalog_lines=[]
-    for i ,f in enumerate(files):
-        catalog_lines.append(f"{i}:{f['name']} - {f['description']}")
-    catalog='\n'.join(catalog_lines)
-
-    prompt = (
-        "Given the recent conversation and the memory catalog below, "
-        "select the indices of memories that are clearly relevant. "
-        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
-        "If none are relevant, return [].\n\n"
-        f"Recent conversation:\n{recent}\n\n"
-        f"Memory catalog:\n{catalog}"
-    )
-
-    try:
-        response=client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
-            messages=[{'role':'user','content':prompt}],
-            temperature=0.7,
-            max_tokens=200,
-
-        )
-        text=_extract_text(response.choices[0].message.content).strip()
-        match=re.search(r'\[.*?\]', text, re.DOTALL) #解析JSON数组，如[0, 3]
-        if match:
-            indices=json.loads(match.group())
-            selected=[]
-            for idx in indices:
-                if isinstance(idx,int) and 0<=idx<len(files):
-                    selected.append(files[idx]['filename'])
-                    if len(selected)>=max_items: #最多选择max_items个记忆文件
-                        break
-            return selected
-    except Exception:
-        pass
-
-    keywords=[w.lower() for w in recent.split() if len(w)>=3] #fallback，根据最近消息中的关键词筛选记忆文件,关键词长度至少为3
-    selected=[]
-    for f in files:
-        text=(f['name']+' '+f['description']).lower()
-        if any(kw in text for kw in keywords): #如果记忆文件的名称或描述包含关键词
-            selected.append(f['filename'])
-            if len(selected)>=max_items:
-                break
-    return selected
-
-def load_memories(messages:list)->str: #加载相关记忆文件内容
-    selected_files=select_relevant_memories(messages)
-    if not selected_files:
-        return ''
-    
-    parts=["<relevant_memories>"]
-    for f in selected_files:
-        content=read_memory_file(f)
+def update_context(context:dict,messages:list)->dict: # 更新上下文，包含工具、工作目录、记忆、技能等
+    memories=''
+    if MEMORY_INDEX.exists():
+        content=MEMORY_INDEX.read_text(encoding='utf-8',errors='replace').strip()
         if content:
-            parts.append(content)
-    parts.append('</relevant_memories>')
-    return '\n\n'.join(parts)
+            memories=content
+    skills=list_skills()
+    return {
+        'enabled_tools':list(tool_registry.keys()),
+        'workspace':str(WORKDIR),
+        'memories':memories,
+        'skills':skills,
+    }
 
-def extract_memories(messages:list): #提取用户偏好、约束、项目事实等记忆
-    # 记忆窗口：会话开头前 10 条（用户偏好通常最先说）+ 结尾最后 10 条
-    if len(messages) <= 20:
-        window=messages
-    else:
-        window=messages[:10]+messages[-10:]
-        
-    dialogue_parts=[]
-    for msg in window:
-        role=msg.get('role','?')
-        content=msg.get('content','')
-        if isinstance(content,list):
-            content = " ".join(
-                str(getattr(b, "text", "")) for b in content
-                if getattr(b, "type", None) == "text"
-            )
-        if isinstance(content, str) and content.strip():
-            dialogue_parts.append(f"{role}: {content}")
-    dialogue = "\n".join(dialogue_parts) #合并所有消息，最多4000个字符，生成对话记录
-
-    if not dialogue.strip():
-        _log("[Memory: extract skipped - no text content in recent messages]")
-        return
-    
-    existing=list_memory_files()
-    existing_desc='\n'.join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
-
-    prompt=(
-        "Extract user preferences, constraints, or project facts from this dialogue.\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n"
-        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
-        "- type: one of 'user' (user preference), 'feedback' (guidance), "
-        "'project' (project fact), 'reference' (external pointer)\n"
-        "- description: one-line summary for index lookup\n"
-        "- body: full detail in markdown\n"
-        "If nothing new or already covered by existing memories, return [].\n"
-        "OUTPUT FORMAT (STRICT): reply with ONLY a plain JSON array. "
-        "Do NOT think out loud, do NOT explain, do NOT wrap it in markdown code "
-        "fences (```json), do NOT add any text before or after the array.\n\n"
-        f"Existing memories:\n{existing_desc}\n\n"
-        f"Dialogue:\n{dialogue[:4000]}"
-    )
-
-    try:
-        response=client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
-            messages=[{'role':'user','content':prompt}],
-            temperature=0.7,
-            max_tokens=4000,
-        )
-        msg=response.choices[0].message
-        text=_extract_text(msg.content or '').strip()
-        if not text:
-            # 推理模型可能把 max_tokens 预算全花在 reasoning_content 上导致 content 为空，
-            # 退而从 reasoning_content 里找 JSON 数组
-            text=_extract_text(getattr(msg,'reasoning_content','') or '').strip()
-        match=re.search(r'\[.*\]', text, re.DOTALL)
-        # 解析 JSON 数组：LLM 回复里可能混有自然语言方括号或多个数组段（Extra data），
-        # 先试贪婪匹配，失败再逐个尝试最短数组段，取第一个能解析成 list 的
-        items=None
-        if match:
-            try:
-                items=json.loads(match.group())
-            except Exception:
-                items=None
-        if not isinstance(items,list):
-            for m in re.finditer(r'\[.*?\]', text, re.DOTALL):
-                try:
-                    cand=json.loads(m.group())
-                    if isinstance(cand,list):
-                        items=cand
-                        break
-                except Exception:
-                    continue
-        if not isinstance(items,list):
-            _log(f"[Memory: extract failed - no valid JSON array in LLM reply: {text[:200]!r}]")
-            return
-        if not items:
-            _log("[Memory: extract returned empty (LLM judged nothing worth remembering)]")
-            return
-        count=0
-        for mem in items:
-            name=mem.get('name',f'memory_{int(time.time())}')
-            mem_type=mem.get('type','user')
-            desc=mem.get('description','')
-            body=mem.get('body','')
-            if desc and body:
-                write_memory_file(name,mem_type,desc,body) #写入新记忆文件，格式为name.md，内容为description\nbody
-                count+=1
-        if count:
-            _log(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
-        else:
-            _log(f"[Memory: extract returned {len(items)} items but none had desc+body]")
-    except Exception as e:
-        _log(f"[Memory: extract error: {e}]")
-
-CONSOLIDATE_THRESHOLD = 10
-
-def consolidate_memories():
-    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
-    files = list_memory_files()
-    if len(files) < CONSOLIDATE_THRESHOLD:
-        return
-
-    catalog = "\n\n".join(
-        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
-        for f in files
-    )
-
-    prompt = (
-        "Consolidate the following memory files. Rules:\n"
-        "1. Merge duplicates into one\n"
-        "2. Remove outdated/contradicted memories\n"
-        "3. Keep the total under 30 memories\n"
-        "4. Preserve important user preferences above all\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
-        f"{catalog[:16000]}"
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
-            messages=[{'role':'user','content':prompt}], max_tokens=3000
-        )
-        text = _extract_text(response.choices[0].message.content).strip()
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            _log(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
-            return
-        items = json.loads(match.group())
-        if not items:
-            # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
-            _log("[Memory: consolidate returned empty - aborting (would delete all memories)]")
-            return
-
-        # Remove old memory files (keep MEMORY.md)
-        for f in MEMORY_DIR.glob("*.md"):
-            if f.name != "MEMORY.md":
-                f.unlink()
-
-        for mem in items:
-            name = mem.get("name", f"memory_{int(time.time())}")
-            mem_type = mem.get("type", "user")
-            desc = mem.get("description", "")
-            body = mem.get("body", "")
-            if desc and body:
-                write_memory_file(name, mem_type, desc, body) #边写边更新索引
-
-
-        _log(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
-    except Exception as e:
-        _log(f"[Memory: consolidate error: {e}]")
-
-
-
-SKILL_REGISTRY:dict[str,dict]={}
-
-
-def _parse_frontmatter(text:str)->tuple[dict,str]:
-
-    if not text.startswith('---'):
-
-        return {},text
-    parts=text.split('---',2)
-    if len(parts)<3:
-        return {},text
-    try:
-        meta=yaml.safe_load(parts[1]) or {}
-
-    except yaml.YAMLError:
-        meta={}
-    if not isinstance(meta, dict):
-        meta={}   # frontmatter 非映射（如缺空格被当纯标量）时按空处理
-    return meta,parts[2].strip()
-
-def _scan_skills():
-    if not SKILLS_DIR.exists():
-        return
-    for d in sorted(SKILLS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        manifest=d / "skill.md"
-        if manifest.exists():
-            raw=manifest.read_text(encoding='utf-8', errors='replace')
-            meta,body=_parse_frontmatter(raw)
-            name=meta.get('name',d.name)
-            desc=meta.get('description',raw.split('\n')[0].lstrip('#').strip())
-            SKILL_REGISTRY[name]={'name':name,
-                'description':desc,
-                'body':body,
-            }
-
-_scan_skills()
-
-def list_skills()->str:
-    if not SKILL_REGISTRY:
-        return "No skills registered"
-    return '\n'.join(f'- **{skill["name"]}**: {skill["description"]}' for skill in SKILL_REGISTRY.values())
 
 def build_system()->str:
-    index=read_memory_index()
-    memories_section = f"\n\nMemories available:\n{index}" if index else ""
-    catalog=list_skills()
-    return SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR, memories_section=memories_section)
+    return assemble_system_prompt(update_context({},[]))
+
 
 def build_sub_system()->str:
-    catalog=list_skills()
-    return SUB_SYSTEM.format(workdir=WORKDIR, catalog=catalog, skills_dir=SKILLS_DIR)
+    return (
+        PROMPT_SECTIONS['identity_sub'].format(workdir=WORKDIR) +
+        '\n\n' +
+        PROMPT_SECTIONS['rules_sub'].format(workdir=WORKDIR) +
+        '\n\n' +
+        PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills())
+    )
+
+
+# ── 记忆 / 压缩 / hooks 逻辑已提取到 agent_core.py ──
 
 
 
-def run_bash(command:str)->str:
-
-    dangerous=["rm -rf /","sudo","shutdown","reboot","> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command, please do not execute"
-    try:
-        r=subprocess.run(command,shell=True,cwd=os.getcwd(),capture_output=True,timeout=120)
-        raw=(r.stdout or b"")+(r.stderr or b"")
-        try:
-            out=raw.decode("utf-8")
-        except UnicodeDecodeError:
-            out=raw.decode("gbk",errors="replace")
-        out=out.strip()
-        out=out.replace('\ufffd','?')  # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
-        return out[:50000] if out else "No output"
-    except subprocess.TimeoutExpired:
-        return "Error: Command timeout(120s)"
-    except (FileNotFoundError,OSError) as e:
-        return f'Error:{e}'
-
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
 
 
-def run_read(path: str, limit: Optional[int] = None) -> str:
-    try:
-        lines = safe_path(path).read_text(encoding='utf-8', errors='replace').splitlines()
-        if limit is None and len(lines) > 500:
-            # 大文件没传 limit：自动截断，防止整文件灌进上下文
-            lines = lines[:200] + [f"... ({len(lines) - 200} more lines; use limit to read in chunks)"]
-        elif limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
 
 
-def run_write(path: str, content: str) -> str:
-    try:
-        file_path = safe_path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding='utf-8')
-        return f"Wrote {len(content)} bytes to {path}"
-    except Exception as e:
-        return f"Error: {e}"
 
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
-    try:
-        file_path = safe_path(path)
-        text = file_path.read_text(encoding='utf-8', errors='replace')
-        if old_text not in text:
-            return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1), encoding='utf-8')
-        return f"Edited {path}"
-    except Exception as e:
-        return f"Error: {e}"
 
 
-def run_glob(pattern: str) -> str:
-    try:
-        base = Path(WORKDIR)
-        if '**' in pattern:
-            matches = [p for p in base.rglob(pattern) if p.is_file() and p.resolve().is_relative_to(WORKDIR)]
-        else:
-            matches = [p for p in base.glob(pattern) if p.is_file() and p.resolve().is_relative_to(WORKDIR)]
-        results = sorted(str(p.relative_to(WORKDIR)) for p in matches)
-        return "\n".join(results) if results else "(no matches)"
-    except Exception as e:
-        return f"Error: {e}"
-
-def _normalize_todos(todos):
-    if isinstance(todos, str):
-        try:
-            todos = json.loads(todos)
-        except json.JSONDecodeError:
-            try:
-                todos = ast.literal_eval(todos)
-            except (SyntaxError, ValueError):
-                return None, "Error: todos must be a list or JSON array string"
-    if not isinstance(todos, list):
-        return None, "Error: todos must be a list"
-    for i, t in enumerate(todos):
-        if not isinstance(t, dict):
-            return None, f"Error: todos[{i}] must be an object"
-        if "content" not in t or "status" not in t:
-            return None, f"Error: todos[{i}] missing 'content' or 'status'"
-        if t["status"] not in ("pending", "in_progress", "completed"):
-            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
-    return todos, None
-
-def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    todos, error = _normalize_todos(todos)
-    if error:
-        return error
-    CURRENT_TODOS = todos
-    # TTY：todo 列表渲染到固定底部面板；非 TTY：退化为普通打印
-    ui.panel.set_todos(CURRENT_TODOS)
-    return f"Updated {len(CURRENT_TODOS)} tasks"
 
 
-tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write}
-
-DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
-DESTRUCTIVE = ["rm ", "del ", "rmdir ", "rd ", "Remove-Item ", "erase ", "> /etc/", "chmod 777"]
-
-HOOKS={"UserPromptSubmit":[],"PreToolUse":[],"PostToolUse":[],"Stop":[]}
-
-def _log(text=''):
-    """日志统一输出入口：TUI 模式下追加到固定面板缓冲并重绘；否则普通打印。
-
-    所有会与 todo/状态栏同时出现的日志都应走这里。
-    """
-    ui.panel.log(text)
-
-def register_hook(event:str,callback):
-    HOOKS[event].append(callback)
-
-def trigger_hooks(event:str,*args):
-    for callback in HOOKS[event]:
-        result=callback(*args)
-        if result is not None:
-            return result #阻断工具调用
-    return None
-
-def is_tool_hook(tool:str,args:dict):
-    if tool not in tool_registry.keys():
-        return f'Error: unknown tool {tool}'
-    return None
-
-def permission_hook(tool:str,args:dict):
-    if tool=='bash':
-        for pattern in DENY_LIST:
-            if pattern in args.get("command", ""):
-                _log(ui.c('error', ui.G['deny'] + ' Blocked: {0}'.format(pattern)))
-                return f"Error: Dangerous command {pattern}, please do not execute"
-        for pattern in DESTRUCTIVE:
-            if pattern in args.get("command", ""):
-                _log(ui.permission_banner('Permission needed', [
-                    ui.c('warning', 'Potentially destructive command'),
-                    ui.tool_line('bash', args),
-                ], level='execute'))
-                choice=input("Allow? (y/n) ").strip().lower()
-                if choice not in ('y','yes'):
-                    return "Permission denied by user"
-    elif tool in ["read", "write", "edit"]:
-        path=args.get('path','')
-        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            level='write' if tool in ('write','edit') else 'read'
-            _log(ui.permission_banner('Permission needed', [
-                ui.c('warning', 'Access outside workspace'),
-                ui.tool_line(tool, {'path': path}),
-            ], level=level))
-            choice=input("Allow? (y/n) ").strip().lower()
-            if choice not in ('y','yes'):
-                return "Permission denied by user"
-
-    return None
-
-def log_hook(tool:str,args:dict,output:str):
-    # 批量模式：多次日志输出合并为一次重绘，减少 TUI 闪烁
-    with ui.panel.batch():
-        if tool == 'bash':
-            # bash 输出用 Claude Code 风格粉色边框框
-            _log(ui.bash_box(args.get('command', ''), output))
-        elif tool == 'read':
-            # read 输出用代码块背景展示，避免整文件被压平成一行 preview
-            _log(ui.code_box(args.get('path', ''), output))
-        else:
-            _log(ui.tool_line(tool, args, output))
-        _log('')  # 工具行后空一行，避免输出拥挤
-    return None
-
-def large_output_hook(tool:str,args:dict,output:str):
-    if len(str(output))>100000:
-        _log(ui.c('warning', ui.G['warn'] + ' Large output from {0}: {1} chars'.format(tool, len(str(output)))))
-    return None
-
-def context_injection_hook(query:str):
-    _log(ui.status('working in {0}'.format(WORKDIR)))
-    return None
-
-def _build_statusline(messages:list) -> str:
-    """生成会话状态行文本（供固定底部面板持续刷新）。
-
-    统计口径：
-    - tools: 会话内实际执行次数（累计，不随上下文压缩重置）
-    - ctx_pct: 优先用最近一次 API 的真实输入 token(usage.prompt_tokens)，
-      无 usage 时退回启发式 estimate_size
-    - tokens/cost: 真实 usage 累计；无 usage 时退回启发式估算
-    """
-    tool_count=_SESSION_METRICS['tools']
-    ctx_pct = None
-    try:
-        if _SESSION_METRICS['ctx_tokens']:
-            # 真实输入量占窗口上限的百分比（比启发式 estimate_size 准）
-            ctx_pct = min(100, 100.0 * _SESSION_METRICS['ctx_tokens'] / max(1, CONTEXT_LIMIT))
-        else:
-            ctx_pct = min(100, 100.0 * estimate_size(messages) / max(1, CONTEXT_LIMIT))
-    except Exception:
-        ctx_pct = None
-    branch = ''
-    try:
-        branch = subprocess.run(
-            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            capture_output=True, text=True, timeout=5).stdout.strip()
-    except Exception:
-        branch = ''
-    # 优先使用真实累计 token；API 未返回 usage 时回退到启发式估算
-    tokens_est = ''
-    cost = None
-    try:
-        if _SESSION_METRICS['tokens']:
-            tokens_est = '{0:.1f}k'.format(_SESSION_METRICS['tokens'] / 1000.0)
-            cost = _SESSION_METRICS['cost']
-        else:
-            tokens_est = '{0}k'.format(round(estimate_size(messages) / 1000.0))
-    except Exception:
-        pass
-    return ui.statusline(model=os.getenv('LLM_MODEL_ID', ''), tools=tool_count,
-                         ctx_pct=ctx_pct, tokens=tokens_est, cost=cost,
-                         workdir=str(WORKDIR), git_branch=branch)
-
-def update_panel_status(messages:list) -> None:
-    """刷新固定底部面板的状态行（会话开始 / 每次工具执行后 / 会话结束）。"""
-    if not messages:
-        return
-    line=_build_statusline(messages)
-    # TTY：渲染进固定底部面板；非 TTY 下由 _log 的调用方按普通打印输出
-    ui.panel.set_status(line)
-
-def summary_hook(messages:list):
-    update_panel_status(messages)
-    return None
-
-register_hook("UserPromptSubmit",context_injection_hook)
-register_hook("Stop",summary_hook)
-register_hook("PreToolUse",is_tool_hook)
-register_hook("PreToolUse",permission_hook)
-register_hook("PostToolUse",log_hook)
-register_hook("PostToolUse",large_output_hook)
-
-SUB_TOOLS=TOOLS.copy()
-
-SUB_HANDLERS=tool_registry.copy()
-
-def _extract_text(text:str)->str:
-    return text.strip()
 
 
-def spawn_subagent(description:str)->str:
-    _log('\n' + ui.c('info', ui.G['play'] + ' Subagent spawned'))
-    messages=[{'role':'system','content':build_sub_system()},{'role':'user','content':description}]
 
 
-    for _ in range(30):
 
-        with ui.Spinner('Subagent thinking'):
-            response=client.chat.completions.create(
-                model=os.getenv("LLM_MODEL_ID"),
-                messages=messages,
-                tools=SUB_TOOLS,
-                temperature=0.7,
-                max_tokens=8000,
-            )
-        message=response.choices[0].message
-        messages.append(message.model_dump())
-
-        if response.choices[0].finish_reason != "tool_calls":
-            force=trigger_hooks('Stop',messages)
-            if force:
-                messages.append({'role':'user','content':force})
-                continue
-            if message.content:
-                _log(ui.markdown(message.content))
-            return message.content or "No output"
-
-        tool_messages = []
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-
-            blocked = trigger_hooks("PreToolUse", name, args)
-            if blocked:
-                output = blocked
-            elif name not in SUB_HANDLERS:
-                output = f"Error: unknown tool {name}"
-            else:
-                output = SUB_HANDLERS[name](**args)
-
-            trigger_hooks("PostToolUse", name, args, output)
-
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": output,
-            })
-
-        messages.extend(tool_messages)
-
-    result=_extract_text(messages[-1]['content']) if isinstance(messages[-1].get('content'), str) else ""
-    if not result:
-        for m in reversed(messages):
-            if m['role']=='assistant' and isinstance(m.get('content'), str):
-                result=_extract_text(m['content'])
-                if result:
-                    break
-        if not result:
-            result="Subagent stopped after 30 turns without final answer."
-    _log(ui.c('info', ui.G['square'] + ' Subagent done'))
-    return result
+# Task tools
 
 
-TOOLS.append({
-    "type":"function",
-    "function":{
-        "name":"task",
-        "description":"Spawn a subagent to complete a task",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "description":{
-                    "type":"string",
-                    "description":"The task description"
-                }
-            },
-            "required":[
-                "description"
-            ]
-        }
-    }
 
 
-})
+
+
+
+
+
+
+
+# ── Cron Tools ──
+
+
+
+
+
+
+
+# ── Team Tools ──
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 tool_registry['task']=spawn_subagent
 
-TOOLS.append({
-    "type":"function",
-    "function":{
-        "name":"load_skill",
-        "description":"Load a registered skill's instructions by its name. When the system prompt lists skills (e.g. 'file-summarizer'), call this tool with that exact name to get the skill body instead of searching the filesystem manually.",
-        "parameters":{
-            "type":"object",
-            "properties":{
-                "name":{
-                    "type":"string",
-                    "description":"The exact skill name shown in the Skills available list, e.g. 'file-summarizer'"
-                }
-            },
-            "required":[
-                "name"
-            ]
-        }
-    }
 
-})
-
-def load_skill(name:str)->str:
-    skill=SKILL_REGISTRY.get(name)
-    if not skill:
-        return f"Error: skill {name} not found"
-    return skill['body']
 
 tool_registry['load_skill']=load_skill
 
 # compact 工具：让模型在上下文过长时主动触发历史摘要
 # （不注册进 tool_registry，由 agent_loop 特殊处理）
-TOOLS.append({
-    "type":"function",
-    "function":{
-        "name":"compact",
-        "description":"Summarize the conversation history to free up context. Call this when the conversation is getting too long or you want to clear old tool outputs.",
-        "parameters":{
-            "type":"object",
-            "properties":{}
-        }
-    }
-})
 
-# 模型上下文窗口（token），可用环境变量 LLM_CONTEXT_WINDOW 覆盖
-MODEL_WINDOWS = {
-    'deepseek-v4-flash': 131072,
-    'deepseek-chat': 65536,
-    'deepseek-reasoner': 65536,
-}
-OUTPUT_RESERVE = 8192        # 给 max_tokens=8000 输出预留
-CTX_SAFETY = 0.8             # 留余量，防 prompt_too_long
+# ============================================================
+# 可复用模块：压缩预处理 / 记忆注入 / 工具执行
+# 压缩原语（estimate_size/snip_compact/micro_compact/compact_history 等）
+# 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
+# ============================================================
 
-def _default_context_limit() -> int:
-    window = int(os.getenv('LLM_CONTEXT_WINDOW') or
-                 MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID', ''), 65536))
-    return max(4000, int((window - OUTPUT_RESERVE) * CTX_SAFETY))
-
-CONTEXT_LIMIT=_default_context_limit()
-KEEP_RECENT=6
-PERSIST_THERSHOLD=10000
-TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
-TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
-
-def estimate_size(msgs):
-    # token 启发式：英文约 3.5 字符/token，中文约 1.3 字符/token（与 CONTEXT_LIMIT 同单位）
-    text=str(msgs)
-    ascii_chars=sum(1 for ch in text if ord(ch) < 128)
-    cjk=len(text)-ascii_chars
-    return max(1, int(ascii_chars/3.5 + cjk*1.3))
+def pre_compact_messages(messages, skip_micro_rounds=0):
+    """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
+    返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
+    messages = tool_result_budget(messages)
+    messages = snip_compact(messages)
+    if skip_micro_rounds > 0:
+        skip_micro_rounds -= 1   # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
+    else:
+        messages = micro_compact(messages)
+    if estimate_size(messages) > CONTEXT_LIMIT:
+        bus.emit('debug', msg="[auto compact]")
+        messages = compact_history(messages)
+        skip_micro_rounds = 3
+    return messages, skip_micro_rounds
 
 
-
-# OpenAI 格式：assistant 的 tool_calls 是顶层字段（content 为 null/字符串），
-# 工具结果是独立的 role='tool' 消息（tool_call_id + content 字符串）
-def _message_has_tool_use(msg): #判断是否工具调用
-    return msg.get('role')=='assistant' and bool(msg.get('tool_calls'))
-
-def _is_tool_result_message(msg): #判断是否工具结果
-    return msg.get('role')=='tool'
-
-def snip_compact(messages,max_messages=50): #保留头 3 条，尾部47 条，中间按 tool_calls 分组
-    if len(messages)<=max_messages:
-        return messages
-    # 头部：保留前 3 条；不能切断"assistant 带多个工具"的分组（否则 dangling）
-    head_end=3
-    if head_end>0 and head_end<len(messages):
-        # 情况 A：头部以 assistant-with-tool_calls 结尾 → 并入其工具结果
-        if _message_has_tool_use(messages[head_end-1]):
-            while head_end<len(messages) and _is_tool_result_message(messages[head_end]):
-                head_end+=1
-        # 情况 B：头部切断在分组中间（前后都是工具结果）→ 并入剩余工具结果
-        while head_end<len(messages) and _is_tool_result_message(messages[head_end-1]) and _is_tool_result_message(messages[head_end]):
-            head_end+=1
-    # 尾部预算：head + 1 条 marker + tail <= max_messages
-    keep_tail=max_messages-head_end-1
-    if keep_tail<=1:
-        return messages[:head_end]
-    tail_start=len(messages)-keep_tail
-    # 裁剪点不能落在工具结果上（其 assistant 已被裁掉=孤儿），推进到非工具消息
-    while tail_start<len(messages) and _is_tool_result_message(messages[tail_start]):
-        tail_start+=1
-    if head_end>=tail_start:
-        return messages
-    result=messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
-    # 若配对调整导致超出预算，从尾部再裁掉超出的条数，并避免以"孤儿"工具结果开头
-    over=len(result)-max_messages
-    while over>0 and tail_start<len(messages):
-        tail_start+=1
-        over-=1
-        while (tail_start<len(messages) and _is_tool_result_message(messages[tail_start])):
-            tail_start+=1
-            over-=1
-    return messages[:head_end]+[{'role':'user','content':f"[snipped {tail_start-head_end} messages]"}]+messages[tail_start:]
-
-def collect_tool_results(messages): #收集所有工具结果
-    return [msg for msg in messages if msg.get('role')=='tool']
-
-def micro_compact(messages): #旧工具结果占位，只保留最近 KEEP_RECENT 条工具结果
-    tool_results=collect_tool_results(messages)
-    if len(tool_results)<KEEP_RECENT:
-        return messages
-    for msg in tool_results[:-KEEP_RECENT]:
-        if len(str(msg.get('content','')))>120:
-            msg['content']="[Earlier tool result compacted. Re-run if needed.]"
-    return messages
-
-def persist_large_output(tool_use_id,output): #持久化大输出
-    if len(output)<=PERSIST_THERSHOLD:
-        return output
-    TOOL_RESULTS_DIR.mkdir(parents=True,exist_ok=True)
-    path=TOOL_RESULTS_DIR / f'{tool_use_id}.txt'
-    if not path.exists():
-        path.write_text(output,encoding='utf-8')
-    return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
-
-def tool_result_budget(messages,max_bytes=None):  #将工具结果压缩到 max_bytes 内存
-    if max_bytes is None:
-        # 默认预算取 CONTEXT_LIMIT 的 80%，保证 budget 先于自动压缩(LLM)触发
-        max_bytes=int(CONTEXT_LIMIT*0.8)
-    tool_msgs=[m for m in messages if m.get('role')=='tool']
-    total=sum(len(str(m.get('content',''))) for m in tool_msgs)
-    if total<=max_bytes:
-        return messages
-    ranked=sorted(tool_msgs,key=lambda m:len(str(m.get('content',''))),reverse=True)
-    for m in ranked:
-        if total<=max_bytes:
-            break
-        content=str(m.get('content',''))
-        if len(content)<=PERSIST_THERSHOLD:
-            continue
-        tid=m.get('tool_call_id','unknown')
-        m['content']=persist_large_output(tid,content) #持久化大输出，返回引用路径和预览内容
-        total=sum(len(str(x.get('content',''))) for x in tool_msgs)
-    return messages
-
-def write_transcript(messages): #写入对话记录，返回路径
-    TRANSCRIPT_DIR.mkdir(parents=True,exist_ok=True)
-
-    path=TRANSCRIPT_DIR /f'transcript_{int(time.time())}.jsonl'
-
-    with open(path,'w',encoding='utf-8') as f:
-        for msg in messages:
-            f.write(json.dumps(msg,default=str)+'\n')
-    return path
-
-def summarize_history(messages): #总结对话记录，返回总结内容
-    if not messages:
-        return "(empty summary)"
-    conversation=json.dumps(messages,default=str)[-80000:]
-    prompt= ("Summarize this coding-agent conversation so work can continue.\n"
-              "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
-              "4. remaining work, 5. user constraints.\nBe compact but concrete, and MUST complete "
-              "all five sections - if tight on space, drop details rather than truncating.\n\n" + conversation)
-    response=client.chat.completions.create(
-        model=os.getenv("LLM_MODEL_ID"),
-        messages=[{'role':'user','content':prompt}],
-        temperature=0.7,
-        max_tokens=4000,
-    )
-    return (response.choices[0].message.content or "(empty summary)").strip()
-
-def compact_history(messages): #使用llm进行对话记录压缩，返回压缩后的消息
-    transcript_path=write_transcript(messages)
-    _log(f'[transcript saved:{transcript_path}]')
-    summary=summarize_history(messages)
-    return [{'role':'system','content':build_system()},
-            {'role':'user','content':f'[Compacted]\n\n{summary}'}]
-
-def reactive_compact(messages): #保存完整对话记录，保留最近五条消息，返回压缩后的消息
-    transcript=write_transcript(messages)
-    tail_start=max(0,len(messages)-5)
-    # 尾部起点不能是孤儿工具结果（其 assistant 已被裁掉）
-    while tail_start<len(messages) and _is_tool_result_message(messages[tail_start]):
-        tail_start+=1
-    summary=summarize_history(messages[:tail_start])
-    result=[{'role':'system','content':build_system()},
-            {'role':'user','content':f'[Reactive compact]\n\n{summary}'}]
-    result.extend(messages[tail_start:])   # 保留最近工作现场
-    return result
-    
-MAX_REACTIVE_RETRIES=1
+def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
+    """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
+    返回 (name, args, tool 消息 dict)。主循环与 teammate 共用同一条安全/兜底路径。
+    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。"""
+    name = tool_call.function.name
+    args = json.loads(tool_call.function.arguments)
+    if registry is None:
+        registry = tool_registry
+    if hooks:
+        blocked = trigger_hooks("PreToolUse", name, args)
+    else:
+        blocked = None
+    if blocked:
+        output = blocked
+    elif name not in registry:
+        output = f"Error: unknown tool {name}"
+    else:
+        try:
+            if background and should_run_background(name, args):
+                bg_id = start_background_task(tool_call, registry)
+                output = (f"[Background task {bg_id} started] "
+                          f"Command: {args.get('command', '')}. "
+                          f"Result will be available when complete.")
+            else:
+                output = registry[name](**args)
+        except Exception as e:
+            # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
+            output = f"Error: {e}"
+    if hooks:
+        trigger_hooks("PostToolUse", name, args, output)
+    return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
 
 # 当前会话累计指标（供 summary_hook / statusline 使用）
 # tokens: 真实 usage.total_tokens 累计；cost: 按单价估算累计（元）
@@ -1129,19 +331,29 @@ def _estimate_cost(prompt_tokens:int,completion_tokens:int,model:str)->float:
         return 0.0
     return (prompt_tokens*cost['input']+completion_tokens*cost['output'])/1_000_000
 
+def update_panel_status(messages:list) -> None:
+    """发送会话状态指标事件（模型 / 工具数 / 上下文占用 / token / 成本）。
+
+    渲染与否由订阅的渲染后端决定（默认 AnsiRenderer 不渲染 status）。"""
+    ctx_pct = 0
+    if messages:
+        ctx_pct = min(100, int(100 * estimate_size(messages) / CONTEXT_LIMIT))
+    bus.emit('status',
+             model=os.getenv('LLM_MODEL_ID', ''),
+             tools=len(tool_registry),
+             ctx_pct=ctx_pct,
+             tokens=str(_SESSION_METRICS.get('tokens', 0)),
+             cost=_SESSION_METRICS.get('cost', 0))
+
 def agent_loop(messages:list):
-    global _SESSION_METRICS
-    _SESSION_METRICS={'tokens':0,'cost':0.0,'tools':0,'ctx_tokens':0}
+    context=update_context({},messages)
+    recovery_state=recovery.RecoveryState()
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
-    messages.append({'role':'system','content':build_system()}) #循环开始前，添加系统提示词
+    system=get_system_prompt(context)
     reactive_retries=0 #响应重试次数
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
-    # 会话开始即激活固定底部面板：状态栏常驻屏幕底部
-    if not ui.panel._enabled:
-        print(f"[ui] 固定面板未启用 (stdout.isatty()={sys.stdout.isatty()})"
-              f" —— 设置 HARNESS_FORCE_PANEL=1 可强制启用")
     update_panel_status(messages)
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
@@ -1149,20 +361,10 @@ def agent_loop(messages:list):
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
 
     while True:
-        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的消息，保留所有消息类型
+        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
-        messages[:]=tool_result_budget(messages) #具体压缩方式：大的工具结果优先压缩
-        messages[:]=snip_compact(messages) #保留头尾消息，切除中间部分
-        if skip_micro_rounds>0:
-            skip_micro_rounds-=1  # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
-        else:
-            messages[:]=micro_compact(messages)
-
-        if estimate_size(messages) > CONTEXT_LIMIT:
-            _log("[auto compact]")
-            messages[:]=compact_history(messages) #调用Llm进行压缩
-            skip_micro_rounds=3
+        messages, skip_micro_rounds = pre_compact_messages(messages, skip_micro_rounds)
 
         if rounds_since_todo >=8 and messages:
             messages.append({
@@ -1170,36 +372,42 @@ def agent_loop(messages:list):
                 'content':"<reminder>Update your todos.</reminder>",
             })
             rounds_since_todo=0
+
+        fired=consume_cron_queue()
+        for job in fired:
+            messages.append({
+                'role':'user',
+                'content':f'[Scheduled] {job.prompt}'
+            })
+            bus.emit('debug', msg=f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+
         
 
 
 
 
-        request_messages = messages
-        if memories_content:
-            # 记忆注入：只往「第一条用户消息」追加（break 后即停），不是每条消息都追加；
-            # 注入的是 request_messages 副本，不污染 messages，压缩/转录/tool 配对保持干净。
-            request_messages = messages.copy()
-            for i, m in enumerate(request_messages):
-                if m.get('role') == 'user' and isinstance(m.get('content'), str):
-                    request_messages[i] = {**m, 'content': memories_content + '\n\n' + m['content']}
-                    break
+        # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
+        request_messages = inject_memories(messages, memories_content, system)
+
+        def _create():
+            max_tokens=(recovery.ESCALATED_MAX_TOKENS
+                        if recovery_state.has_escalated
+                        else recovery.DEFAULT_MAX_TOKENS)
+            return client.chat.completions.create(
+                model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
+                messages=request_messages,
+                tools=TOOLS,
+                temperature=0.7,
+                max_tokens=max_tokens,
+            )
 
         try:
-            with ui.Spinner('Thinking'):
-                response=client.chat.completions.create(
-                    model=os.getenv("LLM_MODEL_ID"),
-                    messages=request_messages,
-                    tools=TOOLS,
-                    temperature=0.7,
-                    max_tokens=8000,
-                )
+            response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
         except Exception as e:
-            if ('prompt_too_long' in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries<MAX_REACTIVE_RETRIES:
-
+            if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 reactive_retries+=1
-                _log('[reactive compact]')
+                bus.emit('debug', msg='[reactive compact]')
                 messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
                 skip_micro_rounds=3
                 continue
@@ -1221,17 +429,23 @@ def agent_loop(messages:list):
         message=response.choices[0].message
         messages.append(message.model_dump()) #添加模型回复到上下文
 
+        # 输出被截断：升级到加大 max_tokens 并提示续写
+        if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
+            recovery_state.has_escalated=True
+            print('  [length] escalating max_tokens and requesting continuation')
+            messages.append({'role':'user','content':recovery.CONTINUATION_PROMPT})
+            continue
+
 
         if response.choices[0].finish_reason != "tool_calls":
             force=trigger_hooks('Stop',messages)
             if force:
                 messages.append({'role':'user','content':force})
                 continue
-            # 最终回复：先退出 TUI 固定面板（局部清除固定区），再普通打印。
-            # 大段回复不再触发全屏重绘 → 无闪烁，且可自由滚动回看。
-            ui.panel.close()
+            # 最终回复：以事件形式交给渲染后端（默认 AnsiRenderer 普通打印）。
+            bus.emit('session_end')
             if message.content:
-                _log(ui.markdown(message.content))
+                bus.emit('assistant_text', text=message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
@@ -1250,64 +464,86 @@ def agent_loop(messages:list):
         tool_messages = []
         compacted = False
         used_todo = False
-        with ui.panel.batch():
-            for tool_call in message.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                if name=='todo_write':
-                    used_todo = True
-                if name == 'compact':
-                    # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
-                    # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
-                    # 改为文本附到新上下文里，避免执行结果丢失。
-                    messages[:] = compact_history(messages)
-                    skip_micro_rounds=3
-                    note = '[Compacted] Conversation history has been summarized.'
-                    if tool_messages:
-                        done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
-                        note += '\n\nTool results executed before compaction:\n' + done
-                    messages.append({'role': 'user', 'content': note})
-                    compacted = True
-                    break
+        for tool_call in message.tool_calls:
+            if tool_call.function.name == 'todo_write':
+                used_todo = True
+            if tool_call.function.name == 'compact':
+                # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
+                # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
+                # 改为文本附到新上下文里，避免执行结果丢失。
+                messages[:] = compact_history(messages)
+                skip_micro_rounds=3
+                note = '[Compacted] Conversation history has been summarized.'
+                if tool_messages:
+                    done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
+                    note += '\n\nTool results executed before compaction:\n' + done
+                messages.append({'role': 'user', 'content': note})
+                compacted = True
+                break
 
-                blocked = trigger_hooks("PreToolUse", name, args)
-                if blocked:
-                    output = blocked
-                elif name not in tool_registry:
-                    output = f"Error: unknown tool {name}"
-                else:
-                    try:
-                        output = tool_registry[name](**args)
-                    except Exception as e:
-                        # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
-                        output = f"Error: {e}"
-                _SESSION_METRICS['tools']+=1   # 会话内实际执行工具次数（含被 hook 拦截的）
-
-                trigger_hooks("PostToolUse", name, args, output)
-
-                tool_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": output,
-                })
+            _, _, tool_message = exec_tool_call(tool_call)   # hook 权限 → 后台/直接执行 → 兜底
+            tool_messages.append(tool_message)
 
         if compacted: #压缩后工具丢失，需要重新执行
             continue
 
+        notifications=collect_background_results()
+        if notifications:
+            for notification in notifications:
+                # 后台任务完成通知：作为 user 消息注入（孤儿 role=tool 会触发 API 400）
+                tool_messages.append(
+                    {
+                        'role':'user',
+                        'content':notification,
+                        
+                    }
+                )
+            print(f"  \033[32m[inject] {len(notifications)} background "
+                  f"notification(s)\033[0m")
+
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        # 工具执行后刷新固定底部面板的状态行（tool 数 / 上下文占用 / token / 成本）
-        update_panel_status(messages)
+        context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
+        system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等
+        update_panel_status(messages)   # 每轮工具后刷新状态事件（渲染后端可消费）
+
+
+def run_agent_turn_locked():
+    """持锁状态下执行一轮对话（供 queue_processor_loop 调用）：
+    消费 cron 队列 → 构造 user 消息 → agent_loop。"""
+    fired = consume_cron_queue()
+    if not fired:
+        return
+    prompts = [f'[Scheduled] {job.prompt}' for job in fired]
+    print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+    try:
+        agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
+    except KeyboardInterrupt:
+        print('\n[会话已中断]')
+
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '请用中文总结当前工作区所有 .py 文件的代码结构。'
-    '注意：以后输出报告一律用中文；'
-    '并且永远不要用 PowerShell Get-Content 读文件（会乱码），改用 read 工具。'}]
+    # 启动 cron 调度线程（生产队列）+ 队列处理器（推送执行）；测试直接调 agent_loop 不受影响
+    load_durable_jobs()
+    threading.Thread(target=cron_scheduler_loop, daemon=True).start()
+    threading.Thread(target=queue_processor_loop,
+                     args=(run_agent_turn_locked,), daemon=True).start()
+
+    # 接入 MCP：连接配置的 server，工具动态注册进 tool_registry + TOOLS
+    TOOLS.extend(register_mcp_tools(tool_registry))
+
+    def _run_session(msgs):
+        try:
+            agent_loop(msgs)
+        except KeyboardInterrupt:
+            print('\n[会话已中断]')
+
+    # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
+    with agent_lock:
+        _run_session([{'role': 'user', 'content': '用 echo 回显 hello，用 add 计算 3+4"即可'}])
+
+    # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
     try:
-        agent_loop(messages)
+        wait_for_cron_idle()
     except KeyboardInterrupt:
-        # Ctrl+C（如 API 挂起时中断）：退出 TUI 后给出友好提示，不打原始 traceback
         print('\n[会话已中断]')
-    finally:
-        # 异常兜底：确保退出 TUI（Rich Live / 面板固定区），不把用户留在备屏/半屏状态
-        ui.panel.close()

@@ -13,11 +13,38 @@ import copy
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
+import pytest
+
+
+@contextmanager
+def _isolate_memories():
+    """隔离记忆目录：真机记忆文件会让 load_memories 提前消费 mock 队列（污染测试）。
+    与 test_memory.py 的 patch 模式一致，测试结束还原 + 清理临时目录。"""
+    orig_dir, orig_index = harness.MEMORY_DIR, harness.MEMORY_INDEX
+    tmp = Path(tempfile.mkdtemp())
+    harness.MEMORY_DIR = tmp
+    harness.MEMORY_INDEX = tmp / 'MEMORY.md'
+    try:
+        yield
+    finally:
+        harness.MEMORY_DIR = orig_dir
+        harness.MEMORY_INDEX = orig_index
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _auto_isolate_memories():
+    with _isolate_memories():
+        yield
 
 
 # ---------- logger：统一输出带时间戳的调试日志，方便排查 ----------
@@ -363,12 +390,13 @@ def test_full_session_scenario():
     compact_calls = []
     reactive_calls = []
     harness.CONTEXT_LIMIT = 100
-    # 会话开始的状态行 + 每轮工具后的状态行也会调用 estimate_size（无 usage 时），
-    # 用计数制 mock 而非耗尽式迭代器，避免 StopIteration；第 6 次调用 = 第 2 轮 pre-API 检查。
+    # 调用点：会话开始状态行(1) + 每轮 pre-API(2,4,6...) + 每轮工具后状态行(3,5,7...)，
+    # 第 4 次调用 = 第 2 轮 pre-API 检查，触发 iteration 2 的自动压缩。
+    # （合并版无循环内额外状态刷新，故计数从旧版的 6 调整为 4）
     est_state = {'n': 0}
     def fake_estimate(msgs):
         est_state['n'] += 1
-        return 10000 if est_state['n'] == 6 else 50
+        return 10000 if est_state['n'] == 4 else 50
     harness.estimate_size = fake_estimate
     harness.compact_history = lambda msgs: (compact_calls.append(len(msgs))
                                             or logger.info("[scenario] compact_history called (auto/compact tool) on %d msgs", len(msgs))
@@ -424,20 +452,21 @@ def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith('test_') and callable(v)]
     failed = 0
-    for t in tests:
-        logger.info("=== running: %s ===", t.__name__)
-        try:
-            t()
-            logger.info("=== PASS: %s ===", t.__name__)
-            print(f"[PASS] {t.__name__}")
-        except AssertionError as e:
-            failed += 1
-            logger.error("=== FAIL: %s: %s ===", t.__name__, e)
-            print(f"[FAIL] {t.__name__}: {e}")
-        except Exception as e:
-            failed += 1
-            logger.error("=== ERROR: %s: %s: %s ===", t.__name__, type(e).__name__, e)
-            print(f"[ERROR] {t.__name__}: {type(e).__name__}: {e}")
+    with _isolate_memories():
+        for t in tests:
+            logger.info("=== running: %s ===", t.__name__)
+            try:
+                t()
+                logger.info("=== PASS: %s ===", t.__name__)
+                print(f"[PASS] {t.__name__}")
+            except AssertionError as e:
+                failed += 1
+                logger.error("=== FAIL: %s: %s ===", t.__name__, e)
+                print(f"[FAIL] {t.__name__}: {e}")
+            except Exception as e:
+                failed += 1
+                logger.error("=== ERROR: %s: %s: %s ===", t.__name__, type(e).__name__, e)
+                print(f"[ERROR] {t.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
 
