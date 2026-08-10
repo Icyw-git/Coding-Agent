@@ -89,5 +89,5 @@ def agent_loop(messages:list):
         messages.extend(tool_messages)
 
 if __name__ == '__main__':
-    messages = [{'role': 'user', 'content': '帮我删除文件test.txt'}]
+    messages = [{'role': 'user', 'content': '帮我删除文件text.txt'}]
     agent_loop(messages)
