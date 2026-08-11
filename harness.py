@@ -172,7 +172,7 @@ def update_context(context:dict,messages:list)->dict: # 更新上下文，包含
     }
 
 
-def build_system()->str:
+def build_system()->str: #暴露给外部调用，返回系统提示
     return assemble_system_prompt(update_context({},[]))
 
 
@@ -262,7 +262,7 @@ tool_registry['load_skill']=load_skill
 # 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
 # ============================================================
 
-def pre_compact_messages(messages, skip_micro_rounds=0):
+def pre_compact_messages(messages, skip_micro_rounds=0): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
     """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
     返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
     messages = tool_result_budget(messages)
@@ -294,7 +294,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
         output = blocked
     elif name not in registry:
         output = f"Error: unknown tool {name}"
-    else:
+    else: #判断是否为后台任务，若为后台任务则启动后台任务，否则直接执行工具
         try:
             if background and should_run_background(name, args):
                 bg_id = start_background_task(tool_call, registry)
@@ -311,7 +311,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
 
 def agent_loop(messages:list):
-    context=update_context({},messages)
+    context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
         trigger_hooks('UserPromptSubmit',messages[-1]['content'])
@@ -328,7 +328,7 @@ def agent_loop(messages:list):
         pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
-        messages, skip_micro_rounds = pre_compact_messages(messages, skip_micro_rounds)
+        messages, skip_micro_rounds = pre_compact_messages(messages, skip_micro_rounds) #压缩预处理流程
 
         if rounds_since_todo >=8 and messages:
             messages.append({
@@ -337,7 +337,7 @@ def agent_loop(messages:list):
             })
             rounds_since_todo=0
 
-        fired=consume_cron_queue()
+        fired=consume_cron_queue() #消费 cron 任务列
         for job in fired:
             messages.append({
                 'role':'user',
@@ -353,7 +353,7 @@ def agent_loop(messages:list):
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         request_messages = inject_memories(messages, memories_content, system)
 
-        def _create():
+        def _create(): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
@@ -365,7 +365,7 @@ def agent_loop(messages:list):
                 max_tokens=max_tokens,
             )
 
-        try:
+        try: #错误恢复逻辑
             response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
         except Exception as e:
@@ -436,7 +436,7 @@ def agent_loop(messages:list):
         if compacted: #压缩后工具丢失，需要重新执行
             continue
 
-        notifications=collect_background_results()
+        notifications=collect_background_results() #收集后台任务结果
         if notifications:
             for notification in notifications:
                 # 后台任务完成通知：作为 user 消息注入（孤儿 role=tool 会触发 API 400）
@@ -488,7 +488,7 @@ if __name__ == '__main__':
 
     # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
     with agent_lock:
-        _run_session([{'role': 'user', 'content': '用 echo 回显 hello，用 add 计算 3+4"即可'}])
+        _run_session([{'role': 'user', 'content': '这个项目的规模有多大'}])
 
     # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
     try:

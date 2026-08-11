@@ -26,7 +26,8 @@ client = openai.OpenAI(
 active_teammates = {}
 
 
-class MessageBus:
+class MessageBus: 
+    """消息总线，用于团队成员之间的通信。"""
     # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = 'message', metadata: dict = None):

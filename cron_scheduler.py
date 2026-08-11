@@ -21,7 +21,7 @@ agent_lock=threading.Lock() # 代理锁，用于保护代理状态
 _last_fired:dict[str,str]={} # id -> last fired time
 DURABLE_PATH=Path(__file__).resolve().parent/'.cache'/'crons.json'
 
-def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间
+def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间，支持通配符、范围、步长
     if field=="*":
         return True
     if field.startswith("*/"):
@@ -60,7 +60,7 @@ def cron_matches(cron_expr:str,dt:datetime)->bool: #对外接口，判断cron表
         return dom_ok   # dow 通配 → 只看 dom
     return dom_ok and dow_ok
 
-def _validate_cron_field(field:str,lo:int,hi:int):
+def _validate_cron_field(field:str,lo:int,hi:int): #验证cron表达式字段是否有效，返回错误信息或None
     if field=='*':
         return None
     if field.startswith("*/"):
@@ -96,7 +96,7 @@ def _validate_cron_field(field:str,lo:int,hi:int):
         return f'Value {val} out of bounds [{lo}-{hi}]'
     return None
 
-def validate_cron(cron_expr:str): #验证cron表达式是否有效，返回错误信息或None
+def validate_cron(cron_expr:str): #验证cron表达式是否有效，返回错误信息或None，对外接口
     fields=cron_expr.strip().split()
     if len(fields)!=5:
         return f'Expected 5 fields,got {len(fields)}'
@@ -130,7 +130,7 @@ def load_durable_jobs(): #加载持久化任务，将有效任务添加到schedu
         valid=[j for j in jobs if j['id'] in scheduled_jobs]
         if valid:
             print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
-    except Exception:
+    except Exception: 
         pass
 
 def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #注册一个cron任务
@@ -145,13 +145,13 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #�
         id=f'cron_{random.randint(0,999999):06d}',
         cron=cron,
         prompt=prompt,
-        recurring=recurring,
-        durable=durable,
+        recurring=recurring, # 是否重复执行
+        durable=durable, # 是否持久化存储
     )
 
-    with cron_lock:
+    with cron_lock: #确保写入scheduled_jobs时线程安全，避免重复注册
         scheduled_jobs[job.id]=job
-    if durable:
+    if durable: # 如果任务持久化存储，保存持久化存储
         save_durable_jobs()
     print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
     return job
@@ -160,30 +160,30 @@ def cancel_job(job_id:str)->str: #取消一个cron任务
     """
     Cancel a cron job with the scheduler.
     """
-    with cron_lock:
+    with cron_lock: #确保取消scheduled_jobs时线程安全，避免重复取消
         job=scheduled_jobs.pop(job_id,None)
     if not job:
         return f'Job {job_id} not found'
-    if job.durable:
+    if job.durable: # 如果任务持久化存储，保存持久化存储
         save_durable_jobs()
     print(f"  \033[31m[cron cancel] {job_id}\033[0m")
     return f'Cancelled {job_id}'
 
 def cron_scheduler_loop(): #cron任务调度循环，每秒检查一次是否有任务到点
     while True:
-        time.sleep(1)
+        time.sleep(1) # 每秒检查一次是否有任务到点
         now=datetime.now()
         minute_marker=now.strftime("%Y-%m-%d %H:%M")
-        with cron_lock:
+        with cron_lock: #确保遍历scheduled_jobs时线程安全，避免并发修改
             for job in list(scheduled_jobs.values()):
                 try:
-                    if cron_matches(job.cron,now):
-                        if _last_fired.get(job.id)!=minute_marker:
+                    if cron_matches(job.cron,now): # 如果任务到点
+                        if _last_fired.get(job.id)!=minute_marker: # 如果任务未触发过
                             cron_queue.append(job)
                             _last_fired[job.id]=minute_marker
                             print(f"  \033[35m[cron fire] {job.id} → "
                                   f"{job.prompt[:40]}\033[0m")
-                        if not job.recurring:
+                        if not job.recurring: # 如果任务不重复执行
                             scheduled_jobs.pop(job.id,None)
                             if job.durable:
                                 save_durable_jobs()
@@ -195,9 +195,9 @@ def consume_cron_queue()->list[CronJob]: #消费cron队列中的任务，返回�
     Consume cron jobs from the queue.
     """
     with cron_lock:
-        fired=list(cron_queue)
-        cron_queue.clear()
-    return fired
+        fired=list(cron_queue) # 复制队列，避免并发修改
+        cron_queue.clear() # 清空队列
+    return fired 
 
 def _has_cron_queue()->bool: #检查cron队列是否为空
     with cron_lock:
@@ -211,8 +211,8 @@ def queue_processor_loop(run_turn, poll_interval: float = 0.2) -> None:
     - 双重检查：拿到锁后队列可能已被取走，避免跑空轮。
     """
     while True:
-        time.sleep(poll_interval)
-        if not _has_cron_queue():
+        time.sleep(poll_interval) # 每 poll_interval 秒检查一次是否有任务到点
+        if not _has_cron_queue(): # 如果队列为空
             continue
         if not agent_lock.acquire(blocking=False):   # 尝试拿锁：agent 忙则跳过这轮
             continue
@@ -221,7 +221,7 @@ def queue_processor_loop(run_turn, poll_interval: float = 0.2) -> None:
                 continue
             run_turn()
         finally:
-            agent_lock.release()
+            agent_lock.release() # 释放锁，允许其他任务执行
 
 
 def wait_for_cron_idle(poll_interval: float = 0.2) -> None:

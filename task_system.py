@@ -27,7 +27,7 @@ import random
 def random_hex(n:int):
     return ''.join(random.choices('0123456789abcdef',k=n))
 
-def create_task(subject:str,description:str='',blockedBy:Optional[List[str]] = None):
+def create_task(subject:str,description:str='',blockedBy:Optional[List[str]] = None): #创建任务
     task=Task(
         id=f'task_{int(time.time())}_{random_hex(4)}',
         subject=subject,
@@ -40,7 +40,7 @@ def create_task(subject:str,description:str='',blockedBy:Optional[List[str]] = N
     save_task(task)   # 与 claim/complete 一致：状态变更即落盘，创建后立即可查
     return task
 
-def can_start(task_id:str):
+def can_start(task_id:str): #判断任务是否可以开始
     task=load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -51,7 +51,7 @@ def can_start(task_id:str):
     return True
 
 
-def claim_task(task_id:str,owner:str='agent')->str:
+def claim_task(task_id:str,owner:str='agent')->str: #认领任务，返回认领结果
     task=load_task(task_id)
     if task.status !='pending':
         return f'Task {task_id} is {task.status},cannot claim '
@@ -64,7 +64,7 @@ def claim_task(task_id:str,owner:str='agent')->str:
     return f'Claimed {task_id} ({task.subject})'
 
 
-def complete_task(task_id:str)->str:
+def complete_task(task_id:str)->str: #完成任务，返回完成结果
     task=load_task(task_id)
 
     task.status='completed'
@@ -75,21 +75,22 @@ def complete_task(task_id:str)->str:
         msg+=f"\nUnblocked:{','.join(unblocked)}"
     return msg
 
-def get_task(task_id:str)->str:
+def get_task(task_id:str)->str: #获取任务详情，返回 JSON 字符串
     task=load_task(task_id)
     return json.dumps(asdict(task),indent=2)
 
-def _task_path(task_id:str)->Path:
+def _task_path(task_id:str)->Path: #获取任务文件路径
     return TASK_DIR/f'{task_id}.json'
 
-def save_task(task:Task):
+def save_task(task:Task): #保存任务到文件
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     _task_path(task.id).write_text(json.dumps(asdict(task),indent=2))
 
-def load_task(task_id:str)->Task:
+def load_task(task_id:str)->Task: #从文件加载任务
     return Task(**json.loads(_task_path(task_id).read_text()))
 
-def list_tasks()->List[Task]:
+def list_tasks()->List[Task]: #列出所有任务
     if not TASKS_DIR.exists():
         return []
     return [Task(**json.loads(p.read_text())) for p in sorted(TASKS_DIR.glob('task_*.json'))]
