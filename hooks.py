@@ -3,6 +3,7 @@
 """
 from agent_core import register_hook
 from tools import tool_registry
+from ui_events import bus
 
 
 def _h():
@@ -19,42 +20,41 @@ def permission_hook(tool:str,args:dict):
     if tool=='bash':
         for pattern in _h().DENY_LIST:
             if pattern in args.get("command", ""):
-                print(f'\n\033[31m⛔ Blocked: {pattern}\033[0m')
+                bus.emit('debug', msg=f'\n\033[31m⛔ Blocked: {pattern}\033[0m')
                 return f"Error: Dangerous command {pattern}, please do not execute"
         for pattern in _h().DESTRUCTIVE:
             if pattern in args.get("command", ""):
-                print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
-                print(f"   Tool: {tool}({args})")
-                choice=input("Allow? (y/n) ").strip().lower()
-                if choice not in ('y','yes'):
+                # 询问统一走 PermissionGate（P1）：Textual 模式弹窗，否则 stdin（行为同旧版）
+                approved = _h().permission_gate.request(
+                    'bash', args, title='Potentially destructive command')
+                if not approved:
                     return "Permission denied by user"
     elif tool in ["read", "write", "edit"]:
         path=args.get('path','')
         if not (_h().WORKDIR / path).resolve().is_relative_to(_h().WORKDIR):
-            print(f"\n\033[33m⚠  Access outside workspace\033[0m")
-            print(f"   Tool: {tool}({path})")
-            choice=input("Allow? (y/n) ").strip().lower()
-            if choice not in ('y','yes'):
+            approved = _h().permission_gate.request(
+                tool, {'path': path}, title='Access outside workspace')
+            if not approved:
                 return "Permission denied by user"
 
     return None
 
 def log_hook(tool:str,args:dict,output:str):
-    print(f"\033[90m[HOOK] {tool}({args}) -> {output[:100]}\033[0m")
+    bus.emit('debug', msg=f"\033[90m[HOOK] {tool}({args}) -> {output[:100]}\033[0m")
     return None
 
 def large_output_hook(tool:str,args:dict,output:str):
     if len(str(output))>100000:
-        print(f"\033[33m[HOOK] ⚠ Large output from {tool}: {len(str(output))} chars\033[0m")
+        bus.emit('debug', msg=f"\033[33m[HOOK] ⚠ Large output from {tool}: {len(str(output))} chars\033[0m")
     return None
 
 def context_injection_hook(query:str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {_h().WORKDIR}\033[0m")
+    bus.emit('debug', msg=f"\033[90m[HOOK] UserPromptSubmit: working in {_h().WORKDIR}\033[0m")
     return None
 
 def summary_hook(messages:list):
     tool_count=sum(1 for m in messages if m.get('role')=='tool')
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    bus.emit('debug', msg=f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
 register_hook("UserPromptSubmit",context_injection_hook)

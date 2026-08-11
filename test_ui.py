@@ -346,6 +346,112 @@ def test_fixed_panel_no_panel_off(monkeypatch):
     assert panel._enabled is False
 
 
+def test_textual_streaming_flow():
+    """CCApp（Textual）流式渲染：帧刷新 + 收尾 Markdown + 状态栏 streaming 指示。
+
+    假 agent 分两段吐流：先一段 delta 挂起（threading.Event 控制），
+    测试确认中间态后放行剩余 delta + end，验证：
+    - 流式中状态栏出现 generating 指示（spinner + 耗时）
+    - 中间态渲染为纯文本 Static（markup 已转义，方括号不报错）
+    - assistant_end 后替换为 Markdown 最终排版（代码块/加粗精致化）"""
+    import asyncio
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return   # 未安装 textual 的环境跳过该用例
+    import threading
+    import time as _time
+    import ui_events as ev
+    import ui_textual
+    import harness
+
+    async def _scenario():
+        orig_loop = harness.agent_loop
+        orig_use_ui = harness.permission_gate.use_ui
+        step = threading.Event()   # 测试放行：中间态确认后继续吐剩余 delta + end
+        inspect = threading.Event()   # 测试放行：Markdown 确认后允许应用退出
+        done = threading.Event()
+
+        def fake_agent_loop(msgs):
+            b = ev.bus
+            b.emit('assistant_start', mid='m1')
+            b.emit('assistant_delta', mid='m1', delta='Hello **world**')
+            step.wait(timeout=5)   # 挂起，等测试确认中间态已渲染
+            b.emit('assistant_delta', mid='m1', delta=' with `code` and [brackets]')
+            b.emit('assistant_end', mid='m1')
+            inspect.wait(timeout=5)   # 挂起，等测试确认 Markdown 最终排版已渲染
+            done.set()
+
+        def _render_map(app):
+            return {type(w).__name__: str(w.render())
+                    for w in app.query_one('#chat').children}
+
+        def _collect_text(w):
+            """递归收集 widget 树文本（Markdown 是容器，正文在子 block 里）。"""
+            parts = [str(w.render())]
+            for c in w.children:
+                parts.append(_collect_text(c))
+            return '\n'.join(parts)
+
+        harness.agent_loop = fake_agent_loop
+        app = ui_textual.CCApp([])
+        try:
+            async with app.run_test() as pilot:
+                # 阶段 1：start + 第一段 delta 后，帧刷新渲染出纯文本 Static；
+                # 同时等 _stream_tick（100ms）在状态栏刷出 generating 指示
+                saw_generating = mid_stream_plain = False
+                for _ in range(80):
+                    await pilot.pause()
+                    await asyncio.sleep(0.03)
+                    if not app.is_running:
+                        break
+                    try:
+                        line = str(app.query_one('#status-line').render())
+                        if 'generating' in line:
+                            saw_generating = True
+                        t = _render_map(app).get('Static', '')
+                        if 'Hello' in t and '**world**' in t:   # 未转 markdown，仍是纯文本
+                            mid_stream_plain = True
+                    except Exception:
+                        continue
+                    if saw_generating and mid_stream_plain:
+                        break
+                step.set()   # 放行剩余 delta + end
+                # 阶段 2：assistant_end 后 Static 替换为 Markdown 最终排版
+                final_markdown = False
+                md_content = ''
+                for _ in range(80):
+                    await pilot.pause()
+                    await asyncio.sleep(0.03)
+                    try:
+                        for w in app.query_one('#chat').children:
+                            if type(w).__name__ == 'Markdown':
+                                t = _collect_text(w)
+                                if 'Hello' in t:
+                                    final_markdown, md_content = True, t
+                                    break
+                        if final_markdown:
+                            break
+                    except Exception:
+                        continue
+                inspect.set()   # 放行：允许应用退出
+                # 阶段 3：等应用自然退出（sentinel 消费完）
+                for _ in range(80):
+                    if not app.is_running:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.03)
+                assert saw_generating, '状态栏应显示 generating 流式指示'
+                assert mid_stream_plain, '流式中间态应渲染为纯文本 Static'
+                assert final_markdown and 'world' in md_content and 'brackets' in md_content, \
+                    f'Markdown 最终排版缺失: {md_content[:200]!r}'
+        finally:
+            harness.agent_loop = orig_loop
+            harness.permission_gate.use_ui = orig_use_ui
+
+    asyncio.run(_scenario())
+
+
 # ---------- 运行 ----------
 
 def main():

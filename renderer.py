@@ -24,10 +24,25 @@ class AnsiRenderer(BaseRenderer):
     def on_event(self, e: UIEvent) -> None:
         if e.type == 'assistant_text':
             print(e.payload.get('text', ''))
+        elif e.type == 'assistant_start':
+            pass
+        elif e.type == 'assistant_delta':
+            # 真流式：增量打印（不换行），assistant_end 收尾换行
+            print(e.payload.get('delta', ''), end='', flush=True)
+        elif e.type == 'assistant_end':
+            print('')
         elif e.type == 'debug':
             print(e.payload.get('msg', ''))
-        # status / tool_* / session_* 当前无需渲染（状态由 hooks 与日志承担）
+        elif e.type == 'status':
+            # 思考中提示：单行覆盖（\r 回行首 + idle 清行），避免等待时无反馈
+            if e.payload.get('phase') == 'thinking':
+                print('  \033[90m[thinking] 模型思考中...\033[0m', end='', flush=True)
+            elif e.payload.get('phase') == 'idle':
+                print('\x1b[2K\r', end='', flush=True)
+        # tool_* / session_* 当前无需渲染（状态由 hooks 与日志承担）
 
 
-# 默认 attach：import renderer 即生效；业务代码无需感知渲染后端
-bus.subscribe(AnsiRenderer().on_event)
+# 默认 attach：import renderer 即生效；业务代码无需感知渲染后端。
+# Textual 模式切换时（ui_textual.run）会 unsubscribe default_renderer。
+default_renderer = AnsiRenderer()
+bus.subscribe(default_renderer.on_event)

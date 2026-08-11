@@ -127,6 +127,8 @@ class FakeCompletions:
         else:
             logger.debug("API call #%d -> finish_reason=%s content=%r",
                          idx, finish, (item.choices[0].message.content or '')[:200])
+        if kwargs.get('stream'):
+            return _stream_response(item)
         return item
 
 
@@ -139,6 +141,43 @@ def make_tool_response(tool_calls):
     calls = [FakeToolCall(cid, name, args) for cid, name, args in tool_calls]
     return FakeResponse(FakeChoice(FakeMessage(content=None, tool_calls=calls),
                                    finish_reason='tool_calls'))
+
+
+def _stream_response(item):
+    """把整块 FakeResponse 转成 OpenAI 流式 chunk 序列（模拟 stream=True）。
+
+    文本按 7 字符/段分段吐（验证 harness 逐 delta 发事件）；tool_calls 按
+    index 分段拼接 name/arguments；最后带 finish_reason 与 usage chunk
+    （stream_options.include_usage 模式，choices 为空）。"""
+    finish = item.choices[0].finish_reason
+    msg = item.choices[0].message
+    chunks = []
+    if msg.tool_calls:
+        for i, tc in enumerate(msg.tool_calls):
+            chunks.append(SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=None, tool_calls=[
+                    SimpleNamespace(index=i, id=tc.id,
+                                    function=SimpleNamespace(name=tc.function.name,
+                                                             arguments=''))]),
+                finish_reason=None)], usage=None))
+            chunks.append(SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=None, tool_calls=[
+                    SimpleNamespace(index=i, id=None,
+                                    function=SimpleNamespace(name='',
+                                                             arguments=tc.function.arguments))]),
+                finish_reason=None)], usage=None))
+    if msg.content:
+        for i in range(0, len(msg.content), 7):
+            chunks.append(SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=msg.content[i:i + 7], tool_calls=None),
+                finish_reason=None)], usage=None))
+    chunks.append(SimpleNamespace(choices=[SimpleNamespace(
+        delta=SimpleNamespace(content=None, tool_calls=None), finish_reason=finish)],
+        usage=None))
+    chunks.append(SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18)))
+    return iter(chunks)
 
 
 # ---------- 工具 / 方法打桩 ----------
@@ -444,6 +483,42 @@ def test_full_session_scenario():
         harness.reactive_compact = orig_reactive
         harness.CONTEXT_LIMIT = orig_limit
         harness.client.chat.completions.create = orig_create
+
+
+def test_streaming_events_emitted():
+    """stream=True：agent_loop 按 delta 增量发 assistant_start/delta/end 事件。
+
+    验证：
+    - 流式文本被逐段拆成多条 assistant_delta，拼接后与完整回复一致
+    - 每轮恰好一次 start/end
+    - usage chunk 累计进 _SESSION_METRICS（真实 token 统计）"""
+    import ui_events
+    events = []
+    _on = lambda e: events.append(e)
+    ui_events.bus.subscribe(_on)
+    orig_tokens = harness._SESSION_METRICS.get('tokens', 0)
+    orig_create = harness.client.chat.completions.create
+    try:
+        fake = FakeCompletions([make_text_response('hello streaming world')])
+        harness.client.chat.completions.create = fake.create
+        try:
+            result = harness.agent_loop([{'role': 'user', 'content': 'hi'}])
+        finally:
+            harness.client.chat.completions.create = orig_create
+        assert result == 'hello streaming world', result
+        starts = [e for e in events if e.type == 'assistant_start']
+        deltas = [e for e in events if e.type == 'assistant_delta']
+        ends = [e for e in events if e.type == 'assistant_end']
+        assert len(starts) == 1, f"start 次数: {len(starts)}"
+        assert len(ends) == 1, f"end 次数: {len(ends)}"
+        assert len(deltas) >= 3, f"7 字符/段应拆出多条 delta: {len(deltas)}"
+        joined = ''.join(e.payload['delta'] for e in deltas)
+        assert joined == 'hello streaming world', f"delta 拼接不符: {joined!r}"
+        # usage chunk 应计入会话累计 token
+        assert harness._SESSION_METRICS['tokens'] == orig_tokens + 18, \
+            f"tokens 未累计: {harness._SESSION_METRICS['tokens']}"
+    finally:
+        ui_events.bus.unsubscribe(_on)
 
 
 # ---------- 运行 ----------
