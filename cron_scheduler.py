@@ -214,10 +214,10 @@ def queue_processor_loop(run_turn, poll_interval: float = 0.2) -> None:
         time.sleep(poll_interval) # 每 poll_interval 秒检查一次是否有任务到点
         if not _has_cron_queue(): # 如果队列为空
             continue
-        if not agent_lock.acquire(blocking=False):   # 尝试拿锁：agent 忙则跳过这轮
+        if not agent_lock.acquire(blocking=False):   # 尝试拿锁：agent 忙则跳过这轮，例如主会话中任务正在执行
             continue
         try:
-            if not _has_cron_queue():                # 双重检查：拿锁后队列可能已被取走
+            if not _has_cron_queue():                # 双重检查：拿锁后队列可能已被取走，例如上一轮 cron 任务已执行
                 continue
             run_turn()
         finally:
@@ -234,7 +234,7 @@ def wait_for_cron_idle(poll_interval: float = 0.2) -> None:
         with cron_lock:
             pending = bool(scheduled_jobs) or bool(cron_queue)
         if not pending and agent_lock.acquire(blocking=False):
-            agent_lock.release()
+            agent_lock.release() # 释放锁，允许其他任务执行
             return
         time.sleep(poll_interval)
 

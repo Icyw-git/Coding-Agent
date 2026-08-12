@@ -25,7 +25,7 @@ class ProtocolState:
     target: str
     status: Literal['pending', 'approved', 'rejected']
     payload: str
-    created_at: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=time.time) #在创建时记录时间戳，使用工厂方法 time.time 获取当前时间戳
 
 
 pending_requests: dict[str, ProtocolState] = {}
@@ -62,7 +62,8 @@ def handle_inbox_message(name, msg, messages):
     return 'message'
 
 
-def match_response(response_type, request_id, approve):
+def match_response(response_type, request_id, approve): # 匹配响应函数
+    """匹配协议响应函数，根据响应类型、请求 ID 和审批状态更新协议状态。"""
     state = pending_requests.get(request_id)
     if not state:
         return
@@ -84,5 +85,5 @@ def consume_lead_inbox(route_protocol=True) -> list:
             req_id = meta.get('request_id', '')
             msg_type = msg.get('type', '')
             if req_id and msg_type.endswith('_response'):
-                match_response(msg_type, req_id, meta.get('approve', False))
+                match_response(msg_type, req_id, meta.get('approve', False)) # 匹配响应，更新协议状态
     return msgs

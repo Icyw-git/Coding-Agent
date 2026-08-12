@@ -19,9 +19,9 @@ def _bus():
 def scan_unclaimed_tasks() -> list:
     unclaimed = []
     for f in sorted(TASKS_DIR.glob('task_*.json')):
-        task = json.loads(f.read_text())
+        task = json.loads(f.read_text()) # 读取任务 JSON 内容
         if (task.get('status') == 'pending' and not task.get('owner')
-                and can_start(task['id'])):
+                and can_start(task['id'])): # 如果任务是待办状态且未被认领且可以开始
             unclaimed.append(task)
     return unclaimed
 

@@ -30,7 +30,7 @@ class MessageBus:
     """消息总线，用于团队成员之间的通信。"""
     # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
     def send(self, from_agent: str, to_agent: str, content: str,
-             msg_type: str = 'message', metadata: dict = None):
+             msg_type: str = 'message', metadata: dict = None): #发送消息至指定_agent的邮箱
         msg = {
             'from': from_agent,
             'to': to_agent,
@@ -46,16 +46,18 @@ class MessageBus:
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
-    def read_inbox(self, agent: str) -> list:
+    def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
+        """读取指定_agent的邮箱消息，清空邮箱。返回消息列表。"""
         inbox = MAILBOX_DIR / f'{agent}.jsonl'
         if not inbox.exists():
             return []
         msgs = [json.loads(line) for line in
                 inbox.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip()]
-        inbox.unlink()
+        inbox.unlink() # 清空邮箱
         return msgs
 
-    def peek(self, agent: str) -> bool:
+    def peek(self, agent: str) -> bool: #检查指定_agent的邮箱是否有消息
+        """检查指定_agent的邮箱是否有消息。返回是否有消息。"""
         inbox = MAILBOX_DIR / f'{agent}.jsonl'
         return inbox.exists() and inbox.stat().st_size > 0
 
@@ -63,7 +65,7 @@ class MessageBus:
 BUS = MessageBus()
 
 
-def _build_team_tools(agent_name: str, wt_ctx: dict = None):
+def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员工具集
     """teammate 工具集 = harness 核心工具子集 + send_message/submit_plan + 任务工具。
 
     wt_ctx：{'path': str|None} 当前任务 worktree 目录；非空时 bash/read/write/edit
@@ -199,6 +201,7 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None):
         return result
 
     def run_complete_task_t(task_id: str) -> str:
+        """完成指定任务，清空当前 worktree 目录。返回完成结果。"""
         result = harness.tool_registry['complete_task'](task_id=task_id)
         wt_ctx['path'] = None   # 完成任务 → 离开 worktree
         return result
@@ -209,7 +212,8 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None):
     return tools, handlers
 
 
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团队成员线程，用于执行任务
+    """创建团队成员线程，用于执行任务。返回线程名称。"""
     if name in active_teammates:
         return f'Teammate {name} already exists'
 
@@ -217,17 +221,18 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
               f"Use tools to complete tasks. "
               f"Send results via send_message to 'lead'.")
 
-    def run():
+    def run(): # 团队成员线程运行函数
+        """团队成员线程运行函数，用于执行任务。"""
         import harness   # 懒导入避免循环导入（harness 顶层已 import agent_teams）
         messages = [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': prompt},
         ]
         wt_ctx = {'path': None}   # 当前任务 worktree 目录（认领任务后切换，完成任务清空）
-        sub_tools, sub_handlers = _build_team_tools(name, wt_ctx)
+        sub_tools, sub_handlers = _build_team_tools(name, wt_ctx) # 构建团队成员工具集
         skip_micro_rounds = 0
         memories_content = harness.load_memories(messages)   # 记忆召回（只读，不提炼，避免污染全局记忆）
-        should_stop=False
+        should_stop=False # 是否停止线程
         
         while not should_stop:
             # 收 inbox：协议消息（shutdown/plan_approval）走 handle_inbox_message，其余注入 <inbox>
@@ -236,7 +241,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             non_protocol = []
             for msg in inbox:
                 result=handle_inbox_message(name, msg, messages)
-                if result=='shutdown':
+                if result=='shutdown': #收到主线程的shutdown指令，停止线程
                     should_stop=True
                     break
                 elif result=='awake':
@@ -244,7 +249,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             
                 else:
                     non_protocol.append(msg)
-            if should_stop:
+            if should_stop: #跳出循环
                 break
             if non_protocol:
                 messages.append({
@@ -311,13 +316,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         active_teammates.pop(name, None)
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
-    active_teammates[name] = True
-    threading.Thread(target=run, daemon=True).start()
+    active_teammates[name] = True # 标记为活跃，等待主线程唤醒
+    threading.Thread(target=run, daemon=True).start() # 启动线程
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role}"
 
 
-def _teammate_submit_plan(from_name:str,plan:str):
+def _teammate_submit_plan(from_name:str,plan:str): # 团队成员提交计划函数
+    """团队成员提交计划函数，用于提交任务计划。"""
     req_id=new_request_id()
     pending_requests[req_id]=ProtocolState(
         request_id=req_id,

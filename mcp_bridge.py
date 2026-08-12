@@ -21,7 +21,7 @@ _loop = asyncio.new_event_loop()
 threading.Thread(target=_loop.run_forever, daemon=True).start()
 
 
-def _load_server_configs() -> List[dict]:
+def _load_server_configs() -> List[dict]: # 加载 MCP server 配置
     """从 MCP_SERVERS（JSON 内联）或 MCP_SERVERS_FILE（json 文件）读取 server 配置。"""
     raw = os.getenv('MCP_SERVERS', '')
     if raw:
