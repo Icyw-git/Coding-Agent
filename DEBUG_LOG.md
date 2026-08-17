@@ -1,7 +1,8 @@
 # Harness Agent 开发实录：问题驱动的功能演进（面试视角）
 
 一个自研的 Coding Agent 框架：`agent_loop` 主循环 + 工具注册表 + Hook 事件系统 +
-子代理 + Skill 按需加载 + 四级上下文压缩 + 跨会话记忆 + 任务系统 + 后台任务 + cron 定时任务
+子代理 + Skill 按需加载 + 四级上下文压缩 + 跨会话记忆 + 任务系统 + 后台任务 + cron 定时任务 +
+MCP 工具接入（外部能力动态注册 + 同步/异步桥）
 
 - 团队协作（teammate 长驻 + 协议 + 自主认领）+ worktree 隔离（任务级沙箱）。harness 按
   「基本 loop + 功能模块」拆分。
@@ -28,7 +29,8 @@
 上下文压缩（落盘/裁剪/占位符 → LLM 摘要 → reactive 抢救）、任务系统（.cache/tasks 持久化）、
 后台任务（慢命令线程 + `<task_notification>` 注入）、cron（调度线程 + 队列 + 推/拉双消费）、
 团队（MessageBus 邮箱 + 协议状态机 shutdown/plan_approval + 自主认领任务）、
-worktree 隔离（.worktrees/<name> 独立分支 + teammate cwd 切换）。
+worktree 隔离（.worktrees/<name> 独立分支 + teammate cwd 切换）、
+MCP（MCPclient 异步客户端 + mcp_bridge 同步桥 + 工具动态注册进 tool_registry）。
 
 ---
 
@@ -226,6 +228,37 @@ except Exception as e:
    （先整体 `json.loads`，失败再逐个最短方括号段试，能解析成 list 才收下）。
 5. **真机产物污染测试**：验证后残留真实记忆文件 → `select_relevant_memories`（文件非空时先调一次 LLM）
    提前消费 mock 队列 → 全崩。教训：真机产物用后即清。
+
+## 对标 mem0：记忆系统的已知取舍与升级方向
+
+**mem0**（AI agent 记忆层的事实标准，Apache-2.0）2026 年 4 月发布新算法，三个关键决策与我们的
+方向**一致**，印证了设计：
+
+- **ADD-only 只增**：放弃 UPDATE/DELETE，记忆累积不覆盖（我们也是 append + consolidate）；
+- **多信号检索**：语义向量 + BM25 关键词 + 实体匹配并行打分融合；
+- **时间感知**：检索区分"当前状态 / 过去事件 / 未来计划"，同主题按新旧排序、最新优先；
+- **评测驱动**：开源 memory-benchmarks（LoCoMo / LongMemEval）公开召回率基准。
+
+**差异与取舍**：
+
+| 维度 | mem0 | 我们 |
+| ---- | ---- | ---- |
+| 存储 | 向量库（Qdrant）+ 图（Neo4j）+ 实体链接 | 纯文件 \*.md + 索引 |
+| 检索 | embedding + BM25 + 实体融合 | LLM 全量筛选（失败 fallback 关键词） |
+| 成本 | 需 embedding 模型 + 向量库/图库依赖 | 零依赖、离线、可测 |
+
+**升级方向（按价值排序，未实现）**：
+
+1. **时间感知检索**：记忆文件加 `updated_at`，同主题按新旧倒序、最新优先（对应"当前状态"）；
+   consolidate 保留最新事实而非随机拼。
+2. **两段式检索**：关键词/BM25 粗筛 top-k（0 API）→ LLM 只精排 top-k——记忆量大后避免 O(n) LLM 成本。
+3. **作用域过滤**：teammate 场景记忆会串（alice 的记忆被 bob 召回）→ 记忆文件加 `scope`
+   （user/agent/task），检索按当前 agent 过滤。
+4. **评测脚本**：构造 N 条事实 → 模拟会话写入 → 提问测召回率（约 30 行），让"记忆有效"可量化。
+
+**面试话术**："我调研过 mem0 v3 新算法，它的 ADD-only / 多信号检索 / 时间感知和我的
+append+consolidate 方向一致；我借鉴了时间排序和两段式检索，并给记忆加 scope 作用域。生产级方案是
+向量库 + 实体图，我选纯文件是零依赖、可测试，代价是记忆量大后检索成本线性增长——这是已知取舍。"
 
 ---
 
@@ -432,11 +465,12 @@ GBK/UTF-8：文件读写显式声明编码、bash 输出替换 U+FFFD、提示�
 图标字符在 GBK 控制台会崩（交互终端 UTF-8 无碍）。
 
 **Q10：最近在做什么？**
-（按第 6/7/8/12/13/14 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
+（按第 6/7/8/12/13/14/15 部分讲）任务系统（持久化 + 依赖）+ 后台任务（慢命令异步 + 通知注入）+
 cron 定时任务（推/拉双轨 + 锁与竞态）+ 模块拆分（无状态逻辑层 + `_h()` 可测试性）+
-团队协作（teammate 长驻 + 协议 + 自主认领）+ worktree 隔离（任务级沙箱 + cwd 切换），
-以及集成时踩的孤儿消息 / NameError / f-string 语法 / Python 3.9 兼容 / 模块拆分回归
-（`harness.run_bash`）等坑。
+团队协作（teammate 长驻 + 协议 + 自主认领）+ worktree 隔离（任务级沙箱 + cwd 切换）+
+MCP 工具接入（同步 harness ↔ 异步 SDK 的桥：常驻事件循环线程 + run_coroutine_threadsafe +
+工具动态注册，外部能力即插即用），以及集成时踩的孤儿消息 / NameError / f-string 语法 /
+Python 3.9 兼容 / 模块拆分回归（`harness.run_bash`）/ MCP 配置只认环境变量 等坑。
 
 ---
 
@@ -555,6 +589,64 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 
 ---
 
+# 第 15 部分：MCP 工具接入——外部能力即插即用（新增）
+
+## 问题：内置工具不够用，外部世界接不进来
+
+agent 只能调内置工具（bash/read/write/edit/...），数据库、浏览器、云 API 等外部能力接不进来；
+且 MCP 官方 SDK 是 asyncio 接口，而 harness 的工具分发是同步的
+（`tool_registry[name](**args)`）——**同步世界怎么桥接异步 SDK**是核心难点。
+
+**方案（三个模块 + 一个集成点）**：
+
+| 文件                 | 职责                                               |
+| -------------------- | -------------------------------------------------- |
+| `MCPclient.py`       | **asyncio 客户端**：connect / call_tool / close    |
+| `mcp_bridge.py`      | **同步桥**：常驻事件循环线程 + 工具动态注册        |
+| `mock_mcp_server.py` | 本地 stdio mock server（echo / add），端到端验证用 |
+| harness `__main__`   | `TOOLS.extend(register_mcp_tools(tool_registry))`  |
+
+- **`MCPclient`（异步客户端）**：`connect()` 用 `AsyncExitStack` 管理子进程全生命周期
+  （stdio_client → ClientSession → initialize → list_tools），中途失败也 `close()` 防子进程泄漏；
+  `call_tool()` 从结果里提取 TextContent 拼成纯文本返回（模型只认文本）；
+  connect/call 统一 `asyncio.wait_for(120s)` 超时，server 挂起不永久阻塞。
+- **`mcp_bridge`（同步桥，核心）**：模块级启动一个 daemon 事件循环线程，用
+  `asyncio.run_coroutine_threadsafe` 把协程投递过去、`fut.result(timeout)` 同步等待；
+  `_make_sync_wrapper` 为每个 MCP 工具生成 `(**kwargs)` 签名的 handler——**与 tool_registry
+  分发签名一致，子代理/teammate 无差别可见**；
+  `_openai_schema` 把 MCP 的 `inputSchema`（本来就是 JSON Schema）直接映射成 OpenAI 工具格式；
+  `_load_server_configs` 从 `MCP_SERVERS`（JSON 内联）或 `MCP_SERVERS_FILE`（json 文件）读配置。
+- **集成语义**：连接失败打印告警继续下一个（不拖垮主流程）；MCP 工具与内置工具重名时跳过并告警。
+
+## 踩过的坑（真机端到端验证）
+
+1. **配置加载只认环境变量（真机踩到）**：`_load_server_configs` 只读 `MCP_SERVERS` /
+   `MCP_SERVERS_FILE` 两个环境变量；`.cache/mcp_servers.json` 文件存在但默认不会被读——必须靠
+   `.env` 里 `load_dotenv()` 把 `MCP_SERVERS_FILE=.cache/mcp_servers.json` 指过去才生效。
+   单独写脚本调 mcp_bridge 不 load_dotenv，拿到的配置是空数组。
+2. **同步/异步鸿沟**：不能直接 await → 常驻事件循环线程 + `run_coroutine_threadsafe`；
+   同步等待必须带超时（`fut.result(timeout)`），否则 server 挂起时主线程永久卡死。
+3. **子进程泄漏**：connect 中途抛错必须 close（`AsyncExitStack.aclose()`），否则僵尸进程常驻；
+   close 要幂等（重复调用不再 aclose）。
+4. **工具重名**：MCP 工具与内置工具同名时若直接覆盖，内置能力被替换 → 跳过 + 告警。
+
+## 验证（E2E）
+
+本地 mock server 全链路：config 加载 → `register_mcp_tools` 连接并注册 echo/add →
+`reg['echo'](text='hello mcp')` 返回 `echo:hello mcp`、`reg['add'](a=3, b=4)` 返回 `sum:7`；
+`_openai_schema` 映射后 `type=object` + `properties` 符合 OpenAI 工具格式；额外参数不崩。
+
+## 收获
+
+- **同步主循环 ↔ 异步 SDK 的通用桥接模式**：常驻事件循环线程 + run_coroutine_threadsafe +
+  同步等待 + 超时兜底——以后接任何 asyncio 库（Playwright、aiohttp 等）复用同一套模式；
+- MCP 的价值：tool_registry 从"写死的内置工具表"升级为"**可动态扩展的注册中心**"，外部能力
+  即插即用，模型/子代理/teammate 无差别可见（分发仍收敛在一处）；
+- 子进程/网络资源生命周期必须显式管理（AsyncExitStack），失败路径也要清理——和 daemon 线程
+  "进程退出即消亡"是同一类兜底思维。
+
+---
+
 ## 核心教训总纲
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。
@@ -570,3 +662,4 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 11. **"公平分工"是协调问题不是并发问题**——轮询认领无协调必然偏斜（相位领先者通吃）；多 agent 协作要显式分配或加抖动。
 12. **改返回值语义必须同步所有调用点**——返回码从布尔改字符串后，调用方真值判断把 'awake' 当成 shutdown，teammate 收到计划批准反而退出。
 13. **隔离优于约束**——与其提示模型"别写错目录"，不如用 git worktree 在物理上隔离；会话级可变状态（当前 cwd）必须显式跟踪完整生命周期，否则泄漏到下一个任务。
+14. **同步主循环 ↔ 异步 SDK 要显式架桥**——常驻事件循环线程 + `run_coroutine_threadsafe` + 同步等待带超时；工具注册表做成"可动态扩展的注册中心"（MCP 外部能力即插即用），分发收敛在一处，子代理/teammate 无差别可见；外部进程资源用 AsyncExitStack 管生命周期，失败路径也清理。

@@ -626,7 +626,8 @@ if __name__ == '__main__':
                   '在 Windows Terminal 里运行可启用全屏 TUI。')
         else:
             import ui_textual
-            ui_textual.run(main_msgs)
+            # 多轮对话框：不预设初始消息，由底部输入框驱动（msgs 由用户逐轮填充）
+            ui_textual.run([])
     else:
         # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
         with agent_lock:

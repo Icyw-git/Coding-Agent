@@ -19,11 +19,12 @@ import queue
 import time
 
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Collapsible, Markdown, Static
+from textual.widgets import Collapsible, Input, Markdown, Static
 
 from rich.markup import escape as markup_escape
+from rich.text import Text
 from ui_events import bus, UIEvent
 
 CSS = """
@@ -55,8 +56,11 @@ Collapsible > .collapsible--title { color: #d77757; }
 .debug-line { margin: 0 2; color: #6e6a6a; }
 .diff-title { margin: 1 2 0 2; color: #96a0b4; }
 
-/* ---- 底部状态栏（CC：dock 固定 + mode pill + model pill + ctx 进度条） ---- */
-#status-line { dock: bottom; height: 1; background: #101010; color: #a7a3a2; padding: 0 2; }
+/* ---- 底部输入框 + 状态栏（dock 固定：输入在上，状态在下） ---- */
+#bottom-bar { dock: bottom; height: 2; background: #101010; }
+#input-line { height: 1; padding: 0 2; background: #101010; color: #e8e6e3; border: none; }
+#input-line:focus { border: none; }
+#status-line { height: 1; background: #101010; color: #a7a3a2; padding: 0 2; }
 
 /* ---- 权限 Modal（CC：蓝紫边框权限确认） ---- */
 #perm-box { width: 76; padding: 2 3; border: round #b1b9f9; background: #262626; }
@@ -94,8 +98,8 @@ class PermissionModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Static(id="perm-box"):
             yield Static(f"[bold]{self.title}[/]", id="perm-title")
-            yield Static(f"[dim]Tool:[/] {markup_escape(self.tool)}")
-            yield Static(f"[dim]Args:[/] {markup_escape(str(self.args))}")
+            yield Static(Text("Tool: ", style="dim") + Text(self.tool))
+            yield Static(Text("Args: ", style="dim") + Text(str(self.args)))
             yield Static("")
             yield Static("[yellow]y[/] = Allow    [yellow]n[/]/[yellow]Esc[/] = Deny    "
                          f"([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])")
@@ -117,15 +121,24 @@ class CCApp(App):
     TITLE = "harness"
     CSS = CSS
 
+    BINDINGS = [
+        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+d", "quit", "Quit"),
+    ]
+
     def __init__(self, msgs: list):
         super().__init__()
         self._msgs = msgs
         self._chat = None
+        self._user_input_q: queue.Queue = queue.Queue()   # 用户输入 → agent 线程（多轮）
+        self._exiting = False
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
         yield VerticalScroll(id="chat")
-        yield Static('', id="status-line")
+        with Vertical(id="bottom-bar"):
+            yield Input(placeholder="输入消息，Enter 发送 · Ctrl+C 退出", id="input-line")
+            yield Static('', id="status-line")
 
     def on_mount(self) -> None:
         import os
@@ -135,6 +148,7 @@ class CCApp(App):
         header.update(f"[#d77757]harness[/] [#a7a3a2]{os.getenv('LLM_MODEL_ID', '')}[/]"
                       f" [dim]{markup_escape(str(h.WORKDIR))}[/]")
         self._chat = self.query_one('#chat', VerticalScroll)
+        self._input = self.query_one('#input-line', Input)
         self._event_queue: queue.Queue = queue.Queue()
         self._active_tools: list = []   # 执行中的工具块（FIFO 匹配 tool_end）
         self._last_status: dict = {}    # 最后已知状态指标（thinking/idle 时状态栏常驻显示）
@@ -156,6 +170,26 @@ class CCApp(App):
         # 单一消费者 worker：严格 FIFO 处理事件（mount 是异步操作，必须 await）
         self.run_worker(self._consume_events, thread=False)
         self.run_worker(self._run_agent, thread=True)
+        self._input.focus()
+
+    # ---------- 底部输入框：多轮对话 ----------
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter 提交：文本进队列交给 agent 线程，同时渲染为 user 消息。"""
+        text = (event.value or '').strip()
+        self._input.value = ''
+        if not text:
+            return
+        self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
+        self._user_input_q.put(text)
+
+    def action_quit(self) -> None:
+        """Ctrl+C / Ctrl+D：唤醒 agent 线程退出（sentinel None → 循环 break）。"""
+        self._exiting = True
+        try:
+            self._user_input_q.put(None)
+        except Exception:
+            pass
 
     async def _consume_events(self) -> None:
         while True:
@@ -179,7 +213,13 @@ class CCApp(App):
         import harness
         with harness.agent_lock:
             harness.permission_gate.use_ui = True   # 权限走事件弹窗模式（PermissionGate 挂起）
-            harness.agent_loop(self._msgs)
+            # 多轮对话：等用户输入 → 跑一轮 agent_loop → 再等输入（历史随 self._msgs 延续）
+            while not self._exiting:
+                text = self._user_input_q.get()   # 阻塞等用户输入（None = 退出 sentinel）
+                if text is None:
+                    break
+                self._msgs.append({'role': 'user', 'content': text})
+                harness.agent_loop(self._msgs)    # 一轮对话；内部会把模型回复 append 回 messages
         self._event_queue.put(None)   # 通知消费者退出
         # 等剩余事件渲染完再退出（带超时兜底，避免消费者异常时永久挂起）
         deadline = time.monotonic() + 10
@@ -194,8 +234,8 @@ class CCApp(App):
 
     async def _apply(self, e):
         if e.type == 'user_message':
-            # 用户输入可能含方括号 → markup 转义，避免 MarkupError
-            await self._chat.mount(Static(f"\u276f {markup_escape(e.payload.get('text', ''))}",
+            # 用户输入可能含方括号 → 用 Text 对象（不做 markup 解析，避免 MarkupError）
+            await self._chat.mount(Static(Text(f"\u276f {e.payload.get('text', '')}"),
                                           classes='user-msg'))
         elif e.type == 'assistant_text':
             # 流式打字机：先挂空 Markdown，再由独立 task 分块增量渲染（CC 流式渲染轻量版）
@@ -205,7 +245,7 @@ class CCApp(App):
         elif e.type == 'assistant_start':
             # 真流式：新消息挂空 Static，delta 由帧刷新逐帧填充（打字机效果）
             mid = e.payload['mid']
-            w = Static('', classes='assistant-msg')
+            w = Static(Text(''), classes='assistant-msg')
             self._active_widgets[mid] = w
             self._assistant_buffers[mid] = ''
             self._flushed[mid] = ''
@@ -235,28 +275,30 @@ class CCApp(App):
             # 工具实时可见：执行中即展开显示（✳ 橙标题），完成后折叠
             name = e.payload.get('name', 'tool')
             args = e.payload.get('args', {})
-            col = Collapsible(title=f"\u2737 {name} {markup_escape(str(args))}", collapsed=False)
+            col = Collapsible(title=Text(f"\u2737 {name} {args}"), collapsed=False)
             await self._chat.mount(col)
             self._active_tools.append(col)   # 工具串行执行，FIFO 匹配 tool_end
         elif e.type == 'tool_end':
             out = str(e.payload.get('output_preview', ''))[:2000]
             if self._active_tools:
                 col = self._active_tools.pop(0)
-                await col.mount(Static(markup_escape(out or '[No output]'), classes='tool-output'))
+                await col.mount(Static(Text(out or '[No output]'), classes='tool-output'))
                 col.collapsed = True
         elif e.type == 'debug':
-            await self._chat.mount(Static(f"[dim]{markup_escape(self._strip_ansi(e.payload.get('msg', '')))}[/]",
+            await self._chat.mount(Static(Text(self._strip_ansi(e.payload.get('msg', ''))),
                                           classes='debug-line'))
         elif e.type == 'diff':
             path = e.payload.get('path', '')
             if path:
-                await self._chat.mount(Static(markup_escape(path), classes='diff-title'))
+                await self._chat.mount(Static(Text(path), classes='diff-title'))
             await self._chat.mount(Static(self._render_diff(e.payload.get('diff_text', '')),
                                           classes='tool-output'))
         elif e.type == 'permission_request':
             self.push_screen(PermissionModal(
                 e.payload['req_id'], e.payload['tool'], e.payload['args'],
                 e.payload.get('title', 'Permission needed')))
+        elif e.type == 'permission_resolve':
+            self._input.focus()   # 弹窗应答后焦点回到输入框
         elif e.type == 'status':
             self._update_status(e.payload)
         # session_end 无需渲染
@@ -278,20 +320,21 @@ class CCApp(App):
         return re.sub(r'\x1b\[[0-9;]*m', '', str(text))
 
     @staticmethod
-    def _render_diff(diff_text: str) -> str:
-        """diff 文本转 rich markup：+ 绿 / - 红 / @@ 灰（对应 CC diff 配色）。"""
-        lines = []
+    def _render_diff(diff_text: str) -> Text:
+        """diff 文本转 rich Text：+ 绿 / - 红 / @@ 灰（对应 CC diff 配色）。
+
+        Text 对象不做 markup 解析（diff 行可能含方括号，字符串 markup 会抛 MarkupError）。"""
+        text = Text()
         for ln in str(diff_text).splitlines():
-            safe = markup_escape(ln)   # diff 行可能含代码方括号 → 转义
             if ln.startswith('+'):
-                lines.append(f'[#4eba65]{safe}[/]')
+                text.append(ln + '\n', style='#4eba65')
             elif ln.startswith('-'):
-                lines.append(f'[#ff6b80]{safe}[/]')
+                text.append(ln + '\n', style='#ff6b80')
             elif ln.startswith('@@'):
-                lines.append(f'[#96a0b4]{safe}[/]')
+                text.append(ln + '\n', style='#96a0b4')
             else:
-                lines.append(safe)
-        return '\n'.join(lines)
+                text.append(ln + '\n')
+        return text
 
     # ---------- 帧刷新：流式渲染平滑化 ----------
 
@@ -305,7 +348,7 @@ class CCApp(App):
         for mid, w in list(self._active_widgets.items()):
             buf = self._assistant_buffers.get(mid, '')
             if self._flushed.get(mid) != buf:
-                w.update(markup_escape(buf))   # 转义方括号，避免 MarkupError
+                w.update(Text(buf))   # Text 对象不做 markup 解析（含方括号也不崩）
                 self._flushed[mid] = buf
 
     _SPINNERS = ('\u28a7', '\u28bd', '\u28bb', '\u28bf', '\u28b7', '\u28af', '\u28ab', '\u28a3')
