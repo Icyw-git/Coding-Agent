@@ -452,6 +452,111 @@ def test_textual_streaming_flow():
     asyncio.run(_scenario())
 
 
+def test_permission_gate_cancel_pending():
+    """退出时取消权限请求必须立即唤醒业务线程，不能等待 300 秒超时。"""
+    import threading
+    from ui_events import PermissionGate, UIEventBus
+
+    local_bus = UIEventBus()
+    gate = PermissionGate(local_bus, use_ui=True)
+    requested = threading.Event()
+    result = []
+
+    def observe(event):
+        if event.type == 'permission_request':
+            requested.set()
+
+    local_bus.subscribe(observe)
+    worker = threading.Thread(
+        target=lambda: result.append(gate.request('bash', {'command': 'del x'})),
+    )
+    worker.start()
+    assert requested.wait(timeout=1), '权限请求未发出'
+    gate.cancel_pending()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), '取消后业务线程仍在等待权限'
+    assert result == [False]
+    assert gate._pending == {}
+
+
+def test_textual_idle_does_not_hold_agent_lock():
+    """Textual 等待输入时必须释放锁，供 cron 队列主动执行。"""
+    import asyncio
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return
+    import harness
+    import ui_textual
+
+    async def _scenario():
+        app = ui_textual.CCApp([])
+        async with app.run_test() as pilot:
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            acquired = harness.agent_lock.acquire(blocking=False)
+            try:
+                assert acquired, 'TUI 空闲时不应占用 agent_lock'
+            finally:
+                if acquired:
+                    harness.agent_lock.release()
+            app.action_quit()
+            for _ in range(50):
+                if not app.is_running:
+                    break
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+
+    asyncio.run(_scenario())
+
+
+def test_textual_agent_error_recovers_input():
+    """agent_loop 失败后应显示错误并恢复输入，而不是让 UI 留在假死状态。"""
+    import asyncio
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return
+    import harness
+    import ui_textual
+
+    async def _scenario():
+        original_loop = harness.agent_loop
+        harness.agent_loop = lambda _msgs: (_ for _ in ()).throw(RuntimeError('simulated failure'))
+        app = ui_textual.CCApp([])
+        try:
+            async with app.run_test() as pilot:
+                app._set_input_busy(True)
+                app._user_input_q.put('trigger error')
+                error_visible = False
+                for _ in range(100):
+                    await pilot.pause()
+                    await asyncio.sleep(0.01)
+                    try:
+                        text = '\n'.join(str(widget.render())
+                                         for widget in app.query_one('#chat').children)
+                        error_visible = 'simulated failure' in text
+                    except Exception:
+                        continue
+                    if error_visible and not app._busy:
+                        break
+                assert error_visible, '异常没有反馈到会话界面'
+                assert not app._busy
+                assert not app.query_one('#input-line').disabled
+                app.action_quit()
+                for _ in range(50):
+                    if not app.is_running:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.01)
+        finally:
+            harness.agent_loop = original_loop
+
+    asyncio.run(_scenario())
+
+
 # ---------- 运行 ----------
 
 def main():

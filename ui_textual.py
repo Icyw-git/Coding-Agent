@@ -54,6 +54,7 @@ Collapsible > .collapsible--title { color: #d77757; }
 
 /* ---- 过程信息 / diff 标题 ---- */
 .debug-line { margin: 0 2; color: #6e6a6a; }
+.error-line { margin: 1 2; padding: 0 1; border-left: thick #ff6b80; color: #ffb4c0; }
 .diff-title { margin: 1 2 0 2; color: #96a0b4; }
 
 /* ---- 底部输入框 + 状态栏（dock 固定：输入在上，状态在下） ---- */
@@ -132,6 +133,7 @@ class CCApp(App):
         self._chat = None
         self._user_input_q: queue.Queue = queue.Queue()   # 用户输入 → agent 线程（多轮）
         self._exiting = False
+        self._busy = False
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
@@ -172,24 +174,54 @@ class CCApp(App):
         self.run_worker(self._run_agent, thread=True)
         self._input.focus()
 
+    def on_unmount(self) -> None:
+        """窗口被外部关闭时同样回收事件订阅与待等待的业务线程。"""
+        self._exiting = True
+        bus.unsubscribe(self._on_event)
+        try:
+            import harness
+            harness.permission_gate.cancel_pending()
+        except Exception:
+            pass
+        self._user_input_q.put(None)
+
     # ---------- 底部输入框：多轮对话 ----------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Enter 提交：文本进队列交给 agent 线程，同时渲染为 user 消息。"""
+        if self._busy or self._exiting:
+            return
         text = (event.value or '').strip()
         self._input.value = ''
         if not text:
             return
+        self._set_input_busy(True)
         self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
         self._user_input_q.put(text)
 
     def action_quit(self) -> None:
-        """Ctrl+C / Ctrl+D：唤醒 agent 线程退出（sentinel None → 循环 break）。"""
+        """Ctrl+C / Ctrl+D：拒绝待审批并唤醒 agent 线程退出。"""
         self._exiting = True
+        try:
+            import harness
+            harness.permission_gate.cancel_pending()
+        except Exception:
+            pass
         try:
             self._user_input_q.put(None)
         except Exception:
             pass
+
+    def _set_input_busy(self, busy: bool) -> None:
+        """只允许一条在途请求，保证聊天记录与实际执行顺序一致。"""
+        self._busy = busy
+        if not hasattr(self, '_input'):
+            return
+        self._input.disabled = busy
+        self._input.placeholder = ('正在处理当前消息...' if busy
+                                   else '输入消息，Enter 发送 · Ctrl+C 退出')
+        if not busy and not self._exiting:
+            self._input.focus()
 
     async def _consume_events(self) -> None:
         while True:
@@ -211,21 +243,31 @@ class CCApp(App):
     def _run_agent(self) -> None:
         import time
         import harness
-        with harness.agent_lock:
-            harness.permission_gate.use_ui = True   # 权限走事件弹窗模式（PermissionGate 挂起）
-            # 多轮对话：等用户输入 → 跑一轮 agent_loop → 再等输入（历史随 self._msgs 延续）
+        try:
+            # 多轮对话：空闲时不占 agent_lock，让 cron 队列能主动执行。
             while not self._exiting:
                 text = self._user_input_q.get()   # 阻塞等用户输入（None = 退出 sentinel）
                 if text is None:
                     break
                 self._msgs.append({'role': 'user', 'content': text})
-                harness.agent_loop(self._msgs)    # 一轮对话；内部会把模型回复 append 回 messages
-        self._event_queue.put(None)   # 通知消费者退出
-        # 等剩余事件渲染完再退出（带超时兜底，避免消费者异常时永久挂起）
-        deadline = time.monotonic() + 10
-        while self._event_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.call_from_thread(self.exit)
+                try:
+                    with harness.agent_lock:
+                        harness.permission_gate.use_ui = True
+                        harness.agent_loop(self._msgs)
+                except Exception as exc:
+                    bus.emit('error', msg=f'{type(exc).__name__}: {exc}')
+                finally:
+                    if not self._exiting:
+                        self.call_from_thread(self._set_input_busy, False)
+        finally:
+            harness.permission_gate.cancel_pending()
+            harness.permission_gate.use_ui = False
+            self._event_queue.put(None)   # 通知消费者退出
+            # 等剩余事件渲染完再退出（带超时兜底，避免消费者异常时永久挂起）
+            deadline = time.monotonic() + 10
+            while self._event_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.call_from_thread(self.exit)
 
     # ---------- 事件流：bus 回调（任意线程）→ 队列 → UI 线程顺序应用 ----------
 
@@ -287,6 +329,9 @@ class CCApp(App):
         elif e.type == 'debug':
             await self._chat.mount(Static(Text(self._strip_ansi(e.payload.get('msg', ''))),
                                           classes='debug-line'))
+        elif e.type == 'error':
+            await self._chat.mount(Static(Text(f"Error: {e.payload.get('msg', '')}"),
+                                          classes='error-line'))
         elif e.type == 'diff':
             path = e.payload.get('path', '')
             if path:
@@ -427,4 +472,7 @@ def run(msgs: list) -> None:
     调用方（harness __main__）已保证 stdout 为 TTY；此处只负责切换渲染后端。"""
     from renderer import default_renderer
     bus.unsubscribe(default_renderer.on_event)   # 避免 ANSI 后端双份渲染
-    CCApp(msgs).run()
+    try:
+        CCApp(msgs).run()
+    finally:
+        bus.subscribe(default_renderer.on_event)

@@ -26,6 +26,7 @@ EVENT_TYPES = {
     'status',              # 会话状态指标 {model, tools, ctx_pct, tokens, cost}
     'diff',                # diff 文本 {path, diff_text}
     'debug',               # 过程/调试信息 {msg}
+    'error',               # 会话错误 {msg}
     'session_start',       # 会话开始 {prompt}
     'session_end',         # 会话结束
 }
@@ -86,27 +87,39 @@ class PermissionGate:
         self.use_ui = use_ui          # True=事件弹窗模式；False=stdin 模式
         self._pending: Dict[str, queue.Queue] = {}
         self._seq = 0
+        self._lock = threading.RLock()
         bus.subscribe(self._on_resolve)
 
     def _on_resolve(self, e: UIEvent) -> None:
         if e.type == 'permission_resolve':
-            q = self._pending.pop(e.payload.get('req_id'), None)
+            with self._lock:
+                q = self._pending.pop(e.payload.get('req_id'), None)
             if q:
                 q.put(e.payload.get('approved', False))
+
+    def cancel_pending(self) -> None:
+        """拒绝并唤醒所有待确认请求，用于 Textual 会话退出。"""
+        with self._lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for q in pending:
+            q.put(False)
 
     def request(self, tool: str, args: dict, title: str = 'Permission needed') -> bool:
         """请求一次权限确认，返回是否批准。业务线程调用，阻塞直到应答。"""
         if not self.use_ui:
             return self._ask_input(tool, args, title)
-        self._seq += 1
-        req_id = f'perm_{self._seq}'
         q: queue.Queue = queue.Queue()
-        self._pending[req_id] = q
+        with self._lock:
+            self._seq += 1
+            req_id = f'perm_{self._seq}'
+            self._pending[req_id] = q
         self._bus.emit('permission_request', req_id=req_id, tool=tool, args=args, title=title)
         try:
             return q.get(timeout=self.REQUEST_TIMEOUT)
         except queue.Empty:
-            self._pending.pop(req_id, None)
+            with self._lock:
+                self._pending.pop(req_id, None)
             return False   # 无人应答：拒绝比等待安全
 
     @staticmethod
