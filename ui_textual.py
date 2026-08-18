@@ -70,8 +70,9 @@ Markdown > .markdown-blockquote { color: $muted; }
 Collapsible { margin: 1 2 0 2; background: $background; }
 Collapsible > .collapsible--title { color: $accent; }
 .tool-output { margin: 0 2 1 2; padding: 1 2;
-               border: round $inactive; background: $raised; color: $text; }
-.tool-failed { border: round $danger; color: $danger; }
+               border-left: thick $inactive; background: $raised; color: $text; }
+.tool-failed { border-left: thick $danger; color: $danger; }
+Collapsible:focus { border-left: thick $info; }
 
 /* ---- 过程信息 / diff 标题 ---- */
 .debug-line { margin: 0 2; color: $inactive; }
@@ -666,7 +667,9 @@ class CCApp(App):
 
     def _update_status(self, payload: dict) -> None:
         """更新指标后重绘状态栏；活动态由 activity 事件统一驱动。"""
-        if any(key in payload for key in ('model', 'tools', 'ctx_pct', 'tokens', 'cost')):
+        if any(key in payload for key in (
+                'model', 'tools', 'ctx_pct', 'ctx_tokens', 'tokens', 'cost',
+                'cost_source', 'ctx_source')):
             self._last_status.update(payload)
         self._refresh_status_line()
         self._refresh_sidebar()
@@ -695,12 +698,32 @@ class CCApp(App):
         if self._activity_detail:
             summary.append(str(self._activity_detail)[:48] + '\n', style=PALETTE['muted'])
         if self._last_status.get('ctx_pct') is not None:
-            summary.append(f"Context  {int(self._last_status['ctx_pct'])}%\n")
+            ctx_source = self._last_status.get('ctx_source', 'estimated')
+            marker = '' if ctx_source == 'confirmed' else '~'
+            ctx_tokens = self._last_status.get('ctx_tokens')
+            ctx_window = self._last_status.get('ctx_window')
+            summary.append(f"Context  {marker}{int(self._last_status['ctx_pct'])}%\n")
+            if ctx_tokens is not None and ctx_window:
+                summary.append(f"         {ctx_tokens} / {ctx_window}\n", style=PALETTE['muted'])
         summary.append(f"Tools    {int(self._last_status.get('tools', 0))}\n")
-        if self._last_status.get('tokens'):
-            summary.append(f"Tokens   {self._last_status['tokens']}\n")
-        if self._last_status.get('cost'):
-            summary.append(f"Cost     {float(self._last_status['cost']):.3f}\n")
+        if self._last_status.get('tokens') is not None:
+            tokens = self._last_status.get('tokens', 0)
+            prompt = self._last_status.get('prompt_tokens', 0)
+            completion = self._last_status.get('completion_tokens', 0)
+            cached = self._last_status.get('cached_tokens', 0)
+            reasoning = self._last_status.get('reasoning_tokens', 0)
+            summary.append(f"Tokens   {tokens}\n")
+            summary.append(f"Input    {prompt}\n")
+            summary.append(f"Output   {completion}\n")
+            if cached or reasoning:
+                summary.append(f"Cache    {cached}\n")
+                summary.append(f"Reason   {reasoning}\n")
+        if self._last_status.get('cost') is not None:
+            source = self._last_status.get('cost_source', 'estimated')
+            summary.append(f"Cost     {self._format_cost(self._last_status['cost'], source)}\n")
+            summary.append(f"Billing  {self._source_label(source)}\n")
+        if self._last_status.get('calls'):
+            summary.append(f"Calls    {int(self._last_status['calls'])}\n")
         self._session_summary.update(summary)
 
         recent = Text()
@@ -758,15 +781,34 @@ class CCApp(App):
             parts.append(f"[{PALETTE['accent']} on {PALETTE['raised']}] {markup_escape(str(payload['model']))} [/]")
         ctx = payload.get('ctx_pct')
         if ctx is not None and width >= 44:
-            parts.append(CCApp._ctx_bar(int(ctx)))
+            marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
+            parts.append(marker + CCApp._ctx_bar(int(ctx)))
         if payload.get('tools') is not None and width >= 68:
             parts.append(f"[dim]{int(payload['tools'])} tools[/]")
         if payload.get('tokens') and width >= 78:
             parts.append(f"[dim]{payload['tokens']} tok[/]")
         cost = payload.get('cost')
         if cost and width >= 96:
-            parts.append(f"[dim]\u00a5{float(cost):.3f}[/]")
+            parts.append(f"[dim]{self._format_cost(cost, payload.get('cost_source', 'estimated'))}[/]")
         return '  '.join(parts)
+
+    @staticmethod
+    def _format_cost(value, source: str = 'estimated') -> str:
+        """Format Decimal/string costs without losing the confirmed/estimated distinction."""
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            amount = 0.0
+        prefix = '' if source == 'confirmed' else '~'
+        return f"{prefix}\u00a5{amount:.4f}"
+
+    @staticmethod
+    def _source_label(source: str) -> str:
+        return {
+            'confirmed': 'Confirmed',
+            'mixed': 'Mixed',
+            'estimated': 'Estimated',
+        }.get(source, 'Estimated')
 
     @staticmethod
     def _ctx_bar(pct: int) -> str:

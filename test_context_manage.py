@@ -215,6 +215,60 @@ def test_normal_tool_flow():
         harness.client.chat.completions.create = orig_create
 
 
+def test_usage_snapshot_and_cost_breakdown(monkeypatch):
+    """Provider usage details drive exact Decimal billing, including cache/reasoning fields."""
+    monkeypatch.setattr(harness, '_MODEL_COSTS', {
+        'demo': {'input': harness.Decimal('1.00'), 'output': harness.Decimal('3.00'),
+                 'cached_input': harness.Decimal('0.10'), 'reasoning_output': harness.Decimal('5.00'),
+                 'context_window': 1000, 'currency': 'CNY', 'version': 'test'}
+    })
+    usage = {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140,
+             'prompt_tokens_details': {'cached_tokens': 25},
+             'completion_tokens_details': {'reasoning_tokens': 10}}
+    snapshot = harness._usage_snapshot(usage)
+    assert snapshot['cached_tokens'] == 25
+    assert snapshot['reasoning_tokens'] == 10
+    expected = (25 * harness.Decimal('0.10') + 75 * harness.Decimal('1.00') +
+                30 * harness.Decimal('3.00') + 10 * harness.Decimal('5.00')) / harness.Decimal(1000000)
+    assert harness._cost_from_usage(snapshot, 'demo') == expected
+    assert isinstance(harness._estimate_cost(100, 40, 'demo'), harness.Decimal)
+
+
+def test_record_usage_tracks_source_and_ledger(monkeypatch):
+    monkeypatch.setattr(harness, '_MODEL_COSTS', {
+        'demo': {'input': harness.Decimal('1'), 'output': harness.Decimal('2'),
+                 'cached_input': None, 'reasoning_output': None,
+                 'context_window': 1000, 'currency': 'CNY', 'version': 'test'}
+    })
+    with harness._METRICS_LOCK:
+        old_metrics = dict(harness._SESSION_METRICS)
+        old_ledger = list(harness._USAGE_LEDGER)
+        harness._USAGE_LEDGER.clear()
+        for key in ('tokens', 'prompt_tokens', 'completion_tokens', 'cached_tokens',
+                    'reasoning_tokens', 'calls'):
+            harness._SESSION_METRICS[key] = 0
+        harness._SESSION_METRICS['cost'] = harness.Decimal('0')
+    try:
+        entry = harness._record_usage('demo', {
+            'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15,
+            'cached_tokens': 0, 'reasoning_tokens': 0,
+        }, 'estimated')
+        assert entry['source'] == 'estimated'
+        assert harness._SESSION_METRICS['calls'] == 1
+        assert harness._SESSION_METRICS['tokens'] == 15
+        assert harness._SESSION_METRICS['cost'] == harness.Decimal('0.00002')
+        harness._record_usage('demo', {
+            'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15,
+            'cached_tokens': 0, 'reasoning_tokens': 0,
+        }, 'confirmed')
+        assert harness._SESSION_METRICS['cost_source'] == 'mixed'
+    finally:
+        with harness._METRICS_LOCK:
+            harness._SESSION_METRICS.clear()
+            harness._SESSION_METRICS.update(old_metrics)
+            harness._USAGE_LEDGER[:] = old_ledger
+
+
 def test_preprocessors_order():
     """每轮循环开头必须按 budget → snip → micro 顺序执行预处理。"""
     names = ('tool_result_budget', 'snip_compact', 'micro_compact')

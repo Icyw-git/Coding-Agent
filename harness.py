@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 import openai
 import json
 import time
+from decimal import Decimal, InvalidOperation
 import sys
 import threading
 from pathlib import Path
@@ -364,21 +365,172 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
 # 当前会话累计指标（供 summary_hook / statusline 使用）
 # tokens: 真实 usage.total_tokens 累计；cost: 按单价估算累计（元）
 # tools: 会话内实际执行工具次数；ctx_tokens: 最近一次请求的真实输入 token（usage.prompt_tokens）
-_SESSION_METRICS={'tokens':0,'cost':0.0,'tools':0,'ctx_tokens':0}
+_SESSION_METRICS={
+    'tokens': 0,
+    'prompt_tokens': 0,
+    'completion_tokens': 0,
+    'cached_tokens': 0,
+    'reasoning_tokens': 0,
+    'cost': Decimal('0'),
+    'tools': 0,
+    'ctx_tokens': 0,
+    'ctx_source': 'estimated',
+    'cost_source': 'estimated',
+    'model': '',
+    'calls': 0,
+}
+_USAGE_LEDGER=[]
+_METRICS_LOCK=threading.RLock()
 
-# 模型单价（人民币/1M tokens，可按实际价格调整或经环境变量覆盖），未配置模型返回 0
+# 价格单位为 CNY / 1M tokens。可通过 LLM_PRICING_JSON 覆盖，避免把价格散落在代码中。
 _MODEL_COSTS={
-    'deepseek-v4-flash': {'input':0.50,'output':1.01},
-    'deepseek-chat':     {'input':1.01,'output':2.02},
-    'deepseek-reasoner': {'input':2.02,'output':7.92},
+    'deepseek-v4-flash': {
+        'input': Decimal('0.50'), 'output': Decimal('1.01'),
+        'cached_input': None, 'reasoning_output': None,
+        'context_window': 131072, 'currency': 'CNY', 'version': 'default',
+    },
+    'deepseek-chat': {
+        'input': Decimal('1.01'), 'output': Decimal('2.02'),
+        'cached_input': None, 'reasoning_output': None,
+        'context_window': 65536, 'currency': 'CNY', 'version': 'default',
+    },
+    'deepseek-reasoner': {
+        'input': Decimal('2.02'), 'output': Decimal('7.92'),
+        'cached_input': None, 'reasoning_output': Decimal('7.92'),
+        'context_window': 65536, 'currency': 'CNY', 'version': 'default',
+    },
 }
 
-def _estimate_cost(prompt_tokens:int,completion_tokens:int,model:str)->float:
-    """根据 prompt/completion token 数和模型单价估算单次调用成本（人民币，估算值）。"""
-    cost=_MODEL_COSTS.get(model.lower(),{})
-    if not cost:
-        return 0.0
-    return (prompt_tokens*cost['input']+completion_tokens*cost['output'])/1_000_000
+
+def _load_model_costs():
+    """读取可选的 JSON 价格表；非法配置回退内置价格并保持可启动。"""
+    raw = os.getenv('LLM_PRICING_JSON', '').strip()
+    if not raw:
+        return _MODEL_COSTS
+    try:
+        configured = json.loads(raw)
+        if not isinstance(configured, dict):
+            return _MODEL_COSTS
+        merged = dict(_MODEL_COSTS)
+        for model, spec in configured.items():
+            if not isinstance(spec, dict):
+                continue
+            base = dict(merged.get(str(model).lower(), {}))
+            for key, value in spec.items():
+                if key in ('input', 'output', 'cached_input', 'reasoning_output'):
+                    base[key] = None if value is None else Decimal(str(value))
+                else:
+                    base[key] = value
+            merged[str(model).lower()] = base
+        return merged
+    except (ValueError, InvalidOperation, TypeError):
+        return _MODEL_COSTS
+
+
+_MODEL_COSTS=_load_model_costs()
+
+
+def _model_spec(model: str):
+    return _MODEL_COSTS.get(str(model or '').lower(), {})
+
+
+def _context_window(model: str) -> int:
+    spec = _model_spec(model)
+    configured = os.getenv('LLM_CONTEXT_WINDOW', '').strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            pass
+    model_key = str(model or '').lower()
+    return int(spec.get('context_window') or MODEL_WINDOWS.get(model_key, 65536))
+
+
+def _estimate_cost(prompt_tokens:int, completion_tokens:int, model:str) -> Decimal:
+    """按当前价格表估算成本；返回 Decimal，未知模型返回 0。"""
+    spec = _model_spec(model)
+    if not spec:
+        return Decimal('0')
+    prompt = Decimal(max(0, int(prompt_tokens)))
+    completion = Decimal(max(0, int(completion_tokens)))
+    return (prompt * spec.get('input', Decimal('0')) +
+            completion * spec.get('output', Decimal('0'))) / Decimal(1000000)
+
+
+def _usage_value(obj, name: str, default=0) -> int:
+    if isinstance(obj, dict):
+        value = obj.get(name, default)
+    else:
+        value = getattr(obj, name, default) if obj is not None else default
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _usage_snapshot(usage):
+    """兼容 OpenAI/DeepSeek usage 以及 *_details 扩展字段。"""
+    prompt = _usage_value(usage, 'prompt_tokens', _usage_value(usage, 'input_tokens'))
+    completion = _usage_value(usage, 'completion_tokens', _usage_value(usage, 'output_tokens'))
+    total = _usage_value(usage, 'total_tokens', prompt + completion)
+    if isinstance(usage, dict):
+        prompt_details = usage.get('prompt_tokens_details')
+        completion_details = usage.get('completion_tokens_details')
+    else:
+        prompt_details = getattr(usage, 'prompt_tokens_details', None)
+        completion_details = getattr(usage, 'completion_tokens_details', None)
+    cached = _usage_value(prompt_details, 'cached_tokens')
+    reasoning = _usage_value(completion_details, 'reasoning_tokens')
+    return {
+        'prompt_tokens': prompt, 'completion_tokens': completion,
+        'total_tokens': total, 'cached_tokens': cached,
+        'reasoning_tokens': reasoning,
+    }
+
+
+def _cost_from_usage(snapshot: dict, model: str) -> Decimal:
+    spec = _model_spec(model)
+    if not spec:
+        return Decimal('0')
+    prompt = Decimal(snapshot['prompt_tokens'])
+    cached = Decimal(min(snapshot['cached_tokens'], snapshot['prompt_tokens']))
+    completion = Decimal(snapshot['completion_tokens'])
+    reasoning = Decimal(min(snapshot['reasoning_tokens'], snapshot['completion_tokens']))
+    cached_rate = spec.get('cached_input')
+    input_cost = ((cached * cached_rate) + ((prompt - cached) * spec.get('input', Decimal('0')))
+                  if cached_rate is not None else prompt * spec.get('input', Decimal('0')))
+    reasoning_rate = spec.get('reasoning_output')
+    if reasoning_rate is not None:
+        output_cost = ((completion - reasoning) * spec.get('output', Decimal('0')) +
+                       reasoning * reasoning_rate)
+    else:
+        output_cost = completion * spec.get('output', Decimal('0'))
+    return (input_cost + output_cost) / Decimal(1000000)
+
+
+def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict:
+    cost = _cost_from_usage(snapshot, model) if source == 'confirmed' else _estimate_cost(
+        snapshot['prompt_tokens'], snapshot['completion_tokens'], model)
+    entry = dict(snapshot, model=model, cost=cost, source=source,
+                 currency=_model_spec(model).get('currency', 'CNY'),
+                 pricing_version=_model_spec(model).get('version', 'unknown'))
+    with _METRICS_LOCK:
+        _USAGE_LEDGER.append(entry)
+        _SESSION_METRICS['calls'] += 1
+        _SESSION_METRICS['tokens'] += snapshot['total_tokens']
+        _SESSION_METRICS['prompt_tokens'] += snapshot['prompt_tokens']
+        _SESSION_METRICS['completion_tokens'] += snapshot['completion_tokens']
+        _SESSION_METRICS['cached_tokens'] += snapshot['cached_tokens']
+        _SESSION_METRICS['reasoning_tokens'] += snapshot['reasoning_tokens']
+        _SESSION_METRICS['cost'] += cost
+        _SESSION_METRICS['ctx_tokens'] = snapshot['prompt_tokens']
+        _SESSION_METRICS['ctx_source'] = source
+        sources = {item['source'] for item in _USAGE_LEDGER}
+        _SESSION_METRICS['cost_source'] = (
+            'confirmed' if sources == {'confirmed'} else
+            'estimated' if sources == {'estimated'} else 'mixed')
+        _SESSION_METRICS['model'] = model
+    return entry
 
 def _build_streamed_message(content, tool_acc):
     """把流式收集的 content + tool_calls（分段拼接）重建为兼容 OpenAI message 的对象。
@@ -412,19 +564,34 @@ def _build_streamed_message(content, tool_acc):
     return _StreamedMessage()
 
 
-def update_panel_status(messages:list) -> None:
+def update_panel_status(messages:list, *, model: str = None,
+                        ctx_tokens: int = None, ctx_source: str = None) -> None:
     """发送会话状态指标事件（模型 / 工具数 / 上下文占用 / token / 成本）。
 
     渲染与否由订阅的渲染后端决定（默认 AnsiRenderer 不渲染 status）。"""
-    ctx_pct = 0
-    if messages:
-        ctx_pct = min(100, int(100 * estimate_size(messages) / CONTEXT_LIMIT))
+    model = model or os.getenv('LLM_MODEL_ID', '')
+    if ctx_tokens is None:
+        ctx_tokens = estimate_size(messages) if messages else 0
+        ctx_source = ctx_source or 'estimated'
+    else:
+        ctx_source = ctx_source or 'confirmed'
+    window = _context_window(model)
+    ctx_pct = min(100, int(100 * ctx_tokens / max(1, window)))
     bus.emit('status',
-             model=os.getenv('LLM_MODEL_ID', ''),
+             model=model,
              tools=_SESSION_METRICS.get('tools', 0),
              ctx_pct=ctx_pct,
+             ctx_tokens=ctx_tokens,
+             ctx_window=window,
+             ctx_source=ctx_source,
              tokens=str(_SESSION_METRICS.get('tokens', 0)),
-             cost=_SESSION_METRICS.get('cost', 0))
+             prompt_tokens=_SESSION_METRICS.get('prompt_tokens', 0),
+             completion_tokens=_SESSION_METRICS.get('completion_tokens', 0),
+             cached_tokens=_SESSION_METRICS.get('cached_tokens', 0),
+             reasoning_tokens=_SESSION_METRICS.get('reasoning_tokens', 0),
+             cost=str(_SESSION_METRICS.get('cost', Decimal('0'))),
+             cost_source=_SESSION_METRICS.get('cost_source', 'estimated'),
+             calls=_SESSION_METRICS.get('calls', 0))
 
 def agent_loop(messages:list):
     bus.emit('activity', state='preparing', detail='Preparing session')
@@ -476,12 +643,14 @@ def agent_loop(messages:list):
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         request_messages = inject_memories(messages, memories_content, system)
 
+        request_model = recovery_state.current_model or os.getenv("LLM_MODEL_ID")
+
         def _create():
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
             return client.chat.completions.create(
-                model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
+                model=request_model,
                 messages=request_messages,
                 tools=TOOLS,
                 temperature=0.7,
@@ -540,17 +709,25 @@ def agent_loop(messages:list):
 
         message = _build_streamed_message(''.join(content_parts) or None, tool_acc)
 
-        # 累计真实 token / 成本（流式末尾 chunk 带 usage，OpenAI 兼容 API）
-        if usage:
-            prompt_tokens=getattr(usage,'prompt_tokens',0)
-            completion_tokens=getattr(usage,'completion_tokens',0)
-            _SESSION_METRICS['tokens']+=getattr(usage,'total_tokens',prompt_tokens+completion_tokens)
-            _SESSION_METRICS['ctx_tokens']=prompt_tokens   # 真实输入量（当前上下文实际大小）
-            _SESSION_METRICS['cost']+=_estimate_cost(
-                prompt_tokens, completion_tokens,
-                os.getenv('LLM_MODEL_ID','')
-            )
-
+        # usage 存在时以 provider 账单口径为准；兼容端点不返回 usage 时明确标记 estimated。
+        if usage is not None:
+            usage_snapshot = _usage_snapshot(usage)
+            usage_source = 'confirmed'
+        else:
+            provisional_message = _build_streamed_message(
+                ''.join(content_parts) or None, tool_acc)
+            usage_snapshot = {
+                'prompt_tokens': estimate_size(request_messages),
+                'completion_tokens': estimate_size([provisional_message.model_dump()]),
+                'total_tokens': 0, 'cached_tokens': 0, 'reasoning_tokens': 0,
+            }
+            usage_snapshot['total_tokens'] = (usage_snapshot['prompt_tokens'] +
+                                              usage_snapshot['completion_tokens'])
+            usage_source = 'estimated'
+        _record_usage(request_model, usage_snapshot, usage_source)
+        update_panel_status(messages, model=request_model,
+                            ctx_tokens=usage_snapshot['prompt_tokens'],
+                            ctx_source=usage_source)
         messages.append(message.model_dump()) #添加模型回复到上下文
 
         # 输出被截断：升级到加大 max_tokens 并提示续写
