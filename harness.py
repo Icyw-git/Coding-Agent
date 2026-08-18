@@ -141,6 +141,38 @@ PERSIST_THERSHOLD=10000
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
 TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 
+
+def serialize_session(messages:list) -> str:
+    """把现有会话消息序列化为可读 Markdown，不改变原始 messages。"""
+    lines = ['# Harness session', '']
+    for index, message in enumerate(messages or [], 1):
+        role = str(message.get('role', 'unknown')).title()
+        lines.append(f'## {index}. {role}')
+        content = message.get('content')
+        if content is None:
+            content = ''
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        lines.append(content)
+        tool_calls = message.get('tool_calls') or []
+        for call in tool_calls:
+            function = call.get('function', {}) if isinstance(call, dict) else {}
+            name = function.get('name', 'tool')
+            arguments = function.get('arguments', '{}')
+            lines.extend(['', f'**Tool call:** `{name}`', '```json', str(arguments), '```'])
+        lines.append('')
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def export_session(messages:list, path=None):
+    """将当前会话导出为 Markdown，返回实际写入路径。"""
+    if path is None:
+        path = TRANSCRIPT_DIR / f'session_export_{int(time.time())}.md'
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(serialize_session(messages), encoding='utf-8')
+    return path
+
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=1
 
@@ -291,6 +323,9 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     args = json.loads(tool_call.function.arguments)
     if registry is None:
         registry = tool_registry
+    started_at = time.monotonic()
+    background_started = False
+    bus.emit('activity', state='tool', detail=name)
     bus.emit('tool_start', name=name, args=args)   # 工具实时可见（渲染层执行中即显示）
     if hooks:
         blocked = trigger_hooks("PreToolUse", name, args)
@@ -304,6 +339,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
         try:
             if background and should_run_background(name, args):
                 bg_id = start_background_task(tool_call, registry)
+                background_started = True
                 output = (f"[Background task {bg_id} started] "
                           f"Command: {args.get('command', '')}. "
                           f"Result will be available when complete.")
@@ -314,7 +350,15 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
             output = f"Error: {e}"
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
-    bus.emit('tool_end', name=name, args=args, output_preview=str(output)[:2000])
+    output_text = str(output)
+    failed = output_text.lstrip().lower().startswith('error:')
+    denied = output_text == 'Permission denied by user'
+    _SESSION_METRICS['tools'] += 1
+    bus.emit('tool_end', name=name, args=args, output_preview=output_text[:2000],
+             output_len=len(output_text), ok=not (failed or denied),
+             background=background_started,
+             duration_ms=round((time.monotonic() - started_at) * 1000))
+    bus.emit('activity', state='thinking', detail='Reviewing tool result')
     return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
 
 # 当前会话累计指标（供 summary_hook / statusline 使用）
@@ -377,12 +421,13 @@ def update_panel_status(messages:list) -> None:
         ctx_pct = min(100, int(100 * estimate_size(messages) / CONTEXT_LIMIT))
     bus.emit('status',
              model=os.getenv('LLM_MODEL_ID', ''),
-             tools=len(tool_registry),
+             tools=_SESSION_METRICS.get('tools', 0),
              ctx_pct=ctx_pct,
              tokens=str(_SESSION_METRICS.get('tokens', 0)),
              cost=_SESSION_METRICS.get('cost', 0))
 
 def agent_loop(messages:list):
+    bus.emit('activity', state='preparing', detail='Preparing session')
     context=update_context({},messages)
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -395,6 +440,7 @@ def agent_loop(messages:list):
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
+    bus.emit('activity', state='preparing', detail='Loading relevant memory')
     bus.emit('status', phase='thinking')
     try:
         memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
@@ -444,6 +490,7 @@ def agent_loop(messages:list):
                 stream_options={"include_usage": True},   # 流式末尾 chunk 携带 usage
             )
 
+        bus.emit('activity', state='thinking', detail='Requesting model response')
         bus.emit('status', phase='thinking')
         try:
             stream = recovery.with_retry(_create, recovery_state)
@@ -465,6 +512,7 @@ def agent_loop(messages:list):
         finish_reason = None
         usage = None
         mid = f'msg_{int(time.time() * 1000)}'
+        bus.emit('activity', state='generating', detail='Streaming response')
         bus.emit('assistant_start', mid=mid)
         try:
             for chunk in stream:
@@ -519,6 +567,7 @@ def agent_loop(messages:list):
                 messages.append({'role':'user','content':force})
                 continue
             # 最终回复：流式 delta 已实时渲染，此处只负责收尾（落盘 / 提炼记忆）
+            bus.emit('activity', state='saving', detail='Saving transcript and memory')
             bus.emit('session_end')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
@@ -533,6 +582,7 @@ def agent_loop(messages:list):
             # consolidate_memories()：仅当记忆文件数 ≥ CONSOLIDATE_THRESHOLD(10) 时触发，
             #    合并重复/过期记忆；LLM 返回空数组时会中止，防止删光所有记忆。
             consolidate_memories()
+            bus.emit('activity', state='complete', detail='Response complete')
             return message.content or "No output"
             
 

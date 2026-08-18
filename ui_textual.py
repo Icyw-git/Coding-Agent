@@ -19,7 +19,7 @@ import queue
 import time
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Collapsible, Input, Markdown, Static
 
@@ -27,46 +27,77 @@ from rich.markup import escape as markup_escape
 from rich.text import Text
 from ui_events import bus, UIEvent
 
+PALETTE = {
+    'background': '#191919',
+    'surface': '#101010',
+    'raised': '#232323',
+    'text': '#e8e6e3',
+    'muted': '#a7a3a2',
+    'inactive': '#6e6a6a',
+    'accent': '#d77757',
+    'info': '#6ab0ff',
+    'success': '#4eba65',
+    'warning': '#ffc107',
+    'danger': '#ff6b80',
+    'permission': '#b1b9f9',
+    'code': '#3c3c42',
+}
+
 CSS = """
-Screen { background: #191919; }
-#chat { height: 1fr; }
+Screen { background: $background; }
+#content { height: 1fr; }
+#chat { width: 1fr; }
+#side-panel { width: 30; padding: 1 1; background: $surface; border-left: thick $inactive; }
+#session-summary { color: $muted; }
+#recent-tools { margin-top: 1; color: $muted; }
 
 /* ---- 顶部状态条（CC：极简深色，无 Textual 默认 Header） ---- */
-#header-line { height: 1; background: #101010; padding: 0 2; }
+#header-line { height: 1; background: $surface; padding: 0 2; }
 
 /* ---- 用户消息（CC：左侧橙竖条 + 深底，与 assistant 区分） ---- */
 .user-msg { margin: 1 2; padding: 0 1;
-            border-left: thick #d77757; background: #1f1f1f; color: #e8e6e3; }
+            border-left: thick $accent; background: $raised; color: $text; }
 
 /* ---- assistant 回复（流式 Static 增量；CC：正文色，无边框纯文本流） ---- */
-.assistant-msg { margin: 1 2; color: #e8e6e3; }
-Markdown { margin: 1 2; background: #191919; }
-Markdown > .markdown-h1, .markdown-h2, .markdown-h3 { color: #ffffff; }
-Markdown > .markdown-code { background: #3c3c42; color: #ffc882; }
-Markdown > .markdown-link { color: #6ab0ff; }
-Markdown > .markdown-blockquote { color: #a0a0aa; }
+.assistant-msg { margin: 1 2; color: $text; }
+Markdown { margin: 1 2; background: $background; }
+Markdown > .markdown-h1, .markdown-h2, .markdown-h3 { color: $text; }
+Markdown > .markdown-code { background: $code; color: $warning; }
+Markdown > .markdown-link { color: $info; }
+Markdown > .markdown-blockquote { color: $muted; }
 
 /* ---- 工具调用块（CC：✳ 橙标题，折叠成一行；输出粉色边框框） ---- */
-Collapsible { margin: 1 2 0 2; background: #191919; }
-Collapsible > .collapsible--title { color: #d77757; }
+Collapsible { margin: 1 2 0 2; background: $background; }
+Collapsible > .collapsible--title { color: $accent; }
 .tool-output { margin: 0 2 1 2; padding: 1 2;
-               border: round #ecb7be; background: #232323; color: #d4d4d4; }
+               border: round $inactive; background: $raised; color: $text; }
+.tool-failed { border: round $danger; color: $danger; }
 
 /* ---- 过程信息 / diff 标题 ---- */
-.debug-line { margin: 0 2; color: #6e6a6a; }
-.error-line { margin: 1 2; padding: 0 1; border-left: thick #ff6b80; color: #ffb4c0; }
-.diff-title { margin: 1 2 0 2; color: #96a0b4; }
+.debug-line { margin: 0 2; color: $inactive; }
+.error-line { margin: 1 2; padding: 0 1; border-left: thick $danger; color: $danger; }
+.diff-title { margin: 1 2 0 2; color: $muted; }
 
 /* ---- 底部输入框 + 状态栏（dock 固定：输入在上，状态在下） ---- */
-#bottom-bar { dock: bottom; height: 2; background: #101010; }
-#input-line { height: 1; padding: 0 2; background: #101010; color: #e8e6e3; border: none; }
+#bottom-bar { dock: bottom; height: 2; background: $surface; }
+#input-line { height: 1; padding: 0 2; background: $surface; color: $text; border: none; }
 #input-line:focus { border: none; }
-#status-line { height: 1; background: #101010; color: #a7a3a2; padding: 0 2; }
+#status-line { height: 1; background: $surface; color: $muted; padding: 0 2; }
 
 /* ---- 权限 Modal（CC：蓝紫边框权限确认） ---- */
-#perm-box { width: 76; padding: 2 3; border: round #b1b9f9; background: #262626; }
-#perm-title { color: #ffc107; }
+#perm-box { width: 76; padding: 2 3; border: round $permission; background: $raised; }
+#perm-title { color: $warning; }
+
+/* ---- 命令 / 搜索弹窗 ---- */
+#command-box, #search-box { width: 66; padding: 1 2; border: round $info; background: $raised; }
+.modal-title { color: $text; }
+.modal-hint { color: $muted; }
+#command-input, #search-input { margin-top: 1; border: none; background: $surface; color: $text; }
+.search-match { background: $raised; border-left: thick $info; }
 """
+
+for _name, _color in PALETTE.items():
+    CSS = CSS.replace(f'${_name}', _color)
 
 
 class PermissionModal(ModalScreen):
@@ -118,6 +149,53 @@ class PermissionModal(ModalScreen):
         self.dismiss()
 
 
+class CommandModal(ModalScreen):
+    """轻量命令面板：输入命令并交给主应用执行。"""
+
+    BINDINGS = [("escape", "dismiss", "Close")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='command-box'):
+            yield Static('Command', classes='modal-title')
+            yield Static('clear  export  search <text>  help', classes='modal-hint')
+            yield Input(placeholder='Type a command', id='command-input')
+
+    def on_mount(self) -> None:
+        self.query_one('#command-input', Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        command = (event.value or '').strip()
+        if command:
+            self.app.execute_command(command)
+        self.dismiss()
+
+    def action_dismiss(self) -> None:
+        self.dismiss()
+
+
+class SearchModal(ModalScreen):
+    """搜索当前可见会话与工具输出，并定位第一条结果。"""
+
+    BINDINGS = [("escape", "dismiss", "Close")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='search-box'):
+            yield Static('Search conversation', classes='modal-title')
+            yield Input(placeholder='Search visible messages and tool output', id='search-input')
+
+    def on_mount(self) -> None:
+        self.query_one('#search-input', Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        query = (event.value or '').strip()
+        if query:
+            self.app.execute_command(f'search {query}')
+        self.dismiss()
+
+    def action_dismiss(self) -> None:
+        self.dismiss()
+
+
 class CCApp(App):
     TITLE = "harness"
     CSS = CSS
@@ -125,6 +203,10 @@ class CCApp(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+d", "quit", "Quit"),
+        ("ctrl+p", "commands", "Commands"),
+        ("ctrl+f", "search", "Search"),
+        ("ctrl+l", "clear", "Clear"),
+        ("ctrl+e", "export", "Export"),
     ]
 
     def __init__(self, msgs: list):
@@ -137,7 +219,11 @@ class CCApp(App):
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
-        yield VerticalScroll(id="chat")
+        with Horizontal(id='content'):
+            yield VerticalScroll(id="chat")
+            with Vertical(id='side-panel'):
+                yield Static('', id='session-summary')
+                yield Static('', id='recent-tools')
         with Vertical(id="bottom-bar"):
             yield Input(placeholder="输入消息，Enter 发送 · Ctrl+C 退出", id="input-line")
             yield Static('', id="status-line")
@@ -147,9 +233,12 @@ class CCApp(App):
         import harness as h
         bus.subscribe(self._on_event)
         header = self.query_one('#header-line', Static)
-        header.update(f"[#d77757]harness[/] [#a7a3a2]{os.getenv('LLM_MODEL_ID', '')}[/]"
+        header.update(f"[{PALETTE['accent']}]harness[/] [{PALETTE['muted']}]{os.getenv('LLM_MODEL_ID', '')}[/]"
                       f" [dim]{markup_escape(str(h.WORKDIR))}[/]")
         self._chat = self.query_one('#chat', VerticalScroll)
+        self._side_panel = self.query_one('#side-panel', Vertical)
+        self._session_summary = self.query_one('#session-summary', Static)
+        self._recent_tools_widget = self.query_one('#recent-tools', Static)
         self._input = self.query_one('#input-line', Input)
         self._event_queue: queue.Queue = queue.Queue()
         self._active_tools: list = []   # 执行中的工具块（FIFO 匹配 tool_end）
@@ -160,6 +249,12 @@ class CCApp(App):
         self._streaming = False           # 正在流式输出（状态栏显示 spinner + 耗时）
         self._stream_start = 0.0
         self._stream_chars = 0
+        self._activity_state = 'ready'
+        self._activity_detail = ''
+        self._recent_tools = []
+        self._search_matches = []
+        self._side_panel.display = self.size.width >= 110
+        self._refresh_sidebar()
         # 帧刷新：网络 chunk 到达频率与 UI 渲染频率解耦 → 无论 chunk 多大都平滑打字机
         self.set_interval(0.05, self._flush_stream_buffers)
         self.set_interval(0.1, self._stream_tick)
@@ -184,6 +279,14 @@ class CCApp(App):
         except Exception:
             pass
         self._user_input_q.put(None)
+
+    def on_resize(self, event) -> None:
+        """窄终端专注会话，宽终端补充执行上下文。"""
+        if not hasattr(self, '_side_panel'):
+            return
+        self._side_panel.display = event.size.width >= 110
+        self._refresh_status_line()
+        self._refresh_sidebar()
 
     # ---------- 底部输入框：多轮对话 ----------
 
@@ -211,6 +314,100 @@ class CCApp(App):
             self._user_input_q.put(None)
         except Exception:
             pass
+
+    def action_commands(self) -> None:
+        if not self._exiting:
+            self.push_screen(CommandModal())
+
+    def action_search(self) -> None:
+        if not self._exiting:
+            self.push_screen(SearchModal())
+
+    def action_clear(self) -> None:
+        self.execute_command('clear')
+
+    def action_export(self) -> None:
+        self.execute_command('export')
+
+    def execute_command(self, command: str) -> None:
+        """从快捷键或命令面板进入同一执行路径。"""
+        asyncio.create_task(self._execute_command(command))
+
+    async def _execute_command(self, command: str) -> None:
+        raw = command.strip()
+        verb, _, argument = raw.partition(' ')
+        verb = verb.lower()
+        argument = argument.strip()
+        if verb in ('help', '?'):
+            await self._show_notice('Commands: clear | export | search <text> | help')
+        elif verb == 'clear':
+            await self._clear_conversation()
+        elif verb == 'export':
+            await self._export_conversation()
+        elif verb == 'search':
+            await self._search_conversation(argument)
+        elif raw:
+            await self._show_notice(f'Unknown command: {raw}')
+
+    async def _clear_conversation(self) -> None:
+        """仅在空闲时清除本轮会话历史，避免破坏正在执行的请求。"""
+        if self._busy:
+            await self._show_notice('Cannot clear while a request is running.')
+            return
+        self._msgs.clear()
+        self._active_tools.clear()
+        self._active_widgets.clear()
+        self._assistant_buffers.clear()
+        self._flushed.clear()
+        self._recent_tools.clear()
+        self._clear_search_matches()
+        await self._chat.remove_children()
+        self._refresh_sidebar()
+        await self._show_notice('Conversation cleared.')
+
+    async def _export_conversation(self) -> None:
+        """导出当前 messages 的 Markdown 副本，不影响会话或 agent 流程。"""
+        import harness
+        try:
+            path = harness.export_session(self._msgs)
+        except Exception as exc:
+            await self._show_notice(f'Export failed: {type(exc).__name__}: {exc}')
+            return
+        await self._show_notice(f'Exported Markdown: {path}')
+
+    async def _search_conversation(self, query: str) -> None:
+        """搜索当前渲染的会话内容，并定位第一条匹配消息。"""
+        self._clear_search_matches()
+        if not query:
+            await self._show_notice('Enter text after search.')
+            return
+        needle = query.casefold()
+        for widget in self._chat.children:
+            if needle in self._widget_text(widget).casefold():
+                widget.add_class('search-match')
+                self._search_matches.append(widget)
+        if self._search_matches:
+            self._chat.scroll_to(self._search_matches[0], animate=False)
+            await self._show_notice(f'Found {len(self._search_matches)} match(es) for: {query}')
+        else:
+            await self._show_notice(f'No visible matches for: {query}')
+
+    def _clear_search_matches(self) -> None:
+        for widget in self._search_matches:
+            widget.remove_class('search-match')
+        self._search_matches = []
+
+    @staticmethod
+    def _widget_text(widget) -> str:
+        """递归收集 widget 的已渲染内容，供会话与工具输出搜索。"""
+        parts = [str(widget.render())]
+        for child in widget.children:
+            parts.append(CCApp._widget_text(child))
+        return '\n'.join(parts)
+
+    async def _show_notice(self, message: str) -> None:
+        await self._chat.mount(Static(Text(message), classes='debug-line'))
+        self._chat.scroll_end(animate=False)
 
     def _set_input_busy(self, busy: bool) -> None:
         """只允许一条在途请求，保证聊天记录与实际执行顺序一致。"""
@@ -255,6 +452,7 @@ class CCApp(App):
                         harness.permission_gate.use_ui = True
                         harness.agent_loop(self._msgs)
                 except Exception as exc:
+                    bus.emit('activity', state='failed', detail='Request failed')
                     bus.emit('error', msg=f'{type(exc).__name__}: {exc}')
                 finally:
                     if not self._exiting:
@@ -317,21 +515,44 @@ class CCApp(App):
             # 工具实时可见：执行中即展开显示（✳ 橙标题），完成后折叠
             name = e.payload.get('name', 'tool')
             args = e.payload.get('args', {})
-            col = Collapsible(title=Text(f"\u2737 {name} {args}"), collapsed=False)
+            col = Collapsible(title=self._tool_title('running', name, args=args), collapsed=False)
             await self._chat.mount(col)
             self._active_tools.append(col)   # 工具串行执行，FIFO 匹配 tool_end
+            self._recent_tools.insert(0, {'name': name, 'state': 'running', 'duration_ms': None})
+            self._recent_tools = self._recent_tools[:5]
+            self._refresh_sidebar()
         elif e.type == 'tool_end':
             out = str(e.payload.get('output_preview', ''))[:2000]
             if self._active_tools:
                 col = self._active_tools.pop(0)
-                await col.mount(Static(Text(out or '[No output]'), classes='tool-output'))
+                name = e.payload.get('name', 'tool')
+                ok = bool(e.payload.get('ok', True))
+                background = bool(e.payload.get('background', False))
+                state = 'queued' if background else 'complete' if ok else 'failed'
+                col.title = self._tool_title(
+                    state, name, duration_ms=e.payload.get('duration_ms', 0))
+                output_len = int(e.payload.get('output_len', len(out)))
+                if output_len > len(out):
+                    out += f'\n\n... output truncated ({output_len:,} characters total)'
+                classes = 'tool-output' if ok else 'tool-output tool-failed'
+                await col.mount(Static(Text(out or '[No output]'), classes=classes))
                 col.collapsed = True
+                for tool in self._recent_tools:
+                    if tool['name'] == name and tool['state'] == 'running':
+                        tool.update(state=state, duration_ms=e.payload.get('duration_ms', 0))
+                        break
+                self._refresh_sidebar()
         elif e.type == 'debug':
             await self._chat.mount(Static(Text(self._strip_ansi(e.payload.get('msg', ''))),
                                           classes='debug-line'))
         elif e.type == 'error':
             await self._chat.mount(Static(Text(f"Error: {e.payload.get('msg', '')}"),
                                           classes='error-line'))
+        elif e.type == 'activity':
+            self._activity_state = e.payload.get('state', 'ready')
+            self._activity_detail = e.payload.get('detail', '')
+            self._refresh_status_line()
+            self._refresh_sidebar()
         elif e.type == 'diff':
             path = e.payload.get('path', '')
             if path:
@@ -359,6 +580,30 @@ class CCApp(App):
             await asyncio.sleep(0.02)
 
     @staticmethod
+    def _short_args(args: dict, limit: int = 72) -> str:
+        """工具参数压成单行摘要，避免工具标题挤占会话宽度。"""
+        compact = ' '.join(str(args).split())
+        return compact if len(compact) <= limit else compact[:limit - 3] + '...'
+
+    @staticmethod
+    def _tool_title(state: str, name: str, args=None, duration_ms=None) -> Text:
+        """用统一的状态语义渲染工具标题，结果默认可折叠扫描。"""
+        icon, label, color = {
+            'running': ('*', 'Running', PALETTE['accent']),
+            'complete': ('+', 'Done', PALETTE['success']),
+            'queued': ('~', 'Queued', PALETTE['info']),
+            'failed': ('!', 'Failed', PALETTE['danger']),
+        }.get(state, ('*', state.title(), PALETTE['muted']))
+        title = Text()
+        title.append(f'{icon} {label} ', style=f'bold {color}')
+        title.append(name, style='bold')
+        if args:
+            title.append(f'  {CCApp._short_args(args)}', style=PALETTE['muted'])
+        if duration_ms is not None:
+            title.append(f'  {duration_ms / 1000:.1f}s', style=PALETTE['muted'])
+        return title
+
+    @staticmethod
     def _strip_ansi(text: str) -> str:
         """剥掉 ANSI 转义（hooks 的 print 收敛为 debug 事件后仍带颜色码）。"""
         import re
@@ -372,11 +617,11 @@ class CCApp(App):
         text = Text()
         for ln in str(diff_text).splitlines():
             if ln.startswith('+'):
-                text.append(ln + '\n', style='#4eba65')
+                text.append(ln + '\n', style=PALETTE['success'])
             elif ln.startswith('-'):
-                text.append(ln + '\n', style='#ff6b80')
+                text.append(ln + '\n', style=PALETTE['danger'])
             elif ln.startswith('@@'):
-                text.append(ln + '\n', style='#96a0b4')
+                text.append(ln + '\n', style=PALETTE['muted'])
             else:
                 text.append(ln + '\n')
         return text
@@ -415,42 +660,111 @@ class CCApp(App):
         line = self._status_line()
         if line is None:
             return
-        line.update(f'{spin} [bold #d77757]generating[/] {elapsed:4.1f}s'
+        line.update(f'{spin} [bold {PALETTE["accent"]}]Generating[/] {elapsed:4.1f}s'
                     f' [dim]{self._stream_chars} chars[/]'
                     f'{("  " + base) if base else ""}')
 
     def _update_status(self, payload: dict) -> None:
-        """CC 状态栏（常驻）：mode pill + model pill + ctx 进度条 + tokens/cost。
+        """更新指标后重绘状态栏；活动态由 activity 事件统一驱动。"""
+        if any(key in payload for key in ('model', 'tools', 'ctx_pct', 'tokens', 'cost')):
+            self._last_status.update(payload)
+        self._refresh_status_line()
+        self._refresh_sidebar()
 
-        thinking 时叠加「思考中」提示；idle 不清空，恢复显示最后已知指标。"""
+    def _refresh_sidebar(self) -> None:
+        """宽屏侧栏只呈现当前会话的高价值摘要，不重复完整日志。"""
+        if not hasattr(self, '_session_summary'):
+            return
+        labels = {
+            'ready': 'Ready', 'preparing': 'Preparing', 'thinking': 'Thinking',
+            'generating': 'Generating', 'tool': 'Running tool',
+            'awaiting_permission': 'Awaiting approval', 'saving': 'Saving',
+            'complete': 'Complete', 'failed': 'Failed', 'idle': 'Idle',
+        }
+        colors = {
+            'ready': PALETTE['muted'], 'preparing': PALETTE['info'],
+            'thinking': PALETTE['warning'], 'generating': PALETTE['accent'],
+            'tool': PALETTE['accent'], 'awaiting_permission': PALETTE['permission'],
+            'saving': PALETTE['info'], 'complete': PALETTE['success'],
+            'failed': PALETTE['danger'], 'idle': PALETTE['muted'],
+        }
+        state = self._activity_state
+        summary = Text()
+        summary.append('SESSION\n', style=f'bold {PALETTE["accent"]}')
+        summary.append(labels.get(state, state.title()) + '\n', style=f'bold {colors.get(state, PALETTE["muted"])}')
+        if self._activity_detail:
+            summary.append(str(self._activity_detail)[:48] + '\n', style=PALETTE['muted'])
+        if self._last_status.get('ctx_pct') is not None:
+            summary.append(f"Context  {int(self._last_status['ctx_pct'])}%\n")
+        summary.append(f"Tools    {int(self._last_status.get('tools', 0))}\n")
+        if self._last_status.get('tokens'):
+            summary.append(f"Tokens   {self._last_status['tokens']}\n")
+        if self._last_status.get('cost'):
+            summary.append(f"Cost     {float(self._last_status['cost']):.3f}\n")
+        self._session_summary.update(summary)
+
+        recent = Text()
+        recent.append('RECENT TOOLS\n', style=f'bold {PALETTE["accent"]}')
+        if not self._recent_tools:
+            recent.append('No tool activity yet.', style=PALETTE['inactive'])
+        for tool in self._recent_tools:
+            state = tool['state']
+            marker, color = {
+                'running': ('*', PALETTE['accent']),
+                'complete': ('+', PALETTE['success']),
+                'queued': ('~', PALETTE['info']),
+                'failed': ('!', PALETTE['danger']),
+            }.get(state, ('*', PALETTE['muted']))
+            recent.append(f'{marker} ', style=color)
+            recent.append(tool['name'])
+            if tool['duration_ms'] is not None:
+                recent.append(f"  {tool['duration_ms'] / 1000:.1f}s", style=PALETTE['muted'])
+            recent.append('\n')
+        self._recent_tools_widget.update(recent)
+
+    def _refresh_status_line(self) -> None:
         line = self._status_line()
         if line is None:
             return
-        phase = payload.get('phase')
-        if phase == 'thinking':
-            base = self._pills(self._last_status)
-            line.update(f'\u23f3 [bold #ffc107]\u601d\u8003\u4e2d...[/]'
-                        f'{("  " + base) if base else ""}')
+        if self._streaming:
             return
-        if phase == 'idle':
-            line.update(self._pills(self._last_status))   # 常驻：idle 不空白
-            return
-        self._last_status = payload
-        line.update(self._pills(payload))
+        label, color = {
+            'ready': ('Ready', PALETTE['muted']),
+            'preparing': ('Preparing', PALETTE['info']),
+            'thinking': ('Thinking', PALETTE['warning']),
+            'generating': ('Generating', PALETTE['accent']),
+            'tool': ('Running tool', PALETTE['accent']),
+            'awaiting_permission': ('Awaiting approval', PALETTE['permission']),
+            'saving': ('Saving', PALETTE['info']),
+            'complete': ('Complete', PALETTE['success']),
+            'failed': ('Failed', PALETTE['danger']),
+            'idle': ('Idle', PALETTE['muted']),
+        }.get(self._activity_state, (self._activity_state.title(), PALETTE['muted']))
+        detail = markup_escape(str(self._activity_detail))
+        if self.size.width < 70:
+            detail = ''
+        elif len(detail) > 36:
+            detail = detail[:33] + '...'
+        base = self._pills(self._last_status)
+        line.update(f'[bold {color}]{label}[/]'
+                    f'{(" [dim]" + detail + "[/]") if detail else ""}'
+                    f'{("  " + base) if base else ""}')
 
-    @staticmethod
-    def _pills(payload: dict) -> str:
-        """组装 CC 状态行：normal · model · ctx 进度条 · tokens · 花费。"""
-        parts = ['[#a7a3a2 on #2a2a2a] normal [/]']   # mode pill
-        if payload.get('model'):
-            parts.append(f"[#d77757 on #2a2a2a] {payload['model']} [/]")
+    def _pills(self, payload: dict) -> str:
+        """按终端宽度保留从模型到成本的递减优先级指标。"""
+        width = self.size.width
+        parts = []
+        if payload.get('model') and width >= 58:
+            parts.append(f"[{PALETTE['accent']} on {PALETTE['raised']}] {markup_escape(str(payload['model']))} [/]")
         ctx = payload.get('ctx_pct')
-        if ctx is not None:
+        if ctx is not None and width >= 44:
             parts.append(CCApp._ctx_bar(int(ctx)))
-        if payload.get('tokens'):
+        if payload.get('tools') is not None and width >= 68:
+            parts.append(f"[dim]{int(payload['tools'])} tools[/]")
+        if payload.get('tokens') and width >= 78:
             parts.append(f"[dim]{payload['tokens']} tok[/]")
         cost = payload.get('cost')
-        if cost:
+        if cost and width >= 96:
             parts.append(f"[dim]\u00a5{float(cost):.3f}[/]")
         return '  '.join(parts)
 
@@ -462,7 +776,7 @@ class CCApp(App):
         pct = max(0, min(100, pct))
         filled = round(pct / 10)
         bar = '\u2588' * filled + '\u2591' * (10 - filled)   # █ 已用 / ░ 剩余
-        color = '#ff6b80' if pct > 75 else '#ffc107' if pct > 50 else '#4eba65'
+        color = PALETTE['danger'] if pct > 75 else PALETTE['warning'] if pct > 50 else PALETTE['success']
         return f'[{color}]{bar}[/] [dim]{pct}%[/]'
 
 

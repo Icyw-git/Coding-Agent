@@ -521,6 +521,52 @@ def test_streaming_events_emitted():
         ui_events.bus.unsubscribe(_on)
 
 
+def test_tool_events_include_outcome_and_timing():
+    """工具事件必须提供 UI 所需的结果语义，而不是只给一段输出文本。"""
+    import ui_events
+    events = []
+    on_event = lambda e: events.append(e)
+    ui_events.bus.subscribe(on_event)
+    old_tools = harness._SESSION_METRICS['tools']
+    try:
+        tool_call = FakeToolCall('ui-tool', 'inspect', '{"path": "demo.txt"}')
+        _, _, result = harness.exec_tool_call(
+            tool_call, registry={'inspect': lambda path: 'x' * 2105},
+            hooks=False, background=False)
+        ends = [event for event in events if event.type == 'tool_end']
+        assert result['content'] == 'x' * 2105
+        assert len(ends) == 1
+        payload = ends[0].payload
+        assert payload['ok'] is True
+        assert payload['output_len'] == 2105
+        assert len(payload['output_preview']) == 2000
+        assert isinstance(payload['duration_ms'], int)
+        assert harness._SESSION_METRICS['tools'] == old_tools + 1
+        assert any(event.type == 'activity' and event.payload['state'] == 'tool'
+                   for event in events)
+    finally:
+        harness._SESSION_METRICS['tools'] = old_tools
+        ui_events.bus.unsubscribe(on_event)
+
+
+def test_serialize_session_is_readable_markdown():
+    """导出接口只格式化现有消息，不改变消息内容。"""
+    messages = [
+        {'role': 'user', 'content': 'hello'},
+        {'role': 'assistant', 'content': 'world', 'tool_calls': [
+            {'function': {'name': 'read', 'arguments': '{"path":"a.txt"}'}}
+        ]},
+        {'role': 'tool', 'content': 'file contents'},
+    ]
+    import harness
+    rendered = harness.serialize_session(messages)
+    assert '# Harness session' in rendered
+    assert '## 1. User' in rendered
+    assert '**Tool call:** `read`' in rendered
+    assert 'file contents' in rendered
+    assert messages[0]['content'] == 'hello'
+
+
 # ---------- 运行 ----------
 
 def main():

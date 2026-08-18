@@ -27,6 +27,7 @@ EVENT_TYPES = {
     'diff',                # diff 文本 {path, diff_text}
     'debug',               # 过程/调试信息 {msg}
     'error',               # 会话错误 {msg}
+    'activity',            # 会话活动 {state, detail}
     'session_start',       # 会话开始 {prompt}
     'session_end',         # 会话结束
 }
@@ -96,6 +97,7 @@ class PermissionGate:
                 q = self._pending.pop(e.payload.get('req_id'), None)
             if q:
                 q.put(e.payload.get('approved', False))
+                self._bus.emit('activity', state='thinking', detail='Continuing after permission')
 
     def cancel_pending(self) -> None:
         """拒绝并唤醒所有待确认请求，用于 Textual 会话退出。"""
@@ -104,6 +106,8 @@ class PermissionGate:
             self._pending.clear()
         for q in pending:
             q.put(False)
+        if pending:
+            self._bus.emit('activity', state='idle', detail='Permission requests cancelled')
 
     def request(self, tool: str, args: dict, title: str = 'Permission needed') -> bool:
         """请求一次权限确认，返回是否批准。业务线程调用，阻塞直到应答。"""
@@ -114,6 +118,7 @@ class PermissionGate:
             self._seq += 1
             req_id = f'perm_{self._seq}'
             self._pending[req_id] = q
+        self._bus.emit('activity', state='awaiting_permission', detail=title)
         self._bus.emit('permission_request', req_id=req_id, tool=tool, args=args, title=title)
         try:
             return q.get(timeout=self.REQUEST_TIMEOUT)

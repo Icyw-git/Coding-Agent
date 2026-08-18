@@ -557,6 +557,63 @@ def test_textual_agent_error_recovers_input():
     asyncio.run(_scenario())
 
 
+def test_textual_tool_titles_and_palette():
+    """工具标题须传达状态和耗时，CSS 只使用集中定义的调色板。"""
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return
+    import ui_textual
+
+    title = ui_textual.CCApp._tool_title(
+        'failed', 'write', {'path': 'a' * 100}, duration_ms=1250)
+    assert 'Failed write' in str(title)
+    assert '1.2s' in str(title)
+    assert len(ui_textual.CCApp._short_args({'path': 'a' * 100})) <= 72
+    assert '$accent' not in ui_textual.CSS
+    assert ui_textual.PALETTE['accent'] in ui_textual.CSS
+
+
+def test_textual_search_and_clear_commands():
+    """命令路径可以定位可见消息，并在空闲时清理会话。"""
+    import asyncio
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        return
+    import ui_events
+    import ui_textual
+
+    async def _scenario():
+        app = ui_textual.CCApp([{'role': 'user', 'content': 'needle'}])
+        async with app.run_test() as pilot:
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+            app.execute_command('search needle')
+            for _ in range(40):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if app._search_matches:
+                    break
+            assert app._search_matches
+            app.execute_command('clear')
+            for _ in range(40):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if not app._msgs:
+                    break
+            assert app._msgs == []
+            app.action_quit()
+            for _ in range(40):
+                if not app.is_running:
+                    break
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+
+    asyncio.run(_scenario())
+
+
 # ---------- 运行 ----------
 
 def main():
