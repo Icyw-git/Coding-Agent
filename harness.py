@@ -27,6 +27,7 @@ from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
 from mcp_bridge import register_mcp_tools
+from session_store import SessionEventStore
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
 
@@ -135,6 +136,7 @@ PERSIST_THERSHOLD=10000
 # ---------- 缓存目录 ----------
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
 TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
+SESSIONS_DIR=WORKDIR/'.cache'/'sessions'
 
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=1
@@ -262,7 +264,7 @@ tool_registry['load_skill']=load_skill
 # 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
 # ============================================================
 
-def pre_compact_messages(messages, skip_micro_rounds=0): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
+def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
     """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
     返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
     messages = tool_result_budget(messages)
@@ -274,6 +276,8 @@ def pre_compact_messages(messages, skip_micro_rounds=0): #压缩逻辑，每轮�
     if estimate_size(messages) > CONTEXT_LIMIT:
         print("[auto compact]")
         messages = compact_history(messages)
+        if on_compact:
+            on_compact(messages, 'auto')
         skip_micro_rounds = 3
     return messages, skip_micro_rounds
 
@@ -310,7 +314,26 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
         trigger_hooks("PostToolUse", name, args, output)
     return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
 
-def agent_loop(messages:list):
+def _record_compaction(session_store, compacted_messages, strategy):
+    summary = next(
+        (str(message.get('content', '')) for message in compacted_messages
+         if message.get('role') == 'user' and str(message.get('content', '')).startswith('[')),
+        '',
+    )
+    for prefix in ('[Compacted]\n\n', '[Reactive compact]\n\n'):
+        if summary.startswith(prefix):
+            summary = summary[len(prefix):]
+            break
+    session_store.append_compaction(summary, strategy)
+
+
+def agent_loop(messages:list, session_store=None):
+    """Run one OpenAI session, recording an append-only event stream for recovery."""
+    if session_store is None:
+        session_store = SessionEventStore(SESSIONS_DIR)
+        for initial_message in messages:
+            session_store.append_message(initial_message)
+        print(f'[session log:{session_store.path}]')
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -328,21 +351,28 @@ def agent_loop(messages:list):
         pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
-        messages, skip_micro_rounds = pre_compact_messages(messages, skip_micro_rounds) #压缩预处理流程
+        messages, skip_micro_rounds = pre_compact_messages(
+            messages, skip_micro_rounds,
+            on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
+        ) #压缩预处理流程
 
         if rounds_since_todo >=8 and messages:
-            messages.append({
+            reminder = {
                 'role':'user',
                 'content':"<reminder>Update your todos.</reminder>",
-            })
+            }
+            messages.append(reminder)
+            session_store.append_message(reminder)
             rounds_since_todo=0
 
         fired=consume_cron_queue() #消费 cron 任务列
         for job in fired:
-            messages.append({
+            cron_message = {
                 'role':'user',
                 'content':f'[Scheduled] {job.prompt}'
-            })
+            }
+            messages.append(cron_message)
+            session_store.append_message(cron_message)
             print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
 
         
@@ -373,13 +403,16 @@ def agent_loop(messages:list):
                 reactive_retries+=1
                 print('[reactive compact]')
                 messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
+                _record_compaction(session_store, messages, 'reactive')
                 skip_micro_rounds=3
                 continue
             raise
 
 
         message=response.choices[0].message
-        messages.append(message.model_dump()) #添加模型回复到上下文
+        assistant_message = message.model_dump()
+        messages.append(assistant_message) #添加模型回复到上下文
+        session_store.append_message(assistant_message)
 
         # 输出被截断：升级到加大 max_tokens 并提示续写
         if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
@@ -397,6 +430,7 @@ def agent_loop(messages:list):
             if message.content:
                 print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
+            session_store.append('turn_completed')
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
             # ⚠️ 提醒：只负责落盘到 .cache/memories/*.md，不会反馈回当前 Loop ——
@@ -421,17 +455,21 @@ def agent_loop(messages:list):
                 # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
                 # 改为文本附到新上下文里，避免执行结果丢失。
                 messages[:] = compact_history(messages)
+                _record_compaction(session_store, messages, 'tool')
                 skip_micro_rounds=3
                 note = '[Compacted] Conversation history has been summarized.'
                 if tool_messages:
                     done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
                     note += '\n\nTool results executed before compaction:\n' + done
                 messages.append({'role': 'user', 'content': note})
+                session_store.append_message(messages[-1])
                 compacted = True
                 break
 
+            session_store.append_tool_started(tool_call)
             _, _, tool_message = exec_tool_call(tool_call)   # hook 权限 → 后台/直接执行 → 兜底
             tool_messages.append(tool_message)
+            session_store.append_message(tool_message)
 
         if compacted: #压缩后工具丢失，需要重新执行
             continue
@@ -447,6 +485,7 @@ def agent_loop(messages:list):
                         
                     }
                 )
+                session_store.append_message(tool_messages[-1])
             print(f"  \033[32m[inject] {len(notifications)} background "
                   f"notification(s)\033[0m")
 
@@ -454,6 +493,17 @@ def agent_loop(messages:list):
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
         system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等
+
+
+def resume_agent_loop(session_path: Path):
+    """Resume a persisted OpenAI session without automatically repeating pending tools."""
+    session_store = SessionEventStore.open(session_path)
+    messages = session_store.rebuild_openai_history()
+    recovery_message = session_store.recovery_message()
+    if recovery_message:
+        messages.append(recovery_message)
+        session_store.append_message(recovery_message)
+    return agent_loop(messages, session_store=session_store)
 
 
 def run_agent_turn_locked():

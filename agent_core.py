@@ -499,8 +499,9 @@ def compact_history(messages):  # 使用 llm 进行对话记录压缩，返回�
     transcript_path = write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
     summary = summarize_history(messages)
-    return [{'role': 'system', 'content': _h().build_system()},
-            {'role': 'user', 'content': f'[Compacted]\n\n{summary}'}]
+    # The request builder owns the system message. Keeping it out of canonical history
+    # avoids duplicating system prompts after a compaction or a replay.
+    return [{'role': 'user', 'content': f'[Compacted]\n\n{summary}'}]
 
 
 def reactive_compact(messages):  # 保存完整对话记录，保留最近五条消息，返回压缩后的消息
@@ -510,8 +511,7 @@ def reactive_compact(messages):  # 保存完整对话记录，保留最近五条
     while tail_start < len(messages) and _is_tool_result_message(messages[tail_start]):
         tail_start += 1
     summary = summarize_history(messages[:tail_start])
-    result = [{'role': 'system', 'content': _h().build_system()},
-              {'role': 'user', 'content': f'[Reactive compact]\n\n{summary}'}]
+    result = [{'role': 'user', 'content': f'[Reactive compact]\n\n{summary}'}]
     result.extend(messages[tail_start:])  # 保留最近工作现场
     return result
 
