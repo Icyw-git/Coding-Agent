@@ -262,6 +262,10 @@ def test_record_usage_tracks_source_and_ledger(monkeypatch):
             'cached_tokens': 0, 'reasoning_tokens': 0,
         }, 'confirmed')
         assert harness._SESSION_METRICS['cost_source'] == 'mixed'
+        assert len(harness._SESSION_METRICS['recent_usage']) == 2
+        summary = harness._session_summary()
+        assert summary['calls'] == 2
+        assert summary['cost_source'] == 'mixed'
     finally:
         with harness._METRICS_LOCK:
             harness._SESSION_METRICS.clear()

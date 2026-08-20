@@ -12,3 +12,6 @@ _harness_lines.txt
 _tmp_analyze.py
 _tmp_struct.txt
 text.txt
+
+# Visualizer belongs to the main branch, not the UI branch
+visualizer/

@@ -150,6 +150,16 @@ def test_statusline_pills():
                         cost=0.5, tokens='1k', mode='plan')
     assert '[Plan Mode]' in out
     assert ui.bg('success') in out and '\u00a5' in out   # cost pill 显示人民币
+
+
+def test_statusline_estimated_cost_and_token_breakdown():
+    out = ui.statusline(model='m', ctx_pct=42, ctx_source='estimated',
+                        cost='0.125', cost_source='mixed', tokens='100',
+                        prompt_tokens=70, completion_tokens=30,
+                        cached_tokens=10, reasoning_tokens=5)
+    assert '~' in out
+    assert 'in 70' in out and 'out 30' in out
+    assert 'cache 10' in out and 'reason 5' in out
     assert ui.bg('inactive') in out                     # tools/tokens pill
     assert ui.b('deepseek-v4-flash') not in out         # 模型不再用纯加粗，走 pill
 

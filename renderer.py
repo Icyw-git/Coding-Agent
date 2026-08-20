@@ -5,6 +5,8 @@
 TextualRenderer 而业务代码零改动。import 本模块即触发默认后端 attach。
 """
 from ui_events import UIEvent, bus
+import cc_ui
+import time
 
 
 class BaseRenderer:
@@ -17,8 +19,7 @@ class BaseRenderer:
 class AnsiRenderer(BaseRenderer):
     """默认渲染后端：普通 print，保持与无 UI 版本一致的显示效果。
 
-    tool_start/tool_end 暂不渲染：工具输出的显示仍由 hooks.log_hook
-    （直接 print）负责，后续 P0 收尾时把工具渲染也收敛进本后端。
+    所有可见业务状态均从事件总线渲染，避免 hooks 直接 print 与 UI 状态脱节。
     """
 
     def on_event(self, e: UIEvent) -> None:
@@ -32,14 +33,63 @@ class AnsiRenderer(BaseRenderer):
         elif e.type == 'assistant_end':
             print('')
         elif e.type == 'debug':
-            print(e.payload.get('msg', ''))
+            cc_ui.safe_print(e.payload.get('msg', ''))
+        elif e.type == 'tool_start':
+            name = e.payload.get('name', 'tool')
+            args = e.payload.get('args', {})
+            cc_ui.safe_print(cc_ui.tool_line(name, args))
+        elif e.type == 'tool_end':
+            name = e.payload.get('name', 'tool')
+            output = str(e.payload.get('output_preview', ''))
+            duration = e.payload.get('duration_ms')
+            outcome = e.payload.get('outcome', 'completed')
+            ok = outcome in ('completed', 'warning')
+            if ok:
+                cc_ui.safe_print(cc_ui.bash_box(name, output))
+            else:
+                label = 'Permission denied' if outcome == 'denied' else 'Tool failed'
+                cc_ui.say('error', '{0}: {1}'.format(label, name))
+                cc_ui.safe_print(output)
+            if duration is not None:
+                cc_ui.safe_print(cc_ui.status('completed in {0:.1f}s'.format(float(duration) / 1000)))
         elif e.type == 'status':
             # 思考中提示：单行覆盖（\r 回行首 + idle 清行），避免等待时无反馈
             if e.payload.get('phase') == 'thinking':
                 print('  \033[90m[thinking] 模型思考中...\033[0m', end='', flush=True)
             elif e.payload.get('phase') == 'idle':
                 print('\x1b[2K\r', end='', flush=True)
-        # tool_* / session_* 当前无需渲染（状态由 hooks 与日志承担）
+            elif 'tokens' in e.payload or 'cost' in e.payload:
+                now = time.monotonic()
+                last = getattr(self, '_last_metric_status', 0.0)
+                if (now - last < 0.2 and
+                        e.payload.get('cost_source') != 'confirmed' and
+                        e.payload.get('ctx_source') != 'confirmed'):
+                    return
+                self._last_metric_status = now
+                line = cc_ui.statusline(
+                    model=e.payload.get('model', ''),
+                    tools=e.payload.get('tools', 0),
+                    ctx_pct=e.payload.get('ctx_pct'),
+                    ctx_source=e.payload.get('ctx_source', 'estimated'),
+                    tokens=e.payload.get('tokens', ''),
+                    prompt_tokens=e.payload.get('prompt_tokens'),
+                    completion_tokens=e.payload.get('completion_tokens'),
+                    cached_tokens=e.payload.get('cached_tokens'),
+                    reasoning_tokens=e.payload.get('reasoning_tokens'),
+                    cost=e.payload.get('cost'),
+                    cost_source=e.payload.get('cost_source', 'estimated'))
+                if line:
+                    cc_ui.safe_print(line)
+        elif e.type == 'session_end':
+            summary = e.payload.get('summary', {})
+            outcomes = summary.get('tool_outcomes', {})
+            failed = outcomes.get('failed', 0) + outcomes.get('denied', 0)
+            source = summary.get('cost_source', 'estimated')
+            prefix = '' if source == 'confirmed' else '~'
+            cc_ui.safe_print(cc_ui.status(
+                'Session complete: {0} rounds, {1} tools ({2} failed/denied), {3} tokens, {4}¥{5:.4f}'.format(
+                    summary.get('rounds', 0), summary.get('tools', 0), failed,
+                    summary.get('tokens', 0), prefix, float(summary.get('cost', 0)))))
 
 
 # 默认 attach：import renderer 即生效；业务代码无需感知渲染后端。

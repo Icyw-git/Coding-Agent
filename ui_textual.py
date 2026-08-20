@@ -87,6 +87,8 @@ Collapsible:focus { border-left: thick $info; }
 
 /* ---- 权限 Modal（CC：蓝紫边框权限确认） ---- */
 #perm-box { width: 76; padding: 2 3; border: round $permission; background: $raised; }
+#perm-box.risk-warning { border: round $warning; }
+#perm-box.risk-danger { border: round $danger; }
 #perm-title { color: $warning; }
 
 /* ---- 命令 / 搜索弹窗 ---- */
@@ -114,12 +116,14 @@ class PermissionModal(ModalScreen):
 
     ARM_DELAY = 0.2
 
-    def __init__(self, req_id: str, tool: str, args: dict, title: str = 'Permission needed'):
+    def __init__(self, req_id: str, tool: str, args: dict, title: str = 'Permission needed',
+                 risk: str = 'warning'):
         super().__init__()
         self.req_id = req_id
         self.tool = tool
         self.args = args
         self.title = title
+        self.risk = risk if risk in ('warning', 'danger') else 'warning'
         self._armed = False
 
     def on_mount(self) -> None:
@@ -129,13 +133,23 @@ class PermissionModal(ModalScreen):
         self._armed = True
 
     def compose(self) -> ComposeResult:
-        with Static(id="perm-box"):
-            yield Static(f"[bold]{self.title}[/]", id="perm-title")
+        with Static(id="perm-box", classes=f"risk-{self.risk}"):
+            label = 'HIGH RISK' if self.risk == 'danger' else 'CONFIRM ACTION'
+            title_color = 'red' if self.risk == 'danger' else 'yellow'
+            yield Static(f"[{title_color}][bold]{label}[/]  {markup_escape(self.title)}[/]",
+                         id="perm-title")
             yield Static(Text("Tool: ", style="dim") + Text(self.tool))
-            yield Static(Text("Args: ", style="dim") + Text(str(self.args)))
+            yield Static(Text("Target: ", style="dim") + Text(self._target_text()))
             yield Static("")
             yield Static("[yellow]y[/] = Allow    [yellow]n[/]/[yellow]Esc[/] = Deny    "
                          f"([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])")
+
+    def _target_text(self) -> str:
+        """Prefer the actionable command/path over a noisy raw argument dict."""
+        for key in ('command', 'path', 'file_path', 'pattern'):
+            if self.args.get(key):
+                return str(self.args[key])
+        return str(self.args)
 
     def action_approve(self):
         if not self._armed:
@@ -158,7 +172,7 @@ class CommandModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id='command-box'):
             yield Static('Command', classes='modal-title')
-            yield Static('clear  export  search <text>  help', classes='modal-hint')
+            yield Static('clear  export  search <text>  failures  all  help', classes='modal-hint')
             yield Input(placeholder='Type a command', id='command-input')
 
     def on_mount(self) -> None:
@@ -206,6 +220,7 @@ class CCApp(App):
         ("ctrl+d", "quit", "Quit"),
         ("ctrl+p", "commands", "Commands"),
         ("ctrl+f", "search", "Search"),
+        ("ctrl+shift+f", "failures", "Failed tools"),
         ("ctrl+l", "clear", "Clear"),
         ("ctrl+e", "export", "Export"),
     ]
@@ -253,12 +268,15 @@ class CCApp(App):
         self._activity_state = 'ready'
         self._activity_detail = ''
         self._recent_tools = []
+        self._tool_filter = 'all'
+        self._status_refresh_pending = False
         self._search_matches = []
         self._side_panel.display = self.size.width >= 110
         self._refresh_sidebar()
         # 帧刷新：网络 chunk 到达频率与 UI 渲染频率解耦 → 无论 chunk 多大都平滑打字机
         self.set_interval(0.05, self._flush_stream_buffers)
         self.set_interval(0.1, self._stream_tick)
+        self.set_interval(0.1, self._flush_status)
         # 初始用户输入先入队（在工具/回复之前渲染，保持对话顺序）
         for m in self._msgs:
             if isinstance(m, dict) and m.get('role') == 'user':
@@ -330,6 +348,9 @@ class CCApp(App):
     def action_export(self) -> None:
         self.execute_command('export')
 
+    def action_failures(self) -> None:
+        self.execute_command('failures')
+
     def execute_command(self, command: str) -> None:
         """从快捷键或命令面板进入同一执行路径。"""
         asyncio.create_task(self._execute_command(command))
@@ -340,13 +361,17 @@ class CCApp(App):
         verb = verb.lower()
         argument = argument.strip()
         if verb in ('help', '?'):
-            await self._show_notice('Commands: clear | export | search <text> | help')
+            await self._show_notice('Commands: clear | export | search <text> | failures | all | help')
         elif verb == 'clear':
             await self._clear_conversation()
         elif verb == 'export':
             await self._export_conversation()
         elif verb == 'search':
             await self._search_conversation(argument)
+        elif verb in ('failures', 'failed'):
+            await self._filter_tools('failed')
+        elif verb in ('all', 'show-all'):
+            await self._filter_tools('all')
         elif raw:
             await self._show_notice(f'Unknown command: {raw}')
 
@@ -361,6 +386,7 @@ class CCApp(App):
         self._assistant_buffers.clear()
         self._flushed.clear()
         self._recent_tools.clear()
+        self._tool_filter = 'all'
         self._clear_search_matches()
         await self._chat.remove_children()
         self._refresh_sidebar()
@@ -393,6 +419,20 @@ class CCApp(App):
         else:
             await self._show_notice(f'No visible matches for: {query}')
 
+    async def _filter_tools(self, mode: str) -> None:
+        """Keep failure investigation in the UI layer without discarding event history."""
+        self._tool_filter = mode
+        shown = 0
+        for widget in self._chat.query('Collapsible'):
+            if not widget.has_class('tool-call'):
+                continue
+            visible = mode == 'all' or widget.has_class('tool-failed-call')
+            widget.display = visible
+            shown += int(visible)
+        label = 'Showing failed tools only.' if mode == 'failed' else 'Showing all tool output.'
+        self._refresh_sidebar()
+        await self._show_notice(f'{label} ({shown} visible)')
+
     def _clear_search_matches(self) -> None:
         for widget in self._search_matches:
             widget.remove_class('search-match')
@@ -409,6 +449,20 @@ class CCApp(App):
     async def _show_notice(self, message: str) -> None:
         await self._chat.mount(Static(Text(message), classes='debug-line'))
         self._chat.scroll_end(animate=False)
+
+    async def _show_session_summary(self, summary: dict) -> None:
+        outcomes = summary.get('tool_outcomes', {})
+        failed = outcomes.get('failed', 0) + outcomes.get('denied', 0)
+        source = summary.get('cost_source', 'estimated')
+        prefix = '' if source == 'confirmed' else '~'
+        try:
+            cost = float(summary.get('cost', 0))
+        except (TypeError, ValueError):
+            cost = 0.0
+        text = (f"Session complete  ·  {summary.get('rounds', 0)} rounds  ·  "
+                f"{summary.get('tools', 0)} tools ({failed} failed/denied)  ·  "
+                f"{summary.get('tokens', 0)} tokens  ·  {prefix}¥{cost:.4f}")
+        await self._chat.mount(Static(Text(text), classes='session-summary-line'))
 
     def _set_input_busy(self, busy: bool) -> None:
         """只允许一条在途请求，保证聊天记录与实际执行顺序一致。"""
@@ -517,6 +571,7 @@ class CCApp(App):
             name = e.payload.get('name', 'tool')
             args = e.payload.get('args', {})
             col = Collapsible(title=self._tool_title('running', name, args=args), collapsed=False)
+            col.add_class('tool-call')
             await self._chat.mount(col)
             self._active_tools.append(col)   # 工具串行执行，FIFO 匹配 tool_end
             self._recent_tools.insert(0, {'name': name, 'state': 'running', 'duration_ms': None})
@@ -529,7 +584,10 @@ class CCApp(App):
                 name = e.payload.get('name', 'tool')
                 ok = bool(e.payload.get('ok', True))
                 background = bool(e.payload.get('background', False))
-                state = 'queued' if background else 'complete' if ok else 'failed'
+                outcome = e.payload.get('outcome')
+                state = outcome or ('queued' if background else 'complete' if ok else 'failed')
+                if state == 'completed':
+                    state = 'complete'
                 col.title = self._tool_title(
                     state, name, duration_ms=e.payload.get('duration_ms', 0))
                 output_len = int(e.payload.get('output_len', len(out)))
@@ -537,7 +595,11 @@ class CCApp(App):
                     out += f'\n\n... output truncated ({output_len:,} characters total)'
                 classes = 'tool-output' if ok else 'tool-output tool-failed'
                 await col.mount(Static(Text(out or '[No output]'), classes=classes))
-                col.collapsed = True
+                if state in ('failed', 'denied'):
+                    col.add_class('tool-failed-call')
+                col.display = self._tool_filter == 'all' or state in ('failed', 'denied')
+                # 失败结果保留展开状态，成功结果收起以便扫描长会话。
+                col.collapsed = ok
                 for tool in self._recent_tools:
                     if tool['name'] == name and tool['state'] == 'running':
                         tool.update(state=state, duration_ms=e.payload.get('duration_ms', 0))
@@ -561,14 +623,17 @@ class CCApp(App):
             await self._chat.mount(Static(self._render_diff(e.payload.get('diff_text', '')),
                                           classes='tool-output'))
         elif e.type == 'permission_request':
+            risk = self._permission_risk(e.payload.get('tool', ''), e.payload.get('args', {}),
+                                         e.payload.get('title', ''))
             self.push_screen(PermissionModal(
                 e.payload['req_id'], e.payload['tool'], e.payload['args'],
-                e.payload.get('title', 'Permission needed')))
+                e.payload.get('title', 'Permission needed'), risk=risk))
         elif e.type == 'permission_resolve':
             self._input.focus()   # 弹窗应答后焦点回到输入框
         elif e.type == 'status':
             self._update_status(e.payload)
-        # session_end 无需渲染
+        elif e.type == 'session_end':
+            await self._show_session_summary(e.payload.get('summary', {}))
         self._chat.scroll_end(animate=False)   # scroll_end 是同步方法（返回 None）
 
     async def _stream_typing(self, md: Markdown, text: str) -> None:
@@ -587,6 +652,16 @@ class CCApp(App):
         return compact if len(compact) <= limit else compact[:limit - 3] + '...'
 
     @staticmethod
+    def _permission_risk(tool: str, args: dict, title: str = '') -> str:
+        """Classify only the presentation; the actual permission decision stays in hooks."""
+        text = (str(tool) + ' ' + str(title) + ' ' + str(args)).lower()
+        if any(word in text for word in ('outside workspace', 'delete', 'remove', 'sudo', 'chmod')):
+            return 'danger'
+        if tool.lower() in ('bash', 'run_command', 'shell', 'write_file', 'edit_file'):
+            return 'danger' if tool.lower() in ('bash', 'run_command', 'shell') else 'warning'
+        return 'warning'
+
+    @staticmethod
     def _tool_title(state: str, name: str, args=None, duration_ms=None) -> Text:
         """用统一的状态语义渲染工具标题，结果默认可折叠扫描。"""
         icon, label, color = {
@@ -594,6 +669,8 @@ class CCApp(App):
             'complete': ('+', 'Done', PALETTE['success']),
             'queued': ('~', 'Queued', PALETTE['info']),
             'failed': ('!', 'Failed', PALETTE['danger']),
+            'denied': ('x', 'Denied', PALETTE['danger']),
+            'warning': ('!', 'Warning', PALETTE['warning']),
         }.get(state, ('*', state.title(), PALETTE['muted']))
         title = Text()
         title.append(f'{icon} {label} ', style=f'bold {color}')
@@ -669,8 +746,14 @@ class CCApp(App):
         """更新指标后重绘状态栏；活动态由 activity 事件统一驱动。"""
         if any(key in payload for key in (
                 'model', 'tools', 'ctx_pct', 'ctx_tokens', 'tokens', 'cost',
-                'cost_source', 'ctx_source')):
+                'cost_source', 'ctx_source', 'recent_calls')):
             self._last_status.update(payload)
+        self._status_refresh_pending = True
+
+    def _flush_status(self) -> None:
+        if not self._status_refresh_pending:
+            return
+        self._status_refresh_pending = False
         self._refresh_status_line()
         self._refresh_sidebar()
 
@@ -706,6 +789,11 @@ class CCApp(App):
             if ctx_tokens is not None and ctx_window:
                 summary.append(f"         {ctx_tokens} / {ctx_window}\n", style=PALETTE['muted'])
         summary.append(f"Tools    {int(self._last_status.get('tools', 0))}\n")
+        failed_tools = sum(1 for tool in self._recent_tools if tool['state'] == 'failed')
+        if failed_tools:
+            summary.append(f"Failed   {failed_tools}\n", style=PALETTE['danger'])
+        if self._tool_filter == 'failed':
+            summary.append('Filter   failures only\n', style=PALETTE['warning'])
         if self._last_status.get('tokens') is not None:
             tokens = self._last_status.get('tokens', 0)
             prompt = self._last_status.get('prompt_tokens', 0)
@@ -724,6 +812,17 @@ class CCApp(App):
             summary.append(f"Billing  {self._source_label(source)}\n")
         if self._last_status.get('calls'):
             summary.append(f"Calls    {int(self._last_status['calls'])}\n")
+        recent_calls = self._last_status.get('recent_calls', [])
+        if recent_calls:
+            summary.append('RECENT CALLS\n', style=f'bold {PALETTE["accent"]}')
+            for call in recent_calls:
+                marker = '' if call.get('source') == 'confirmed' else '~'
+                try:
+                    cost = float(call.get('cost', 0))
+                except (TypeError, ValueError):
+                    cost = 0.0
+                summary.append(f"{str(call.get('model', ''))[:18]}  {marker}¥{cost:.4f}\n",
+                               style=PALETTE['muted'])
         self._session_summary.update(summary)
 
         recent = Text()

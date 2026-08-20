@@ -354,9 +354,17 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     output_text = str(output)
     failed = output_text.lstrip().lower().startswith('error:')
     denied = output_text == 'Permission denied by user'
-    _SESSION_METRICS['tools'] += 1
+    warning = any(line.lstrip().lower().startswith(('warning:', 'warn:'))
+                  for line in output_text.splitlines())
+    outcome = ('denied' if denied else 'failed' if failed else
+               'queued' if background_started else 'warning' if warning else 'completed')
+    with _METRICS_LOCK:
+        _SESSION_METRICS['tools'] += 1
+        _SESSION_METRICS['tool_outcomes'][outcome] = (
+            _SESSION_METRICS['tool_outcomes'].get(outcome, 0) + 1)
     bus.emit('tool_end', name=name, args=args, output_preview=output_text[:2000],
              output_len=len(output_text), ok=not (failed or denied),
+             outcome=outcome,
              background=background_started,
              duration_ms=round((time.monotonic() - started_at) * 1000))
     bus.emit('activity', state='thinking', detail='Reviewing tool result')
@@ -378,6 +386,11 @@ _SESSION_METRICS={
     'cost_source': 'estimated',
     'model': '',
     'calls': 0,
+    'recent_usage': [],
+    'tool_outcomes': {'completed': 0, 'warning': 0, 'failed': 0,
+                      'denied': 0, 'queued': 0},
+    'ctx_peak_tokens': 0,
+    'rounds': 0,
 }
 _USAGE_LEDGER=[]
 _METRICS_LOCK=threading.RLock()
@@ -524,12 +537,23 @@ def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict
         _SESSION_METRICS['reasoning_tokens'] += snapshot['reasoning_tokens']
         _SESSION_METRICS['cost'] += cost
         _SESSION_METRICS['ctx_tokens'] = snapshot['prompt_tokens']
+        _SESSION_METRICS['ctx_peak_tokens'] = max(
+            _SESSION_METRICS['ctx_peak_tokens'], snapshot['prompt_tokens'])
         _SESSION_METRICS['ctx_source'] = source
         sources = {item['source'] for item in _USAGE_LEDGER}
         _SESSION_METRICS['cost_source'] = (
             'confirmed' if sources == {'confirmed'} else
             'estimated' if sources == {'estimated'} else 'mixed')
         _SESSION_METRICS['model'] = model
+        _SESSION_METRICS['recent_usage'] = [
+            {
+                'call': item.get('call', 0), 'model': item['model'],
+                'prompt_tokens': item['prompt_tokens'],
+                'completion_tokens': item['completion_tokens'],
+                'cost': str(item['cost']), 'source': item['source'],
+            }
+            for item in (_USAGE_LEDGER[-3:])
+        ]
     return entry
 
 def _build_streamed_message(content, tool_acc):
@@ -591,7 +615,22 @@ def update_panel_status(messages:list, *, model: str = None,
              reasoning_tokens=_SESSION_METRICS.get('reasoning_tokens', 0),
              cost=str(_SESSION_METRICS.get('cost', Decimal('0'))),
              cost_source=_SESSION_METRICS.get('cost_source', 'estimated'),
-             calls=_SESSION_METRICS.get('calls', 0))
+             calls=_SESSION_METRICS.get('calls', 0),
+             recent_calls=list(_SESSION_METRICS.get('recent_usage', [])))
+
+
+def _session_summary() -> dict:
+    with _METRICS_LOCK:
+        return {
+            'rounds': _SESSION_METRICS.get('rounds', 0),
+            'calls': _SESSION_METRICS.get('calls', 0),
+            'tools': _SESSION_METRICS.get('tools', 0),
+            'tool_outcomes': dict(_SESSION_METRICS.get('tool_outcomes', {})),
+            'ctx_peak_tokens': _SESSION_METRICS.get('ctx_peak_tokens', 0),
+            'tokens': _SESSION_METRICS.get('tokens', 0),
+            'cost': str(_SESSION_METRICS.get('cost', Decimal('0'))),
+            'cost_source': _SESSION_METRICS.get('cost_source', 'estimated'),
+        }
 
 def agent_loop(messages:list):
     bus.emit('activity', state='preparing', detail='Preparing session')
@@ -615,6 +654,7 @@ def agent_loop(messages:list):
         bus.emit('status', phase='idle')
 
     while True:
+        _SESSION_METRICS['rounds'] += 1
         pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
@@ -745,7 +785,7 @@ def agent_loop(messages:list):
                 continue
             # 最终回复：流式 delta 已实时渲染，此处只负责收尾（落盘 / 提炼记忆）
             bus.emit('activity', state='saving', detail='Saving transcript and memory')
-            bus.emit('session_end')
+            bus.emit('session_end', summary=_session_summary())
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。

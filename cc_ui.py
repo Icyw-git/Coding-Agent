@@ -668,7 +668,10 @@ def ctx_bar(pct, width: int = 10) -> str:
 
 
 def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
-               workdir: str = '', git_branch: str = '', cost=None, mode: str = '') -> str:
+               workdir: str = '', git_branch: str = '', cost=None, mode: str = '',
+               cost_source: str = 'confirmed', ctx_source: str = 'confirmed',
+               prompt_tokens=None, completion_tokens=None, cached_tokens=None,
+               reasoning_tokens=None) -> str:
     """会话状态行：模式标签 / model(tier 色 pill) / git 分支 / 工具数 / 进度条 / 成本 / token。
 
     上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
@@ -684,13 +687,27 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
     if tools:
         parts.append(_pill('inactive', '{0} tools'.format(tools)))
     if ctx_pct is not None:
-        parts.append(ctx_bar(ctx_pct))
+        prefix = '' if ctx_source == 'confirmed' else '~'
+        parts.append(prefix + ctx_bar(ctx_pct))
     if cost is not None:
         # GBK 终端不支持半角 ¥(U+00A5)，退回全角 ￥(U+FFE5)，避免符号被替换成 ?
         cny = '\u00a5' if _can_encode('\u00a5') else '\uffe5'
-        parts.append(_pill('success', cny + '{0:.3f}'.format(cost)))
+        prefix = '' if cost_source == 'confirmed' else '~'
+        cost_color = 'success' if cost_source == 'confirmed' else 'warning'
+        parts.append(_pill(cost_color, prefix + cny + '{0:.4f}'.format(float(cost))))
     if tokens:
         parts.append(_pill('inactive', tokens))
+    breakdown = []
+    if prompt_tokens is not None:
+        breakdown.append('in ' + str(prompt_tokens))
+    if completion_tokens is not None:
+        breakdown.append('out ' + str(completion_tokens))
+    if cached_tokens:
+        breakdown.append('cache ' + str(cached_tokens))
+    if reasoning_tokens:
+        breakdown.append('reason ' + str(reasoning_tokens))
+    if breakdown:
+        parts.append(_pill('inactive', ' / '.join(breakdown)))
     if workdir:
         parts.append(t('inactive') + workdir + _RESET)
     if not parts:
