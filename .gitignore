@@ -4,6 +4,18 @@
 # Caches
 __pycache__/
 .cache/
+.pytest_cache/
+.pytest-basetemp/
+.pytest-tmp/
+.test-tmp/
+*.py[cod]
+
+# Visualizer dependencies and build output
+visualizer/node_modules/
+visualizer/.npm-cache/
+visualizer/dist/
+visualizer/.vite/
+npm-debug.log*
 
 # Scratch / temp
 _check_log.py
