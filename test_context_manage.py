@@ -273,6 +273,32 @@ def test_record_usage_tracks_source_and_ledger(monkeypatch):
             harness._USAGE_LEDGER[:] = old_ledger
 
 
+def test_round_metric_emits_observability_event():
+    """Round metrics are append-only observability data, not loop control state."""
+    received = []
+    harness.bus.subscribe(lambda event: received.append(event)
+                      if event.type == 'round_end' else None)
+    with harness._METRICS_LOCK:
+        old_metrics = dict(harness._SESSION_METRICS)
+        old_ledger = list(harness._USAGE_LEDGER)
+        harness._SESSION_METRICS['round_metrics'] = []
+        harness._USAGE_LEDGER[:] = [{'cost': harness.Decimal('0.001'), 'source': 'confirmed'}]
+    try:
+        metric = harness._record_round_metric(
+            3, harness.time.monotonic() - 0.01, model='demo',
+            usage={'prompt_tokens': 20, 'completion_tokens': 5, 'total_tokens': 25},
+            ctx_before=30, ctx_after=20)
+        assert metric['round'] == 3
+        assert metric['compressed'] is True
+        assert metric['cost'] == '0.001'
+        assert received[-1].payload['duration_ms'] >= 0
+    finally:
+        with harness._METRICS_LOCK:
+            harness._SESSION_METRICS.clear()
+            harness._SESSION_METRICS.update(old_metrics)
+            harness._USAGE_LEDGER[:] = old_ledger
+
+
 def test_preprocessors_order():
     """每轮循环开头必须按 budget → snip → micro 顺序执行预处理。"""
     names = ('tool_result_budget', 'snip_compact', 'micro_compact')

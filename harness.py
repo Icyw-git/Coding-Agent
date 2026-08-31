@@ -391,6 +391,7 @@ _SESSION_METRICS={
                       'denied': 0, 'queued': 0},
     'ctx_peak_tokens': 0,
     'rounds': 0,
+    'round_metrics': [],
 }
 _USAGE_LEDGER=[]
 _METRICS_LOCK=threading.RLock()
@@ -632,6 +633,30 @@ def _session_summary() -> dict:
             'cost_source': _SESSION_METRICS.get('cost_source', 'estimated'),
         }
 
+
+def _record_round_metric(round_no: int, started_at: float, *, model: str,
+                         usage: dict, ctx_before: int, ctx_after: int) -> dict:
+    """Record one round's observability data without influencing the loop decision path."""
+    with _METRICS_LOCK:
+        latest = _USAGE_LEDGER[-1] if _USAGE_LEDGER else {}
+        metric = {
+            'round': round_no,
+            'model': model,
+            'duration_ms': round((time.monotonic() - started_at) * 1000),
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+            'cost': str(latest.get('cost', Decimal('0'))),
+            'source': latest.get('source', 'estimated'),
+            'ctx_before': ctx_before,
+            'ctx_after': ctx_after,
+            'compressed': ctx_after < ctx_before,
+        }
+        _SESSION_METRICS['round_metrics'].append(metric)
+        _SESSION_METRICS['round_metrics'] = _SESSION_METRICS['round_metrics'][-10:]
+    bus.emit('round_end', **metric)
+    return metric
+
 def agent_loop(messages:list):
     bus.emit('activity', state='preparing', detail='Preparing session')
     context=update_context({},messages)
@@ -654,7 +679,11 @@ def agent_loop(messages:list):
         bus.emit('status', phase='idle')
 
     while True:
+        round_started_at = time.monotonic()
         _SESSION_METRICS['rounds'] += 1
+        round_no = _SESSION_METRICS['rounds']
+        # 复用上一轮已记录的上下文，埋点不额外调用 estimate_size，避免改变压缩判定。
+        ctx_before = _SESSION_METRICS.get('ctx_tokens', 0)
         pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
@@ -682,6 +711,7 @@ def agent_loop(messages:list):
 
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         request_messages = inject_memories(messages, memories_content, system)
+        ctx_after = _SESSION_METRICS.get('ctx_tokens', 0)
 
         request_model = recovery_state.current_model or os.getenv("LLM_MODEL_ID")
 
@@ -765,6 +795,10 @@ def agent_loop(messages:list):
                                               usage_snapshot['completion_tokens'])
             usage_source = 'estimated'
         _record_usage(request_model, usage_snapshot, usage_source)
+        ctx_after = usage_snapshot['prompt_tokens']
+        _record_round_metric(round_no, round_started_at, model=request_model,
+                             usage=usage_snapshot, ctx_before=ctx_before,
+                             ctx_after=ctx_after)
         update_panel_status(messages, model=request_model,
                             ctx_tokens=usage_snapshot['prompt_tokens'],
                             ctx_source=usage_source)

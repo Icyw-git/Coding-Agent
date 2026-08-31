@@ -29,6 +29,7 @@ EVENT_TYPES = {
     'error',               # 会话错误 {msg}
     'activity',            # 会话活动 {state, detail}
     'session_start',       # 会话开始 {prompt}
+    'round_end',           # 单轮模型调用指标 {round, duration_ms, cost, ctx_*}
     'session_end',         # 会话结束
 }
 
