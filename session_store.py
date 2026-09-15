@@ -32,6 +32,11 @@ class SessionEventStore:
     def open(cls, path: Path):
         return cls(Path(path).parent, path=path)
 
+    @property
+    def last_seq(self) -> int:
+        """最后一个已写入事件的 seq（还没写过事件时为 0）。"""
+        return self._next_seq - 1
+
     @classmethod
     def _path_lock(cls, path: Path) -> threading.Lock:
         with cls._locks_guard:
@@ -82,6 +87,28 @@ class SessionEventStore:
             replaces_through_seq=self._next_seq - 1,
         )
 
+    def append_checkpoint(self, checkpoint_id: str, through_seq: int | None = None, *,
+                          label: str = "", trigger: str = "turn") -> dict:
+        """记录一个可回溯节点；快照本体在 .cache/checkpoints/<id>/ 下，不进事件流。"""
+        return self.append(
+            "checkpoint",
+            checkpoint_id=checkpoint_id,
+            through_seq=self.last_seq if through_seq is None else through_seq,
+            label=label,
+            trigger=trigger,
+        )
+
+    def append_rewind(self, checkpoint_id: str, *, scope: str = "session+files",
+                      snapshot_path: str | None = None, restored_files: list | None = None) -> dict:
+        """记录一次回溯；重放时用它把历史替换回该节点的快照。"""
+        return self.append(
+            "rewind",
+            checkpoint_id=checkpoint_id,
+            scope=scope,
+            snapshot_path=snapshot_path,
+            restored_files=list(restored_files or []),
+        )
+
     def read_events(self, *, allow_partial_tail: bool = True) -> list[dict]:
         if not self.path.exists():
             return []
@@ -123,8 +150,48 @@ class SessionEventStore:
                 if not isinstance(summary, str):
                     raise SessionReplayError(f"invalid compaction event at seq {event.get('seq')}")
                 messages = [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+            elif event_type == "rewind":
+                messages = self._rewound_history(event)
         self.validate_openai_history(messages, allow_pending=True)
         return messages
+
+    def _rewound_history(self, event: dict) -> list[dict]:
+        """回溯事件：用 checkpoint 的 messages 快照替换此前历史，并标注回滚点。"""
+        checkpoint_id = event.get("checkpoint_id")
+        raw_path = event.get("snapshot_path")
+        if not checkpoint_id or not raw_path:
+            raise SessionReplayError(f"invalid rewind event at seq {event.get('seq')}")
+        snapshot_path = Path(raw_path)
+        if not snapshot_path.exists():
+            raise SessionReplayError(
+                f"rewind at seq {event.get('seq')}: snapshot missing for {checkpoint_id}")
+        messages = []
+        for line in snapshot_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            message = json.loads(line)
+            if not isinstance(message, dict) or "role" not in message:
+                raise SessionReplayError(f"invalid message in snapshot {checkpoint_id}")
+            messages.append(message)
+        if self._pending_ids(messages):
+            # 快照停在「工具已发出、结果未回来」的位置：此时插入 user 消息会破坏配对
+            return messages
+        return messages + [{
+            "role": "user",
+            "content": f"[Rewound to {checkpoint_id}] Conversation history restored to this checkpoint.",
+        }]
+
+    @staticmethod
+    def _pending_ids(messages: list[dict]) -> set[str]:
+        pending: set[str] = set()
+        for message in messages:
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict) and call.get("id"):
+                        pending.add(call["id"])
+            elif message.get("role") == "tool":
+                pending.discard(message.get("tool_call_id"))
+        return pending
 
     @staticmethod
     def validate_openai_history(messages: list[dict], *, allow_pending: bool = False) -> None:

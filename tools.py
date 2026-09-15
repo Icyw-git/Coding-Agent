@@ -429,6 +429,12 @@ def safe_path(p: str, cwd: str = None) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+def _capture_checkpoint(path: Path) -> None:
+    """把「写入前」的内容交给当前活跃 checkpoint 节点；无活跃 manager 时静默跳过。"""
+    manager = getattr(_h(), 'CHECKPOINT_MANAGER', None)
+    if manager is not None:
+        manager.capture_pre_image(path)
+
 def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
     try:
         lines = safe_path(path, cwd).read_text(encoding='utf-8', errors='replace').splitlines()
@@ -444,6 +450,7 @@ def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
 def run_write(path: str, content: str, cwd: str = None) -> str:
     try:
         file_path = safe_path(path, cwd)
+        _capture_checkpoint(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding='utf-8')
         return f"Wrote {len(content)} bytes to {path}"
@@ -456,6 +463,7 @@ def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
         text = file_path.read_text(encoding='utf-8', errors='replace')
         if old_text not in text:
             return f"Error: text not found in {path}"
+        _capture_checkpoint(file_path)   # 确认能改再抓 pre-image，避免记下无意义的快照
         file_path.write_text(text.replace(old_text, new_text, 1), encoding='utf-8')
         return f"Edited {path}"
     except Exception as e:
@@ -623,6 +631,26 @@ tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit
                'spawn_teammate':run_spawn_teammate,'send_message':run_send_message,'check_inbox':run_check_inbox,
                'request_shutdown':run_request_shutdown,'request_plan':run_request_plan,'review_plan':run_review_plan,
                'create_worktree':create_worktree,'remove_worktree':remove_worktree,'keep_worktree':keep_worktree}
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"checkpoint",
+        "description":("Create a rewindable checkpoint of the current conversation and workspace. "
+                       "Call it before risky multi-file refactors so the user can rewind with /rewind. "
+                       "Only the user can trigger a rewind."),
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "label":{
+                    "type":"string",
+                    "description":"Short label describing the safe point, e.g. 'before refactor'"
+                }
+            },
+            "required":[]
+        }
+    }
+})
 
 TOOLS.append({
     "type":"function",

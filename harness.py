@@ -28,6 +28,7 @@ from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
 from mcp_bridge import register_mcp_tools
 from session_store import SessionEventStore
+from checkpoints import CheckpointManager, CheckpointError
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
 
@@ -137,6 +138,15 @@ PERSIST_THERSHOLD=10000
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
 TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
 SESSIONS_DIR=WORKDIR/'.cache'/'sessions'
+
+# ---------- Checkpoint / Rewind 配置 ----------
+CHECKPOINT_DIR=WORKDIR/'.cache'/'checkpoints'
+CHECKPOINT_MAX_NODES=20          # 保留最近 N 个节点（由 /checkpoint-gc 触发回收）
+CHECKPOINT_KEEP_LABELED=True     # 带 label 的显式节点不被 GC
+CHECKPOINT_CAPTURE_FILES=True    # 关闭后退化为纯会话回溯
+CHECKPOINT_IGNORE=['.cache','.git','.worktrees','.mailbox','__pycache__','.pytest_cache']
+CHECKPOINT_SECRETS=['.env','*.pem','*_rsa']
+CHECKPOINT_MANAGER=None          # 当前活跃 manager；tools 的 write/edit 通过 _h() 读取它抓 pre-image
 
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=1
@@ -327,6 +337,166 @@ def _record_compaction(session_store, compacted_messages, strategy):
     session_store.append_compaction(summary, strategy)
 
 
+# ============================================================
+# Checkpoint / Rewind（设计见 CHECKPOINT_DESIGN.md）
+# ============================================================
+
+def get_checkpoint_manager(session_store):
+    """按 session 复用 manager，并把它暴露给 tools.run_write/run_edit 抓 pre-image。"""
+    global CHECKPOINT_MANAGER
+    manager=CHECKPOINT_MANAGER
+    if manager is None or manager.session_id!=session_store.session_id:
+        manager=CheckpointManager(
+            CHECKPOINT_DIR,WORKDIR,session_store.session_id,
+            max_nodes=CHECKPOINT_MAX_NODES,
+            keep_labeled=CHECKPOINT_KEEP_LABELED,
+            capture_files=CHECKPOINT_CAPTURE_FILES,
+            ignore=CHECKPOINT_IGNORE,
+            secrets=CHECKPOINT_SECRETS,
+        )
+        CHECKPOINT_MANAGER=manager
+    return manager
+
+
+def _safe_checkpoint(action,*args,**kwargs):
+    """快照/回收失败不能打断主循环，只告警。"""
+    try:
+        return action(*args,**kwargs)
+    except Exception as e:
+        print(f"  \033[33m[checkpoint] skipped: {e}\033[0m")
+        return None
+
+
+def _snapshot_path(cp_id:str)->Path:
+    return CHECKPOINT_DIR/cp_id/'messages.jsonl'
+
+
+def format_checkpoint_list(manager)->str:
+    rows=manager.list()
+    if not rows:
+        return '  (no checkpoints)'
+    head=manager.head()
+    lines=[]
+    for row in rows:
+        mark='*' if row['cp_id']==head else ' '
+        label=f" {row['label']}" if row.get('label') else ''
+        lines.append(f"  {mark} {row['cp_id']}  {row['status']:<6} {row['trigger']:<6} "
+                     f"files={len(row['files'])}{label}")
+    return '\n'.join(lines)
+
+
+def format_restore_report(plan:dict)->str:
+    lines=[f"  \033[36m[rewind] {plan['cp_id']}"
+           f"{(' ' + plan['label']) if plan.get('label') else ''} "
+           f"(chain={len(plan['chain'])}, scope={plan.get('scope','all')})\033[0m"]
+    for entry in plan['actions']:
+        lines.append(f"    {entry['action']:<9} {entry['path']}  ({entry['reason']})")
+    for title,items in (('conflicts',plan['conflicts']),
+                        ('unverified (节点未 seal，无法校验)',plan['unverified']),
+                        ('unrestorable by bash/external',plan['drift'])):
+        if items:
+            lines.append(f"    \033[33m{title}: {', '.join(items[:10])}\033[0m")
+    side=plan['side_effects']
+    lines.append(f"    \033[90mnot rolled back: memories={side['memories']} "
+                 f"crons={side['crons_file']} tasks={side['tasks']} "
+                 f"worktrees={side['worktrees']} background={side['background_tasks']}\033[0m")
+    if not plan['ok']:
+        lines.append(f"    \033[31m{plan['reason']}\033[0m")
+    return '\n'.join(lines)
+
+
+def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='all',report=True)->bool:
+    """把 messages 就地替换成回溯后的历史，并把 rewind 事件写进 session。
+
+    report=True 时打印完整计划+结果（直接调用时用）；命令层已经打印过计划，传 report=False，
+    这里只输出「实际做了什么」，避免同一份报告刷两遍。
+    """
+    try:
+        cp_id=manager.resolve(ref)
+    except CheckpointError as e:
+        print(f"  \033[31m[rewind] {e}\033[0m")
+        return False
+    if not _snapshot_path(cp_id).exists():
+        print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
+        return False
+
+    plan=manager.restore(cp_id,force=force,scope=scope)
+    if report:
+        print(format_restore_report(plan))
+    if not plan['ok']:
+        print(f"  \033[33m[rewind] 未执行任何改动；确认可覆盖后重试 "
+              f"/rewind {cp_id} --force\033[0m")
+        return False
+
+    session_store.append_rewind(cp_id,scope=scope,
+                                snapshot_path=str(_snapshot_path(cp_id)),
+                                restored_files=plan['applied'])
+    messages[:]=session_store.rebuild_openai_history()
+    applied=', '.join(plan['applied']) if plan['applied'] else '(no file change)'
+    print(f"  \033[36m[rewind] {cp_id} applied: {applied}\033[0m")
+    print(f"  \033[36m[rewind] session history restored to {cp_id}\033[0m")
+    return True
+
+
+def _confirm(prompt:str)->bool:
+    try:
+        return input(f"{prompt} (y/n) ").strip().lower() in ('y','yes')
+    except (EOFError,KeyboardInterrupt):
+        return False
+
+
+def handle_command(line:str,messages:list,session_store)->None:
+    """REPL 里的 /命令；回溯需要调用方已持有 agent_lock。"""
+    parts=line.split()
+    command=parts[0].lower()
+    manager=get_checkpoint_manager(session_store)
+
+    if command=='/checkpoints':
+        print(format_checkpoint_list(manager))
+
+    elif command=='/checkpoint':
+        label=' '.join(parts[1:])
+        cp_id=_safe_checkpoint(manager.begin_turn,messages,session_store,label=label,trigger='manual')
+        if cp_id:
+            print(f"  \033[36m[checkpoint] {cp_id}{(' ' + label) if label else ''}\033[0m")
+
+    elif command=='/rewind':
+        ref=next((p for p in parts[1:] if not p.startswith('--')),'last')
+        force='--force' in parts
+        scope='session' if '--session' in parts else 'all'
+        try:
+            cp_id=manager.resolve(ref)
+        except CheckpointError as e:
+            print(f"  \033[31m[rewind] {e}\033[0m")
+            return
+        if not _snapshot_path(cp_id).exists():
+            print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
+            return
+
+        # 先预览（plan_restore 不落盘），再确认执行
+        preview=_safe_checkpoint(manager.plan_restore,cp_id)
+        if preview is None:
+            return
+        preview['scope']=scope
+        print(format_restore_report(preview))
+        if preview['conflicts'] and not force:
+            print(f"  \033[33m[rewind] 未执行任何改动；确认可覆盖后重试 "
+                  f"/rewind {cp_id} --force\033[0m")
+            return
+        if '--yes' not in parts and not _confirm('Apply rewind?'):
+            print('  [rewind] cancelled')
+            return
+        _safe_checkpoint(rewind_to,messages,session_store,manager,cp_id,
+                         force=force,scope=scope,report=False)
+
+    elif command=='/checkpoint-gc':
+        removed=manager.gc()
+        print(f"  \033[36m[checkpoint] gc removed {len(removed)} node(s)\033[0m")
+
+    else:
+        print(f"  unknown command: {command}")
+
+
 def agent_loop(messages:list, session_store=None):
     """Run one OpenAI session, recording an append-only event stream for recovery."""
     if session_store is None:
@@ -346,8 +516,12 @@ def agent_loop(messages:list, session_store=None):
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
+    checkpoint_manager=get_checkpoint_manager(session_store) # 节点按 session 复用；tools 的 write/edit 通过它抓 pre-image
 
     while True:
+        # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
+        _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
+
         pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
         
 
@@ -431,6 +605,7 @@ def agent_loop(messages:list, session_store=None):
                 print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
+            _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
             # ⚠️ 提醒：只负责落盘到 .cache/memories/*.md，不会反馈回当前 Loop ——
@@ -450,6 +625,22 @@ def agent_loop(messages:list, session_store=None):
         for tool_call in message.tool_calls:
             if tool_call.function.name == 'todo_write':
                 used_todo = True
+            if tool_call.function.name == 'checkpoint':
+                # 显式节点：先 seal 当前节点，再以 label 开一个新节点（后续写文件仍会被抓 pre-image）。
+                # 与 compact 一样不进 tool_registry —— 它是 loop 行为，不是普通工具。
+                try:
+                    label=str(json.loads(tool_call.function.arguments or '{}').get('label',''))
+                except json.JSONDecodeError:
+                    label=''
+                cp_id=_safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store,
+                                       label=label,trigger='manual')
+                tool_messages.append({
+                    'role':'tool','tool_call_id':tool_call.id,
+                    'content':(f'Checkpoint created: {cp_id}' if cp_id
+                               else 'Checkpoint failed; continue without one.'),
+                })
+                session_store.append_message(tool_messages[-1])
+                continue
             if tool_call.function.name == 'compact':
                 # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
                 # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
@@ -520,6 +711,42 @@ def run_agent_turn_locked():
         print('\n[会话已中断]')
 
 
+def run_repl(initial_messages:list):
+    """最小交互循环：普通输入走 agent_loop，/ 开头的走 checkpoint 命令（见 handle_command）。
+
+    agent_loop 每轮结束就返回，canonical history 由 session_store 维护，
+    因此每轮结束后用 rebuild_openai_history() 刷新本地 messages —— 这样 /rewind 与多轮对话共用同一份历史。
+    """
+    messages=[dict(m) for m in initial_messages]
+    session_store=SessionEventStore(SESSIONS_DIR)
+    for message in messages:
+        session_store.append_message(message)
+    print(f'[session log:{session_store.path}]')
+    print('  \033[90mcommands: /checkpoints /checkpoint [label] '
+          '/rewind <id|last|head> [--force] [--session] [--yes] /checkpoint-gc\033[0m')
+
+    while True:
+        try:
+            line=input('\n> ').strip()
+        except (EOFError,KeyboardInterrupt):
+            print('\n[会话已结束]')
+            break
+        if not line:
+            continue
+        if line.startswith('/'):
+            if line.split()[0].lower() in ('/exit','/quit'):
+                break
+            handle_command(line,messages,session_store)
+            continue
+        messages.append({'role':'user','content':line})
+        session_store.append_message(messages[-1])
+        try:
+            agent_loop(messages,session_store=session_store)
+        except KeyboardInterrupt:
+            print('\n[会话已中断]')
+        messages[:]=session_store.rebuild_openai_history()
+
+
 if __name__ == '__main__':
     # 启动 cron 调度线程（生产队列）+ 队列处理器（推送执行）；测试直接调 agent_loop 不受影响
     load_durable_jobs()
@@ -530,15 +757,13 @@ if __name__ == '__main__':
     # 接入 MCP：连接配置的 server，工具动态注册进 tool_registry + TOOLS
     TOOLS.extend(register_mcp_tools(tool_registry))
 
-    def _run_session(msgs):
+    # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务；
+    # /rewind 等命令也在锁内执行，避免与 cron turn 并发改 messages。
+    with agent_lock:
         try:
-            agent_loop(msgs)
+            run_repl([])
         except KeyboardInterrupt:
             print('\n[会话已中断]')
-
-    # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务
-    with agent_lock:
-        _run_session([{'role': 'user', 'content': '这个项目的规模有多大'}])
 
     # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
     try:

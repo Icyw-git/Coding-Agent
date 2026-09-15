@@ -8,24 +8,25 @@
 
 相关模块职责如下：
 
-| 模块 | 职责 |
-| --- | --- |
-| `harness.py` | 主 agent loop、请求构造、工具编排、cron 注入、会话恢复入口 |
-| `agent_core.py` | hooks、记忆、上下文压缩、transcript 快照、记忆注入 |
-| `tools.py` | OpenAI tool schema、工具注册表、任务/cron/团队工具实现 |
-| `session_store.py` | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测 |
-| `recovery.py` | 429/overload 重试、备用模型、输出截断和上下文超限判断 |
-| `background_task.py` | 慢工具后台执行和完成通知收集 |
-| `cron_scheduler.py` | cron 时间匹配、持久化、队列生产和队列处理线程 |
-| `mcp_bridge.py` | MCP server 连接、异步事件循环、动态工具注册 |
-| `subagent.py` | `task` 工具启动的短生命周期子代理循环 |
-| `agent_teams.py` | 常驻 teammate 线程、邮箱通信、计划审批、任务工具和 worktree 上下文 |
-| `task_system.py` | 持久化任务板、依赖、认领、完成和解锁 |
-| `autonomous_agent.py` | teammate 空闲轮询、收消息、自动认领任务 |
-| `team_protocols.py` | shutdown/plan approval 协议状态机 |
-| `skill_system.py` | skill 扫描、目录展示和按需加载 |
-| `worktree.py` | git worktree 创建、任务绑定、变更保护和保留/删除 |
-| `hooks.py` | 工具权限、日志、大输出、用户提交和停止 hook |
+| 模块                  | 职责                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| `harness.py`          | 主 agent loop、请求构造、工具编排、cron 注入、会话恢复入口                                       |
+| `agent_core.py`       | hooks、记忆、上下文压缩、transcript 快照、记忆注入                                               |
+| `tools.py`            | OpenAI tool schema、工具注册表、任务/cron/团队工具实现                                           |
+| `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
+| `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收（见 `CHECKPOINT_DESIGN.md`） |
+| `recovery.py`         | 429/overload 重试、备用模型、输出截断和上下文超限判断                                            |
+| `background_task.py`  | 慢工具后台执行和完成通知收集                                                                     |
+| `cron_scheduler.py`   | cron 时间匹配、持久化、队列生产和队列处理线程                                                    |
+| `mcp_bridge.py`       | MCP server 连接、异步事件循环、动态工具注册                                                      |
+| `subagent.py`         | `task` 工具启动的短生命周期子代理循环                                                            |
+| `agent_teams.py`      | 常驻 teammate 线程、邮箱通信、计划审批、任务工具和 worktree 上下文                               |
+| `task_system.py`      | 持久化任务板、依赖、认领、完成和解锁                                                             |
+| `autonomous_agent.py` | teammate 空闲轮询、收消息、自动认领任务                                                          |
+| `team_protocols.py`   | shutdown/plan approval 协议状态机                                                                |
+| `skill_system.py`     | skill 扫描、目录展示和按需加载                                                                   |
+| `worktree.py`         | git worktree 创建、任务绑定、变更保护和保留/删除                                                 |
+| `hooks.py`            | 工具权限、日志、大输出、用户提交和停止 hook                                                      |
 
 主循环中的 `messages` 是 OpenAI canonical history；system prompt 和相关记忆通过请求副本注入，不应混入 canonical history。
 
@@ -260,6 +261,8 @@ compact 后面尚未执行的工具不会由旧响应强行执行，而是等待
 - `message`：OpenAI 原生消息；
 - `tool_started`：工具意图已经发出；
 - `compaction`：历史已被摘要替换；
+- `checkpoint`：一个可回溯节点已创建（只记录引用，快照在 `.cache/checkpoints/`）；
+- `rewind`：用户回溯到某节点，重放时用该节点快照替换此前历史；
 - `turn_completed`：一轮正常完成。
 
 每条事件包含版本、序号、session id、时间戳，并使用追加写入、flush、fsync。
@@ -624,7 +627,75 @@ collect_background_results
 下一轮压缩和 LLM 调用
 ```
 
-## 22. 重要实现边界
+## 22. Checkpoint / Rewind 节点
+
+设计细节见 [`CHECKPOINT_DESIGN.md`](CHECKPOINT_DESIGN.md)，这里只描述它在循环里的位置。
+
+### 22.1 节点产生
+
+```text
+while True 开头
+  ↓
+begin_turn(messages, session_store)     # 快照 messages + git 基线，状态 open
+  ↓
+...(LLM 调用、工具执行)...
+  ├─ write / edit 落盘前
+  │    ↓
+  │  capture_pre_image(file)            # 首次修改时把 pre-image 存进当前节点
+  ↓
+turn_completed
+  ↓
+seal()                                  # 记录每个文件写入后的 hash，状态 sealed
+```
+
+上一轮如果是异常退出的（节点停在 `open`），下一次 `begin_turn` 会先把它 seal，不会留下悬挂节点。
+
+模型显式调用 `checkpoint` 工具时，loop 会先 seal 当前节点，再以 `trigger=manual` 开一个新节点，
+并把 `Checkpoint created: <cp_id>` 作为 `role=tool` 结果回填（和 `compact` 一样属于 loop 行为，
+不进 `tool_registry`）。
+
+### 22.2 事件流
+
+| 事件         | 写入时机           | 重放语义                                                        |
+| ------------ | ------------------ | --------------------------------------------------------------- |
+| `checkpoint` | `begin_turn`       | 不改变历史，只记录节点引用与 `through_seq`                      |
+| `rewind`     | 用户执行 `/rewind` | 用节点快照替换此前历史，并追加 `[Rewound to <cp_id>]` user 消息 |
+| `compaction` | 压缩               | 用摘要替换此前历史（原有行为）                                  |
+
+`checkpoint` 与 `rewind` 的快照本体存在 `.cache/checkpoints/<cp_id>/`，不进 session JSONL；
+`rewind` 事件只带 `snapshot_path`，`session_store` 因此不需要知道 checkpoint 目录布局。
+
+### 22.3 回溯入口
+
+```text
+/checkpoints                列出节点（* 标记当前 head，files=N 表示该节点是否带 pre-image）
+/checkpoint [label]         手动打点
+/rewind last                回溯到「最近一个有文件改动的节点」（默认引用）
+/rewind head                回溯到最新节点（可能只回滚会话）
+/rewind <cp_id>             回溯到指定节点
+/rewind <cp_id> --session   只回滚会话
+/rewind <cp_id> --force     冲突时强制覆盖
+/rewind <cp_id> --yes       跳过确认
+/checkpoint-gc              按保留策略回收旧节点
+```
+
+节点按 loop 迭代生成，一个用户回合常有两个节点（改文件的那次迭代 + 只输出回答的那次迭代），
+后者不带任何 pre-image，所以 `last` 与 `head` 特意区分开。
+
+这些命令由 [`harness.py`](harness.py) 的 `handle_command` 处理，入口是 `__main__` 里的最小 REPL
+`run_repl`：普通输入追加 user 消息后调用 `agent_loop(messages, session_store=...)`，
+`/` 开头的输入不进 LLM。REPL 整体持有 `agent_lock`，回溯因此不会与 cron turn 并发。
+`/rewind` 先打印 `plan_restore()` 的计划，确认后执行，执行完只补一行实际改动（`applied: ...`）。
+
+### 22.4 边界
+
+1. 只回滚 canonical messages 与被 `write`/`edit` 改过的文件；`bash`、MCP、外部进程的改动只提示不恢复。
+2. 记忆、cron、任务板、worktree、后台任务等副作用不回滚（报告里显式列出）。
+3. `.worktrees/`、`.cache/`、`.git/` 及敏感文件不抓 pre-image。
+4. 恢复默认要求目标文件与节点 seal 时的 hash 一致，否则整体中止（`--force` 才覆盖）。
+5. teammate / subagent 的写入会挂到主会话当前节点，但它们没有自己的节点，也不产生会话事件。
+
+## 23. 重要实现边界
 
 1. 主 agent 有 session event 记录；subagent 和 teammate 目前没有完全接入同一套 session event store。
 2. `resume_agent_loop()` 能识别 pending tool，但副作用工具的自动恢复策略仍应按工具类型细分。
@@ -636,7 +707,7 @@ collect_background_results
 8. 后台任务完成不会主动打断当前 LLM 调用，只能在后续工具轮被收集。
 9. `write_transcript()` 是快照，不应作为 session crash recovery 的唯一来源。
 
-## 23. 推荐的维护方向
+## 24. 推荐的维护方向
 
 后续如果继续增强，优先级建议为：
 
@@ -646,4 +717,4 @@ collect_background_results
 4. 为 mailbox 增加消息 id、ack 和未确认重放能力。
 5. 给 MCP wrapper 增加工具调用耗时、server 名称和错误类型事件。
 6. 为自动认领加入 owner lease、超时回收和公平调度。
-
+7. 让 checkpoint 覆盖 `bash` 侧的文件改动（git 基线 → 可选精确回滚）。

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 
@@ -64,3 +65,47 @@ def test_partial_tail_is_ignored_but_non_tail_corruption_fails(tmp_path):
     bad.write_text('{"v":1}\nnot-json\n{"v":1}\n', encoding="utf-8")
     with pytest.raises(SessionReplayError):
         SessionEventStore.open(bad).read_events()
+
+
+def _snapshot(tmp_path, messages):
+    path = tmp_path / "cp_x" / "messages.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(m) + "\n" for m in messages), encoding="utf-8")
+    return path
+
+
+def test_rewind_event_replaces_history_with_snapshot(tmp_path):
+    snapshot = _snapshot(tmp_path, [
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "original answer"},
+    ])
+    store = SessionEventStore(tmp_path / "sessions", session_id="rewound")
+    store.append_message({"role": "user", "content": "original request"})
+    store.append_message({"role": "assistant", "content": "original answer"})
+    store.append_message({"role": "user", "content": "bad detour"})
+    store.append_rewind("cp_x", snapshot_path=str(snapshot))
+    store.append_message({"role": "user", "content": "continue"})
+
+    history = store.rebuild_openai_history()
+    assert [m["content"] for m in history[:2]] == ["original request", "original answer"]
+    assert history[2]["content"].startswith("[Rewound to cp_x]")
+    assert history[-1] == {"role": "user", "content": "continue"}
+
+
+def test_rewind_without_snapshot_fails_replay(tmp_path):
+    store = SessionEventStore(tmp_path / "sessions", session_id="missing")
+    store.append_message({"role": "user", "content": "hello"})
+    store.append_rewind("cp_gone", snapshot_path=str(tmp_path / "nope.jsonl"))
+
+    with pytest.raises(SessionReplayError):
+        store.rebuild_openai_history()
+
+
+def test_checkpoint_event_does_not_change_replayed_history(tmp_path):
+    store = SessionEventStore(tmp_path / "sessions", session_id="cpevent")
+    store.append_message({"role": "user", "content": "hello"})
+    store.append_checkpoint("cp_1", label="before refactor", trigger="manual")
+
+    assert store.rebuild_openai_history() == [{"role": "user", "content": "hello"}]
+    assert store.last_seq == 2
+    assert store.read_events()[1]["label"] == "before refactor"
