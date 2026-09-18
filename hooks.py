@@ -17,12 +17,14 @@ def is_tool_hook(tool:str,args:dict):
 
 def permission_hook(tool:str,args:dict):
     if tool=='bash':
+        command=args.get("command", "")
+        normalized=command.casefold()
         for pattern in _h().DENY_LIST:
-            if pattern in args.get("command", ""):
+            if pattern.casefold() in normalized:
                 print(f'\n\033[31m⛔ Blocked: {pattern}\033[0m')
                 return f"Error: Dangerous command {pattern}, please do not execute"
         for pattern in _h().DESTRUCTIVE:
-            if pattern in args.get("command", ""):
+            if pattern.casefold() in normalized:
                 print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
                 print(f"   Tool: {tool}({args})")
                 choice=input("Allow? (y/n) ").strip().lower()

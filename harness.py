@@ -114,7 +114,8 @@ CONSOLIDATE_THRESHOLD=10
 
 # ---------- 安全策略 ----------
 DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
-DESTRUCTIVE=["rm ","del ","rmdir ","rd ","Remove-Item ","erase ","> /etc/","chmod 777"]
+DESTRUCTIVE=["rm ","del ","rmdir ","rd ","remove-item ","erase ",
+             "clear-content ","> /etc/","chmod 777"]
 
 # ---------- 模型上下文配置 ----------
 MODEL_WINDOWS={

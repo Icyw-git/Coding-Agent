@@ -28,6 +28,14 @@ active_teammates = {}
 
 class MessageBus: 
     """消息总线，用于团队成员之间的通信。"""
+    def __init__(self):
+        self._locks: dict[Path, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _inbox_lock(self, inbox: Path) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(inbox, threading.Lock())
+
     # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = 'message', metadata: dict = None): #发送消息至指定_agent的邮箱
@@ -41,25 +49,28 @@ class MessageBus:
         if metadata:
             msg['metadata'] = metadata
         inbox = MAILBOX_DIR / f'{to_agent}.jsonl'
-        with open(inbox, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+        with self._inbox_lock(inbox):
+            with open(inbox, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
         """读取指定_agent的邮箱消息，清空邮箱。返回消息列表。"""
         inbox = MAILBOX_DIR / f'{agent}.jsonl'
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in
-                inbox.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip()]
-        inbox.unlink() # 清空邮箱
-        return msgs
+        with self._inbox_lock(inbox):
+            if not inbox.exists():
+                return []
+            msgs = [json.loads(line) for line in
+                    inbox.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip()]
+            inbox.unlink() # 清空邮箱
+            return msgs
 
     def peek(self, agent: str) -> bool: #检查指定_agent的邮箱是否有消息
         """检查指定_agent的邮箱是否有消息。返回是否有消息。"""
         inbox = MAILBOX_DIR / f'{agent}.jsonl'
-        return inbox.exists() and inbox.stat().st_size > 0
+        with self._inbox_lock(inbox):
+            return inbox.exists() and inbox.stat().st_size > 0
 
 
 BUS = MessageBus()

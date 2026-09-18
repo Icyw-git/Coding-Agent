@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import threading
 import time
@@ -16,7 +17,7 @@ class CronJob:
 
 scheduled_jobs:dict[str,CronJob]={} # id -> job
 cron_queue:list[CronJob]=[] #任务队列
-cron_lock=threading.Lock() # 任务队列锁，用于保护任务队列
+cron_lock=threading.RLock() # 任务队列锁，用于保护任务队列
 agent_lock=threading.Lock() # 代理锁，用于保护代理状态
 _last_fired:dict[str,str]={} # id -> last fired time
 DURABLE_PATH=Path(__file__).resolve().parent/'.cache'/'crons.json'
@@ -58,7 +59,8 @@ def cron_matches(cron_expr:str,dt:datetime)->bool: #对外接口，判断cron表
         return dow_ok   # dom 通配 → 只看 dow
     if dow_unconstrained:
         return dom_ok   # dow 通配 → 只看 dom
-    return dom_ok and dow_ok
+    # 与常见 crontab 一致：当日期和星期都指定时，任意一个匹配即可触发。
+    return dom_ok or dow_ok
 
 def _validate_cron_field(field:str,lo:int,hi:int): #验证cron表达式字段是否有效，返回错误信息或None
     if field=='*':
@@ -110,9 +112,12 @@ def validate_cron(cron_expr:str): #验证cron表达式是否有效，返回错�
 
 
 def save_durable_jobs(): #保存持久化任务
-    DURABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    durable=[asdict(j) for j in scheduled_jobs.values() if j.durable]
-    DURABLE_PATH.write_text(json.dumps(durable,ensure_ascii=False,indent=2))
+    with cron_lock:
+        DURABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        durable=[asdict(j) for j in scheduled_jobs.values() if j.durable]
+        tmp=DURABLE_PATH.with_suffix('.tmp')
+        tmp.write_text(json.dumps(durable,ensure_ascii=False,indent=2),encoding='utf-8')
+        os.replace(tmp,DURABLE_PATH)
 
 def load_durable_jobs(): #加载持久化任务，将有效任务添加到scheduled_jobs中
     if not DURABLE_PATH.exists():
