@@ -52,7 +52,7 @@
 ## 3. 数据布局
 
 ```text
-.cache/checkpoints/
+.cache/checkpoints/<session_id>/
   index.jsonl                 # append-only 索引，每行一个节点
   state.json                  # {current_head: cp_xxx} 当前分支头
   <cp_id>/
@@ -95,7 +95,7 @@
 
 ```json
 {"type":"checkpoint","seq":43,"checkpoint_id":"cp_xxx","through_seq":42,"label":"","trigger":"turn"}
-{"type":"rewind","seq":88,"checkpoint_id":"cp_xxx","snapshot_path":".cache/checkpoints/cp_xxx/messages.jsonl",
+{"type":"rewind","seq":88,"checkpoint_id":"cp_xxx","snapshot_path":".cache/checkpoints/<session_id>/cp_xxx/messages.jsonl",
  "scope":"session+files","restored_files":["t.py"]}
 ```
 

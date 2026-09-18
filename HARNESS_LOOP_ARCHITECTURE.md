@@ -261,7 +261,7 @@ compact 后面尚未执行的工具不会由旧响应强行执行，而是等待
 - `message`：OpenAI 原生消息；
 - `tool_started`：工具意图已经发出；
 - `compaction`：历史已被摘要替换；
-- `checkpoint`：一个可回溯节点已创建（只记录引用，快照在 `.cache/checkpoints/`）；
+- `checkpoint`：一个可回溯节点已创建（只记录引用，快照在 `.cache/checkpoints/<session_id>/`）；
 - `rewind`：用户回溯到某节点，重放时用该节点快照替换此前历史；
 - `turn_completed`：一轮正常完成。
 
@@ -662,7 +662,7 @@ seal()                                  # 记录每个文件写入后的 hash，
 | `rewind`     | 用户执行 `/rewind` | 用节点快照替换此前历史，并追加 `[Rewound to <cp_id>]` user 消息 |
 | `compaction` | 压缩               | 用摘要替换此前历史（原有行为）                                  |
 
-`checkpoint` 与 `rewind` 的快照本体存在 `.cache/checkpoints/<cp_id>/`，不进 session JSONL；
+`checkpoint` 与 `rewind` 的快照本体存在 `.cache/checkpoints/<session_id>/<cp_id>/`，不进 session JSONL；
 `rewind` 事件只带 `snapshot_path`，`session_store` 因此不需要知道 checkpoint 目录布局。
 
 ### 22.3 回溯入口

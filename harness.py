@@ -367,8 +367,8 @@ def _safe_checkpoint(action,*args,**kwargs):
         return None
 
 
-def _snapshot_path(cp_id:str)->Path:
-    return CHECKPOINT_DIR/cp_id/'messages.jsonl'
+def _snapshot_path(manager, cp_id:str)->Path:
+    return manager.snapshot_path(cp_id)
 
 
 def format_checkpoint_list(manager)->str:
@@ -416,7 +416,7 @@ def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='a
     except CheckpointError as e:
         print(f"  \033[31m[rewind] {e}\033[0m")
         return False
-    if not _snapshot_path(cp_id).exists():
+    if not _snapshot_path(manager, cp_id).exists():
         print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
         return False
 
@@ -429,7 +429,7 @@ def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='a
         return False
 
     session_store.append_rewind(cp_id,scope=scope,
-                                snapshot_path=str(_snapshot_path(cp_id)),
+                                 snapshot_path=str(_snapshot_path(manager, cp_id)),
                                 restored_files=plan['applied'])
     messages[:]=session_store.rebuild_openai_history()
     applied=', '.join(plan['applied']) if plan['applied'] else '(no file change)'
@@ -469,7 +469,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         except CheckpointError as e:
             print(f"  \033[31m[rewind] {e}\033[0m")
             return
-        if not _snapshot_path(cp_id).exists():
+        if not _snapshot_path(manager, cp_id).exists():
             print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
             return
 
@@ -626,14 +626,15 @@ def agent_loop(messages:list, session_store=None):
             if tool_call.function.name == 'todo_write':
                 used_todo = True
             if tool_call.function.name == 'checkpoint':
-                # 显式节点：先 seal 当前节点，再以 label 开一个新节点（后续写文件仍会被抓 pre-image）。
+                # 当前节点在本轮请求前已创建，快照是完整 OpenAI 历史。只给它加标签，不能
+                # 在 assistant tool_calls 与对应 tool 结果之间新建快照，否则 rewind 后历史无法重放。
                 # 与 compact 一样不进 tool_registry —— 它是 loop 行为，不是普通工具。
                 try:
                     label=str(json.loads(tool_call.function.arguments or '{}').get('label',''))
                 except json.JSONDecodeError:
                     label=''
-                cp_id=_safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store,
-                                       label=label,trigger='manual')
+                cp_id=_safe_checkpoint(checkpoint_manager.label_active,label,session_store,
+                                       trigger='manual')
                 tool_messages.append({
                     'role':'tool','tool_call_id':tool_call.id,
                     'content':(f'Checkpoint created: {cp_id}' if cp_id

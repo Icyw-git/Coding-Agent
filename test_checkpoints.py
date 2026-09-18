@@ -28,7 +28,7 @@ def test_turn_node_writes_messages_and_index(tmp_path, ws):
     mgr = _mgr(ws)
 
     cp_id = mgr.begin_turn(_msgs(), store)
-    node = ws / '.cache' / 'checkpoints' / cp_id
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
 
     assert mgr.messages_snapshot(cp_id) == _msgs()
     assert json.loads((node / 'meta.json').read_text(encoding='utf-8'))['status'] == 'open'
@@ -49,7 +49,7 @@ def test_capture_pre_image_is_idempotent_per_node(ws):
     target.write_text('v2', encoding='utf-8')
     mgr.capture_pre_image(target)
 
-    assert (ws / '.cache' / 'checkpoints' / cp_id / 'files' / 'a.txt').read_text(encoding='utf-8') == 'v1'
+    assert (ws / '.cache' / 'checkpoints' / 'sid' / cp_id / 'files' / 'a.txt').read_text(encoding='utf-8') == 'v1'
     assert len(mgr.get(cp_id)['files']) == 1
 
 
@@ -146,7 +146,7 @@ def test_ignored_and_sensitive_paths_are_not_snapshotted(ws):
     files = mgr.get(cp_id)['files']
     assert '.cache/x.txt' not in files
     assert files['.env']['sensitive'] is True
-    assert not (ws / '.cache' / 'checkpoints' / cp_id / 'files' / '.env').exists()
+    assert not (ws / '.cache' / 'checkpoints' / 'sid' / cp_id / 'files' / '.env').exists()
 
 
 def test_rewind_is_idempotent(ws):
@@ -236,6 +236,22 @@ def test_head_survives_restart(ws):
     assert reopened.resolve('last') == cp_id
 
 
+def test_sessions_use_isolated_checkpoint_state(ws):
+    """同一工作区的不同会话不能读取或继承彼此的 checkpoint。"""
+    base_dir = ws / '.cache' / 'checkpoints'
+    first = CheckpointManager(base_dir, ws, 'first')
+    cp_id = first.begin_turn(_msgs('first'))
+    first.seal()
+
+    second = CheckpointManager(base_dir, ws, 'second')
+
+    assert first.head() == cp_id
+    assert second.head() is None
+    assert second.list() == []
+    assert (base_dir / 'first' / cp_id).is_dir()
+    assert not (base_dir / 'second').exists()
+
+
 def test_resolve_without_nodes_raises(ws):
     mgr = _mgr(ws)
 
@@ -288,7 +304,7 @@ def test_gc_keeps_head_and_labeled_and_reports(ws):
     assert nodes[-1] in remaining          # head 保留
     assert nodes[0] in remaining           # 带 label 保留
     assert len(removed) == 3
-    assert all(not (ws / '.cache' / 'checkpoints' / cp_id).exists() for cp_id in removed)
+    assert all(not (ws / '.cache' / 'checkpoints' / 'sid' / cp_id).exists() for cp_id in removed)
     assert any(line.get('gc') for line in _index_rows(ws))
 
 
@@ -381,8 +397,8 @@ def test_agent_loop_records_nodes_and_rewind_restores_file(tmp_path, monkeypatch
     assert any(event['type'] == 'rewind' for event in session_store.read_events())
 
 
-def test_agent_loop_checkpoint_tool_creates_labeled_node(tmp_path, monkeypatch):
-    """模型调用 checkpoint 工具：生成 manual 节点，且工具结果配对不破。"""
+def test_agent_loop_checkpoint_tool_labels_valid_turn_node(tmp_path, monkeypatch):
+    """模型调用 checkpoint 工具：标记本回合节点，rewind 后历史仍有完整工具配对。"""
     from test_context_manage import FakeCompletions, make_text_response, make_tool_response
 
     harness, workspace = _loop_env(tmp_path, monkeypatch)
@@ -404,6 +420,9 @@ def test_agent_loop_checkpoint_tool_creates_labeled_node(tmp_path, monkeypatch):
     history = session_store.rebuild_openai_history()
     assert 'Checkpoint created: ' in json.dumps(history, ensure_ascii=False)
     harness.SessionEventStore.validate_openai_history(history)
+    assert harness.rewind_to(messages, session_store, harness.CHECKPOINT_MANAGER,
+                             manual[0]['cp_id']) is True
+    harness.SessionEventStore.validate_openai_history(messages)
 
 
 def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
@@ -435,5 +454,5 @@ def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
 
 
 def _index_rows(ws):
-    path = ws / '.cache' / 'checkpoints' / 'index.jsonl'
+    path = ws / '.cache' / 'checkpoints' / 'sid' / 'index.jsonl'
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]

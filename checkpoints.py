@@ -50,11 +50,12 @@ def _read_json(path: Path) -> dict:
 
 
 class CheckpointManager:
-    """一个 session 对应一个 manager；节点按 <base_dir>/<cp_id>/ 落盘。"""
+    """一个 session 对应一个 manager；节点按 <base_dir>/<session_id>/<cp_id>/ 落盘。"""
 
     def __init__(self, base_dir, workspace, session_id, *, max_nodes=20, keep_labeled=True,
                  capture_files=True, ignore=None, secrets=None, max_file_bytes=MAX_FILE_BYTES):
-        self.base_dir = Path(base_dir)
+        # state.json、index.jsonl 与节点必须按 session 隔离；否则新会话会继承旧会话的 head。
+        self.base_dir = Path(base_dir) / session_id
         self.workspace = Path(workspace).resolve()
         self.session_id = session_id
         self.max_nodes = max_nodes
@@ -78,6 +79,11 @@ class CheckpointManager:
 
     def _node_dir(self, cp_id: str) -> Path:
         return self.base_dir / cp_id
+
+    def snapshot_path(self, cp_id: str) -> Path:
+        """返回指定节点的会话快照路径，并校验它属于当前 session。"""
+        self.get(cp_id)
+        return self._node_dir(cp_id) / 'messages.jsonl'
 
     def _abs_of(self, key: str) -> Path:
         return self.workspace / key
@@ -189,6 +195,22 @@ class CheckpointManager:
         if session_store is not None:
             session_store.append_checkpoint(cp_id, meta['through_seq'], label=label, trigger=trigger)
         return cp_id
+
+    def label_active(self, label: str, session_store=None, *, trigger: str = 'manual') -> str:
+        """给当前回合的有效快照加标签，不在未完成 tool call 中间另建快照。"""
+        if not self._active:
+            raise CheckpointError('no active checkpoint to label')
+        node_dir = self._node_dir(self._active)
+        meta = self.get(self._active)
+        meta['label'] = label
+        meta['trigger'] = trigger
+        self._write_meta(node_dir, meta)
+        self._append_index(self._summary(meta))
+        if session_store is not None:
+            session_store.append_checkpoint(
+                self._active, session_store.last_seq, label=label, trigger=trigger,
+            )
+        return self._active
 
     def capture_pre_image(self, path) -> None:
         """保存「写入前」的文件内容；同一节点内同一路径只保存一次。异常只告警，不打断写盘。"""
