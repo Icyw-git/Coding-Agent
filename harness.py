@@ -1,3 +1,4 @@
+import argparse
 import os 
 from dotenv import load_dotenv
 import openai
@@ -6,14 +7,15 @@ import time
 import threading
 from pathlib import Path
 from typing import Optional, List
-from background_task import should_run_background, start_background_task, collect_background_results
+from background_task import (should_run_background, start_background_task, collect_background_results,
+                             background_lock, background_tasks)
 import recovery
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 from cron_scheduler import (schedule_job, cancel_job, consume_cron_queue,
                             cron_lock, scheduled_jobs, cron_scheduler_loop,
                             load_durable_jobs, agent_lock,
                             queue_processor_loop, wait_for_cron_idle)
-from agent_teams import spawn_teammate_thread, BUS
+from agent_teams import spawn_teammate_thread, BUS, active_teammates
 from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
                         _parse_frontmatter, write_memory_file, _rebuild_index,
                         read_memory_index, read_memory_file, list_memory_files,
@@ -27,7 +29,7 @@ from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
 from mcp_bridge import register_mcp_tools
-from session_store import SessionEventStore
+from session_store import SessionEventStore, SessionReplayError
 from checkpoints import CheckpointManager, CheckpointError
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
@@ -56,6 +58,70 @@ def validate_runtime_config(environ=None) -> None:
             'Missing required configuration: ' + ', '.join(missing)
             + '. Set them in .env before starting Harness Agent.'
         )
+
+
+def list_session_paths(limit: int = 20) -> list[Path]:
+    """Return the most recently modified persisted session logs."""
+    if not SESSIONS_DIR.is_dir():
+        return []
+    sessions = SESSIONS_DIR.glob('session_*.jsonl')
+    return sorted(sessions, key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+
+
+def resolve_session_path(session_id: str) -> Path:
+    """Resolve a session ID without accepting arbitrary filesystem paths."""
+    if not session_id or not session_id.replace('-', '').replace('_', '').isalnum():
+        raise ValueError('Invalid session ID')
+    path = SESSIONS_DIR / f'session_{session_id}.jsonl'
+    if not path.is_file():
+        raise FileNotFoundError(f'Session {session_id} not found')
+    return path
+
+
+def format_session_list(limit: int = 20) -> str:
+    rows = list_session_paths(limit)
+    if not rows:
+        return '  (no saved sessions)'
+    lines = []
+    for path in rows:
+        store = SessionEventStore.open(path)
+        lines.append(f'  {store.session_id}  events={store.last_seq}  '
+                     f'updated={time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))}')
+    return '\n'.join(lines)
+
+
+def format_status(session_store) -> str:
+    """Summarize local runtime state for the interactive REPL."""
+    manager = get_checkpoint_manager(session_store)
+    with cron_lock:
+        cron_count = len(scheduled_jobs)
+    with background_lock:
+        background_count = len(background_tasks)
+    return (
+        f'  session={session_store.session_id} events={session_store.last_seq}\n'
+        f'  model={os.getenv("LLM_MODEL_ID", "(not configured)")} workspace={WORKDIR}\n'
+        f'  checkpoints={len(manager.list(limit=10_000))} tasks={len(list_tasks())} '
+        f'cron={cron_count} background={background_count} teammates={len(active_teammates)}'
+    )
+
+
+def run_doctor() -> int:
+    """Report startup prerequisites without contacting the model provider."""
+    checks = [
+        ('LLM_API_KEY', bool(os.getenv('LLM_API_KEY'))),
+        ('LLM_MODEL_ID', bool(os.getenv('LLM_MODEL_ID'))),
+        ('workspace', WORKDIR.is_dir()),
+        ('git repository', (WORKDIR / '.git').exists()),
+    ]
+    for directory in (SESSIONS_DIR, CHECKPOINT_DIR, MEMORY_DIR, TOOL_RESULTS_DIR):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            checks.append((f'writable {directory.relative_to(WORKDIR)}', True))
+        except OSError:
+            checks.append((f'writable {directory}', False))
+    for label, passed in checks:
+        print(f'[{"ok" if passed else "missing"}] {label}')
+    return 0 if all(passed for _, passed in checks) else 1
 
 PROMPT_SECTIONS={
     'identity_main':(
@@ -466,6 +532,12 @@ def handle_command(line:str,messages:list,session_store)->None:
     if command=='/checkpoints':
         print(format_checkpoint_list(manager))
 
+    elif command == '/status':
+        print(format_status(session_store))
+
+    elif command == '/sessions':
+        print(format_session_list())
+
     elif command=='/checkpoint':
         label=' '.join(parts[1:])
         cp_id=_safe_checkpoint(manager.begin_turn,messages,session_store,label=label,trigger='manual')
@@ -724,18 +796,19 @@ def run_agent_turn_locked():
         print('\n[会话已中断]')
 
 
-def run_repl(initial_messages:list):
+def run_repl(initial_messages:list, session_store=None):
     """最小交互循环：普通输入走 agent_loop，/ 开头的走 checkpoint 命令（见 handle_command）。
 
     agent_loop 每轮结束就返回，canonical history 由 session_store 维护，
     因此每轮结束后用 rebuild_openai_history() 刷新本地 messages —— 这样 /rewind 与多轮对话共用同一份历史。
     """
     messages=[dict(m) for m in initial_messages]
-    session_store=SessionEventStore(SESSIONS_DIR)
-    for message in messages:
-        session_store.append_message(message)
+    if session_store is None:
+        session_store=SessionEventStore(SESSIONS_DIR)
+        for message in messages:
+            session_store.append_message(message)
     print(f'[session log:{session_store.path}]')
-    print('  \033[90mcommands: /checkpoints /checkpoint [label] '
+    print('  \033[90mcommands: /status /sessions /resume <id> /checkpoints /checkpoint [label] '
           '/rewind <id|last|head> [--force] [--session] [--yes] /checkpoint-gc\033[0m')
 
     while True:
@@ -749,6 +822,18 @@ def run_repl(initial_messages:list):
         if line.startswith('/'):
             if line.split()[0].lower() in ('/exit','/quit'):
                 break
+            if line.split()[0].lower() == '/resume':
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    print('  usage: /resume <session_id>')
+                    continue
+                try:
+                    session_store = SessionEventStore.open(resolve_session_path(parts[1]))
+                    messages = session_store.rebuild_openai_history()
+                    print(f'  [session] resumed {session_store.session_id}')
+                except (FileNotFoundError, ValueError, SessionReplayError) as exc:
+                    print(f'  [session] {exc}')
+                continue
             handle_command(line,messages,session_store)
             continue
         messages.append({'role':'user','content':line})
@@ -761,6 +846,13 @@ def run_repl(initial_messages:list):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Harness Agent')
+    parser.add_argument('--doctor', action='store_true', help='check local configuration and exit')
+    parser.add_argument('--resume', metavar='SESSION_ID', help='resume a saved session')
+    args = parser.parse_args()
+
+    if args.doctor:
+        raise SystemExit(run_doctor())
     try:
         validate_runtime_config()
     except RuntimeError as exc:
@@ -779,7 +871,13 @@ if __name__ == '__main__':
     # /rewind 等命令也在锁内执行，避免与 cron turn 并发改 messages。
     with agent_lock:
         try:
-            run_repl([])
+            if args.resume:
+                store = SessionEventStore.open(resolve_session_path(args.resume))
+                run_repl(store.rebuild_openai_history(), session_store=store)
+            else:
+                run_repl([])
+        except (FileNotFoundError, ValueError, SessionReplayError) as exc:
+            print(f'[session] {exc}')
         except KeyboardInterrupt:
             print('\n[会话已中断]')
 

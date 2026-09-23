@@ -162,3 +162,25 @@ def test_runtime_config_requires_key_and_model():
 
 def test_runtime_config_allows_default_openai_base_url():
     harness.validate_runtime_config({'LLM_API_KEY': 'key', 'LLM_MODEL_ID': 'model'})
+
+
+def test_session_path_resolution_accepts_id_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    path = tmp_path / 'session_demo_1.jsonl'
+    path.write_text('', encoding='utf-8')
+    assert harness.resolve_session_path('demo_1') == path
+    try:
+        harness.resolve_session_path('..\\outside')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('session path traversal was accepted')
+
+
+def test_format_session_list_reports_event_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    store = harness.SessionEventStore(tmp_path, session_id='demo')
+    store.append_message({'role': 'user', 'content': 'hello'})
+    listing = harness.format_session_list()
+    assert 'demo' in listing
+    assert 'events=1' in listing

@@ -74,6 +74,20 @@ python harness.py
 
 首次启动时，程序会进入交互式 Agent 会话。使用 `HARNESS_UI=ansi` 可在不支持全屏终端的环境中运行。
 
+启动前检查本地配置和目录：
+
+```bash
+python harness.py --doctor
+```
+
+恢复已保存的会话：
+
+```bash
+python harness.py --resume <session_id>
+```
+
+交互过程中可使用 `/status` 查看当前运行状态，使用 `/sessions` 查看已保存会话，使用 `/resume <session_id>` 切换到已有会话。
+
 ## 启动可视化界面
 
 ```bash
