@@ -360,6 +360,7 @@ def _loop_env(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
     monkeypatch.setattr(harness, 'extract_memories', lambda messages: None)
     monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
+    monkeypatch.setattr(harness, 'generate_session_title', lambda messages: 'test session')
     return harness, workspace
 
 

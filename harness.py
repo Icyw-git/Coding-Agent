@@ -83,11 +83,110 @@ def format_session_list(limit: int = 20) -> str:
     if not rows:
         return '  (no saved sessions)'
     lines = []
+    generated = False
     for path in rows:
         store = SessionEventStore.open(path)
-        lines.append(f'  {store.session_id}  events={store.last_seq}  '
+        title = store.session_title()
+        if title == '(untitled session)' and not generated:
+            history = store.rebuild_openai_history()
+            if _has_session_title_source(history):
+                generated = True
+                title = generate_session_title(history)
+                if title != '(untitled session)':
+                    store.append_session_title(title)
+        lines.append(f'  {store.session_id}  {title}  events={store.last_seq}  '
                      f'updated={time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))}')
     return '\n'.join(lines)
+
+
+def generate_session_title(messages: list[dict]) -> str:
+    """Ask the configured model for a compact session topic, with a local fallback."""
+    exchanges = []
+    has_tool_context = False
+    for message in messages:
+        role = message.get('role')
+        content = message.get('content')
+        if role in ('user', 'assistant') and isinstance(content, str) and content.strip():
+            exchanges.append(f"{role}: {content.strip()[:600]}")
+        if role == 'assistant':
+            for call in message.get('tool_calls') or []:
+                function = call.get('function') or {}
+                name = function.get('name', '')
+                arguments = function.get('arguments', '')
+                if name:
+                    exchanges.append(f"tool call: {name} {str(arguments)[:300]}")
+                    has_tool_context = True
+    fallback = next((
+        ' '.join(line.split()).strip()[:60]
+        for message in messages
+        if message.get('role') == 'user' and isinstance(message.get('content'), str)
+        for line in message['content'].splitlines()
+        if _is_session_title_candidate(line)
+    ), None)
+    if fallback is None:
+        fallback = next((
+            ' '.join(line.split()).strip()[:60]
+            for message in messages
+            if message.get('role') == 'assistant' and isinstance(message.get('content'), str)
+            for line in message['content'].splitlines()
+            if _is_session_title_candidate(line)
+        ), '(untitled session)')
+    if fallback == '(untitled session)' and not has_tool_context:
+        return fallback
+    if not exchanges:
+        return '(untitled session)'
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[
+                {'role': 'system', 'content': (
+                    '为这段 coding agent 会话概括一个简短主题。只输出标题，使用用户原语言，'
+                    '控制在 20 个汉字或 8 个英文词以内。忽略“继续、好的、go、do it”等确认语，'
+                    '根据实际任务概括；如果记录没有提供足够信息，只输出 (untitled session)，不要猜测。'
+                )},
+                {'role': 'user', 'content': '\n'.join(exchanges[-8:])},
+            ],
+            temperature=0,
+            max_tokens=40,
+        )
+        title = (response.choices[0].message.content or '').strip().strip('"“”\'')
+        if title:
+            return ' '.join(title.split())[:60]
+    except Exception as exc:
+        print(f'  [session title] using local fallback: {exc}')
+    return fallback
+
+
+def _is_session_title_candidate(line: str) -> bool:
+    text = ' '.join(line.split()).strip()
+    normalized = text.casefold()
+    if len(text) < 12 or text.startswith(('[', '<', '- out:')):
+        return False
+    if normalized.startswith((
+        'tool results executed before compaction:',
+        'done after compact',
+        'final answer',
+        'recovered',
+        '[scheduled]',
+    )):
+        return False
+    words = normalized.split()
+    return not (len(words) >= 4 and len(set(words)) == 1)
+
+
+def _has_session_title_source(messages: list[dict]) -> bool:
+    if any(
+        message.get('role') == 'assistant' and message.get('tool_calls')
+        for message in messages
+    ):
+        return True
+    return any(
+        _is_session_title_candidate(line)
+        for message in messages
+        if message.get('role') in ('user', 'assistant')
+        and isinstance(message.get('content'), str)
+        for line in message['content'].splitlines()
+    )
 
 
 def format_status(session_store) -> str:
@@ -689,6 +788,10 @@ def agent_loop(messages:list, session_store=None):
                 print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
+            if not session_store.saved_session_title():
+                title = generate_session_title(messages)
+                if title != '(untitled session)':
+                    session_store.append_session_title(title)
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
             # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
             # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。

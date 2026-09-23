@@ -71,6 +71,47 @@ class SessionEventStore:
     def append_message(self, message: dict) -> dict:
         return self.append("message", message=copy.deepcopy(message))
 
+    def append_session_title(self, title: str) -> dict:
+        """Persist a short human-readable topic for session listings."""
+        return self.append("session_title", title=title)
+
+    def session_title(self) -> str:
+        """Return the saved topic, or derive one from the first user message for older logs."""
+        title = self.saved_session_title()
+        if title:
+            return title
+        events = self.read_events()
+        user_messages = []
+        assistant_messages = []
+        for event in events:
+            if event.get("type") != "message":
+                continue
+            message = event.get("message") or {}
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if message.get("role") == "user":
+                user_messages.append(content.strip())
+            elif message.get("role") == "assistant":
+                assistant_messages.append(content.strip())
+        for content in user_messages:
+            title = _useful_title_line(content)
+            if title:
+                return title
+        for content in assistant_messages:
+            title = _useful_title_line(content)
+            if title:
+                return title
+        return "(untitled session)"
+
+    def saved_session_title(self) -> str | None:
+        """Return only an explicitly persisted title, if present."""
+        for event in reversed(self.read_events()):
+            if event.get("type") == "session_title" and event.get("title"):
+                return str(event["title"])
+        return None
+
+
     def append_tool_started(self, tool_call) -> dict:
         return self.append(
             "tool_started",
@@ -243,3 +284,28 @@ class SessionEventStore:
                 + ". Verify current state before repeating any operation with side effects.</recovery>"
             ),
         }
+
+
+def _useful_title_line(content: str) -> str | None:
+    """Choose a useful single-line fallback, ignoring short acknowledgments."""
+    for line in content.splitlines():
+        line = " ".join(line.split()).strip()
+        normalized = line.casefold()
+        if len(line) < 12 or line.startswith(("[", "<")):
+            continue
+        if normalized.startswith((
+            "tool results executed before compaction:",
+            "- out:",
+            "done after compact",
+            "final answer",
+            "recovered",
+            "<task_notification>",
+            "<reminder>",
+            "[scheduled]",
+        )):
+            continue
+        words = normalized.split()
+        if len(words) >= 4 and len(set(words)) == 1:
+            continue
+        return line[:60]
+    return None

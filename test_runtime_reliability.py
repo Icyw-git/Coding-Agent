@@ -183,4 +183,83 @@ def test_format_session_list_reports_event_count(tmp_path, monkeypatch):
     store.append_message({'role': 'user', 'content': 'hello'})
     listing = harness.format_session_list()
     assert 'demo' in listing
+    assert 'hello' in listing
     assert 'events=1' in listing
+
+
+def test_format_session_list_uses_saved_topic_for_acknowledgment_first_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    store = harness.SessionEventStore(tmp_path, session_id='topic')
+    store.append_message({'role': 'user', 'content': 'go'})
+    store.append_message({'role': 'assistant', 'content': 'We will inspect the checkpoint rewind flow.'})
+    store.append_session_title('检查 checkpoint 回滚流程')
+
+    assert '检查 checkpoint 回滚流程' in harness.format_session_list()
+
+
+def test_format_session_list_generates_and_persists_legacy_title(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    store = harness.SessionEventStore(tmp_path, session_id='legacy-tool')
+    store.append_message({'role': 'user', 'content': 'x'})
+    store.append_message({
+        'role': 'assistant',
+        'content': None,
+        'tool_calls': [{
+            'id': 'call-1',
+            'type': 'function',
+            'function': {'name': 'bash', 'arguments': '{"command":"echo 2"}'},
+        }],
+    })
+    store.append_message({'role': 'tool', 'tool_call_id': 'call-1', 'content': '2'})
+    store.append_message({'role': 'assistant', 'content': 'The command printed 2 successfully.'})
+    monkeypatch.setattr(harness, 'generate_session_title', lambda _messages: '验证 bash 命令输出')
+
+    listing = harness.format_session_list()
+
+    assert '验证 bash 命令输出' in listing
+    assert store.saved_session_title() == '验证 bash 命令输出'
+
+
+def test_generate_session_title_does_not_call_model_for_empty_session(monkeypatch):
+    def fail_if_called(**_kwargs):
+        raise AssertionError('model should not be called')
+
+    monkeypatch.setattr(harness, 'client', SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fail_if_called))))
+    assert harness.generate_session_title([{'role': 'user', 'content': 'x'}]) == '(untitled session)'
+
+
+def test_session_title_is_persisted_and_legacy_title_is_derived(tmp_path):
+    legacy = harness.SessionEventStore(tmp_path, session_id='legacy')
+    legacy.append_message({'role': 'user', 'content': 'go'})
+    legacy.append_message({'role': 'user', 'content': 'Tool results executed before compaction:\n- read completed'})
+    legacy.append_message({'role': 'assistant', 'content': 'I will inspect the project structure and explain the architecture.'})
+    assert legacy.session_title() == 'I will inspect the project structure and explain the architecture.'
+
+    legacy.append_session_title('Project summary')
+    reopened = harness.SessionEventStore.open(legacy.path)
+    assert reopened.session_title() == 'Project summary'
+
+
+def test_legacy_title_skips_repeated_filler():
+    from session_store import _useful_title_line
+
+    assert _useful_title_line('hello hello hello hello hello hello') is None
+    assert _useful_title_line('Build a session topic summary') == 'Build a session topic summary'
+
+
+def test_generate_session_title_ignores_acknowledgment(monkeypatch):
+    class Message:
+        content = '修复 checkpoint 回滚后的工具调用历史'
+
+    class Completions:
+        @staticmethod
+        def create(**_kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=Message())])
+
+    monkeypatch.setattr(harness, 'client', SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    title = harness.generate_session_title([
+        {'role': 'user', 'content': 'go'},
+        {'role': 'assistant', 'content': 'We should fix the checkpoint rewind history and preserve tool pairing.'},
+    ])
+    assert title == '修复 checkpoint 回滚后的工具调用历史'
