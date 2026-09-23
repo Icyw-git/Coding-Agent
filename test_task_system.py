@@ -75,6 +75,7 @@ def test_claim_non_pending_task_is_rejected(isolated_tasks):
 
 def test_claim_completed_task_is_rejected(isolated_tasks):
     task = task_system.create_task("Done")
+    task_system.claim_task(task.id, owner="alice")
     task_system.complete_task(task.id)
     result = task_system.claim_task(task.id, owner="alice")
     assert "cannot claim" in result
@@ -94,6 +95,7 @@ def test_claim_blocked_task_is_rejected(isolated_tasks):
 def test_claim_blocked_task_after_dependency_completed(isolated_tasks):
     dep = task_system.create_task("Dependency")
     blocked = task_system.create_task("Blocked", blockedBy=[dep.id])
+    task_system.claim_task(dep.id, owner="alice")
     task_system.complete_task(dep.id)
     result = task_system.claim_task(blocked.id, owner="alice")
     assert "Claimed" in result
@@ -102,15 +104,30 @@ def test_claim_blocked_task_after_dependency_completed(isolated_tasks):
 
 def test_complete_task(isolated_tasks):
     task = task_system.create_task("Finish")
+    task_system.claim_task(task.id, owner="alice")
     result = task_system.complete_task(task.id)
     assert "Completed" in result
     loaded = task_system.load_task(task.id)
     assert loaded.status == "completed"
 
 
+def test_claim_task_reports_missing_dependency(isolated_tasks):
+    task = task_system.create_task("Blocked", blockedBy=["task_missing"])
+    result = task_system.claim_task(task.id, owner="alice")
+    assert "task_missing (missing)" in result
+
+
+def test_pending_task_cannot_be_completed(isolated_tasks):
+    task = task_system.create_task("Not claimed")
+    result = task_system.complete_task(task.id)
+    assert "claim it before completing" in result
+    assert task_system.load_task(task.id).status == "pending"
+
+
 def test_complete_task_unblocks_dependents(isolated_tasks):
     dep = task_system.create_task("Dependency")
     blocked = task_system.create_task("Blocked", blockedBy=[dep.id])
+    task_system.claim_task(dep.id, owner="alice")
     result = task_system.complete_task(dep.id)
     assert "Completed" in result
     assert "Unblocked" in result

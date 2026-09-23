@@ -43,6 +43,17 @@ def test_message_bus_reads_all_sent_messages(tmp_path, monkeypatch):
     assert bus.read_inbox('lead') == []
 
 
+def test_message_bus_rejects_path_traversal_agent_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+    try:
+        bus.send('alice', '..\\escape', 'blocked')
+    except ValueError as exc:
+        assert 'Invalid agent name' in str(exc)
+    else:
+        raise AssertionError('path traversal agent name was accepted')
+
+
 def test_background_failure_is_reported():
     with background_task.background_lock:
         background_task.background_tasks.clear()
@@ -69,6 +80,23 @@ def test_background_failure_is_reported():
     assert 'background bash failed: boom' in notifications[0]
 
 
+def test_background_non_string_result_is_reported():
+    with background_task.background_lock:
+        background_task.background_tasks.clear()
+        background_task.background_results.clear()
+    call = SimpleNamespace(
+        id='call-none',
+        function=SimpleNamespace(name='noop', arguments=json.dumps({})),
+    )
+    background_task.start_background_task(call, {'noop': lambda **_kwargs: None})
+    for _ in range(50):
+        notifications = background_task.collect_background_results()
+        if notifications:
+            break
+        time.sleep(0.01)
+    assert '<summary>None</summary>' in notifications[0]
+
+
 def test_cron_uses_standard_day_or_weekday_matching():
     expression = '0 9 1 * 1'
 
@@ -88,6 +116,25 @@ def test_durable_cron_save_writes_valid_json(tmp_path, monkeypatch):
 
     assert saved[0]['id'] == job.id
     assert not path.with_suffix('.tmp').exists()
+
+
+def test_cron_ids_do_not_overwrite_existing_jobs(monkeypatch):
+    with cron_scheduler.cron_lock:
+        cron_scheduler.scheduled_jobs.clear()
+    ids = iter(('same00000001', 'same00000002'))
+    monkeypatch.setattr(cron_scheduler.uuid, 'uuid4', lambda: SimpleNamespace(hex=next(ids)))
+    first = cron_scheduler.schedule_job('* * * * *', 'one', durable=False)
+    second = cron_scheduler.schedule_job('* * * * *', 'two', durable=False)
+    assert first.id != second.id
+    assert len(cron_scheduler.scheduled_jobs) == 2
+
+
+def test_corrupt_durable_cron_file_is_reported(tmp_path, monkeypatch, capsys):
+    path = tmp_path / 'crons.json'
+    path.write_text('{bad', encoding='utf-8')
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', path)
+    cron_scheduler.load_durable_jobs()
+    assert 'failed to load durable jobs' in capsys.readouterr().out
 
 
 def test_shell_permission_check_is_case_insensitive(monkeypatch):

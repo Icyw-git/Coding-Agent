@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import threading
 import time
@@ -24,6 +25,7 @@ client = openai.OpenAI(
 )
 
 active_teammates = {}
+AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
 class MessageBus: 
@@ -35,6 +37,15 @@ class MessageBus:
     def _inbox_lock(self, inbox: Path) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(inbox, threading.Lock())
+
+    @staticmethod
+    def _validate_agent_name(agent: str) -> str:
+        if not isinstance(agent, str) or not AGENT_NAME_RE.fullmatch(agent):
+            raise ValueError('Invalid agent name: use 1-64 letters, digits, _ or -')
+        return agent
+
+    def _inbox_path(self, agent: str) -> Path:
+        return MAILBOX_DIR / f'{self._validate_agent_name(agent)}.jsonl'
 
     # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
     def send(self, from_agent: str, to_agent: str, content: str,
@@ -48,7 +59,7 @@ class MessageBus:
         }
         if metadata:
             msg['metadata'] = metadata
-        inbox = MAILBOX_DIR / f'{to_agent}.jsonl'
+        inbox = self._inbox_path(to_agent)
         with self._inbox_lock(inbox):
             with open(inbox, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(msg, ensure_ascii=False) + '\n')
@@ -57,7 +68,7 @@ class MessageBus:
 
     def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
         """读取指定_agent的邮箱消息，清空邮箱。返回消息列表。"""
-        inbox = MAILBOX_DIR / f'{agent}.jsonl'
+        inbox = self._inbox_path(agent)
         with self._inbox_lock(inbox):
             if not inbox.exists():
                 return []
@@ -68,7 +79,7 @@ class MessageBus:
 
     def peek(self, agent: str) -> bool: #检查指定_agent的邮箱是否有消息
         """检查指定_agent的邮箱是否有消息。返回是否有消息。"""
-        inbox = MAILBOX_DIR / f'{agent}.jsonl'
+        inbox = self._inbox_path(agent)
         with self._inbox_lock(inbox):
             return inbox.exists() and inbox.stat().st_size > 0
 
@@ -225,6 +236,7 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团队成员线程，用于执行任务
     """创建团队成员线程，用于执行任务。返回线程名称。"""
+    MessageBus._validate_agent_name(name)
     if name in active_teammates:
         return f'Teammate {name} already exists'
 

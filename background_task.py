@@ -45,7 +45,7 @@ def start_background_task(tool_call,registry:dict)->str: #启动后台任务，�
 
     def worker(): #后台任务线程函数
         try:
-            result=execute_tool(name,args,registry)
+            result=str(execute_tool(name,args,registry))
             status='completed'
         except Exception as exc:
             result=f'Error: background {name} failed: {exc}'
@@ -71,6 +71,7 @@ def collect_background_results()->list[dict]: #收集后台任务结果，返回
         with background_lock:
             task=background_tasks.pop(bg_id)
             output=background_results.pop(bg_id,'')
+        output=str(output)
         summary=output[:200] if len(output)>200 else output
         notifications.append(
             f'<task_notification>\n'

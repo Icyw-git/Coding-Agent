@@ -3,6 +3,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -135,8 +136,8 @@ def load_durable_jobs(): #加载持久化任务，将有效任务添加到schedu
         valid=[j for j in jobs if j['id'] in scheduled_jobs]
         if valid:
             print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
-    except Exception: 
-        pass
+    except Exception as exc:
+        print(f"  \033[31m[cron] failed to load durable jobs: {exc}\033[0m")
 
 def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #注册一个cron任务
     """
@@ -146,15 +147,15 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #�
     err=validate_cron(cron)
     if err:
         return err
-    job=CronJob(
-        id=f'cron_{random.randint(0,999999):06d}',
-        cron=cron,
-        prompt=prompt,
-        recurring=recurring, # 是否重复执行
-        durable=durable, # 是否持久化存储
-    )
-
     with cron_lock: #确保写入scheduled_jobs时线程安全，避免重复注册
+        job_id = f'cron_{uuid.uuid4().hex[:12]}'
+        job=CronJob(
+            id=job_id,
+            cron=cron,
+            prompt=prompt,
+            recurring=recurring, # 是否重复执行
+            durable=durable, # 是否持久化存储
+        )
         scheduled_jobs[job.id]=job
     if durable: # 如果任务持久化存储，保存持久化存储
         save_durable_jobs()
