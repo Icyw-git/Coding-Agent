@@ -8,6 +8,7 @@ import agent_teams
 import background_task
 import cron_scheduler
 import hooks
+import harness
 import task_system
 
 
@@ -148,3 +149,16 @@ def test_shell_permission_check_is_case_insensitive(monkeypatch):
     assert hooks.permission_hook('bash', {'command': 'DEL file.txt'}) == 'Permission denied by user'
     assert hooks.permission_hook('bash', {'command': 'CLEAR-CONTENT file.txt'}) == 'Permission denied by user'
     assert 'Dangerous command' in hooks.permission_hook('bash', {'command': 'SUDO whoami'})
+
+
+def test_runtime_config_requires_key_and_model():
+    try:
+        harness.validate_runtime_config({})
+    except RuntimeError as exc:
+        assert 'LLM_API_KEY, LLM_MODEL_ID' in str(exc)
+    else:
+        raise AssertionError('missing model configuration was accepted')
+
+
+def test_runtime_config_allows_default_openai_base_url():
+    harness.validate_runtime_config({'LLM_API_KEY': 'key', 'LLM_MODEL_ID': 'model'})

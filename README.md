@@ -48,7 +48,23 @@ HARNESS_UI=ansi
 
 ### 3. 安装 Python 依赖
 
-当前仓库未提供 `requirements.txt`，请根据代码使用的 OpenAI、Textual、dotenv 等库安装依赖，或在你的环境中使用已有依赖配置。
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+macOS / Linux：
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
 ### 4. 启动 Agent
 
@@ -76,10 +92,15 @@ npm run preview
 ## 测试
 
 ```bash
-pytest
+python -m pytest
 ```
 
 测试文件位于项目根目录，覆盖会话存储、上下文压缩、记忆、任务系统和 Worktree 等模块。
+在受限环境中，可为 pytest 指定一个可写的临时目录：
+
+```bash
+python -m pytest --basetemp .test-tmp
+```
 
 ## 项目结构
 

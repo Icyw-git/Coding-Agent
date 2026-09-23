@@ -46,6 +46,17 @@ client=openai.OpenAI(
     timeout=120,   # API 挂起时最多等 120s 抛错，避免静默阻塞 600s（SDK 默认）
 )
 
+
+def validate_runtime_config(environ=None) -> None:
+    """Fail early with an actionable error when required model settings are absent."""
+    environ = os.environ if environ is None else environ
+    missing = [name for name in ('LLM_API_KEY', 'LLM_MODEL_ID') if not environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            'Missing required configuration: ' + ', '.join(missing)
+            + '. Set them in .env before starting Harness Agent.'
+        )
+
 PROMPT_SECTIONS={
     'identity_main':(
         'You are a coding agent working on Windows at {workdir}. '
@@ -750,6 +761,11 @@ def run_repl(initial_messages:list):
 
 
 if __name__ == '__main__':
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        raise SystemExit(f'[config] {exc}') from exc
+
     # 启动 cron 调度线程（生产队列）+ 队列处理器（推送执行）；测试直接调 agent_loop 不受影响
     load_durable_jobs()
     threading.Thread(target=cron_scheduler_loop, daemon=True).start()
