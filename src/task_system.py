@@ -10,7 +10,7 @@ import threading
 import uuid
 
 # 任务持久化目录：与仓库 .cache 约定一致，保存时按需自动创建
-TASK_DIR = Path(__file__).resolve().parent / '.cache' / 'tasks'
+TASK_DIR = Path(__file__).resolve().parents[1] / '.cache' / 'tasks'
 TASKS_DIR = TASK_DIR
 task_lock = threading.RLock()
 

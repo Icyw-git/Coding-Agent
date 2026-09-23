@@ -109,7 +109,7 @@ npm run preview
 python -m pytest
 ```
 
-测试文件位于项目根目录，覆盖会话存储、上下文压缩、记忆、任务系统和 Worktree 等模块。
+测试文件位于 `tests/`，覆盖会话存储、上下文压缩、记忆、任务系统和 Worktree 等模块。
 在受限环境中，可为 pytest 指定一个可写的临时目录：
 
 ```bash
@@ -121,15 +121,11 @@ python -m pytest --basetemp .test-tmp
 | 路径 | 说明 |
 | --- | --- |
 | `harness.py` | Agent 主循环与程序入口 |
-| `agent_core.py` | Hook、记忆、上下文压缩和提示词上下文 |
-| `tools.py` | 工具 Schema、注册表和工具执行 |
-| `session_store.py` | Session JSONL 存储与历史恢复 |
-| `recovery.py` | API 错误、重试和输出恢复 |
-| `mcp_bridge.py` | MCP Server 连接与动态工具注册 |
-| `agent_teams.py` | Teammate 协作与 Worktree 上下文 |
-| `task_system.py` | 持久化任务板和任务依赖 |
+| `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
+| `tests/` | 自动化测试与测试辅助程序 |
+| `docs/` | 架构、检查点设计和开发记录 |
+| `archive/legacy/` | 已停用的历史实现 |
 | `visualizer/` | React/Vite Web 可视化前端 |
-| `test_*.py` | 自动化测试 |
 
 ## 分支说明
 

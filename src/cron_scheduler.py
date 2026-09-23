@@ -21,7 +21,7 @@ cron_queue:list[CronJob]=[] #任务队列
 cron_lock=threading.RLock() # 任务队列锁，用于保护任务队列
 agent_lock=threading.Lock() # 代理锁，用于保护代理状态
 _last_fired:dict[str,str]={} # id -> last fired time
-DURABLE_PATH=Path(__file__).resolve().parent/'.cache'/'crons.json'
+DURABLE_PATH=Path(__file__).resolve().parents[1]/'.cache'/'crons.json'
 
 def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间，支持通配符、范围、步长
     if field=="*":

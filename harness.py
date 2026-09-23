@@ -5,8 +5,12 @@ import openai
 import json
 import time
 import threading
+import sys
 from pathlib import Path
 from typing import Optional, List
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
 from background_task import (should_run_background, start_background_task, collect_background_results,
                              background_lock, background_tasks)
 import recovery
