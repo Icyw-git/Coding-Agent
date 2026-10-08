@@ -9,6 +9,7 @@ harness 的工具分发是同步的（tool_registry[name](**args)），而 MCP S
   MCP_SERVERS_FILE  json 文件路径，内容同上（如 .cache/mcp_servers.json）
 """
 import asyncio
+import atexit
 import json
 import os
 import threading
@@ -18,7 +19,11 @@ from MCPclient import MCPclient
 
 # 后台事件循环线程：MCP 是 asyncio，harness 是同步，通过 run_coroutine_threadsafe 桥接
 _loop = asyncio.new_event_loop()
-threading.Thread(target=_loop.run_forever, daemon=True).start()
+_loop_thread = threading.Thread(target=_loop.run_forever, name="mcp-event-loop", daemon=True)
+_loop_thread.start()
+_clients: list[MCPclient] = []
+_clients_lock = threading.Lock()
+_shutdown = False
 
 
 def _load_server_configs() -> List[dict]: # 加载 MCP server 配置
@@ -26,17 +31,42 @@ def _load_server_configs() -> List[dict]: # 加载 MCP server 配置
     raw = os.getenv('MCP_SERVERS', '')
     if raw:
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            configs = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"  \033[31m[mcp] invalid MCP_SERVERS JSON: {exc}\033[0m")
             return []
-    path = os.getenv('MCP_SERVERS_FILE', '')
-    if path and os.path.exists(path):
+    else:
+        path = os.getenv('MCP_SERVERS_FILE', '')
+        if not path:
+            return []
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
+                configs = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  \033[31m[mcp] cannot read MCP_SERVERS_FILE '{path}': {exc}\033[0m")
             return []
-    return []
+
+    if not isinstance(configs, list):
+        print("  \033[31m[mcp] server configuration must be a JSON array\033[0m")
+        return []
+
+    valid = []
+    for index, config in enumerate(configs):
+        if not isinstance(config, dict):
+            print(f"  \033[31m[mcp] skipping server config #{index + 1}: expected an object\033[0m")
+            continue
+        name, command, args = config.get('name'), config.get('command'), config.get('args', [])
+        if not isinstance(name, str) or not name.strip():
+            reason = "'name' must be a non-empty string"
+        elif not isinstance(command, str) or not command.strip():
+            reason = "'command' must be a non-empty string"
+        elif not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            reason = "'args' must be an array of strings"
+        else:
+            valid.append({**config, 'name': name, 'command': command, 'args': args})
+            continue
+        print(f"  \033[31m[mcp] skipping server config #{index + 1}: {reason}\033[0m")
+    return valid
 
 
 def _openai_schema(tool: dict) -> dict:
@@ -76,6 +106,8 @@ def _make_sync_wrapper(client: MCPclient, tool_name: str):
 def register_mcp_tools(registry: dict) -> List[dict]:
     """连接配置的所有 MCP server，把工具动态注册进 registry（tool_registry）。
     返回新增的 OpenAI 工具 schema 列表，供 harness 追加进 TOOLS；无配置返回 []。"""
+    if _shutdown:
+        return []
     new_schemas = []
     for cfg in _load_server_configs():
         client = MCPclient(cfg['name'], cfg['command'], cfg.get('args'))
@@ -84,6 +116,8 @@ def register_mcp_tools(registry: dict) -> List[dict]:
         except Exception as e:
             print(f"  \033[31m[mcp] {cfg['name']} connect failed: {e}\033[0m")
             continue
+        with _clients_lock:
+            _clients.append(client)
         for tool in tools:
             name = tool['name']
             if name in registry:
@@ -93,3 +127,23 @@ def register_mcp_tools(registry: dict) -> List[dict]:
             new_schemas.append(_openai_schema(tool))
         print(f"  \033[32m[mcp] {cfg['name']}: {len(tools)} tool(s)\033[0m")
     return new_schemas
+
+
+def shutdown_mcp() -> None:
+    """Close connected MCP sessions and stop the bridge event loop."""
+    global _shutdown
+    if _shutdown:
+        return
+    _shutdown = True
+    with _clients_lock:
+        clients = list(_clients)
+        _clients.clear()
+    for client in clients:
+        try:
+            _run_async(client.close(), timeout=client._timeout)
+        except Exception as exc:
+            print(f"  \033[33m[mcp] close failed for {client.name}: {exc}\033[0m")
+    _loop.call_soon_threadsafe(_loop.stop)
+
+
+atexit.register(shutdown_mcp)

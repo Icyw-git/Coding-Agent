@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import threading
 
 import pytest
 
@@ -109,3 +110,28 @@ def test_checkpoint_event_does_not_change_replayed_history(tmp_path):
     assert store.rebuild_openai_history() == [{"role": "user", "content": "hello"}]
     assert store.last_seq == 2
     assert store.read_events()[1]["label"] == "before refactor"
+
+
+def test_concurrent_store_instances_allocate_unique_sequences(tmp_path):
+    first = SessionEventStore(tmp_path, session_id="concurrent")
+    second = SessionEventStore(tmp_path, session_id="concurrent")
+    barrier = threading.Barrier(2)
+    sequences = []
+
+    def append_from(store, content):
+        barrier.wait()
+        sequences.append(store.append_message({"role": "user", "content": content})["seq"])
+
+    threads = [
+        threading.Thread(target=append_from, args=(first, "one")),
+        threading.Thread(target=append_from, args=(second, "two")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    events = first.read_events()
+    assert sorted(sequences) == [1, 2]
+    assert [event["seq"] for event in events] == [1, 2]
+    assert sorted(message["content"] for message in first.rebuild_openai_history()) == ["one", "two"]

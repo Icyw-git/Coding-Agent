@@ -1,23 +1,38 @@
-# Env / secrets
+# Local credentials and configuration
 .env
+.env.*
+!.env.example
 
-# Caches
+# Python bytecode and test tooling
 __pycache__/
-.cache/
-.pytest_cache/
-.pytest-basetemp/
-.pytest-tmp/
-.test-tmp/
 *.py[cod]
+.pytest_cache/
+.pytest-*/
+.test-tmp/
+.test-tmp-*/
+.coverage
+htmlcov/
 
-# Visualizer dependencies and build output
+# Runtime state and generated workspaces
+.cache/
+.mailbox/
+.worktrees/
+
+# Frontend dependencies and build output
 visualizer/node_modules/
 visualizer/.npm-cache/
-visualizer/dist/
 visualizer/.vite/
+visualizer/dist/
 npm-debug.log*
 
-# Scratch / temp
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local scratch files
 _check_log.py
 _logtail_utf8.txt
 _harness_lines.txt

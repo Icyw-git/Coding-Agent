@@ -49,23 +49,25 @@ class SessionEventStore:
         return max((int(event.get("seq", 0)) for event in events), default=0)
 
     def append(self, event_type: str, **payload) -> dict:
-        event = {
-            "v": 1,
-            "seq": self._next_seq,
-            "session_id": self.session_id,
-            "type": event_type,
-            "ts": time.time(),
-            **payload,
-        }
-        encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
         self.directory.mkdir(parents=True, exist_ok=True)
         with self._path_lock(self.path):
+            # Re-read under the path lock so separate store instances cannot reuse a sequence number.
+            next_seq = self._read_last_seq() + 1
+            event = {
+                "v": 1,
+                "seq": next_seq,
+                "session_id": self.session_id,
+                "type": event_type,
+                "ts": time.time(),
+                **payload,
+            }
+            encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
             # One line is written and flushed before the loop continues. A partial tail is ignored on replay.
             with open(self.path, "a", encoding="utf-8", newline="\n") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-        self._next_seq += 1
+            self._next_seq = next_seq + 1
         return event
 
     def append_message(self, message: dict) -> dict:

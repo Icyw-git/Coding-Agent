@@ -32,7 +32,7 @@ from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
 from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
-from mcp_bridge import register_mcp_tools
+from mcp_bridge import register_mcp_tools, shutdown_mcp
 from session_store import SessionEventStore, SessionReplayError
 from checkpoints import CheckpointManager, CheckpointError
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
@@ -993,3 +993,5 @@ if __name__ == '__main__':
         wait_for_cron_idle()
     except KeyboardInterrupt:
         print('\n[会话已中断]')
+    finally:
+        shutdown_mcp()
