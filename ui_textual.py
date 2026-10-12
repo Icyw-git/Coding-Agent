@@ -280,12 +280,19 @@ class CCApp(App):
         self._tool_filter = 'all'
         self._status_refresh_pending = False
         self._search_matches = []
+        # Context usage is animated independently from event delivery.  The
+        # target remains the reported value; only the presentation eases.
+        self._ctx_target_tokens = None
+        self._ctx_display_tokens = None
+        self._ctx_window = None
+        self._ctx_anim_ticks = 0
         self._side_panel.display = self.size.width >= 110
         self._refresh_sidebar()
         # 帧刷新：网络 chunk 到达频率与 UI 渲染频率解耦 → 无论 chunk 多大都平滑打字机
         self.set_interval(0.05, self._flush_stream_buffers)
         self.set_interval(0.1, self._stream_tick)
         self.set_interval(0.1, self._flush_status)
+        self.set_interval(0.04, self._animate_context)
         # 初始用户输入先入队（在工具/回复之前渲染，保持对话顺序）
         for m in self._msgs:
             if isinstance(m, dict):
@@ -601,7 +608,14 @@ class CCApp(App):
         self._event_queue.put(e)   # 线程安全；由 _consume_events worker 顺序处理
 
     async def _apply(self, e):
-        if e.type == 'user_message':
+        if e.type == 'session_start':
+            # A new session may reuse the model's window size; clear the
+            # presentation state so its first report is shown immediately.
+            self._ctx_target_tokens = None
+            self._ctx_display_tokens = None
+            self._ctx_window = None
+            self._ctx_anim_ticks = 0
+        elif e.type == 'user_message':
             # 用户输入可能含方括号 → 用 Text 对象（不做 markup 解析，避免 MarkupError）
             await self._chat.mount(Static(Text(f"\u276f {e.payload.get('text', '')}"),
                                           classes='user-msg'))
@@ -876,7 +890,63 @@ class CCApp(App):
                 'model', 'workdir', 'tools', 'ctx_pct', 'ctx_tokens', 'tokens', 'cost',
                 'cost_source', 'ctx_source', 'recent_calls')):
             self._last_status.update(payload)
+            self._update_context_target(payload)
         self._status_refresh_pending = True
+
+    def _update_context_target(self, payload: dict) -> None:
+        """Record reported context usage while keeping the visual value smooth."""
+        raw_tokens = payload.get('ctx_tokens', self._last_status.get('ctx_tokens'))
+        raw_window = payload.get('ctx_window', self._last_status.get('ctx_window'))
+        if raw_tokens is None and raw_window:
+            raw_pct = payload.get('ctx_pct', self._last_status.get('ctx_pct'))
+            try:
+                raw_tokens = float(raw_pct) / 100 * float(raw_window)
+            except (TypeError, ValueError):
+                raw_tokens = None
+        try:
+            target = max(0.0, float(raw_tokens)) if raw_tokens is not None else None
+            window = max(1.0, float(raw_window)) if raw_window is not None else None
+        except (TypeError, ValueError):
+            return
+        if target is None or window is None:
+            return
+        if self._ctx_window != window:
+            self._ctx_window = window
+            # A new context window represents a new scale, so avoid animating
+            # from an unrelated previous session or model.
+            self._ctx_display_tokens = target
+        elif self._ctx_display_tokens is None:
+            self._ctx_display_tokens = target
+        self._ctx_target_tokens = target
+
+    def _animate_context(self) -> None:
+        """Ease the context indicator toward the latest reported token count."""
+        target = self._ctx_target_tokens
+        current = self._ctx_display_tokens
+        if target is None or current is None:
+            return
+        delta = target - current
+        if abs(delta) <= 0.5:
+            self._ctx_display_tokens = target
+            return
+        # Proportional motion feels immediate for large jumps and settles
+        # without visible stepping for the small updates from streaming.
+        step = min(abs(delta), max(1.0, abs(delta) * 0.22))
+        self._ctx_display_tokens = current + step * (1 if delta > 0 else -1)
+        self._ctx_anim_ticks += 1
+        self._refresh_status_line()
+        if self._ctx_anim_ticks % 3 == 0:
+            self._refresh_sidebar()
+
+    def _display_status(self, payload: dict) -> dict:
+        """Return status metrics with the animated context value for rendering."""
+        if self._ctx_display_tokens is None or not self._ctx_window:
+            return payload
+        display = dict(payload)
+        display['ctx_tokens'] = int(round(self._ctx_display_tokens))
+        display['ctx_window'] = int(self._ctx_window)
+        display['ctx_pct'] = self._ctx_display_tokens / self._ctx_window * 100
+        return display
 
     def _flush_status(self) -> None:
         if not self._status_refresh_pending:
@@ -913,12 +983,13 @@ class CCApp(App):
         summary.append(labels.get(state, state.title()) + '\n', style=f'bold {colors.get(state, PALETTE["muted"])}')
         if self._activity_detail:
             summary.append(str(self._activity_detail)[:48] + '\n', style=PALETTE['muted'])
-        if self._last_status.get('ctx_pct') is not None:
-            ctx_source = self._last_status.get('ctx_source', 'estimated')
+        display_status = self._display_status(self._last_status)
+        if display_status.get('ctx_pct') is not None:
+            ctx_source = display_status.get('ctx_source', 'estimated')
             marker = '' if ctx_source == 'confirmed' else '~'
-            ctx_tokens = self._last_status.get('ctx_tokens')
-            ctx_window = self._last_status.get('ctx_window')
-            summary.append(f"Context  {marker}{int(self._last_status['ctx_pct'])}%\n")
+            ctx_tokens = display_status.get('ctx_tokens')
+            ctx_window = display_status.get('ctx_window')
+            summary.append(f"Context  {marker}{self._format_pct(display_status.get('ctx_pct', 0))}%\n")
             if ctx_tokens is not None and ctx_window:
                 summary.append(f"         {ctx_tokens} / {ctx_window}\n", style=PALETTE['muted'])
         summary.append(f"Tools    {int(self._last_status.get('tools', 0))}\n")
@@ -1025,6 +1096,7 @@ class CCApp(App):
 
     def _pills(self, payload: dict) -> str:
         """按终端宽度保留从模型到成本的递减优先级指标。"""
+        payload = self._display_status(payload)
         width = self.size.width
         parts = []
         if payload.get('model') and width >= 58:
@@ -1032,7 +1104,7 @@ class CCApp(App):
         ctx = payload.get('ctx_pct')
         if ctx is not None and width >= 44:
             marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
-            label = marker + CCApp._ctx_bar(int(ctx))
+            label = marker + CCApp._ctx_bar(float(ctx))
             if payload.get('ctx_tokens') is not None and payload.get('ctx_window'):
                 label += f" [dim]{int(payload['ctx_tokens'])}/{int(payload['ctx_window'])}[/]"
             parts.append(label)
@@ -1067,16 +1139,23 @@ class CCApp(App):
         }.get(source, 'Estimated')
 
     @staticmethod
-    def _ctx_bar(pct: int) -> str:
-        """上下文占用进度条：10 格，实心=已用 / 空心=剩余，附百分比。
+    def _format_pct(pct: float) -> str:
+        """Keep small context changes visible without noisy precision."""
+        pct = float(pct or 0)
+        return f'{pct:.1f}' if pct < 10 else f'{pct:.0f}'
+
+    @staticmethod
+    def _ctx_bar(pct: float) -> str:
+        """上下文占用进度条：20 格，实心=已用 / 空心=剩余，附百分比。
 
         >75% 红 / >50% 黄 / 否则绿。占用随会话推进由 status 事件实时刷新。"""
-        pct = max(0, min(100, pct))
+        pct = max(0.0, min(100.0, float(pct)))
         width = 20
         filled = round(pct / 100 * width)
         bar = '\u2588' * filled + '\u2591' * (width - filled)
         color = PALETTE['danger'] if pct > 75 else PALETTE['warning'] if pct > 50 else PALETTE['success']
-        return f'[{color}]{bar}[/] [dim]{pct}%[/]'
+        label = CCApp._format_pct(pct)
+        return f'[{color}]{bar}[/] [dim]{label}%[/]'
 
 
 def run(msgs: list) -> None:

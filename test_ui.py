@@ -177,6 +177,14 @@ def test_statusline_pills():
     assert ui.bg('success') in out and '\u00a5' in out   # cost pill 显示人民币
 
 
+def test_context_bar_preserves_sub_ten_percent_precision():
+    import pytest
+    ui_textual = pytest.importorskip('ui_textual')
+    out = ui_textual.CCApp._ctx_bar(4.7)
+    assert '4.7%' in out
+    assert '\u2588' in out and '\u2591' in out
+
+
 def test_statusline_estimated_cost_and_token_breakdown():
     out = ui.statusline(model='m', ctx_pct=42, ctx_source='estimated',
                         cost='0.125', cost_source='mixed', tokens='100',
