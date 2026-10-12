@@ -40,6 +40,13 @@ def start_background_task(tool_call,registry:dict)->str:
         with background_lock:
             background_tasks[bg_id]['status']='completed'
             background_results[bg_id]=result
+        try:
+            from ui_events import bus
+            bus.emit('background_end', task_id=bg_id, command=cmd,
+                     ok=not str(result).lower().startswith('error:'),
+                     output_len=len(str(result)))
+        except ImportError:
+            pass
 
     with background_lock:
         background_tasks[bg_id]={
@@ -49,7 +56,11 @@ def start_background_task(tool_call,registry:dict)->str:
         }
     thread=threading.Thread(target=worker,daemon=True)
     thread.start()
-    print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
+    try:
+        from ui_events import bus
+        bus.emit('background_start', task_id=bg_id, command=cmd)
+    except ImportError:
+        pass
     return bg_id
 
 

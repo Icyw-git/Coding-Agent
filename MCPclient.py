@@ -31,7 +31,14 @@ class MCPclient:
                 await self.session.initialize()
                 return await self.session.list_tools()
 
-            tools_result = await asyncio.wait_for(_setup(), timeout)
+            # Keep setup and AsyncExitStack cleanup in the same task. wait_for
+            # creates a child task, which breaks anyio cancel scopes used by
+            # stdio_client when the parent later closes the stack.
+            if hasattr(asyncio, 'timeout'):
+                async with asyncio.timeout(timeout):
+                    tools_result = await _setup()
+            else:
+                tools_result = await _setup()
         except Exception:
             await self.close()   # 中途失败也清理子进程，避免泄漏
             raise

@@ -15,6 +15,7 @@ bus 事件进线程安全队列，由 UI 事件循环里的消费者 worker 顺�
 启用：HARNESS_UI=textual 且 stdout 为 TTY（否则自动回退 ANSI）。
 """
 import asyncio
+import json
 import queue
 import time
 
@@ -172,7 +173,7 @@ class CommandModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id='command-box'):
             yield Static('Command', classes='modal-title')
-            yield Static('clear  export  search <text>  failures  all  help', classes='modal-hint')
+            yield Static('clear  export  sessions  resume <n>  search <text>  failures  all  help', classes='modal-hint')
             yield Input(placeholder='Type a command', id='command-input')
 
     def on_mount(self) -> None:
@@ -270,6 +271,8 @@ class CCApp(App):
         self._activity_state = 'ready'
         self._activity_detail = ''
         self._recent_tools = []
+        self._round_metrics = []
+        self._background_tasks = {}
         self._tool_filter = 'all'
         self._status_refresh_pending = False
         self._search_matches = []
@@ -281,10 +284,8 @@ class CCApp(App):
         self.set_interval(0.1, self._flush_status)
         # 初始用户输入先入队（在工具/回复之前渲染，保持对话顺序）
         for m in self._msgs:
-            if isinstance(m, dict) and m.get('role') == 'user':
-                text = str(m.get('content', ''))
-                if text:
-                    self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
+            if isinstance(m, dict):
+                self._event_queue.put(UIEvent('history_message', {'message': m}))
         # 单一消费者 worker：严格 FIFO 处理事件（mount 是异步操作，必须 await）
         self.run_worker(self._consume_events, thread=False)
         self.run_worker(self._run_agent, thread=True)
@@ -365,11 +366,17 @@ class CCApp(App):
         verb = verb.lower()
         argument = argument.strip()
         if verb in ('help', '?'):
-            await self._show_notice('Commands: clear | export | search <text> | failures | all | help')
+            await self._show_notice('Commands: clear | export | sessions | resume <n> | allow <tool> | deny <tool> | ask <tool> | search <text> | failures | all | help')
         elif verb == 'clear':
             await self._clear_conversation()
         elif verb == 'export':
             await self._export_conversation()
+        elif verb in ('sessions', 'transcripts'):
+            await self._list_sessions()
+        elif verb == 'resume':
+            await self._resume_session(argument)
+        elif verb in ('allow', 'deny', 'ask'):
+            await self._set_permission_policy(verb, argument)
         elif verb == 'search':
             await self._search_conversation(argument)
         elif verb in ('failures', 'failed'):
@@ -405,6 +412,57 @@ class CCApp(App):
             await self._show_notice(f'Export failed: {type(exc).__name__}: {exc}')
             return
         await self._show_notice(f'Exported Markdown: {path}')
+
+    async def _list_sessions(self) -> None:
+        import harness
+        sessions = harness.list_transcripts()
+        if not sessions:
+            await self._show_notice('No saved sessions.')
+            return
+        lines = ['Saved sessions:']
+        for index, session in enumerate(sessions, 1):
+            lines.append(f"{index}. {session['name']}")
+        await self._show_notice('\n'.join(lines))
+
+    async def _set_permission_policy(self, policy: str, tool: str) -> None:
+        if not tool:
+            await self._show_notice(f'Use {policy} <tool>.')
+            return
+        import harness
+        harness.permission_gate.set_policy(tool, policy)
+        await self._show_notice(f'Permission policy for {tool}: {policy}.')
+
+    async def _resume_session(self, argument: str) -> None:
+        if self._busy:
+            await self._show_notice('Cannot resume while a request is running.')
+            return
+        import harness
+        sessions = harness.list_transcripts()
+        if not argument:
+            await self._show_notice('Use resume <number> from sessions.')
+            return
+        try:
+            index = int(argument)
+            path = sessions[index - 1]['path']
+            messages = harness.load_transcript(path)
+        except (ValueError, IndexError, json.JSONDecodeError) as exc:
+            await self._show_notice(f'Unable to resume session: {exc}')
+            return
+        self._msgs[:] = messages
+        await self._clear_rendered_conversation()
+        for message in messages:
+            await self._render_history_message(message)
+        await self._show_notice(f'Resumed {sessions[index - 1]["name"]}.')
+
+    async def _clear_rendered_conversation(self) -> None:
+        self._active_tools.clear()
+        self._active_widgets.clear()
+        self._assistant_buffers.clear()
+        self._flushed.clear()
+        self._recent_tools.clear()
+        self._clear_search_matches()
+        await self._chat.remove_children()
+        self._refresh_sidebar()
 
     async def _search_conversation(self, query: str) -> None:
         """搜索当前渲染的会话内容，并定位第一条匹配消息。"""
@@ -536,6 +594,8 @@ class CCApp(App):
             # 用户输入可能含方括号 → 用 Text 对象（不做 markup 解析，避免 MarkupError）
             await self._chat.mount(Static(Text(f"\u276f {e.payload.get('text', '')}"),
                                           classes='user-msg'))
+        elif e.type == 'history_message':
+            await self._render_history_message(e.payload.get('message', {}))
         elif e.type == 'assistant_text':
             # 流式打字机：先挂空 Markdown，再由独立 task 分块增量渲染（CC 流式渲染轻量版）
             md = Markdown('')
@@ -638,6 +698,8 @@ class CCApp(App):
             self._update_status(e.payload)
         elif e.type == 'round_end':
             metric = e.payload
+            self._round_metrics.append(dict(metric))
+            self._round_metrics = self._round_metrics[-10:]
             source = metric.get('source', 'estimated')
             marker = '' if source in ('confirmed', 'provider_reported') else '~'
             compressed = ' · compressed' if metric.get('compressed') else ''
@@ -647,7 +709,26 @@ class CCApp(App):
                 f"{marker}¥{float(metric.get('cost', 0)):.4f}{compressed}")
         elif e.type == 'session_end':
             await self._show_session_summary(e.payload.get('summary', {}))
+        elif e.type == 'background_start':
+            task_id = e.payload.get('task_id', '')
+            self._background_tasks[task_id] = 'running'
+            await self._show_notice(f'Background task started: {task_id}')
+        elif e.type == 'background_end':
+            task_id = e.payload.get('task_id', '')
+            state = 'completed' if e.payload.get('ok') else 'failed'
+            self._background_tasks[task_id] = state
+            await self._show_notice(f'Background task {state}: {task_id}')
         self._chat.scroll_end(animate=False)   # scroll_end 是同步方法（返回 None）
+
+    async def _render_history_message(self, message: dict) -> None:
+        role = message.get('role')
+        content = message.get('content') or ''
+        if role == 'user':
+            await self._chat.mount(Static(Text(f"❯ {content}"), classes='user-msg'))
+        elif role == 'assistant':
+            await self._chat.mount(Markdown(str(content)))
+        elif role == 'tool':
+            await self._chat.mount(Static(Text(str(content)), classes='tool-output'))
 
     async def _stream_typing(self, md: Markdown, text: str) -> None:
         """打字机效果：分块增量渲染 Markdown（约 80 步完成，模拟流式）。"""
@@ -779,6 +860,7 @@ class CCApp(App):
             'generating': 'Generating', 'tool': 'Running tool',
             'awaiting_permission': 'Awaiting approval', 'saving': 'Saving',
             'complete': 'Complete', 'failed': 'Failed', 'idle': 'Idle',
+            'cancelled': 'Cancelled',
         }
         colors = {
             'ready': PALETTE['muted'], 'preparing': PALETTE['info'],
@@ -786,6 +868,7 @@ class CCApp(App):
             'tool': PALETTE['accent'], 'awaiting_permission': PALETTE['permission'],
             'saving': PALETTE['info'], 'complete': PALETTE['success'],
             'failed': PALETTE['danger'], 'idle': PALETTE['muted'],
+            'cancelled': PALETTE['warning'],
         }
         state = self._activity_state
         summary = Text()
@@ -839,6 +922,18 @@ class CCApp(App):
                     cost = 0.0
                 summary.append(f"{str(call.get('model', ''))[:18]}  {marker}¥{cost:.4f}\n",
                                style=PALETTE['muted'])
+        if self._round_metrics:
+            summary.append('RECENT ROUNDS\n', style=f'bold {PALETTE["accent"]}')
+            for metric in self._round_metrics[-5:]:
+                compressed = ' *' if metric.get('compressed') else ''
+                summary.append(
+                    f"#{metric.get('round', 0)} {metric.get('duration_ms', 0)}ms "
+                    f"{metric.get('prompt_tokens', 0)}/{metric.get('completion_tokens', 0)}"
+                    f"{compressed}\n", style=PALETTE['muted'])
+        if self._background_tasks:
+            summary.append('BACKGROUND\n', style=f'bold {PALETTE["accent"]}')
+            for task_id, state in list(self._background_tasks.items())[-5:]:
+                summary.append(f'{task_id}  {state}\n', style=PALETTE['muted'])
         self._session_summary.update(summary)
 
         recent = Text()

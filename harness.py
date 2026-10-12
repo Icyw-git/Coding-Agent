@@ -174,6 +174,36 @@ def export_session(messages:list, path=None):
     path.write_text(serialize_session(messages), encoding='utf-8')
     return path
 
+
+def list_transcripts(limit: int = 20) -> list:
+    """Return recent JSONL sessions, newest first."""
+    if not TRANSCRIPT_DIR.exists():
+        return []
+    paths = sorted(TRANSCRIPT_DIR.glob('transcript_*.jsonl'),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    result = []
+    for path in paths[:max(0, limit)]:
+        result.append({'path': path, 'name': path.name,
+                       'modified': path.stat().st_mtime})
+    return result
+
+
+def load_transcript(path) -> list:
+    """Load and validate a transcript without mutating the active session."""
+    path = Path(path)
+    if not path.is_file() or path.suffix != '.jsonl':
+        raise ValueError('Transcript must be an existing .jsonl file')
+    messages = []
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        if not line.strip():
+            continue
+        message = json.loads(line)
+        if not isinstance(message, dict) or message.get('role') not in (
+                'system', 'user', 'assistant', 'tool'):
+            raise ValueError('Transcript contains an invalid message')
+        messages.append(message)
+    return messages
+
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=1
 
@@ -392,6 +422,7 @@ _SESSION_METRICS={
     'ctx_peak_tokens': 0,
     'rounds': 0,
     'round_metrics': [],
+    'budget_notified': False,
 }
 _USAGE_LEDGER=[]
 _METRICS_LOCK=threading.RLock()
@@ -594,6 +625,14 @@ def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict
             snapshot.get('cache_creation_tokens', 0))
         _SESSION_METRICS['reasoning_tokens'] += snapshot['reasoning_tokens']
         _SESSION_METRICS['cost'] += cost
+        budget = os.getenv('LLM_SESSION_BUDGET', '').strip()
+        if budget and not _SESSION_METRICS['budget_notified']:
+            try:
+                if _SESSION_METRICS['cost'] >= Decimal(budget):
+                    _SESSION_METRICS['budget_notified'] = True
+                    bus.emit('error', msg=f'Session budget reached: {budget}')
+            except InvalidOperation:
+                pass
         _SESSION_METRICS['ctx_tokens'] = snapshot['prompt_tokens']
         _SESSION_METRICS['ctx_peak_tokens'] = max(
             _SESSION_METRICS['ctx_peak_tokens'], snapshot['prompt_tokens'])
@@ -781,6 +820,7 @@ def agent_loop(messages:list):
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
+            timeout = float(os.getenv('LLM_TIMEOUT', '120'))
             return client.chat.completions.create(
                 model=request_model,
                 messages=request_messages,
@@ -789,6 +829,7 @@ def agent_loop(messages:list):
                 max_tokens=max_tokens,
                 stream=True,
                 stream_options={"include_usage": True},   # 流式末尾 chunk 携带 usage
+                timeout=timeout,
             )
 
         bus.emit('activity', state='thinking', detail='Requesting model response')

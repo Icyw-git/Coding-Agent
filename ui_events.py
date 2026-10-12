@@ -31,6 +31,8 @@ EVENT_TYPES = {
     'session_start',       # 会话开始 {prompt}
     'round_end',           # 单轮模型调用指标 {round, duration_ms, cost, ctx_*}
     'session_end',         # 会话结束
+    'background_start',    # 后台任务开始 {task_id, command}
+    'background_end',      # 后台任务结束 {task_id, command, ok, output_len}
 }
 
 
@@ -106,6 +108,7 @@ class PermissionGate:
         self._bus = bus
         self.use_ui = use_ui          # True=事件弹窗模式；False=stdin 模式
         self._pending: Dict[str, queue.Queue] = {}
+        self._policies: Dict[str, str] = {}
         self._seq = 0
         self._lock = threading.RLock()
         bus.subscribe(self._on_resolve)
@@ -132,6 +135,11 @@ class PermissionGate:
         """请求一次权限确认，返回是否批准。业务线程调用，阻塞直到应答。"""
         if not self.use_ui:
             return self._ask_input(tool, args, title)
+        policy = self._policies.get(tool)
+        if policy == 'allow':
+            return True
+        if policy == 'deny':
+            return False
         q: queue.Queue = queue.Queue()
         with self._lock:
             self._seq += 1
@@ -145,6 +153,17 @@ class PermissionGate:
             with self._lock:
                 self._pending.pop(req_id, None)
             return False   # 无人应答：拒绝比等待安全
+
+    def set_policy(self, tool: str, policy: str) -> None:
+        if policy not in ('allow', 'deny', 'ask'):
+            raise ValueError('policy must be allow, deny, or ask')
+        if policy == 'ask':
+            self._policies.pop(tool, None)
+        else:
+            self._policies[tool] = policy
+
+    def policy(self, tool: str) -> str:
+        return self._policies.get(tool, 'ask')
 
     @staticmethod
     def _ask_input(tool: str, args: dict, title: str) -> bool:

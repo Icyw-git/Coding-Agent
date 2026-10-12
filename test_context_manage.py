@@ -315,6 +315,38 @@ def test_provider_reported_cost_wins_over_local_pricing(monkeypatch):
             harness._USAGE_LEDGER[:] = old_ledger
 
 
+def test_transcript_round_trip(monkeypatch):
+    tmp_path = Path('.test-tmp') / 'transcript-tests'
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / 'transcript_1.jsonl'
+    path.write_text(
+        json.dumps({'role': 'user', 'content': 'continue'}, ensure_ascii=False) + '\n' +
+        json.dumps({'role': 'assistant', 'content': 'ok'}, ensure_ascii=False) + '\n',
+        encoding='utf-8')
+    monkeypatch.setattr(harness, 'TRANSCRIPT_DIR', tmp_path)
+    try:
+        sessions = harness.list_transcripts()
+        assert sessions[0]['name'] == 'transcript_1.jsonl'
+        assert harness.load_transcript(path) == [
+            {'role': 'user', 'content': 'continue'},
+            {'role': 'assistant', 'content': 'ok'},
+        ]
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_load_transcript_rejects_invalid_message():
+    tmp_path = Path('.test-tmp') / 'transcript-tests'
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / 'transcript_bad.jsonl'
+    path.write_text('{"role":"invalid","content":"x"}\n', encoding='utf-8')
+    try:
+        with pytest.raises(ValueError):
+            harness.load_transcript(path)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_round_metric_emits_observability_event():
     """Round metrics are append-only observability data, not loop control state."""
     received = []

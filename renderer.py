@@ -23,7 +23,14 @@ class AnsiRenderer(BaseRenderer):
     """
 
     def on_event(self, e: UIEvent) -> None:
-        if e.type == 'assistant_text':
+        if e.type == 'user_message':
+            cc_ui.safe_print('> ' + str(e.payload.get('text', '')))
+        elif e.type == 'activity':
+            cc_ui.safe_print(cc_ui.status(
+                f"[{e.payload.get('state', 'ready')}] {e.payload.get('detail', '')}"))
+        elif e.type == 'session_start':
+            cc_ui.safe_print(cc_ui.status('Session started'))
+        elif e.type == 'assistant_text':
             print(e.payload.get('text', ''))
         elif e.type == 'assistant_start':
             pass
@@ -52,6 +59,21 @@ class AnsiRenderer(BaseRenderer):
                 cc_ui.safe_print(output)
             if duration is not None:
                 cc_ui.safe_print(cc_ui.status('completed in {0:.1f}s'.format(float(duration) / 1000)))
+        elif e.type == 'error':
+            cc_ui.say('error', str(e.payload.get('msg', 'Unknown error')))
+        elif e.type == 'diff':
+            if e.payload.get('path'):
+                cc_ui.safe_print(cc_ui.status(str(e.payload['path'])))
+            cc_ui.safe_print(cc_ui.diff(e.payload.get('diff_text', '')))
+        elif e.type == 'permission_request':
+            cc_ui.safe_print(cc_ui.permission_banner(
+                e.payload.get('title', 'Permission needed'),
+                [e.payload.get('tool', ''), str(e.payload.get('args', {}))]))
+        elif e.type == 'background_start':
+            cc_ui.safe_print(cc_ui.status(f"Background started: {e.payload.get('task_id', '')}"))
+        elif e.type == 'background_end':
+            state = 'completed' if e.payload.get('ok') else 'failed'
+            cc_ui.safe_print(cc_ui.status(f"Background {state}: {e.payload.get('task_id', '')}"))
         elif e.type == 'status':
             # 思考中提示：单行覆盖（\r 回行首 + idle 清行），避免等待时无反馈
             if e.payload.get('phase') == 'thinking':
