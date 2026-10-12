@@ -273,6 +273,48 @@ def test_record_usage_tracks_source_and_ledger(monkeypatch):
             harness._USAGE_LEDGER[:] = old_ledger
 
 
+def test_usage_normalizes_model_and_accounts_for_cache_creation(monkeypatch):
+    monkeypatch.setattr(harness, '_MODEL_COSTS', {
+        'demo-model': {'input': harness.Decimal('1'), 'output': harness.Decimal('2'),
+                       'cached_input': harness.Decimal('0.1'),
+                       'cache_creation_input': harness.Decimal('0.5'),
+                       'reasoning_output': None, 'currency': 'USD', 'version': 'v1'}
+    })
+    snapshot = harness._usage_snapshot({
+        'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120,
+        'cache_creation_input_tokens': 10,
+        'prompt_tokens_details': {'cached_tokens': 30},
+    })
+    assert harness._normalize_model_id('Provider/demo.model-2026-10-12:route') == 'demo-model'
+    assert snapshot['cache_creation_tokens'] == 10
+    expected = (30 * harness.Decimal('0.1') + 70 * harness.Decimal('1') +
+                10 * harness.Decimal('0.5') + 20 * harness.Decimal('2')) / harness.Decimal(1000000)
+    assert harness._cost_from_usage(snapshot, 'demo.model-2026-10-12') == expected
+
+
+def test_provider_reported_cost_wins_over_local_pricing(monkeypatch):
+    monkeypatch.setattr(harness, '_MODEL_COSTS', {
+        'demo': {'input': harness.Decimal('1'), 'output': harness.Decimal('2'),
+                 'cached_input': None, 'reasoning_output': None, 'currency': 'USD', 'version': 'v1'}
+    })
+    with harness._METRICS_LOCK:
+        old_metrics = dict(harness._SESSION_METRICS)
+        old_ledger = list(harness._USAGE_LEDGER)
+    try:
+        entry = harness._record_usage('demo', {
+            'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15,
+            'cached_tokens': 0, 'cache_creation_tokens': 0, 'reasoning_tokens': 0,
+            'reported_cost': '9.8765',
+        }, 'confirmed')
+        assert entry['source'] == 'provider_reported'
+        assert entry['cost'] == harness.Decimal('9.8765')
+    finally:
+        with harness._METRICS_LOCK:
+            harness._SESSION_METRICS.clear()
+            harness._SESSION_METRICS.update(old_metrics)
+            harness._USAGE_LEDGER[:] = old_ledger
+
+
 def test_round_metric_emits_observability_event():
     """Round metrics are append-only observability data, not loop control state."""
     received = []

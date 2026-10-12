@@ -73,6 +73,24 @@ class UIEventBus:
 bus = UIEventBus()
 
 
+# Session cancellation is intentionally separate from the event bus: the
+# worker loop needs a cheap, thread-safe signal while it is blocked in a
+# provider stream.
+_cancel_event = threading.Event()
+
+
+def request_cancel() -> None:
+    _cancel_event.set()
+
+
+def clear_cancel() -> None:
+    _cancel_event.clear()
+
+
+def cancel_requested() -> bool:
+    return _cancel_event.is_set()
+
+
 class PermissionGate:
     """权限确认挂起（UI 改进方案 P1）：业务线程请求 → 渲染层弹窗应答 → 唤醒。
 

@@ -75,11 +75,22 @@ class AnsiRenderer(BaseRenderer):
                     prompt_tokens=e.payload.get('prompt_tokens'),
                     completion_tokens=e.payload.get('completion_tokens'),
                     cached_tokens=e.payload.get('cached_tokens'),
+                    cache_creation_tokens=e.payload.get('cache_creation_tokens'),
                     reasoning_tokens=e.payload.get('reasoning_tokens'),
                     cost=e.payload.get('cost'),
                     cost_source=e.payload.get('cost_source', 'estimated'))
                 if line:
                     cc_ui.safe_print(line)
+        elif e.type == 'round_end':
+            metric = e.payload
+            source = metric.get('source', 'estimated')
+            prefix = '' if source in ('confirmed', 'provider_reported') else '~'
+            suffix = ' [compressed]' if metric.get('compressed') else ''
+            cc_ui.safe_print(cc_ui.status(
+                'Round {0}: {1}ms, {2} in / {3} out, {4}¥{5:.4f}{6}'.format(
+                    metric.get('round', 0), metric.get('duration_ms', 0),
+                    metric.get('prompt_tokens', 0), metric.get('completion_tokens', 0),
+                    prefix, float(metric.get('cost', 0)), suffix)))
         elif e.type == 'session_end':
             summary = e.payload.get('summary', {})
             outcomes = summary.get('tool_outcomes', {})

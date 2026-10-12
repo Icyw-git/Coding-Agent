@@ -247,6 +247,8 @@ class CCApp(App):
     def on_mount(self) -> None:
         import os
         import harness as h
+        from ui_events import clear_cancel
+        clear_cancel()
         bus.subscribe(self._on_event)
         header = self.query_one('#header-line', Static)
         header.update(f"[{PALETTE['accent']}]harness[/] [{PALETTE['muted']}]{os.getenv('LLM_MODEL_ID', '')}[/]"
@@ -324,6 +326,8 @@ class CCApp(App):
     def action_quit(self) -> None:
         """Ctrl+C / Ctrl+D：拒绝待审批并唤醒 agent 线程退出。"""
         self._exiting = True
+        from ui_events import request_cancel
+        request_cancel()
         try:
             import harness
             harness.permission_gate.cancel_pending()
@@ -454,7 +458,7 @@ class CCApp(App):
         outcomes = summary.get('tool_outcomes', {})
         failed = outcomes.get('failed', 0) + outcomes.get('denied', 0)
         source = summary.get('cost_source', 'estimated')
-        prefix = '' if source == 'confirmed' else '~'
+        prefix = '' if source in ('confirmed', 'provider_reported') else '~'
         try:
             cost = float(summary.get('cost', 0))
         except (TypeError, ValueError):
@@ -632,6 +636,15 @@ class CCApp(App):
             self._input.focus()   # 弹窗应答后焦点回到输入框
         elif e.type == 'status':
             self._update_status(e.payload)
+        elif e.type == 'round_end':
+            metric = e.payload
+            source = metric.get('source', 'estimated')
+            marker = '' if source in ('confirmed', 'provider_reported') else '~'
+            compressed = ' · compressed' if metric.get('compressed') else ''
+            await self._show_notice(
+                f"Round {metric.get('round', 0)} · {metric.get('duration_ms', 0)}ms · "
+                f"{metric.get('prompt_tokens', 0)} in / {metric.get('completion_tokens', 0)} out · "
+                f"{marker}¥{float(metric.get('cost', 0)):.4f}{compressed}")
         elif e.type == 'session_end':
             await self._show_session_summary(e.payload.get('summary', {}))
         self._chat.scroll_end(animate=False)   # scroll_end 是同步方法（返回 None）
@@ -799,12 +812,15 @@ class CCApp(App):
             prompt = self._last_status.get('prompt_tokens', 0)
             completion = self._last_status.get('completion_tokens', 0)
             cached = self._last_status.get('cached_tokens', 0)
+            cache_creation = self._last_status.get('cache_creation_tokens', 0)
             reasoning = self._last_status.get('reasoning_tokens', 0)
             summary.append(f"Tokens   {tokens}\n")
             summary.append(f"Input    {prompt}\n")
             summary.append(f"Output   {completion}\n")
-            if cached or reasoning:
+            if cached or cache_creation or reasoning:
                 summary.append(f"Cache    {cached}\n")
+                if cache_creation:
+                    summary.append(f"Cache new {cache_creation}\n")
                 summary.append(f"Reason   {reasoning}\n")
         if self._last_status.get('cost') is not None:
             source = self._last_status.get('cost_source', 'estimated')
@@ -816,7 +832,7 @@ class CCApp(App):
         if recent_calls:
             summary.append('RECENT CALLS\n', style=f'bold {PALETTE["accent"]}')
             for call in recent_calls:
-                marker = '' if call.get('source') == 'confirmed' else '~'
+                marker = '' if call.get('source') in ('confirmed', 'provider_reported') else '~'
                 try:
                     cost = float(call.get('cost', 0))
                 except (TypeError, ValueError):
@@ -860,6 +876,7 @@ class CCApp(App):
             'saving': ('Saving', PALETTE['info']),
             'complete': ('Complete', PALETTE['success']),
             'failed': ('Failed', PALETTE['danger']),
+            'cancelled': ('Cancelled', PALETTE['warning']),
             'idle': ('Idle', PALETTE['muted']),
         }.get(self._activity_state, (self._activity_state.title(), PALETTE['muted']))
         detail = markup_escape(str(self._activity_detail))
@@ -898,13 +915,14 @@ class CCApp(App):
             amount = float(value)
         except (TypeError, ValueError):
             amount = 0.0
-        prefix = '' if source == 'confirmed' else '~'
+        prefix = '' if source in ('confirmed', 'provider_reported') else '~'
         return f"{prefix}\u00a5{amount:.4f}"
 
     @staticmethod
     def _source_label(source: str) -> str:
         return {
             'confirmed': 'Confirmed',
+            'provider_reported': 'Provider reported',
             'mixed': 'Mixed',
             'estimated': 'Estimated',
         }.get(source, 'Estimated')

@@ -9,8 +9,31 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cc_ui as ui
+import ui_events
+import renderer
 
 _RESET = '\x1b[0m'
+
+
+def test_session_cancel_signal_is_thread_safe_and_resettable():
+    ui_events.clear_cancel()
+    assert ui_events.cancel_requested() is False
+
+
+def test_ansi_renderer_displays_round_metrics(capsys):
+    renderer.default_renderer.on_event(ui_events.UIEvent('round_end', {
+        'round': 2, 'duration_ms': 1250, 'prompt_tokens': 100,
+        'completion_tokens': 25, 'cost': '0.0012',
+        'source': 'provider_reported', 'compressed': True,
+    }))
+    output = capsys.readouterr().out
+    assert 'Round 2' in output
+    assert '100 in / 25 out' in output
+    assert 'compressed' in output
+    ui_events.request_cancel()
+    assert ui_events.cancel_requested() is True
+    ui_events.clear_cancel()
+    assert ui_events.cancel_requested() is False
 
 
 # ---------- 颜色 ----------

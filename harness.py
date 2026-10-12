@@ -29,7 +29,7 @@ from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
 from mcp_bridge import register_mcp_tools
-from ui_events import bus, PermissionGate
+from ui_events import bus, PermissionGate, cancel_requested
 import renderer   # 副作用：attach 默认 AnsiRenderer（渲染后端由事件流驱动）
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
@@ -445,7 +445,33 @@ _MODEL_COSTS=_load_model_costs()
 
 
 def _model_spec(model: str):
-    return _MODEL_COSTS.get(str(model or '').lower(), {})
+    key = _normalize_model_id(model)
+    spec = _MODEL_COSTS.get(key, {})
+    if spec:
+        return spec
+    # Compatibility aliases: providers frequently return a dated or routed id.
+    for candidate, value in _MODEL_COSTS.items():
+        if candidate and (key.startswith(candidate + '-') or candidate.startswith(key + '-')):
+            return value
+    return {}
+
+
+def _normalize_model_id(model: str) -> str:
+    """Normalize routed model ids before pricing lookup.
+
+    Mirrors the useful part of CC Switch's matching rules while preserving the
+    raw model elsewhere for audit/debugging.
+    """
+    import re
+    key = str(model or '').strip().lower().rsplit('/', 1)[-1]
+    key = key.split(':', 1)[0].strip()
+    key = key.replace('@', '-')
+    key = re.sub(r'\[1m\]$', '', key)
+    key = re.sub(r'-v\d+(?:\.\d+)*$', '', key)
+    key = re.sub(r'-\d{8}$', '', key)
+    key = re.sub(r'-\d{4}-\d{2}-\d{2}$', '', key)
+    key = re.sub(r'\.+', '-', key).strip('-')
+    return key
 
 
 def _context_window(model: str) -> int:
@@ -494,11 +520,27 @@ def _usage_snapshot(usage):
         prompt_details = getattr(usage, 'prompt_tokens_details', None)
         completion_details = getattr(usage, 'completion_tokens_details', None)
     cached = _usage_value(prompt_details, 'cached_tokens')
+    # Providers use several names for cache writes. Keep both dimensions so
+    # cache reads are not accidentally counted as ordinary input twice.
+    cache_creation = (_usage_value(usage, 'cache_creation_input_tokens') or
+                      _usage_value(usage, 'cache_creation_tokens') or
+                      _usage_value(prompt_details, 'cache_creation_input_tokens'))
     reasoning = _usage_value(completion_details, 'reasoning_tokens')
+    reported_cost = None
+    for key in ('cost', 'total_cost', 'estimated_cost'):
+        value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+        if value not in (None, ''):
+            try:
+                reported_cost = str(Decimal(str(value)))
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+            break
     return {
         'prompt_tokens': prompt, 'completion_tokens': completion,
         'total_tokens': total, 'cached_tokens': cached,
+        'cache_creation_tokens': cache_creation,
         'reasoning_tokens': reasoning,
+        'reported_cost': reported_cost,
     }
 
 
@@ -508,11 +550,15 @@ def _cost_from_usage(snapshot: dict, model: str) -> Decimal:
         return Decimal('0')
     prompt = Decimal(snapshot['prompt_tokens'])
     cached = Decimal(min(snapshot['cached_tokens'], snapshot['prompt_tokens']))
+    cache_creation = Decimal(max(0, snapshot.get('cache_creation_tokens', 0)))
     completion = Decimal(snapshot['completion_tokens'])
     reasoning = Decimal(min(snapshot['reasoning_tokens'], snapshot['completion_tokens']))
     cached_rate = spec.get('cached_input')
+    cache_creation_rate = spec.get('cache_creation_input')
     input_cost = ((cached * cached_rate) + ((prompt - cached) * spec.get('input', Decimal('0')))
                   if cached_rate is not None else prompt * spec.get('input', Decimal('0')))
+    if cache_creation_rate is not None:
+        input_cost += cache_creation * cache_creation_rate
     reasoning_rate = spec.get('reasoning_output')
     if reasoning_rate is not None:
         output_cost = ((completion - reasoning) * spec.get('output', Decimal('0')) +
@@ -523,11 +569,19 @@ def _cost_from_usage(snapshot: dict, model: str) -> Decimal:
 
 
 def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict:
-    cost = _cost_from_usage(snapshot, model) if source == 'confirmed' else _estimate_cost(
-        snapshot['prompt_tokens'], snapshot['completion_tokens'], model)
-    entry = dict(snapshot, model=model, cost=cost, source=source,
-                 currency=_model_spec(model).get('currency', 'CNY'),
-                 pricing_version=_model_spec(model).get('version', 'unknown'))
+    reported = snapshot.get('reported_cost')
+    if reported is not None:
+        cost = Decimal(reported)
+        cost_source = 'provider_reported'
+    else:
+        cost = _cost_from_usage(snapshot, model) if source == 'confirmed' else _estimate_cost(
+            snapshot['prompt_tokens'], snapshot['completion_tokens'], model)
+        cost_source = source
+    spec = _model_spec(model)
+    entry = dict(snapshot, model=model, pricing_model=_normalize_model_id(model),
+                 cost=cost, source=cost_source,
+                 currency=spec.get('currency', 'CNY'),
+                 pricing_version=spec.get('version', 'unknown'))
     with _METRICS_LOCK:
         _USAGE_LEDGER.append(entry)
         _SESSION_METRICS['calls'] += 1
@@ -535,6 +589,9 @@ def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict
         _SESSION_METRICS['prompt_tokens'] += snapshot['prompt_tokens']
         _SESSION_METRICS['completion_tokens'] += snapshot['completion_tokens']
         _SESSION_METRICS['cached_tokens'] += snapshot['cached_tokens']
+        _SESSION_METRICS['cache_creation_tokens'] = (
+            _SESSION_METRICS.get('cache_creation_tokens', 0) +
+            snapshot.get('cache_creation_tokens', 0))
         _SESSION_METRICS['reasoning_tokens'] += snapshot['reasoning_tokens']
         _SESSION_METRICS['cost'] += cost
         _SESSION_METRICS['ctx_tokens'] = snapshot['prompt_tokens']
@@ -543,8 +600,7 @@ def _record_usage(model: str, snapshot: dict, source: str = 'confirmed') -> dict
         _SESSION_METRICS['ctx_source'] = source
         sources = {item['source'] for item in _USAGE_LEDGER}
         _SESSION_METRICS['cost_source'] = (
-            'confirmed' if sources == {'confirmed'} else
-            'estimated' if sources == {'estimated'} else 'mixed')
+            next(iter(sources)) if len(sources) == 1 else 'mixed')
         _SESSION_METRICS['model'] = model
         _SESSION_METRICS['recent_usage'] = [
             {
@@ -658,6 +714,9 @@ def _record_round_metric(round_no: int, started_at: float, *, model: str,
     return metric
 
 def agent_loop(messages:list):
+    if cancel_requested():
+        bus.emit('activity', state='cancelled', detail='Request cancelled')
+        return
     bus.emit('activity', state='preparing', detail='Preparing session')
     context=update_context({},messages)
     recovery_state=recovery.RecoveryState()
@@ -679,6 +738,9 @@ def agent_loop(messages:list):
         bus.emit('status', phase='idle')
 
     while True:
+        if cancel_requested():
+            bus.emit('activity', state='cancelled', detail='Request cancelled')
+            return
         round_started_at = time.monotonic()
         _SESSION_METRICS['rounds'] += 1
         round_no = _SESSION_METRICS['rounds']
@@ -755,6 +817,12 @@ def agent_loop(messages:list):
         bus.emit('assistant_start', mid=mid)
         try:
             for chunk in stream:
+                if cancel_requested():
+                    close = getattr(stream, 'close', None)
+                    if close:
+                        close()
+                    bus.emit('activity', state='cancelled', detail='Request cancelled')
+                    return
                 if getattr(chunk, 'usage', None) is not None:
                     usage = chunk.usage
                 if not chunk.choices:
@@ -807,7 +875,7 @@ def agent_loop(messages:list):
         # 输出被截断：升级到加大 max_tokens 并提示续写
         if finish_reason=='length' and not recovery_state.has_escalated:
             recovery_state.has_escalated=True
-            print('  [length] escalating max_tokens and requesting continuation')
+            bus.emit('debug', msg='[length] escalating max_tokens and requesting continuation')
             messages.append({'role':'user','content':recovery.CONTINUATION_PROMPT})
             continue
 
@@ -877,8 +945,7 @@ def agent_loop(messages:list):
                         
                     }
                 )
-            print(f"  \033[32m[inject] {len(notifications)} background "
-                  f"notification(s)\033[0m")
+            bus.emit('debug', msg=f"[inject] {len(notifications)} background notification(s)")
 
         messages.extend(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
@@ -894,11 +961,11 @@ def run_agent_turn_locked():
     if not fired:
         return
     prompts = [f'[Scheduled] {job.prompt}' for job in fired]
-    print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+    bus.emit('debug', msg=f"[cron turn] {len(fired)} scheduled job(s)")
     try:
         agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
     except KeyboardInterrupt:
-        print('\n[会话已中断]')
+        bus.emit('error', msg='Session interrupted')
 
 
 if __name__ == '__main__':

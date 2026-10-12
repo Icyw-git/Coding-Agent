@@ -1,9 +1,19 @@
 # Env / secrets
 .env
 
-# Caches
+# Python
 __pycache__/
+*.pyc
 .cache/
+
+# Pytest / test runtime temp dirs
+.pytest*
+.test-tmp/
+.verify-pytest-temp/
+.mailbox/
+
+# Git worktrees storage
+.worktrees/
 
 # Scratch / temp
 _check_log.py

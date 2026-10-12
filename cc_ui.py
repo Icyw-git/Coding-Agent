@@ -671,7 +671,7 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
                workdir: str = '', git_branch: str = '', cost=None, mode: str = '',
                cost_source: str = 'confirmed', ctx_source: str = 'confirmed',
                prompt_tokens=None, completion_tokens=None, cached_tokens=None,
-               reasoning_tokens=None) -> str:
+               reasoning_tokens=None, cache_creation_tokens=None) -> str:
     """会话状态行：模式标签 / model(tier 色 pill) / git 分支 / 工具数 / 进度条 / 成本 / token。
 
     上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
@@ -692,8 +692,9 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
     if cost is not None:
         # GBK 终端不支持半角 ¥(U+00A5)，退回全角 ￥(U+FFE5)，避免符号被替换成 ?
         cny = '\u00a5' if _can_encode('\u00a5') else '\uffe5'
-        prefix = '' if cost_source == 'confirmed' else '~'
-        cost_color = 'success' if cost_source == 'confirmed' else 'warning'
+        confirmed_cost = cost_source in ('confirmed', 'provider_reported')
+        prefix = '' if confirmed_cost else '~'
+        cost_color = 'success' if confirmed_cost else 'warning'
         parts.append(_pill(cost_color, prefix + cny + '{0:.4f}'.format(float(cost))))
     if tokens:
         parts.append(_pill('inactive', tokens))
@@ -704,6 +705,8 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
         breakdown.append('out ' + str(completion_tokens))
     if cached_tokens:
         breakdown.append('cache ' + str(cached_tokens))
+    if cache_creation_tokens:
+        breakdown.append('cache new ' + str(cache_creation_tokens))
     if reasoning_tokens:
         breakdown.append('reason ' + str(reasoning_tokens))
     if breakdown:
