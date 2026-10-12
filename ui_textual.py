@@ -618,6 +618,10 @@ class CCApp(App):
             delta = e.payload.get('delta', '')
             self._assistant_buffers[mid] = self._assistant_buffers.get(mid, '') + delta
             self._stream_chars += len(delta)
+            # Generating is meaningful only after visible model output starts.
+            self._activity_state = 'generating'
+            self._activity_detail = 'Streaming response'
+            self._refresh_status_line()
         elif e.type == 'assistant_end':
             mid = e.payload['mid']
             w = self._active_widgets.pop(mid, None)
@@ -668,6 +672,9 @@ class CCApp(App):
                     if tool['name'] == name and tool['state'] == 'running':
                         tool.update(state=state, duration_ms=e.payload.get('duration_ms', 0))
                         break
+                self._activity_state = 'tool_complete' if ok else 'failed'
+                self._activity_detail = 'Tool result ready'
+                self._refresh_status_line()
                 self._refresh_sidebar()
         elif e.type == 'debug':
             await self._chat.mount(Static(Text(self._strip_ansi(e.payload.get('msg', ''))),
@@ -676,8 +683,17 @@ class CCApp(App):
             await self._chat.mount(Static(Text(f"Error: {e.payload.get('msg', '')}"),
                                           classes='error-line'))
         elif e.type == 'activity':
-            self._activity_state = e.payload.get('state', 'ready')
-            self._activity_detail = e.payload.get('detail', '')
+            state = e.payload.get('state', 'ready')
+            detail = e.payload.get('detail', '')
+            # Internal bookkeeping should not overwrite a visible tool result
+            # or claim that generation started before the first delta arrives.
+            if state == 'thinking' and detail == 'Reviewing tool result':
+                return
+            if state == 'thinking' and detail == 'Requesting model response':
+                state = 'waiting'
+                detail = 'Waiting for response'
+            self._activity_state = state
+            self._activity_detail = detail
             self._refresh_status_line()
             self._refresh_sidebar()
         elif e.type == 'diff':
@@ -857,15 +873,18 @@ class CCApp(App):
             return
         labels = {
             'ready': 'Ready', 'preparing': 'Preparing', 'thinking': 'Thinking',
-            'generating': 'Generating', 'tool': 'Running tool',
+            'generating': 'Generating', 'waiting': 'Waiting for response',
+            'tool': 'Running tool', 'tool_complete': 'Tool complete',
             'awaiting_permission': 'Awaiting approval', 'saving': 'Saving',
             'complete': 'Complete', 'failed': 'Failed', 'idle': 'Idle',
             'cancelled': 'Cancelled',
         }
         colors = {
             'ready': PALETTE['muted'], 'preparing': PALETTE['info'],
-            'thinking': PALETTE['warning'], 'generating': PALETTE['accent'],
+            'thinking': PALETTE['warning'], 'waiting': PALETTE['info'],
+            'generating': PALETTE['accent'],
             'tool': PALETTE['accent'], 'awaiting_permission': PALETTE['permission'],
+            'tool_complete': PALETTE['success'],
             'saving': PALETTE['info'], 'complete': PALETTE['success'],
             'failed': PALETTE['danger'], 'idle': PALETTE['muted'],
             'cancelled': PALETTE['warning'],
@@ -966,7 +985,9 @@ class CCApp(App):
             'preparing': ('Preparing', PALETTE['info']),
             'thinking': ('Thinking', PALETTE['warning']),
             'generating': ('Generating', PALETTE['accent']),
+            'waiting': ('Waiting for response', PALETTE['info']),
             'tool': ('Running tool', PALETTE['accent']),
+            'tool_complete': ('Tool complete', PALETTE['success']),
             'awaiting_permission': ('Awaiting approval', PALETTE['permission']),
             'saving': ('Saving', PALETTE['info']),
             'complete': ('Complete', PALETTE['success']),
