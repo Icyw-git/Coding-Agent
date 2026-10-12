@@ -440,6 +440,8 @@ def test_textual_streaming_flow():
         app = ui_textual.CCApp([])
         try:
             async with app.run_test() as pilot:
+                # _run_agent 阻塞等用户输入后才调 agent_loop（63278d3 起），需主动投递触发
+                app._user_input_q.put('go')
                 # 阶段 1：start + 第一段 delta 后，帧刷新渲染出纯文本 Static；
                 # 同时等 _stream_tick（100ms）在状态栏刷出 generating 指示
                 saw_generating = mid_stream_plain = False
@@ -450,7 +452,7 @@ def test_textual_streaming_flow():
                         break
                     try:
                         line = str(app.query_one('#status-line').render())
-                        if 'generating' in line:
+                        if 'generating' in line.lower():   # 状态栏渲染为 Generating（首字母大写）
                             saw_generating = True
                         t = _render_map(app).get('Static', '')
                         if 'Hello' in t and '**world**' in t:   # 未转 markdown，仍是纯文本

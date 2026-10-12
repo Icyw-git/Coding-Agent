@@ -47,10 +47,12 @@ PALETTE = {
     'code': '#3c3c42',
 }
 
+CTX_BAR_CELLS = 20   # 上下文占用条格数；缓动以格为单位，标签显示目标值
+
 CSS = """
 Screen { background: $background; }
 #content { height: 1fr; }
-#chat { width: 1fr; }
+#chat { width: 1fr; scrollbar-gutter: stable; }
 #side-panel { width: 30; padding: 1 1; background: $surface; border-left: thick $inactive; }
 #session-summary { color: $muted; }
 #recent-tools { margin-top: 1; color: $muted; }
@@ -281,11 +283,12 @@ class CCApp(App):
         self._status_refresh_pending = False
         self._search_matches = []
         # Context usage is animated independently from event delivery.  The
-        # target remains the reported value; only the presentation eases.
+        # bar cells ease toward the reported value; the numeric labels show
+        # the target directly so digits change once per event (no spinning).
         self._ctx_target_tokens = None
-        self._ctx_display_tokens = None
+        self._ctx_target_cells = None
+        self._ctx_display_cells = None
         self._ctx_window = None
-        self._ctx_anim_ticks = 0
         self._side_panel.display = self.size.width >= 110
         self._refresh_sidebar()
         # 帧刷新：网络 chunk 到达频率与 UI 渲染频率解耦 → 无论 chunk 多大都平滑打字机
@@ -612,9 +615,9 @@ class CCApp(App):
             # A new session may reuse the model's window size; clear the
             # presentation state so its first report is shown immediately.
             self._ctx_target_tokens = None
-            self._ctx_display_tokens = None
+            self._ctx_target_cells = None
+            self._ctx_display_cells = None
             self._ctx_window = None
-            self._ctx_anim_ticks = 0
         elif e.type == 'user_message':
             # 用户输入可能含方括号 → 用 Text 对象（不做 markup 解析，避免 MarkupError）
             await self._chat.mount(Static(Text(f"\u276f {e.payload.get('text', '')}"),
@@ -687,12 +690,14 @@ class CCApp(App):
                 if output_len > len(out):
                     out += f'\n\n... output truncated ({output_len:,} characters total)'
                 classes = 'tool-output' if ok else 'tool-output tool-failed'
-                await col.mount(Static(Text(out or '[No output]'), classes=classes))
                 if state in ('failed', 'denied'):
                     col.add_class('tool-failed-call')
                 col.display = self._tool_filter == 'all' or state in ('failed', 'denied')
                 # 失败结果保留展开状态，成功结果收起以便扫描长会话。
+                # 先定折叠态再挂输出：输出挂进已折叠容器不产生中间帧，
+                # 避免"输出块以展开态闪现一帧后被折叠"的双帧闪烁。
                 col.collapsed = ok
+                await col.mount(Static(Text(out or '[No output]'), classes=classes))
                 for tool in self._recent_tools:
                     if tool['name'] == name and tool['state'] == 'running':
                         tool.update(state=state, duration_ms=e.payload.get('duration_ms', 0))
@@ -910,42 +915,51 @@ class CCApp(App):
             return
         if target is None or window is None:
             return
+        cells = self._pct_to_cells(target, window)
         if self._ctx_window != window:
             self._ctx_window = window
             # A new context window represents a new scale, so avoid animating
             # from an unrelated previous session or model.
-            self._ctx_display_tokens = target
-        elif self._ctx_display_tokens is None:
-            self._ctx_display_tokens = target
+            self._ctx_target_cells = cells
+            self._ctx_display_cells = cells
+        else:
+            self._ctx_target_cells = cells
+            if self._ctx_display_cells is None:
+                self._ctx_display_cells = cells
         self._ctx_target_tokens = target
 
+    @staticmethod
+    def _pct_to_cells(tokens: float, window: float) -> int:
+        """Reported token count → bar cells (clamped to the bar width)."""
+        pct = max(0.0, min(100.0, float(tokens) / float(window) * 100.0))
+        return int(round(pct / 100.0 * CTX_BAR_CELLS))
+
     def _animate_context(self) -> None:
-        """Ease the context indicator toward the latest reported token count."""
-        target = self._ctx_target_tokens
-        current = self._ctx_display_tokens
-        if target is None or current is None:
+        """Ease the context bar cells toward the latest reported value.
+
+        只动画格子填充数；百分比 / token 标签由 _display_status 直接取目标值，
+        数字一次性到位、bar 平滑滑动，避免高频滚动数字造成的跳动与闪烁。"""
+        target = self._ctx_target_cells
+        current = self._ctx_display_cells
+        if target is None or current is None or current == target:
             return
-        delta = target - current
-        if abs(delta) <= 0.5:
-            self._ctx_display_tokens = target
-            return
-        # Proportional motion feels immediate for large jumps and settles
-        # without visible stepping for the small updates from streaming.
-        step = min(abs(delta), max(1.0, abs(delta) * 0.22))
-        self._ctx_display_tokens = current + step * (1 if delta > 0 else -1)
-        self._ctx_anim_ticks += 1
+        # Proportional motion settles large jumps fast; the 1-cell floor
+        # keeps small updates visibly gliding instead of stepping.
+        step = max(1, int(abs(target - current) * 0.34))
+        moved = current + step * (1 if target > current else -1)
+        self._ctx_display_cells = max(0, min(CTX_BAR_CELLS, moved))
         self._refresh_status_line()
-        if self._ctx_anim_ticks % 3 == 0:
-            self._refresh_sidebar()
+        self._refresh_sidebar()
 
     def _display_status(self, payload: dict) -> dict:
-        """Return status metrics with the animated context value for rendering."""
-        if self._ctx_display_tokens is None or not self._ctx_window:
+        """Status metrics for rendering: numeric labels show the reported
+        (target) value, changing once per event while only bar cells ease."""
+        if self._ctx_target_tokens is None or not self._ctx_window:
             return payload
         display = dict(payload)
-        display['ctx_tokens'] = int(round(self._ctx_display_tokens))
+        display['ctx_tokens'] = int(round(self._ctx_target_tokens))
         display['ctx_window'] = int(self._ctx_window)
-        display['ctx_pct'] = self._ctx_display_tokens / self._ctx_window * 100
+        display['ctx_pct'] = self._ctx_target_tokens / self._ctx_window * 100
         return display
 
     def _flush_status(self) -> None:
@@ -1104,7 +1118,7 @@ class CCApp(App):
         ctx = payload.get('ctx_pct')
         if ctx is not None and width >= 44:
             marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
-            label = marker + CCApp._ctx_bar(float(ctx))
+            label = marker + CCApp._ctx_bar(float(ctx), cells=self._ctx_display_cells)
             if payload.get('ctx_tokens') is not None and payload.get('ctx_window'):
                 label += f" [dim]{int(payload['ctx_tokens'])}/{int(payload['ctx_window'])}[/]"
             parts.append(label)
@@ -1145,14 +1159,16 @@ class CCApp(App):
         return f'{pct:.1f}' if pct < 10 else f'{pct:.0f}'
 
     @staticmethod
-    def _ctx_bar(pct: float) -> str:
+    def _ctx_bar(pct: float, cells: int = None) -> str:
         """上下文占用进度条：20 格，实心=已用 / 空心=剩余，附百分比。
 
-        >75% 红 / >50% 黄 / 否则绿。占用随会话推进由 status 事件实时刷新。"""
+        >75% 红 / >50% 黄 / 否则绿。cells 由调用方传入缓动中的填充数
+        （None 时按 pct 推导），百分比标签始终取 pct 本身。"""
         pct = max(0.0, min(100.0, float(pct)))
-        width = 20
-        filled = round(pct / 100 * width)
-        bar = '\u2588' * filled + '\u2591' * (width - filled)
+        if cells is None:
+            cells = round(pct / 100 * CTX_BAR_CELLS)
+        cells = max(0, min(CTX_BAR_CELLS, int(cells)))
+        bar = '\u2588' * cells + '\u2591' * (CTX_BAR_CELLS - cells)
         color = PALETTE['danger'] if pct > 75 else PALETTE['warning'] if pct > 50 else PALETTE['success']
         label = CCApp._format_pct(pct)
         return f'[{color}]{bar}[/] [dim]{label}%[/]'
