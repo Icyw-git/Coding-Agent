@@ -23,16 +23,15 @@ class MCPclient: #进程间通信客户端
 
         self._exit_stack = AsyncExitStack()
         try:
-            async def _setup(): #下面都是异步操作，需要等待完成
-                read, write = await self._exit_stack.enter_async_context(
-                    stdio_client(server_params)) # 进接 MCP server
-                self.session = await self._exit_stack.enter_async_context(
-                    ClientSession(read, write)) # 创建 MCP session
-                await self.session.initialize() # 初始化 MCP session
-                return await self.session.list_tools() # 列出所有工具
-
-
-            tools_result = await asyncio.wait_for(_setup(), timeout) #启动_setup函数
+            # Enter and later close both context managers in this same task. Wrapping
+            # the whole setup in wait_for creates a child task, which violates AnyIO's
+            # cancel-scope ownership when the stack is closed during shutdown.
+            read, write = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)) # 进接 MCP server
+            self.session = await self._exit_stack.enter_async_context(
+                ClientSession(read, write)) # 创建 MCP session
+            await asyncio.wait_for(self.session.initialize(), timeout)
+            tools_result = await asyncio.wait_for(self.session.list_tools(), timeout)
         except Exception:
             await self.close()   # 中途失败也清理子进程，避免泄漏
             raise

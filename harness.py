@@ -953,45 +953,8 @@ def run_repl(initial_messages:list, session_store=None):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Harness Agent')
-    parser.add_argument('--doctor', action='store_true', help='check local configuration and exit')
-    parser.add_argument('--resume', metavar='SESSION_ID', help='resume a saved session')
-    args = parser.parse_args()
+    # Keep ``python harness.py`` working while the real process entrypoint lives
+    # in a module that can be tested and reused independently.
+    from entrypoint import main
 
-    if args.doctor:
-        raise SystemExit(run_doctor())
-    try:
-        validate_runtime_config()
-    except RuntimeError as exc:
-        raise SystemExit(f'[config] {exc}') from exc
-
-    # 启动 cron 调度线程（生产队列）+ 队列处理器（推送执行）；测试直接调 agent_loop 不受影响
-    load_durable_jobs()
-    threading.Thread(target=cron_scheduler_loop, daemon=True).start()
-    threading.Thread(target=queue_processor_loop,
-                     args=(run_agent_turn_locked,), daemon=True).start()
-
-    # 接入 MCP：连接配置的 server，工具动态注册进 tool_registry + TOOLS
-    TOOLS.extend(register_mcp_tools(tool_registry))
-
-    # 主会话持 agent_lock：队列处理器只会在主会话结束后才推送 cron 任务；
-    # /rewind 等命令也在锁内执行，避免与 cron turn 并发改 messages。
-    with agent_lock:
-        try:
-            if args.resume:
-                store = SessionEventStore.open(resolve_session_path(args.resume))
-                run_repl(store.rebuild_openai_history(), session_store=store)
-            else:
-                run_repl([])
-        except (FileNotFoundError, ValueError, SessionReplayError) as exc:
-            print(f'[session] {exc}')
-        except KeyboardInterrupt:
-            print('\n[会话已中断]')
-
-    # 保持进程存活直到 cron 任务全部处理完（无任务立即退出）；Ctrl+C 退出
-    try:
-        wait_for_cron_idle()
-    except KeyboardInterrupt:
-        print('\n[会话已中断]')
-    finally:
-        shutdown_mcp()
+    main()

@@ -69,7 +69,7 @@ python -m pip install -r requirements.txt
 ### 4. 启动 Agent
 
 ```bash
-python harness.py
+python entrypoint.py
 ```
 
 首次启动时，程序会进入交互式 Agent 会话。使用 `HARNESS_UI=ansi` 可在不支持全屏终端的环境中运行。
@@ -77,13 +77,13 @@ python harness.py
 启动前检查本地配置和目录：
 
 ```bash
-python harness.py --doctor
+python entrypoint.py --doctor
 ```
 
 恢复已保存的会话：
 
 ```bash
-python harness.py --resume <session_id>
+python entrypoint.py --resume <session_id>
 ```
 
 交互过程中可使用 `/status` 查看当前运行状态，使用 `/sessions` 查看已保存会话，使用 `/resume <session_id>` 切换到已有会话。
@@ -120,7 +120,8 @@ python -m pytest --basetemp .test-tmp
 
 | 路径 | 说明 |
 | --- | --- |
-| `harness.py` | Agent 主循环与程序入口 |
+| `entrypoint.py` | 命令行入口、服务启动和退出清理 |
+| `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `tests/` | 自动化测试与测试辅助程序 |
 | `docs/` | 架构、检查点设计和开发记录 |
