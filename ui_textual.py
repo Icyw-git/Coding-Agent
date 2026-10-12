@@ -16,6 +16,7 @@ bus 事件进线程安全队列，由 UI 事件循环里的消费者 worker 顺�
 """
 import asyncio
 import json
+import logging
 import queue
 import time
 
@@ -27,6 +28,8 @@ from textual.widgets import Collapsible, Input, Markdown, Static
 from rich.markup import escape as markup_escape
 from rich.text import Text
 from ui_events import bus, UIEvent
+
+logger = logging.getLogger('harness.ui')
 
 PALETTE = {
     'background': '#191919',
@@ -224,6 +227,7 @@ class CCApp(App):
         ("ctrl+shift+f", "failures", "Failed tools"),
         ("ctrl+l", "clear", "Clear"),
         ("ctrl+e", "export", "Export"),
+        ("escape", "jump_bottom", "Jump to latest"),
     ]
 
     def __init__(self, msgs: list):
@@ -355,6 +359,13 @@ class CCApp(App):
 
     def action_failures(self) -> None:
         self.execute_command('failures')
+
+    def action_jump_bottom(self) -> None:
+        """Return to the newest conversation item while browsing history."""
+        if self._chat is not None:
+            self._chat.scroll_end(animate=False)
+        if not self._exiting and hasattr(self, '_input'):
+            self._input.focus()
 
     def execute_command(self, command: str) -> None:
         """从快捷键或命令面板进入同一执行路径。"""
@@ -677,8 +688,7 @@ class CCApp(App):
                 self._refresh_status_line()
                 self._refresh_sidebar()
         elif e.type == 'debug':
-            await self._chat.mount(Static(Text(self._strip_ansi(e.payload.get('msg', ''))),
-                                          classes='debug-line'))
+            logger.debug(self._strip_ansi(e.payload.get('msg', '')))
         elif e.type == 'error':
             await self._chat.mount(Static(Text(f"Error: {e.payload.get('msg', '')}"),
                                           classes='error-line'))
@@ -719,21 +729,25 @@ class CCApp(App):
             source = metric.get('source', 'estimated')
             marker = '' if source in ('confirmed', 'provider_reported') else '~'
             compressed = ' · compressed' if metric.get('compressed') else ''
-            await self._show_notice(
-                f"Round {metric.get('round', 0)} · {metric.get('duration_ms', 0)}ms · "
-                f"{metric.get('prompt_tokens', 0)} in / {metric.get('completion_tokens', 0)} out · "
-                f"{marker}¥{float(metric.get('cost', 0)):.4f}{compressed}")
+            logger.info(
+                "round=%s duration_ms=%s input=%s output=%s cost=%s compressed=%s",
+                metric.get('round', 0), metric.get('duration_ms', 0),
+                metric.get('prompt_tokens', 0), metric.get('completion_tokens', 0),
+                metric.get('cost', 0), bool(metric.get('compressed')))
         elif e.type == 'session_end':
             await self._show_session_summary(e.payload.get('summary', {}))
         elif e.type == 'background_start':
             task_id = e.payload.get('task_id', '')
             self._background_tasks[task_id] = 'running'
-            await self._show_notice(f'Background task started: {task_id}')
+            logger.info('background task started: %s', task_id)
         elif e.type == 'background_end':
             task_id = e.payload.get('task_id', '')
             state = 'completed' if e.payload.get('ok') else 'failed'
             self._background_tasks[task_id] = state
-            await self._show_notice(f'Background task {state}: {task_id}')
+            if state == 'failed':
+                await self._show_notice(f'Background task failed: {task_id}')
+            else:
+                logger.info('background task completed: %s', task_id)
         self._chat.scroll_end(animate=False)   # scroll_end 是同步方法（返回 None）
 
     async def _render_history_message(self, message: dict) -> None:
@@ -786,7 +800,11 @@ class CCApp(App):
         title.append(f'{icon} {label} ', style=f'bold {color}')
         title.append(name, style='bold')
         if args:
-            title.append(f'  {CCApp._short_args(args)}', style=PALETTE['muted'])
+            detail = args.get('path') or args.get('file_path') or args.get('command')
+            if detail:
+                title.append(f'  {str(detail)}', style=PALETTE['muted'])
+            else:
+                title.append(f'  {CCApp._short_args(args)}', style=PALETTE['muted'])
         if duration_ms is not None:
             title.append(f'  {duration_ms / 1000:.1f}s', style=PALETTE['muted'])
         return title
@@ -855,7 +873,7 @@ class CCApp(App):
     def _update_status(self, payload: dict) -> None:
         """更新指标后重绘状态栏；活动态由 activity 事件统一驱动。"""
         if any(key in payload for key in (
-                'model', 'tools', 'ctx_pct', 'ctx_tokens', 'tokens', 'cost',
+                'model', 'workdir', 'tools', 'ctx_pct', 'ctx_tokens', 'tokens', 'cost',
                 'cost_source', 'ctx_source', 'recent_calls')):
             self._last_status.update(payload)
         self._status_refresh_pending = True
@@ -1014,7 +1032,10 @@ class CCApp(App):
         ctx = payload.get('ctx_pct')
         if ctx is not None and width >= 44:
             marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
-            parts.append(marker + CCApp._ctx_bar(int(ctx)))
+            label = marker + CCApp._ctx_bar(int(ctx))
+            if payload.get('ctx_tokens') is not None and payload.get('ctx_window'):
+                label += f" [dim]{int(payload['ctx_tokens'])}/{int(payload['ctx_window'])}[/]"
+            parts.append(label)
         if payload.get('tools') is not None and width >= 68:
             parts.append(f"[dim]{int(payload['tools'])} tools[/]")
         if payload.get('tokens') and width >= 78:
@@ -1022,6 +1043,8 @@ class CCApp(App):
         cost = payload.get('cost')
         if cost and width >= 96:
             parts.append(f"[dim]{self._format_cost(cost, payload.get('cost_source', 'estimated'))}[/]")
+        if payload.get('workdir') and width >= 72:
+            parts.append(f"[dim]{markup_escape(str(payload['workdir']))}[/]")
         return '  '.join(parts)
 
     @staticmethod
@@ -1049,8 +1072,9 @@ class CCApp(App):
 
         >75% 红 / >50% 黄 / 否则绿。占用随会话推进由 status 事件实时刷新。"""
         pct = max(0, min(100, pct))
-        filled = round(pct / 10)
-        bar = '\u2588' * filled + '\u2591' * (10 - filled)   # █ 已用 / ░ 剩余
+        width = 20
+        filled = round(pct / 100 * width)
+        bar = '\u2588' * filled + '\u2591' * (width - filled)
         color = PALETTE['danger'] if pct > 75 else PALETTE['warning'] if pct > 50 else PALETTE['success']
         return f'[{color}]{bar}[/] [dim]{pct}%[/]'
 

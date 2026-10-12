@@ -671,7 +671,8 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
                workdir: str = '', git_branch: str = '', cost=None, mode: str = '',
                cost_source: str = 'confirmed', ctx_source: str = 'confirmed',
                prompt_tokens=None, completion_tokens=None, cached_tokens=None,
-               reasoning_tokens=None, cache_creation_tokens=None) -> str:
+               reasoning_tokens=None, cache_creation_tokens=None,
+               ctx_tokens=None, ctx_window=None) -> str:
     """会话状态行：模式标签 / model(tier 色 pill) / git 分支 / 工具数 / 进度条 / 成本 / token。
 
     上下文使用率按阈值变色：>75% 红、>50% 黄、否则绿（Claude Code 状态行规则）。
@@ -688,7 +689,10 @@ def statusline(model: str = '', tools: int = 0, ctx_pct=None, tokens: str = '',
         parts.append(_pill('inactive', '{0} tools'.format(tools)))
     if ctx_pct is not None:
         prefix = '' if ctx_source == 'confirmed' else '~'
-        parts.append(prefix + ctx_bar(ctx_pct))
+        context_label = ctx_bar(ctx_pct)
+        if ctx_tokens is not None and ctx_window:
+            context_label += ' ' + str(ctx_tokens) + '/' + str(ctx_window)
+        parts.append(prefix + context_label)
     if cost is not None:
         # GBK 终端不支持半角 ¥(U+00A5)，退回全角 ￥(U+FFE5)，避免符号被替换成 ?
         cny = '\u00a5' if _can_encode('\u00a5') else '\uffe5'

@@ -699,6 +699,7 @@ def update_panel_status(messages:list, *, model: str = None,
     ctx_pct = min(100, int(100 * ctx_tokens / max(1, window)))
     bus.emit('status',
              model=model,
+             workdir=str(WORKDIR),
              tools=_SESSION_METRICS.get('tools', 0),
              ctx_pct=ctx_pct,
              ctx_tokens=ctx_tokens,

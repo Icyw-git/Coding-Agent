@@ -6,7 +6,10 @@ TextualRenderer 而业务代码零改动。import 本模块即触发默认后端
 """
 from ui_events import UIEvent, bus
 import cc_ui
+import logging
 import time
+
+logger = logging.getLogger('harness.ui')
 
 
 class BaseRenderer:
@@ -26,8 +29,7 @@ class AnsiRenderer(BaseRenderer):
         if e.type == 'user_message':
             cc_ui.safe_print('> ' + str(e.payload.get('text', '')))
         elif e.type == 'activity':
-            cc_ui.safe_print(cc_ui.status(
-                f"[{e.payload.get('state', 'ready')}] {e.payload.get('detail', '')}"))
+            logger.debug('[%s] %s', e.payload.get('state', 'ready'), e.payload.get('detail', ''))
         elif e.type == 'session_start':
             cc_ui.safe_print(cc_ui.status('Session started'))
         elif e.type == 'assistant_text':
@@ -40,7 +42,7 @@ class AnsiRenderer(BaseRenderer):
         elif e.type == 'assistant_end':
             print('')
         elif e.type == 'debug':
-            cc_ui.safe_print(e.payload.get('msg', ''))
+            logger.debug(e.payload.get('msg', ''))
         elif e.type == 'tool_start':
             name = e.payload.get('name', 'tool')
             args = e.payload.get('args', {})
@@ -70,10 +72,10 @@ class AnsiRenderer(BaseRenderer):
                 e.payload.get('title', 'Permission needed'),
                 [e.payload.get('tool', ''), str(e.payload.get('args', {}))]))
         elif e.type == 'background_start':
-            cc_ui.safe_print(cc_ui.status(f"Background started: {e.payload.get('task_id', '')}"))
+            logger.info('background task started: %s', e.payload.get('task_id', ''))
         elif e.type == 'background_end':
             state = 'completed' if e.payload.get('ok') else 'failed'
-            cc_ui.safe_print(cc_ui.status(f"Background {state}: {e.payload.get('task_id', '')}"))
+            logger.info('background task %s: %s', state, e.payload.get('task_id', ''))
         elif e.type == 'status':
             # 思考中提示：单行覆盖（\r 回行首 + idle 清行），避免等待时无反馈
             if e.payload.get('phase') == 'thinking':
@@ -90,9 +92,12 @@ class AnsiRenderer(BaseRenderer):
                 self._last_metric_status = now
                 line = cc_ui.statusline(
                     model=e.payload.get('model', ''),
+                    workdir=e.payload.get('workdir', ''),
                     tools=e.payload.get('tools', 0),
                     ctx_pct=e.payload.get('ctx_pct'),
                     ctx_source=e.payload.get('ctx_source', 'estimated'),
+                    ctx_tokens=e.payload.get('ctx_tokens'),
+                    ctx_window=e.payload.get('ctx_window'),
                     tokens=e.payload.get('tokens', ''),
                     prompt_tokens=e.payload.get('prompt_tokens'),
                     completion_tokens=e.payload.get('completion_tokens'),
@@ -105,14 +110,10 @@ class AnsiRenderer(BaseRenderer):
                     cc_ui.safe_print(line)
         elif e.type == 'round_end':
             metric = e.payload
-            source = metric.get('source', 'estimated')
-            prefix = '' if source in ('confirmed', 'provider_reported') else '~'
-            suffix = ' [compressed]' if metric.get('compressed') else ''
-            cc_ui.safe_print(cc_ui.status(
-                'Round {0}: {1}ms, {2} in / {3} out, {4}¥{5:.4f}{6}'.format(
-                    metric.get('round', 0), metric.get('duration_ms', 0),
-                    metric.get('prompt_tokens', 0), metric.get('completion_tokens', 0),
-                    prefix, float(metric.get('cost', 0)), suffix)))
+            logger.info('round=%s duration_ms=%s input=%s output=%s cost=%s compressed=%s',
+                        metric.get('round', 0), metric.get('duration_ms', 0),
+                        metric.get('prompt_tokens', 0), metric.get('completion_tokens', 0),
+                        metric.get('cost', 0), bool(metric.get('compressed')))
         elif e.type == 'session_end':
             summary = e.payload.get('summary', {})
             outcomes = summary.get('tool_outcomes', {})
