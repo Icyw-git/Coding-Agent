@@ -90,14 +90,21 @@ python entrypoint.py --resume <session_id>
 
 启动 HTTP API（可选）：
 
-```bash
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-api.txt
-uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
-```
+  ```bash
+  python -m pip install -r requirements.txt
+  python -m pip install -r requirements-api.txt
+  # PowerShell: $env:HARNESS_API_TOKEN = "replace-with-a-long-random-token"
+  uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
+  ```
 
-API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
-`GET /v1/sessions/{id}/events`（SSE）。
+  API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
+  `GET /v1/sessions/{id}/events`（SSE）。所有 `/v1/` 请求都需要
+  `Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
+  通过 SDK/应用工厂传入 `access_log_path`）。API 默认启用每个客户端和路径每分钟 60 次的轻量限流。
+
+  局域网手机访问：将监听地址改为 `--host 0.0.0.0`，确保电脑和手机在同一 Wi-Fi，查找电脑 IPv4 地址后在手机打开
+  `http://<电脑IPv4>:8000/docs`。首次使用时在 Swagger 页面点击 **Authorize**，填入
+  `Bearer <HARNESS_API_TOKEN>`。Windows 防火墙需要允许该端口的专用网络访问；不要在公网直接暴露此端口。
 
 ## 启动可视化界面
 
