@@ -96,6 +96,33 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['content']
 
+    def send_stream(self, content: str, session_id: str | None = None,
+                    on_delta=None) -> str:
+        """Run a turn over the message SSE endpoint and return final text."""
+        session_id = session_id or self.session_id
+        if not session_id:
+            raise RuntimeError('no active session; use /new first')
+        final = ''
+        with self.http.stream('POST', f'/v1/sessions/{session_id}/messages/stream',
+                              json={'content': content}) as response:
+            response.raise_for_status()
+            event = None
+            for line in response.iter_lines():
+                if line.startswith('event:'):
+                    event = line[6:].strip()
+                elif line.startswith('data:'):
+                    payload = json.loads(line[5:].strip())
+                    if event == 'delta':
+                        text = payload.get('text', '')
+                        final += text
+                        if on_delta:
+                            on_delta(text)
+                    elif event == 'done':
+                        final = payload.get('content', final)
+                    elif event == 'error':
+                        raise RuntimeError(payload.get('detail', 'stream failed'))
+        return final
+
     def start_stream(self) -> bool:
         """Follow the active session's SSE stream on a background thread."""
         if not self.session_id:

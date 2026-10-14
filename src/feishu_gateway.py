@@ -100,7 +100,7 @@ class LarkTransport:
         self._client = lark.Client.builder() \
             .app_id(app_id).app_secret(app_secret).build()
 
-    def send_text(self, chat_id: str, text: str) -> None:
+    def send_text(self, chat_id: str, text: str) -> str | None:
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
         request = CreateMessageRequest.builder() \
@@ -116,6 +116,18 @@ class LarkTransport:
         if not response.success():
             raise RuntimeError(
                 f'feishu send failed: {response.code} {response.msg}')
+        data = getattr(response, 'data', None)
+        return getattr(data, 'message_id', None) if data else None
+
+    def update_text(self, message_id: str, text: str) -> None:
+        from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
+        request = UpdateMessageRequest.builder().message_id(message_id).request_body(
+            UpdateMessageRequestBody.builder()
+            .content(json.dumps({'text': text}, ensure_ascii=False)).build()
+        ).build()
+        response = self._client.im.v1.message.update(request)
+        if not response.success():
+            raise RuntimeError(f'feishu update failed: {response.code} {response.msg}')
 
     def send_markdown(self, chat_id: str, md_text: str) -> None:
         """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
@@ -223,10 +235,36 @@ class FeishuGateway:
                 self._save_bindings()
             self._reply(chat_id, f'已创建会话 {session_id}')
         try:
-            reply = self.api.send(text, session_id=session_id)
-            self._reply(chat_id, f'{reply}')
+            self._send_agent_reply(chat_id, session_id, text)
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
+
+    def _send_agent_reply(self, chat_id: str, session_id: str, text: str) -> None:
+        """Stream into one editable text message when the transport supports it."""
+        updater = getattr(self.transport, 'update_text', None)
+        message_id = None
+        parts = []
+        last_update = 0.0
+
+        def on_delta(part: str) -> None:
+            nonlocal message_id, last_update
+            parts.append(part)
+            now = time.monotonic()
+            if updater and now - last_update >= 0.6:
+                if message_id is None:
+                    message_id = self.transport.send_text(chat_id, ''.join(parts) or '生成中…')
+                if message_id:
+                    updater(message_id, ''.join(parts))
+                    last_update = now
+
+        try:
+            reply = self.api.send_stream(text, session_id=session_id, on_delta=on_delta)
+        except (AttributeError, NotImplementedError):
+            reply = self.api.send(text, session_id=session_id)
+        if message_id and updater:
+            updater(message_id, reply)
+        else:
+            self._reply(chat_id, reply)
 
     # ---------- 快捷审批 ----------
 
@@ -413,7 +451,7 @@ class FeishuGateway:
         with self._chat_locks_guard:
             return self._chat_locks.setdefault(chat_id, threading.Lock())
 
-    def _reply(self, chat_id: str, text: str) -> None:
+    def _reply(self, chat_id: str, text: str):
         if self.transport is None or not text:
             return
         # 优先卡片（markdown 可渲染），失败回退纯文本
@@ -424,7 +462,7 @@ class FeishuGateway:
                 return
             except Exception as exc:
                 print(f'[feishu] card send failed, fallback to text: {exc}')
-        self.transport.send_text(chat_id, text)
+        return self.transport.send_text(chat_id, text)
 
     # ---------- 飞书长连接（需真实凭证） ----------
 
