@@ -90,6 +90,8 @@ Collapsible:focus { border-left: thick $info; }
 #input-line { height: 1; padding: 0 2; background: $surface; color: $text; border: none; }
 #input-line:focus { border: none; }
 #status-line { height: 1; background: $surface; color: $muted; padding: 0 2; }
+#status-main { width: 1fr; }
+#status-context { width: auto; min-width: 24; }
 
 /* ---- 权限 Modal（CC：蓝紫边框权限确认） ---- */
 #perm-box { width: 76; padding: 2 3; border: round $permission; background: $raised; }
@@ -249,7 +251,9 @@ class CCApp(App):
                 yield Static('', id='recent-tools')
         with Vertical(id="bottom-bar"):
             yield Input(placeholder="输入消息，Enter 发送 · Ctrl+C 退出", id="input-line")
-            yield Static('', id="status-line")
+            with Horizontal(id="status-line"):
+                yield Static('', id="status-main")
+                yield Static('', id="status-context")
 
     def on_mount(self) -> None:
         import os
@@ -871,7 +875,13 @@ class CCApp(App):
     def _status_line(self):
         """#status-line 的防御性查询：应用关闭窗口期 widget 可能已销毁。"""
         try:
-            return self.query_one('#status-line', Static)
+            return self.query_one('#status-main', Static)
+        except Exception:
+            return None
+
+    def _context_line(self):
+        try:
+            return self.query_one('#status-context', Static)
         except Exception:
             return None
 
@@ -881,7 +891,7 @@ class CCApp(App):
             return
         elapsed = time.monotonic() - self._stream_start
         spin = self._SPINNERS[int(time.monotonic() * 6) % len(self._SPINNERS)]
-        base = self._pills(self._last_status)
+        base = self._pills(self._last_status, include_context=False)
         line = self._status_line()
         if line is None:
             return
@@ -948,8 +958,7 @@ class CCApp(App):
         step = max(1, int(abs(target - current) * 0.34))
         moved = current + step * (1 if target > current else -1)
         self._ctx_display_cells = max(0, min(CTX_BAR_CELLS, moved))
-        self._refresh_status_line()
-        self._refresh_sidebar()
+        self._refresh_context_line()
 
     def _display_status(self, payload: dict) -> dict:
         """Status metrics for rendering: numeric labels show the reported
@@ -1103,12 +1112,28 @@ class CCApp(App):
             detail = ''
         elif len(detail) > 36:
             detail = detail[:33] + '...'
-        base = self._pills(self._last_status)
+        base = self._pills(self._last_status, include_context=False)
         line.update(f'[bold {color}]{label}[/]'
                     f'{(" [dim]" + detail + "[/]") if detail else ""}'
                     f'{("  " + base) if base else ""}')
+        self._refresh_context_line()
 
-    def _pills(self, payload: dict) -> str:
+    def _refresh_context_line(self) -> None:
+        line = self._context_line()
+        if line is None:
+            return
+        payload = self._display_status(self._last_status)
+        ctx = payload.get('ctx_pct')
+        if ctx is None or self.size.width < 44:
+            line.update('')
+            return
+        marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
+        label = marker + CCApp._ctx_bar(float(ctx), cells=self._ctx_display_cells)
+        if payload.get('ctx_tokens') is not None and payload.get('ctx_window'):
+            label += f" [dim]{int(payload['ctx_tokens'])}/{int(payload['ctx_window'])}[/]"
+        line.update(label)
+
+    def _pills(self, payload: dict, include_context: bool = True) -> str:
         """按终端宽度保留从模型到成本的递减优先级指标。"""
         payload = self._display_status(payload)
         width = self.size.width
@@ -1116,7 +1141,7 @@ class CCApp(App):
         if payload.get('model') and width >= 58:
             parts.append(f"[{PALETTE['accent']} on {PALETTE['raised']}] {markup_escape(str(payload['model']))} [/]")
         ctx = payload.get('ctx_pct')
-        if ctx is not None and width >= 44:
+        if include_context and ctx is not None and width >= 44:
             marker = '' if payload.get('ctx_source') == 'confirmed' else '~'
             label = marker + CCApp._ctx_bar(float(ctx), cells=self._ctx_display_cells)
             if payload.get('ctx_tokens') is not None and payload.get('ctx_window'):
