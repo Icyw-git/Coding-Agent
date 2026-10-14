@@ -190,14 +190,17 @@ class LarkTransport:
         return getattr(data, 'message_id', None) if data else None
 
     def update_markdown(self, message_id: str, md_text: str) -> None:
-        """Update an existing interactive card in place."""
-        from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
-        request = UpdateMessageRequest.builder().message_id(message_id).request_body(
-            UpdateMessageRequestBody.builder()
-            .msg_type('interactive')
+        """Update an existing interactive card in place.
+
+        PATCH /im/v1/messages/:message_id 的 body 只收 content（卡片 JSON），
+        带 msg_type 会报 230001 invalid msg_type——message.update 那条路不通。
+        """
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+        request = PatchMessageRequest.builder().message_id(message_id).request_body(
+            PatchMessageRequestBody.builder()
             .content(self._markdown_card(md_text)).build()
         ).build()
-        response = self._client.im.v1.message.update(request)
+        response = self._client.im.v1.message.patch(request)
         if not response.success():
             raise RuntimeError(
                 f'feishu card update failed: {response.code} {response.msg}')
