@@ -8,13 +8,29 @@ from collections.abc import Iterable
 from harness_sdk import HarnessClient
 from agent_runtime import SessionAlreadyExistsError
 
+try:
+    from pydantic import BaseModel, Field
+except ImportError:  # Keep CLI-only installs importable without API dependencies.
+    BaseModel = None
+    Field = None
+
+# 请求模型必须放在模块层：端点注解经 `from __future__ import annotations`
+# 惰性化后，FastAPI 只在模块全局命名空间解析；若定义在 create_app 内部会
+# 解析失败，request 被降级成 query 参数（表现为 422 Field required）。
+if BaseModel is not None:
+    class CreateSessionRequest(BaseModel):
+        id: str | None = Field(default=None, min_length=1)
+
+
+    class SendMessageRequest(BaseModel):
+        content: str = Field(min_length=1)
+
 
 def create_app(runtime=None):
     """Create the HTTP application without starting background services."""
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.responses import StreamingResponse
-        from pydantic import BaseModel, Field
     except ImportError as exc:  # optional dependency for CLI-only installs
         raise RuntimeError(
             "FastAPI support requires optional dependencies; install with "
@@ -22,12 +38,6 @@ def create_app(runtime=None):
         ) from exc
 
     client = HarnessClient(runtime or _default_runtime())
-
-    class CreateSessionRequest(BaseModel):
-        id: str | None = Field(default=None, min_length=1)
-
-    class SendMessageRequest(BaseModel):
-        content: str = Field(min_length=1)
 
     app = FastAPI(title="Harness Agent API", version="1.0")
 
