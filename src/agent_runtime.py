@@ -1,0 +1,79 @@
+"""Reusable session service around the existing agent turn executor.
+
+The runtime deliberately owns session orchestration, while the caller supplies
+the actual turn executor. This keeps CLI, SDK, and HTTP adapters on one path
+without making the core loop depend on a particular transport.
+"""
+
+from __future__ import annotations
+
+import threading
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Type
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    """Result returned by one completed user turn."""
+
+    session_id: str
+    content: str
+
+
+class AgentRuntime:
+    """Coordinate persisted sessions and invoke a supplied agent turn runner."""
+
+    def __init__(
+        self,
+        run_turn: Callable[..., str],
+        session_store_cls: Type,
+        sessions_dir: Path,
+        resolve_session_path: Callable[[str], Path] | None = None,
+    ) -> None:
+        self._run_turn = run_turn
+        self._session_store_cls = session_store_cls
+        self._sessions_dir = Path(sessions_dir)
+        self._resolve_session_path = resolve_session_path
+        self._locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
+
+    def create_session(self, session_id: str | None = None) -> str:
+        """Create an empty persisted session and return its identifier."""
+        session_id = session_id or uuid.uuid4().hex
+        if not session_id.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("Invalid session ID")
+        store = self._session_store_cls(self._sessions_dir, session_id=session_id)
+        store.append("session_created")
+        return store.session_id
+
+    def send(self, session_id: str, content: str) -> AgentResult:
+        """Append a user message, run one turn, and return the assistant content."""
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("message content must be a non-empty string")
+        store = self._open_session(session_id)
+        with self._session_lock(session_id):
+            messages = store.rebuild_openai_history()
+            message = {"role": "user", "content": content}
+            messages.append(message)
+            store.append_message(message)
+            result = self._run_turn(messages, session_store=store)
+            return AgentResult(session_id=store.session_id, content=result)
+
+    def history(self, session_id: str) -> list[dict]:
+        """Return the replayable OpenAI history for a persisted session."""
+        return self._open_session(session_id).rebuild_openai_history()
+
+    def _open_session(self, session_id: str):
+        if self._resolve_session_path is not None:
+            path = self._resolve_session_path(session_id)
+        else:
+            path = self._sessions_dir / f"session_{session_id}.jsonl"
+            if not path.is_file():
+                raise FileNotFoundError(f"Session {session_id} not found")
+        return self._session_store_cls.open(path)
+
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        with self._locks_guard:
+            return self._locks.setdefault(session_id, threading.RLock())

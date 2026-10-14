@@ -88,6 +88,16 @@ python entrypoint.py --resume <session_id>
 
 交互过程中可使用 `/status` 查看当前运行状态，使用 `/sessions` 查看已保存会话，使用 `/resume <session_id>` 切换到已有会话。
 
+启动 HTTP API（可选）：
+
+```bash
+python -m pip install -r requirements.txt
+uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
+`GET /v1/sessions/{id}/events`（SSE）。
+
 ## 启动可视化界面
 
 ```bash
@@ -123,6 +133,9 @@ python -m pytest --basetemp .test-tmp
 | `entrypoint.py` | 命令行入口、服务启动和退出清理 |
 | `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
+| `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
+| `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
+| `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
 | `tests/` | 自动化测试与测试辅助程序 |
 | `docs/` | 架构、检查点设计和开发记录 |
 | `archive/legacy/` | 已停用的历史实现 |

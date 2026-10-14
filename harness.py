@@ -34,6 +34,7 @@ from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
 from mcp_bridge import register_mcp_tools, shutdown_mcp
 from session_store import SessionEventStore, SessionReplayError
+from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
@@ -887,6 +888,16 @@ def resume_agent_loop(session_path: Path):
         messages.append(recovery_message)
         session_store.append_message(recovery_message)
     return agent_loop(messages, session_store=session_store)
+
+
+def create_runtime() -> AgentRuntime:
+    """Build the transport-independent runtime used by SDK and API adapters."""
+    return AgentRuntime(
+        run_turn=agent_loop,
+        session_store_cls=SessionEventStore,
+        sessions_dir=SESSIONS_DIR,
+        resolve_session_path=resolve_session_path,
+    )
 
 
 def run_agent_turn_locked():

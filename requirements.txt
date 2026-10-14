@@ -2,5 +2,9 @@
 openai>=1.0
 python-dotenv>=1.0
 
+# Optional HTTP API dependencies
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+
 # Test dependencies
 pytest>=8.0
