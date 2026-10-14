@@ -10,6 +10,7 @@ class RuntimeClient(Protocol):
     def create_session(self, session_id: str | None = None) -> str: ...
     def send(self, session_id: str, content: str): ...
     def history(self, session_id: str) -> list[dict]: ...
+    def list_sessions(self, limit: int = 20) -> list[dict]: ...
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,9 @@ class Sessions:
 
     def get(self, session_id: str) -> Session:
         return Session(id=session_id, history=self._runtime.history(session_id))
+
+    def list(self, limit: int = 20) -> list[dict]:
+        return self._runtime.list_sessions(limit)
 
 
 class Messages:

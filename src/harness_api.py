@@ -8,11 +8,13 @@ import os
 import secrets
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from dataclasses import asdict
 from pathlib import Path
 
 from harness_sdk import HarnessClient
 from agent_runtime import SessionAlreadyExistsError
+from session_store import SessionReplayError
+from task_manager import TaskManager
 
 try:
     from pydantic import BaseModel, Field
@@ -32,12 +34,17 @@ if BaseModel is not None:
         content: str = Field(min_length=1)
 
 
+    class CreateTaskRequest(BaseModel):
+        command: str = Field(min_length=1)
+        cwd: str | None = None
+
+
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
-               access_log_path: str | None = None):
+               access_log_path: str | None = None, task_root=None):
     """Create the HTTP application without starting background services."""
     try:
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
         from starlette.middleware.base import BaseHTTPMiddleware
     except ImportError as exc:  # optional dependency for CLI-only installs
         raise RuntimeError(
@@ -51,7 +58,15 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     if rate_limit < 1:
         raise ValueError("rate_limit must be at least 1")
 
-    client = HarnessClient(runtime or _default_runtime())
+    runtime = runtime or _default_runtime()
+    client = HarnessClient(runtime)
+    # 独立命名空间：.cache/tasks 已被 task_system（agent TODO 列表）占用
+    task_base = Path(task_root or os.getenv("HARNESS_TASK_ROOT")
+                     or Path.cwd() / ".cache" / "os_tasks")
+    tasks = TaskManager(
+        task_base,
+        allowed_root=os.getenv("HARNESS_TASK_ROOT") or Path.cwd(),
+    )
 
     app = FastAPI(title="Harness Agent API", version="1.0")
 
@@ -128,6 +143,106 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"id": session.id, "history": session.history}
+
+    @app.get("/v1/sessions")
+    def list_sessions(limit: int = 20):
+        return {"sessions": runtime.list_sessions(limit)}
+
+    @app.get("/v1/sessions/{session_id}/stream")
+    def stream_session(session_id: str, after: int = 0, poll: float = 0.3,
+                       once: bool = False, follow_seconds: float = 0.0):
+        """SSE live monitoring: replay events after ``seq > after``, then follow.
+
+        Emits every raw session event (message / tool_started / compaction /
+        turn_completed / ...) as ``event: <type>`` frames, with heartbeat
+        comments while idle. ``once=1`` closes right after the replay
+        (snapshot pull); ``follow_seconds`` bounds the follow phase (0 = open
+        until client disconnect).
+        """
+        try:
+            store = runtime.open_session(session_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        poll = min(max(poll, 0.05), 5.0)
+        follow_budget = min(max(follow_seconds, 0.0), 3600.0)
+
+        def render(event: dict) -> str:
+            return (f"event: {event.get('type', 'event')}\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
+
+        def follow():
+            try:
+                history = store.read_events()
+            except SessionReplayError as exc:
+                yield ("event: stream_error\ndata: "
+                       + json.dumps({"detail": str(exc)}, ensure_ascii=False)
+                       + "\n\n")
+                return
+            offset = store.path.stat().st_size
+            for event in history:
+                if int(event.get("seq", 0)) > after:
+                    yield render(event)
+            if once:
+                yield "event: done\ndata: {}\n\n"
+                return
+            deadline = time.monotonic() + follow_budget if follow_budget else None
+            last_beat = time.monotonic()
+            while True:
+                fresh, offset = store.tail_events(offset)
+                for event in fresh:
+                    last_beat = time.monotonic()
+                    yield render(event)
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    yield "event: done\ndata: {}\n\n"
+                    return
+                if now - last_beat >= 15:
+                    yield ": ping\n\n"
+                    last_beat = now
+                time.sleep(poll)
+
+        return StreamingResponse(
+            follow(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/v1/tasks", status_code=201)
+    def create_task(request: CreateTaskRequest):
+        try:
+            record = tasks.create(request.command, request.cwd)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"task": asdict(record)}
+
+    @app.get("/v1/tasks")
+    def list_tasks(limit: int = 50):
+        return {"tasks": [asdict(record) for record in tasks.list(limit)]}
+
+    @app.get("/v1/tasks/{task_id}")
+    def get_task(task_id: str):
+        try:
+            record = tasks.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        return {"task": asdict(record)}
+
+    @app.post("/v1/tasks/{task_id}/stop")
+    def stop_task(task_id: str):
+        try:
+            record = tasks.stop(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"task": asdict(record)}
+
+    @app.get("/v1/tasks/{task_id}/logs")
+    def task_logs(task_id: str, tail: int = 200):
+        try:
+            tasks.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+        return PlainTextResponse(tasks.tail_logs(task_id, tail))
 
     @app.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):

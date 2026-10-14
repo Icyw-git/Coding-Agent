@@ -30,6 +30,32 @@ def test_rebuild_openai_history_preserves_tool_pair(tmp_path):
     assert store.pending_tool_calls() == []
 
 
+def test_tail_events_reads_incrementally_and_holds_partial_line(tmp_path):
+    """tail_events：增量读、暂停在半行上、半行补全后可继续读出。"""
+    store = SessionEventStore(tmp_path, session_id="tail")
+    store.append("session_created")
+    store.append_message({"role": "user", "content": "hi"})
+
+    events, offset = store.tail_events(0)
+    assert [e["type"] for e in events] == ["session_created", "message"]
+
+    again, offset = store.tail_events(offset)
+    assert again == []
+
+    # 写半行（模拟进程写到一半）→ tail 停在它之前
+    with open(store.path, "a", encoding="utf-8") as handle:
+        handle.write('{"v":1,"seq":3,"type":"turn')
+    partial, held_offset = store.tail_events(offset)
+    assert partial == [] and held_offset == offset
+
+    # 半行补全 → 下次 tail 读出完整事件
+    with open(store.path, "a", encoding="utf-8") as handle:
+        handle.write('_completed"}\n')
+    done, offset = store.tail_events(offset)
+    assert [e["type"] for e in done] == ["turn_completed"]
+    assert offset > held_offset
+
+
 def test_pending_tool_call_produces_recovery_message(tmp_path):
     store = SessionEventStore(tmp_path, session_id="pending")
     store.append_message({"role": "user", "content": "inspect"})

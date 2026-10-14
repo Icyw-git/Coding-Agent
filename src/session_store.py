@@ -178,6 +178,37 @@ class SessionEventStore:
             events.append(event)
         return events
 
+    def tail_events(self, offset: int = 0) -> tuple[list[dict], int]:
+        """Incrementally read complete JSONL events from a byte offset.
+
+        Returns (events, new_offset). A trailing partial line (mid-write) is
+        left unconsumed until it is completed, so a live tailer never sees
+        torn events. Corrupt lines are skipped to keep the tail resilient.
+        """
+        if offset < 0:
+            offset = 0
+        if not self.path.exists():
+            return [], offset
+        with open(self.path, 'rb') as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+        if not chunk:
+            return [], offset
+        events = []
+        lines = chunk.split(b'\n')
+        lines.pop()   # trailing piece: complete only when chunk ended with \n
+        for raw in lines:
+            offset += len(raw) + 1
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue   # torn/corrupt line: skip, keep the tail alive
+            if isinstance(event, dict):
+                events.append(event)
+        return events, offset
+
     def rebuild_openai_history(self) -> list[dict]:
         """Rebuild the current compacted OpenAI history from the append-only event stream."""
         messages = []

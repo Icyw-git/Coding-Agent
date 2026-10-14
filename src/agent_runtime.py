@@ -73,6 +73,33 @@ class AgentRuntime:
         """Return the replayable OpenAI history for a persisted session."""
         return self._open_session(session_id).rebuild_openai_history()
 
+    def open_session(self, session_id: str):
+        """Open the persisted event store of an existing session (live tailing)."""
+        return self._open_session(session_id)
+
+    def list_sessions(self, limit: int = 20) -> list[dict]:
+        """Summarize persisted sessions, most recently updated first."""
+        if not self._sessions_dir.is_dir():
+            return []
+        paths = sorted(
+            self._sessions_dir.glob('session_*.jsonl'),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        )[:limit]
+        rows = []
+        for path in paths:
+            try:
+                store = self._session_store_cls.open(path)
+                title = store.session_title()
+            except (OSError, ValueError):
+                continue   # unreadable/corrupt log: leave it out of the listing
+            rows.append({
+                'id': store.session_id,
+                'title': title,
+                'events': store.last_seq,
+                'updated': path.stat().st_mtime,
+            })
+        return rows
+
     def _open_session(self, session_id: str):
         if self._resolve_session_path is not None:
             path = self._resolve_session_path(session_id)
