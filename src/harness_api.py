@@ -6,6 +6,8 @@ import json
 import asyncio
 import logging
 import os
+import queue
+import threading
 import secrets
 import time
 from collections import defaultdict, deque
@@ -293,6 +295,43 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"session_id": response.session_id, "content": response.content}
+
+    @app.post("/v1/sessions/{session_id}/messages/stream")
+    def stream_message(session_id: str, request: SendMessageRequest):
+        """Run one turn and emit text deltas as SSE frames."""
+        deltas: queue.Queue = queue.Queue()
+        finished = object()
+
+        def run() -> None:
+            try:
+                response = client.messages.create(
+                    session_id, request.content,
+                    on_delta=lambda text: deltas.put(("delta", text)),
+                )
+                deltas.put(("done", {"session_id": response.session_id,
+                                     "content": response.content}))
+            except Exception as exc:
+                deltas.put(("error", str(exc)))
+            finally:
+                deltas.put(("close", finished))
+
+        threading.Thread(target=run, daemon=True).start()
+
+        def events():
+            while True:
+                kind, payload = deltas.get()
+                if kind == "delta":
+                    yield f"event: delta\ndata: {json.dumps({'text': payload}, ensure_ascii=False)}\n\n"
+                elif kind == "done":
+                    yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif kind == "error":
+                    yield f"event: error\ndata: {json.dumps({'detail': payload}, ensure_ascii=False)}\n\n"
+                else:
+                    return
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
 
     @app.get("/v1/sessions/{session_id}/events")
     def stream_events(session_id: str):

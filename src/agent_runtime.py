@@ -56,7 +56,7 @@ class AgentRuntime:
             store.append("session_created")
             return store.session_id
 
-    def send(self, session_id: str, content: str) -> AgentResult:
+    def send(self, session_id: str, content: str, on_delta=None) -> AgentResult:
         """Append a user message, run one turn, and return the assistant content."""
         if not isinstance(content, str) or not content.strip():
             raise ValueError("message content must be a non-empty string")
@@ -66,7 +66,10 @@ class AgentRuntime:
             message = {"role": "user", "content": content}
             messages.append(message)
             store.append_message(message)
-            result = self._run_turn(messages, session_store=store)
+            if on_delta is None:
+                result = self._run_turn(messages, session_store=store)
+            else:
+                result = self._run_turn(messages, session_store=store, on_delta=on_delta)
             return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:

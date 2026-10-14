@@ -8,7 +8,7 @@ from typing import Protocol
 
 class RuntimeClient(Protocol):
     def create_session(self, session_id: str | None = None) -> str: ...
-    def send(self, session_id: str, content: str): ...
+    def send(self, session_id: str, content: str, on_delta=None): ...
     def history(self, session_id: str) -> list[dict]: ...
     def list_sessions(self, limit: int = 20) -> list[dict]: ...
 
@@ -44,8 +44,11 @@ class Messages:
     def __init__(self, runtime: RuntimeClient) -> None:
         self._runtime = runtime
 
-    def create(self, session_id: str, content: str) -> MessageResponse:
-        result = self._runtime.send(session_id, content)
+    def create(self, session_id: str, content: str, on_delta=None) -> MessageResponse:
+        if on_delta is None:
+            result = self._runtime.send(session_id, content)
+        else:
+            result = self._runtime.send(session_id, content, on_delta=on_delta)
         return MessageResponse(session_id=result.session_id, content=result.content)
 
 

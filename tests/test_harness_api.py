@@ -46,14 +46,29 @@ class FakeRuntime:
         return [{'id': sid, 'title': '(untitled session)', 'events': 0,
                  'updated': 0.0} for sid in list(self.sessions)[:limit]]
 
-    def send(self, session_id, content):
+    def send(self, session_id, content, on_delta=None):
         if session_id not in self.sessions:
             raise FileNotFoundError(session_id)
         self.sessions[session_id].extend([
             {"role": "user", "content": content},
             {"role": "assistant", "content": "done"},
         ])
+        if on_delta:
+            on_delta('done')
         return Result(session_id, "done")
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_streams_message_deltas(api_client):
+    runtime = FakeRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'stream-api'}, headers=headers).status_code == 201
+    response = client.post('/v1/sessions/stream-api/messages/stream',
+                           json={'content': 'hello'}, headers=headers)
+    assert response.status_code == 200
+    assert 'event: delta' in response.text
+    assert 'event: done' in response.text
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")

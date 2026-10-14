@@ -25,12 +25,16 @@ import pytest
 def _isolate_llm_side_channels(monkeypatch):
     """这些测试只脚本化「主循环」的 LLM 调用。load_memories / extract_memories /
     consolidate_memories / generate_session_title 是同一 client 上的副通道调用，
-    会按序消费脚本响应队列，导致工具流程断言全部错位——一律打桩。"""
+    会按序消费脚本响应队列，导致工具流程断言全部错位——一律打桩。
+    回合后的后台 housekeeping 线程同样打桩（否则 monkeypatch 还原后会在
+    测试结束前Race 到真实 LLM 调用）。"""
     monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
     monkeypatch.setattr(harness, 'extract_memories', lambda pre_compress: None)
     monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
     monkeypatch.setattr(harness, 'generate_session_title',
                         lambda messages: '(untitled session)')
+    monkeypatch.setattr(harness, '_post_turn_housekeeping',
+                        lambda *args, **kwargs: None)
 
 
 # ---------- logger：统一输出带时间戳的调试日志，方便排查 ----------

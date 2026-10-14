@@ -75,3 +75,21 @@ def test_runtime_uses_resolver_for_session_ids(tmp_path):
 
     assert runtime.history("known") == []
     assert seen == ["known"]
+
+
+def test_runtime_forwards_stream_delta_callback(tmp_path):
+    received = []
+
+    def run_turn(messages, session_store, on_delta=None):
+        on_delta('hello')
+        assistant = {'role': 'assistant', 'content': 'hello'}
+        messages.append(assistant)
+        session_store.append_message(assistant)
+        return 'hello'
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('stream')
+    result = runtime.send(session_id, 'go', on_delta=received.append)
+
+    assert result.content == 'hello'
+    assert received == ['hello']

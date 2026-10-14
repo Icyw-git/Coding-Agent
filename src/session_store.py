@@ -27,6 +27,7 @@ class SessionEventStore:
             self.session_id = session_id or uuid.uuid4().hex
             self.path = self.directory / f"session_{self.session_id}.jsonl"
         self._next_seq = self._read_last_seq() + 1
+        self._known_size = self.path.stat().st_size if self.path.exists() else 0
 
     @classmethod
     def open(cls, path: Path):
@@ -52,7 +53,10 @@ class SessionEventStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self._path_lock(self.path):
             # Re-read under the path lock so separate store instances cannot reuse a sequence number.
-            next_seq = self._read_last_seq() + 1
+            current_size = self.path.stat().st_size if self.path.exists() else 0
+            if current_size != self._known_size:
+                self._next_seq = self._read_last_seq() + 1
+            next_seq = self._next_seq
             event = {
                 "v": 1,
                 "seq": next_seq,
@@ -68,6 +72,7 @@ class SessionEventStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             self._next_seq = next_seq + 1
+            self._known_size = current_size + len(encoded.encode('utf-8'))
         return event
 
     def append_message(self, message: dict) -> dict:

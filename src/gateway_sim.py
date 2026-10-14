@@ -166,8 +166,11 @@ class GatewayClient:
 
     # ---------- tasks ----------
 
-    def create_task(self, command: str) -> dict:
-        response = self.http.post('/v1/tasks', json={'command': command})
+    def create_task(self, command: str, cwd: str | None = None) -> dict:
+        payload = {'command': command}
+        if cwd:
+            payload['cwd'] = cwd
+        response = self.http.post('/v1/tasks', json=payload)
         response.raise_for_status()
         return response.json()['task']
 

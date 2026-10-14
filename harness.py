@@ -6,6 +6,7 @@ import json
 import time
 import threading
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Optional, List
 
@@ -81,6 +82,20 @@ def resolve_session_path(session_id: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f'Session {session_id} not found')
     return path
+
+
+def set_workspace(path: str) -> Path:
+    """Switch the agent workspace without changing the process-wide cwd."""
+    global WORKDIR, SKILLS_DIR
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = WORKDIR / candidate
+    candidate = candidate.resolve()
+    if not candidate.is_dir():
+        raise ValueError(f'Workspace does not exist: {candidate}')
+    WORKDIR = candidate
+    SKILLS_DIR = WORKDIR / 'skills'
+    return WORKDIR
 
 
 def format_session_list(limit: int = 20) -> str:
@@ -635,6 +650,10 @@ def handle_command(line:str,messages:list,session_store)->None:
     parts=line.split()
     command=parts[0].lower()
     manager=get_checkpoint_manager(session_store)
+    command = {
+        '/s': '/sessions', '/p': '/pwd', '/w': '/pwd',
+        '/cps': '/checkpoints', '/cp': '/checkpoint',
+    }.get(command, command)
 
     if command=='/checkpoints':
         print(format_checkpoint_list(manager))
@@ -644,6 +663,18 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/sessions':
         print(format_session_list())
+
+    elif command == '/pwd':
+        print(f'  workspace: {WORKDIR}')
+
+    elif command == '/cd':
+        if len(parts) < 2:
+            print(f'  workspace: {WORKDIR}')
+            return
+        try:
+            print(f'  workspace: {set_workspace(" ".join(parts[1:]))}')
+        except ValueError as exc:
+            print(f'  [workspace] {exc}')
 
     elif command=='/checkpoint':
         label=' '.join(parts[1:])
@@ -688,7 +719,75 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(f"  unknown command: {command}")
 
 
-def agent_loop(messages:list, session_store=None):
+def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store):
+    """回合结束后的副通道作业：会话标题生成 + 记忆提炼/合并。
+
+    每项各自要走一次 LLM——放后台线程执行，回复立即返回给调用方，
+    不让飞书/SDK 用户多等几秒到几十秒。异常只告警，绝不影响主流程。
+    """
+    try:
+        if not session_store.saved_session_title():
+            title = generate_session_title(messages_snapshot)
+            if title != '(untitled session)':
+                session_store.append_session_title(title)
+    except Exception as exc:
+        print(f'  \033[33m[title] skipped: {exc}\033[0m')
+    try:
+        extract_memories(pre_compress)
+        consolidate_memories()
+    except Exception as exc:
+        print(f'  \033[33m[memory] skipped: {exc}\033[0m')
+
+
+_housekeeping_threads: list[threading.Thread] = []
+_housekeeping_lock = threading.Lock()
+
+
+def wait_for_housekeeping(timeout: float = 30.0) -> None:
+    """等待回合末尾的后台作业全部结束（测试断言/优雅退出用）。"""
+    deadline = time.time() + timeout
+    for thread in list(_housekeeping_threads):
+        thread.join(timeout=max(0.0, deadline - time.time()))
+
+
+def _stream_completion(create_kwargs, on_delta):
+    """Collect a streamed completion while preserving the existing response shape."""
+    stream = client.chat.completions.create(**create_kwargs, stream=True)
+    text_parts = []
+    tool_calls = {}
+    finish_reason = None
+    for chunk in stream:
+        choice = chunk.choices[0]
+        finish_reason = choice.finish_reason or finish_reason
+        delta = choice.delta
+        if getattr(delta, 'content', None):
+            part = delta.content
+            text_parts.append(part)
+            on_delta(part)
+        for call in getattr(delta, 'tool_calls', None) or []:
+            current = tool_calls.setdefault(call.index, {
+                'id': call.id or '', 'type': call.type or 'function',
+                'function': {'name': '', 'arguments': ''},
+            })
+            if call.id:
+                current['id'] = call.id
+            function = getattr(call, 'function', None)
+            if function is not None:
+                current['function']['name'] += function.name or ''
+                current['function']['arguments'] += function.arguments or ''
+    calls = [SimpleNamespace(
+        id=item['id'], type=item['type'],
+        function=SimpleNamespace(**item['function']))
+        for _, item in sorted(tool_calls.items())]
+    message = SimpleNamespace(
+        role='assistant', content=''.join(text_parts) or None,
+        tool_calls=calls or None,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
+
+
+def agent_loop(messages:list, session_store=None, on_delta=None):
     """Run one OpenAI session, recording an append-only event stream for recovery."""
     if session_store is None:
         session_store = SessionEventStore(SESSIONS_DIR)
@@ -752,13 +851,16 @@ def agent_loop(messages:list, session_store=None):
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
-            return client.chat.completions.create(
+            kwargs = dict(
                 model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
                 messages=request_messages,
                 tools=TOOLS,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
+            if on_delta is None:
+                return client.chat.completions.create(**kwargs)
+            return _stream_completion(kwargs, on_delta)
 
         try: #错误恢复逻辑
             response=recovery.with_retry(_create,recovery_state)
@@ -775,7 +877,19 @@ def agent_loop(messages:list, session_store=None):
 
 
         message=response.choices[0].message
-        assistant_message = message.model_dump()
+        if hasattr(message, 'model_dump'):
+            assistant_message = message.model_dump()
+        else:
+            assistant_message = {
+                'role': 'assistant',
+                'content': message.content,
+                'tool_calls': [
+                    {'id': call.id, 'type': call.type,
+                     'function': {'name': call.function.name,
+                                  'arguments': call.function.arguments}}
+                    for call in (message.tool_calls or [])
+                ] or None,
+            }
         messages.append(assistant_message) #添加模型回复到上下文
         session_store.append_message(assistant_message)
 
@@ -796,19 +910,21 @@ def agent_loop(messages:list, session_store=None):
                 print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
-            if not session_store.saved_session_title():
-                title = generate_session_title(messages)
-                if title != '(untitled session)':
-                    session_store.append_session_title(title)
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
-            # extract_memories(pre_compress)：从「压缩前快照」提炼记忆（压缩会丢细节，快照保证不漏）。
-            # 提炼对象：user(用户偏好) / feedback(引导性反馈) / project(项目事实) / reference(外部参考)。
-            # ⚠️ 提醒：只负责落盘到 .cache/memories/*.md，不会反馈回当前 Loop ——
-            #    本会话的新记忆要等下一次会话 load_memories 才会被召回。
-            extract_memories(pre_compress)   # 从压缩前快照提炼记忆，压缩不丢信息
-            # consolidate_memories()：仅当记忆文件数 ≥ CONSOLIDATE_THRESHOLD(10) 时触发，
-            #    合并重复/过期记忆；LLM 返回空数组时会中止，防止删光所有记忆。
-            consolidate_memories()
+            # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
+            # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
+            housekeeping = threading.Thread(
+                target=_post_turn_housekeeping,
+                args=(pre_compress, list(messages), session_store),
+                daemon=True,
+            )
+            with _housekeeping_lock:
+                # 只清理「已启动且已死」的旧线程——is_alive() 对未 start 的线程
+                # 也返回 False，必须先清理再注册，否则会把本线程误删
+                _housekeeping_threads[:] = [th for th in _housekeeping_threads
+                                            if th.is_alive()]
+                _housekeeping_threads.append(housekeeping)
+            housekeeping.start()
             return message.content or "No output"
             
 
@@ -929,7 +1045,8 @@ def run_repl(initial_messages:list, session_store=None):
         for message in messages:
             session_store.append_message(message)
     print(f'[session log:{session_store.path}]')
-    print('  \033[90mcommands: /status /sessions /resume <id> /checkpoints /checkpoint [label] '
+    print('  \033[90mshortcuts: /s sessions  /r <id> resume  /n [id] new  /p pwd  /cd <path> '
+          '/status /checkpoints /checkpoint [label] '
           '/rewind <id|last|head> [--force] [--session] [--yes] /checkpoint-gc\033[0m')
 
     while True:
@@ -940,20 +1057,48 @@ def run_repl(initial_messages:list, session_store=None):
             break
         if not line:
             continue
-        if line.startswith('/'):
-            if line.split()[0].lower() in ('/exit','/quit'):
+        if line.startswith('/') or line == 'cd' or line.startswith('cd '):
+            command = line.split()[0].lower()
+            if command in ('/exit','/quit'):
                 break
-            if line.split()[0].lower() == '/resume':
+            if command in ('/r', '/resume'):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    print('  usage: /resume <session_id>')
+                    print('  usage: /r <session_id>')
                     continue
                 try:
-                    session_store = SessionEventStore.open(resolve_session_path(parts[1]))
+                    identifier = parts[1]
+                    matches = [path for path in list_session_paths(100)
+                               if SessionEventStore.open(path).session_id.startswith(identifier)]
+                    if len(matches) == 1:
+                        path = matches[0]
+                    elif len(matches) > 1:
+                        print('  [session] id prefix is ambiguous')
+                        continue
+                    else:
+                        path = resolve_session_path(identifier)
+                    session_store = SessionEventStore.open(path)
                     messages = session_store.rebuild_openai_history()
                     print(f'  [session] resumed {session_store.session_id}')
                 except (FileNotFoundError, ValueError, SessionReplayError) as exc:
                     print(f'  [session] {exc}')
+                continue
+            if command in ('/n', '/new'):
+                parts = line.split(maxsplit=1)
+                requested = parts[1].strip() if len(parts) > 1 else None
+                if requested and not requested.replace('-', '').replace('_', '').isalnum():
+                    print('  [session] invalid session id')
+                    continue
+                if requested and (SESSIONS_DIR / f'session_{requested}.jsonl').exists():
+                    print(f'  [session] already exists: {requested}; use /r {requested}')
+                    continue
+                session_store = SessionEventStore(SESSIONS_DIR, session_id=requested)
+                session_store.append('session_created')
+                messages = []
+                print(f'  [session] new {session_store.session_id}')
+                continue
+            if command == 'cd':
+                handle_command('/cd' + line[2:], messages, session_store)
                 continue
             handle_command(line,messages,session_store)
             continue

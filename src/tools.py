@@ -408,7 +408,8 @@ def run_bash(command:str, cwd: str = None)->str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command, please do not execute"
     try:
-        r=subprocess.run(command,shell=True,cwd=cwd or os.getcwd(),capture_output=True,timeout=120)
+        base = cwd or str(_h().WORKDIR)
+        r=subprocess.run(command,shell=True,cwd=base,capture_output=True,timeout=120)
         raw=(r.stdout or b"")+(r.stderr or b"")
         try:
             out=raw.decode("utf-8")

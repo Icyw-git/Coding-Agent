@@ -177,6 +177,18 @@ def test_session_path_resolution_accepts_id_only(tmp_path, monkeypatch):
         raise AssertionError('session path traversal was accepted')
 
 
+def test_set_workspace_resolves_relative_path_without_chdir(tmp_path, monkeypatch):
+    original = harness.WORKDIR
+    original_cwd = __import__('os').getcwd()
+    monkeypatch.setattr(harness, 'WORKDIR', tmp_path)
+    selected = tmp_path / 'project'
+    selected.mkdir()
+    assert harness.set_workspace('project') == selected.resolve()
+    assert harness.WORKDIR == selected.resolve()
+    assert __import__('os').getcwd() == original_cwd
+    monkeypatch.setattr(harness, 'WORKDIR', original)
+
+
 def test_format_session_list_reports_event_count(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
     store = harness.SessionEventStore(tmp_path, session_id='demo')

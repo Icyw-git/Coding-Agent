@@ -14,11 +14,15 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 环境变量：
     FEISHU_APP_ID / FEISHU_APP_SECRET   应用凭证
+    FEISHU_ALLOWED_USERS                用户白名单（open_id，逗号分隔）；
+                                        不配置则任何能 @ 到机器人的人都可触发
     HARNESS_API_URL / HARNESS_API_TOKEN Agent API 地址与令牌
 
 聊天命令（@机器人 发送）：
-    /new [id] /sessions /run <cmd> /status [id] /logs <id> /stop <id>
-    /perms /approve <req_id> y|n /quit(解绑)
+    /new [id] /sessions /cd [dir] /run <cmd> /status [id] /logs <id> /stop <id>
+    /perms /approve [req_id] y|n /quit(解绑)
+    y / n          —— 快捷决议最早的待审批请求（无需输 ID）
+    /cd <dir>      —— 切换该聊天的任务执行目录（/run 生效）
     其余文本 → 作为消息发给绑定的 agent 会话
 """
 
@@ -27,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -50,19 +55,116 @@ def format_permission_prompt(req: dict) -> str:
             f"回复 /approve {req['req_id']} y（允许）或 n（拒绝）")
 
 
+CARD_MD_LIMIT = 24000   # 飞书卡片 JSON 上限约 30KB，留余量
+
+
+def markdown_to_card_md(md_text: str) -> str:
+    """标准 Markdown → 飞书卡片 lark_md（子集）。
+
+    message 卡片的 markdown 元素不支持标题/水平线/无序列表标记，
+    转成卡片支持的加粗行、符号列表等近似样式；代码块原样保留。
+    """
+    lines = md_text.splitlines()
+    out = []
+    in_code = False
+    for line in lines:
+        if line.strip().startswith('```'):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        stripped = line.lstrip()
+        indent = line[:len(line) - len(stripped)]
+        m = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+        if m:   # 标题 → 加粗行
+            out.append(f'{indent}**{m.group(2).strip()}**')
+            continue
+        if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):   # 水平线 → 空行
+            out.append('')
+            continue
+        m = re.match(r'^[-*+]\s+(.*)$', stripped)
+        if m:   # 无序列表 → 符号列表
+            out.append(f'{indent}• {m.group(1)}')
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+class LarkTransport:
+    """飞书消息发送传输层：im/v1/message.create（text / interactive 卡片）。"""
+
+    def __init__(self, app_id: str, app_secret: str) -> None:
+        import lark_oapi as lark
+        self._client = lark.Client.builder() \
+            .app_id(app_id).app_secret(app_secret).build()
+
+    def send_text(self, chat_id: str, text: str) -> None:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody)
+        request = CreateMessageRequest.builder() \
+            .receive_id_type('chat_id') \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type('text')
+                .content(json.dumps({'text': text}, ensure_ascii=False))
+                .build()
+            ).build()
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu send failed: {response.code} {response.msg}')
+
+    def send_markdown(self, chat_id: str, md_text: str) -> None:
+        """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
+        卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody)
+        content = markdown_to_card_md(md_text)
+        if len(content) > CARD_MD_LIMIT:
+            content = content[:CARD_MD_LIMIT] + '\n…[内容过长已截断]'
+        card = {
+            'config': {'wide_screen_mode': True},
+            'elements': [{'tag': 'markdown', 'content': content}],
+        }
+        request = CreateMessageRequest.builder() \
+            .receive_id_type('chat_id') \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type('interactive')
+                .content(json.dumps(card, ensure_ascii=False))
+                .build()
+            ).build()
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu card send failed: {response.code} {response.msg}')
+
+
 class FeishuGateway:
     """核心编排：聊天绑定、命令分发、权限轮询。传输层可注入以便测试。"""
 
     def __init__(self, api: GatewayClient, transport=None,
-                 bindings_path: Path | None = None) -> None:
+                 bindings_path: Path | None = None,
+                 allowed_users: set[str] | None = None) -> None:
         self.api = api
         self.transport = transport          # 需实现 send_text(chat_id, text)
         self.bindings_path = Path(bindings_path or BINDINGS_PATH)
         self.bindings: dict[str, str] = {}   # chat_id → session_id
         self._bindings_lock = threading.RLock()
+        # 用户白名单（飞书 open_id）：None=不限制；配置后仅名单内用户可触发 agent。
+        # 机器人一旦被拉进群，群内任何人都能 @ 它——真 shell 工具必须有这道闸。
+        self.allowed_users = set(allowed_users) if allowed_users else None
         self._load_bindings()
         self._notified: set[str] = set()
         self._poll_stop = threading.Event()
+        # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
+        self._chat_pending: dict[str, list[str]] = {}
+        # 每聊天的任务工作目录（/cd 设置，/run 使用；对话 agent 的工作区不受影响）
+        self._chat_cwd: dict[str, str] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
         self._events: queue.Queue = queue.Queue(maxsize=1000)
@@ -95,10 +197,20 @@ class FeishuGateway:
 
     # ---------- 消息入口（可测试核心） ----------
 
-    def on_message(self, chat_id: str, text: str) -> None:
+    def on_message(self, chat_id: str, text: str,
+                   sender_id: str | None = None) -> None:
         """飞书文本消息入口。命令本地处理；普通文本转发给 agent 会话。"""
         text = (text or '').strip()
         if not text:
+            return
+        if self.allowed_users is not None and sender_id not in self.allowed_users:
+            # 未授权用户：静默忽略（不回执、不建会话），避免暴露机器人行为
+            print(f'[feishu] ignored message from unauthorized user '
+                  f'{sender_id!r} in chat {chat_id!r}')
+            return
+        # y/n 快捷审批：该聊天有待审批请求时，y/n 不再当作普通消息
+        if text.lower() in ('y', 'n') and self._chat_pending.get(chat_id):
+            self._resolve_chat_pending(chat_id, text.lower() == 'y')
             return
         session_id = self.bindings.get(chat_id)
         if text.startswith('/'):
@@ -106,14 +218,30 @@ class FeishuGateway:
             return
         if not session_id:
             session_id = self.api.create_session()
-            self.bindings[chat_id] = session_id
-            self._save_bindings()
+            with self._bindings_lock:
+                self.bindings[chat_id] = session_id
+                self._save_bindings()
             self._reply(chat_id, f'已创建会话 {session_id}')
         try:
             reply = self.api.send(text, session_id=session_id)
             self._reply(chat_id, f'{reply}')
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
+
+    # ---------- 快捷审批 ----------
+
+    def _resolve_chat_pending(self, chat_id: str, allow: bool) -> None:
+        """决议该聊天最早的待审批请求（免输 req_id）。"""
+        pending_ids = self._chat_pending.get(chat_id) or []
+        while pending_ids:
+            req_id = pending_ids.pop(0)
+            try:
+                record = self.api.resolve_permission(req_id, allow)
+            except Exception:
+                continue   # 已决议/超时的请求：跳过，试下一个
+            self._reply(chat_id, f"{record['req_id']} → {record['status']}")
+            return
+        self._reply(chat_id, '(没有可决议的待审批请求，试试 /perms 查看)')
 
     def _handle_command(self, chat_id: str, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -122,18 +250,32 @@ class FeishuGateway:
         try:
             if command == '/new':
                 session_id = self.api.create_session(argument or None)
-                self.bindings[chat_id] = session_id
-                self._save_bindings()
+                with self._bindings_lock:
+                    self.bindings[chat_id] = session_id
+                    self._save_bindings()
                 self._reply(chat_id, f'已创建并绑定会话 {session_id}')
             elif command == '/sessions':
                 rows = self.api.list_sessions(limit=10)
                 lines = [f"{row['id'][:12]}  events={row['events']}  "
                          f"{row['title']}" for row in rows]
                 self._reply(chat_id, '\n'.join(lines) or '(no sessions)')
+            elif command == '/cd':
+                if not argument:
+                    current = self._chat_cwd.get(chat_id, '(默认：服务器工作区)')
+                    self._reply(chat_id, f'当前任务目录: {current}')
+                    return
+                self._chat_cwd[chat_id] = argument
+                self._reply(chat_id, f'任务目录已切换（下次 /run 生效，'
+                              f'由服务器校验）: {argument}')
             elif command == '/run':
-                task = self.api.create_task(argument)
+                if not argument:
+                    self._reply(chat_id, '用法: /run <命令>')
+                    return
+                task = self.api.create_task(
+                    argument, cwd=self._chat_cwd.get(chat_id))
+                where = f"\n目录: {task['cwd']}" if task.get('cwd') else ''
                 self._reply(chat_id, f"任务已创建 {task['id']} "
-                              f"({task['status']})")
+                              f"({task['status']}){where}")
             elif command == '/status':
                 if argument:
                     task = self.api.get_task(argument)
@@ -159,14 +301,21 @@ class FeishuGateway:
                     self._reply(chat_id, format_permission_prompt(req))
             elif command == '/approve':
                 tokens = argument.split()
+                if tokens and tokens[-1] in ('y', 'n') and len(tokens) == 1:
+                    # /approve y|n —— 决议本聊天最早的待审批请求
+                    self._resolve_chat_pending(chat_id, tokens[0] == 'y')
+                    return
                 if len(tokens) != 2 or tokens[1] not in ('y', 'n'):
-                    self._reply(chat_id, '用法: /approve <req_id> y|n')
+                    self._reply(chat_id, '用法: /approve [req_id] y|n'
+                                          '\n（省略 req_id 时决议最早的一条）')
                     return
                 record = self.api.resolve_permission(tokens[0], tokens[1] == 'y')
                 self._reply(chat_id, f"{record['req_id']} → {record['status']}")
             elif command == '/quit':
-                self.bindings.pop(chat_id, None)
-                self._save_bindings()
+                with self._bindings_lock:
+                    self.bindings.pop(chat_id, None)
+                    self._save_bindings()
+                self._chat_cwd.pop(chat_id, None)
                 self._reply(chat_id, '会话绑定已解除')
             else:
                 self._reply(chat_id, f'未知命令: {command}')
@@ -188,9 +337,15 @@ class FeishuGateway:
                 continue
             self._notified.add(req_id)
             for chat_id in chats:
+                fifo = self._chat_pending.setdefault(chat_id, [])
+                if req_id not in fifo:
+                    fifo.append(req_id)
                 self._reply(chat_id, format_permission_prompt(req))
-        # 决议完成（或超时）的请求退出通知集合，避免集合无界增长
-        self._notified &= {req['req_id'] for req in pending}
+        # 决议完成（或超时）的请求退出通知集合与各聊天 FIFO，避免无界增长
+        pending_ids = {req['req_id'] for req in pending}
+        self._notified &= pending_ids
+        for chat_id, fifo in self._chat_pending.items():
+            fifo[:] = [req_id for req_id in fifo if req_id in pending_ids]
 
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:
@@ -215,10 +370,11 @@ class FeishuGateway:
 
     # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
 
-    def dispatch(self, chat_id: str, text: str) -> None:
+    def dispatch(self, chat_id: str, text: str,
+                 sender_id: str | None = None) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
         try:
-            self._events.put_nowait((chat_id, text))
+            self._events.put_nowait((chat_id, text, sender_id))
         except queue.Full:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
@@ -235,14 +391,14 @@ class FeishuGateway:
                 if item is None:
                     self._events.task_done()
                     break
-                chat_id, text = item
+                chat_id, text, sender_id = item
                 try:
                     # Approval must be able to unblock a turn holding the chat lock.
                     if text.lstrip().lower().startswith('/approve '):
-                        self.on_message(chat_id, text)
+                        self.on_message(chat_id, text, sender_id=sender_id)
                     else:
                         with self._chat_lock(chat_id):
-                            self.on_message(chat_id, text)
+                            self.on_message(chat_id, text, sender_id=sender_id)
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
@@ -258,8 +414,17 @@ class FeishuGateway:
             return self._chat_locks.setdefault(chat_id, threading.Lock())
 
     def _reply(self, chat_id: str, text: str) -> None:
-        if self.transport is not None and text:
-            self.transport.send_text(chat_id, text)
+        if self.transport is None or not text:
+            return
+        # 优先卡片（markdown 可渲染），失败回退纯文本
+        send_md = getattr(self.transport, 'send_markdown', None)
+        if send_md is not None:
+            try:
+                send_md(chat_id, text)
+                return
+            except Exception as exc:
+                print(f'[feishu] card send failed, fallback to text: {exc}')
+        self.transport.send_text(chat_id, text)
 
     # ---------- 飞书长连接（需真实凭证） ----------
 
@@ -279,7 +444,18 @@ class FeishuGateway:
                 if message.message_type != 'text':
                     return
                 content = json.loads(message.content)
-                self.dispatch(message.chat_id, content.get('text', ''))
+                # 群聊里 @机器人 会留下 <at user_id="...">名字</at> 标签，
+                # 必须剥掉，否则 "/run ..." 这类命令识别不到
+                text = re.sub(r'<at[^>]*>.*?</at>', '',
+                              content.get('text', ''), flags=re.DOTALL).strip()
+                # 发送者 open_id 用于白名单校验（FEISHU_ALLOWED_USERS）
+                sender_id = getattr(
+                    getattr(getattr(data.event, 'sender', None),
+                            'sender_id', None), 'open_id', None)
+                print(f'[feishu] message from {sender_id!r} '
+                      f'in chat {message.chat_id!r}')
+                self.dispatch(message.chat_id, text,
+                              sender_id=sender_id)
             except Exception as exc:
                 print(f'[feishu] event error: {exc}')
 
@@ -302,11 +478,21 @@ def main(argv=None) -> int:
     app_secret = os.getenv('FEISHU_APP_SECRET', '')
     token = os.getenv('HARNESS_API_TOKEN', '')
     base_url = os.getenv('HARNESS_API_URL', 'http://127.0.0.1:8000')
+    allowed_raw = os.getenv('FEISHU_ALLOWED_USERS', '').strip()
+    allowed_users = {u.strip() for u in allowed_raw.split(',') if u.strip()} \
+        or None
     if not (app_id and app_secret and token):
         print('FEISHU_APP_ID / FEISHU_APP_SECRET / HARNESS_API_TOKEN are required')
         return 1
     api = GatewayClient(base_url, token)
-    gateway = FeishuGateway(api)
+    transport = LarkTransport(app_id, app_secret)
+    gateway = FeishuGateway(api, transport=transport,
+                            allowed_users=allowed_users)
+    if allowed_users:
+        print(f'[feishu] user allowlist active: {", ".join(sorted(allowed_users))}')
+    else:
+        print('[feishu] WARNING: no FEISHU_ALLOWED_USERS set — anyone who can '
+              'reach this bot can run commands on this machine')
     try:
         gateway.run(app_id, app_secret)
     except KeyboardInterrupt:

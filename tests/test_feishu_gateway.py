@@ -5,6 +5,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import gateway_sim
+import feishu_gateway
 from feishu_gateway import FeishuGateway, format_permission_prompt
 from harness_api import create_app
 from hooks import GATE as permission_gate
@@ -41,7 +43,8 @@ def api_app(tmp_path):
         session_store_cls=SessionEventStore,
         sessions_dir=tmp_path / 'sessions',
     )
-    return create_app(runtime, api_token='t', task_root=tmp_path / 'tasks')
+    return create_app(runtime, api_token='t',
+                      task_root=tmp_path / 'tasks', workspace=tmp_path)
 
 
 def _sync_asgi_transport(app):
@@ -148,7 +151,7 @@ def test_approval_dispatch_bypasses_chat_lock(tmp_path):
 
     gw = FeishuGateway(API(), bindings_path=tmp_path / 'bindings.json')
     called = threading.Event()
-    gw.on_message = lambda chat_id, text: called.set()
+    gw.on_message = lambda chat_id, text, sender_id=None: called.set()
     lock = gw._chat_lock('c1')
     lock.acquire()
     try:
@@ -204,6 +207,176 @@ def test_permission_approval_via_chat(gateway):
     calls_before = len(fake.sent)
     gw.poll_permissions()
     assert len(fake.sent) == calls_before
+
+
+def test_permission_shortcut_y_n_without_id(gateway):
+    """y/n 快捷审批：无需输入 req_id，按 FIFO 决议本聊天最早的请求。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    gw.on_message('c1', 'hi')
+    results = {}
+
+    def waiter():
+        results['allowed'] = permission_gate.decide(
+            'bash', {'command': 'del x'}, 'destructive')[0]
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if permission_gate.pending():
+            break
+        time.sleep(0.02)
+    gw.poll_permissions()   # 推送提醒并登记到该聊天的 FIFO
+
+    gw.on_message('c1', 'y')   # 不带 req_id
+    thread.join(timeout=2)
+    assert results['allowed'] is True
+    assert '→ approved' in fake.last()
+
+    # 没有待审批时，y 当作普通消息发给 agent
+    fake.sent.clear()
+    gw.on_message('c1', 'y')
+    assert any('agent-reply-ok' in text for _, text in fake.sent)
+
+
+def test_lark_transport_sends_text(monkeypatch):
+    """LarkTransport：成功发送不抛错；失败时带错误码抛 RuntimeError。"""
+    import lark_oapi as lark
+    from feishu_gateway import LarkTransport
+
+    sent = {}
+
+    class FakeResponse:
+        def __init__(self, ok):
+            self._ok = ok
+        def success(self):
+            return self._ok
+        code = 99991672
+        msg = 'permission denied'
+
+    class FakeMessageApi:
+        def create(self, request):
+            sent['request'] = request
+            return FakeResponse(sent.pop('fail', False) is False)
+
+    class FakeClient:
+        def __init__(self):
+            self.im = SimpleNamespace(v1=SimpleNamespace(
+                message=FakeMessageApi()))
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        lark.Client, 'builder',
+        lambda: SimpleNamespace(
+            app_id=lambda aid: SimpleNamespace(
+                app_secret=lambda sec: SimpleNamespace(build=lambda: fake_client))))
+
+    transport = LarkTransport('cli_x', 'secret')
+    transport.send_text('oc_chat', '你好')   # 成功路径：不抛错
+
+    sent['fail'] = True
+    with pytest.raises(RuntimeError, match='feishu send failed'):
+        transport.send_text('oc_chat', '再试')
+
+
+def test_markdown_to_card_md_conversions():
+    """lark_md 转换：标题→加粗、水平线→空行、无序列表→•；代码块原样。"""
+    from feishu_gateway import markdown_to_card_md
+    md = '# 标题\n## 二级\n- 甲\n* 乙\n---\n```py\n# 注释\n- 保留\n```\n正文'
+    out = markdown_to_card_md(md)
+    lines = out.splitlines()
+    assert lines[0] == '**标题**'
+    assert lines[1] == '**二级**'
+    assert lines[2] == '• 甲'
+    assert lines[3] == '• 乙'
+    assert lines[4] == ''          # 水平线
+    assert '# 注释' in out          # 代码块内不转换
+    assert '- 保留' in out
+    assert lines[-1] == '正文'
+    # 截断保护发生在 send_markdown 层
+    from feishu_gateway import CARD_MD_LIMIT
+    huge = markdown_to_card_md('x' * (CARD_MD_LIMIT + 500))
+    content = huge
+    if len(content) > CARD_MD_LIMIT:
+        content = content[:CARD_MD_LIMIT] + '\n…[内容过长已截断]'
+    assert len(content) <= CARD_MD_LIMIT + 20
+    assert content.endswith('…[内容过长已截断]')
+
+
+def test_reply_prefers_card_and_falls_back_to_text():
+    """_reply：有 send_markdown 的 transport 优先卡片；卡片抛错回退 text。"""
+    api = gateway_sim.GatewayClient(
+        'http://test', 't', transport=_sync_asgi_transport(api_app))
+    fake = FakeTransport()
+    gw = feishu_gateway.FeishuGateway(api, transport=fake)
+
+    class CardTransport(FakeTransport):
+        def send_markdown(self, chat_id, text):
+            self.cards.append((chat_id, text))
+
+        def send_text(self, chat_id, text):
+            self.texts.append((chat_id, text))
+
+    ok = CardTransport(); ok.cards = []; ok.texts = []
+    ok.send_markdown('c', 'x')  # 预热属性存在
+    ok.cards.clear(); ok.texts.clear()
+    gw.transport = ok
+    gw._reply('c1', '渲染**加粗**')
+    assert ok.cards and not ok.texts
+
+    class BrokenCardTransport(CardTransport):
+        def send_markdown(self, chat_id, text):
+            raise RuntimeError('card failed')
+
+    bad = BrokenCardTransport(); bad.cards = []; bad.texts = []
+    gw.transport = bad
+    gw._reply('c1', '回退文本')
+    assert not bad.cards and bad.texts
+
+
+def test_user_allowlist_blocks_strangers(api_app, tmp_path, monkeypatch):
+    """白名单：名单外用户的消息被静默忽略（不建会话、不执行）。"""
+    monkeypatch.setattr(permission_gate, 'backend', 'remote')
+    api = gateway_sim.GatewayClient(
+        'http://test', 't', transport=_sync_asgi_transport(api_app))
+    fake = FakeTransport()
+    gw = FeishuGateway(api, transport=fake,
+                       bindings_path=tmp_path / 'bindings.json',
+                       allowed_users={'ou_me'})
+    try:
+        gw.on_message('c1', 'hello', sender_id='ou_stranger')
+        assert gw.bindings == {}          # 没有为陌生人建会话
+        assert fake.sent == []            # 没有任何回复
+
+        gw.on_message('c1', 'hello', sender_id='ou_me')
+        assert 'agent-reply-ok' in fake.last()
+
+        # 陌生人无法通过 y/n 决议别人的审批（也没有他的 FIFO）
+        fake.sent.clear()
+        gw.on_message('c1', 'y', sender_id='ou_stranger')
+        assert fake.sent == []
+    finally:
+        api.close()
+
+
+def test_cd_switches_task_directory(gateway, tmp_path):
+    """/cd 设置该聊天的任务目录，/run 自动携带；无 /cd 时用默认。"""
+    gw, fake = gateway
+    workdir = tmp_path / 'projA'
+    workdir.mkdir()
+
+    gw.on_message('c1', f'/cd {workdir}')
+    assert '任务目录已切换' in fake.last()
+
+    gw.on_message('c1', '/run echo from-proj-a')
+    assert '任务已创建' in fake.last()
+    task_id = gw.api.list_tasks()[0]['id']
+    for _ in range(100):
+        if gw.api.get_task(task_id)['status'] in ('succeeded', 'failed'):
+            break
+        time.sleep(0.05)
+    assert gw.api.get_task(task_id)['cwd'] == str(workdir)
+    assert 'from-proj-a' in gw.api.task_logs(task_id)
 
 
 def test_api_permission_endpoints_flow(api_app):

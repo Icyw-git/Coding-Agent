@@ -106,6 +106,9 @@ def test_agent_loop_memory_injection():
 
         result = harness.agent_loop([{'role': 'user', 'content': 'do it'}])
         assert result == 'task done', result
+        # 提炼已移入后台线程：等它结束后再断言脚本队列的第 3 次调用。
+        # 60s 余量：Windows 上新写入文件的首次读取可能被 AV 实时扫描卡住数秒。
+        harness.wait_for_housekeeping(60)
 
         # 主调用（calls[1]）应包含注入的记忆，且与原任务在同一 user 消息
         first_user = next(m for m in fake.calls[1] if m.get('role') == 'user')

@@ -180,6 +180,10 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
 
 
 def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
+    # HARNESS_LOAD_MEMORIES=0 可关闭记忆召回：它每条消息要走一次 LLM 筛选，
+    # 网关/无人值守场景对延迟敏感时可省掉这次往返。
+    if os.getenv('HARNESS_LOAD_MEMORIES', '1') == '0':
+        return ''
     selected_files = select_relevant_memories(messages)
     if not selected_files:
         return ''
