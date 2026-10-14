@@ -211,8 +211,7 @@ class FeishuGateway:
                 break
         for thread in self._dispatch_threads:
             thread.join(timeout=3)
-        self._dispatch_threads = [thread for thread in self._dispatch_threads
-                                  if thread.is_alive()]
+        self._dispatch_threads.clear()
 
     # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
 
@@ -224,8 +223,6 @@ class FeishuGateway:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
     def start_dispatcher(self, workers: int = DISPATCH_WORKERS) -> None:
-        self._dispatch_threads = [thread for thread in self._dispatch_threads
-                                  if thread.is_alive()]
         if self._dispatch_threads:
             return
         self._dispatch_stop.clear()
