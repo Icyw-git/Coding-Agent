@@ -123,6 +123,7 @@ class LarkTransport:
         from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
         request = UpdateMessageRequest.builder().message_id(message_id).request_body(
             UpdateMessageRequestBody.builder()
+            .msg_type('text')
             .content(json.dumps({'text': text}, ensure_ascii=False)).build()
         ).build()
         response = self._client.im.v1.message.update(request)
