@@ -1,5 +1,7 @@
 import importlib.util
 import time
+from contextlib import ExitStack
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +9,14 @@ from harness_api import create_app
 
 
 fastapi_available = importlib.util.find_spec("fastapi") is not None
+
+
+@pytest.fixture
+def api_client():
+    from fastapi.testclient import TestClient
+
+    with ExitStack() as stack:
+        yield lambda app: stack.enter_context(TestClient(app))
 
 
 class Result:
@@ -47,11 +57,11 @@ class FakeRuntime:
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_api_routes_use_runtime(monkeypatch):
+def test_api_routes_use_runtime(monkeypatch, api_client):
     from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime, api_token="test-token"))
+    client = api_client(create_app(runtime, api_token="test-token"))
 
     headers = {"Authorization": "Bearer test-token"}
     created = client.post("/v1/sessions", json={"id": "api-test"}, headers=headers)
@@ -71,20 +81,20 @@ def test_api_routes_use_runtime(monkeypatch):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_api_maps_missing_session_to_404():
+def test_api_maps_missing_session_to_404(api_client):
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(FakeRuntime(), api_token="test-token"))
+    client = api_client(create_app(FakeRuntime(), api_token="test-token"))
     response = client.get("/v1/sessions/missing", headers={"Authorization": "Bearer test-token"})
     assert response.status_code == 404
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_api_maps_duplicate_session_to_409():
+def test_api_maps_duplicate_session_to_409(api_client):
     from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime, api_token="test-token"))
+    client = api_client(create_app(runtime, api_token="test-token"))
     headers = {"Authorization": "Bearer test-token"}
     assert client.post("/v1/sessions", json={"id": "same"}, headers=headers).status_code == 201
     response = client.post("/v1/sessions", json={"id": "same"}, headers=headers)
@@ -92,11 +102,11 @@ def test_api_maps_duplicate_session_to_409():
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_api_requires_token_and_limits_requests(tmp_path):
+def test_api_requires_token_and_limits_requests(tmp_path, api_client):
     from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime, api_token="secret", rate_limit=1,
+    client = api_client(create_app(runtime, api_token="secret", rate_limit=1,
                                    access_log_path=str(tmp_path / "api.log")))
     assert client.get("/v1/sessions/missing").status_code == 401
     headers = {"Authorization": "Bearer secret"}
@@ -110,10 +120,10 @@ def test_api_requires_token_and_limits_requests(tmp_path):
 # ---------- 会话列表 / SSE 实时流 ----------
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_api_lists_sessions():
+def test_api_lists_sessions(api_client):
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(FakeRuntime(), api_token="t"))
+    client = api_client(create_app(FakeRuntime(), api_token="t"))
     headers = {"Authorization": "Bearer t"}
     client.post("/v1/sessions", json={"id": "api-test"}, headers=headers)
     response = client.get("/v1/sessions", headers=headers)
@@ -133,12 +143,12 @@ def _stream_runtime(tmp_path):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_stream_replays_session_events(tmp_path):
+def test_stream_replays_session_events(tmp_path, api_client):
     """SSE 端点回放既有事件流（含非 message 事件）；once=1 回放即关闭。"""
     from fastapi.testclient import TestClient
 
     runtime = _stream_runtime(tmp_path)
-    client = TestClient(create_app(runtime, api_token="t"))
+    client = api_client(create_app(runtime, api_token="t"))
     headers = {"Authorization": "Bearer t"}
     created = client.post("/v1/sessions", json={"id": "live-1"}, headers=headers)
     assert created.status_code == 201
@@ -158,14 +168,14 @@ def test_stream_replays_session_events(tmp_path):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_stream_follow_picks_up_new_events(tmp_path):
+def test_stream_follow_picks_up_new_events(tmp_path, api_client):
     """follow 阶段能增量拾取连接之后新写入的事件（实时监控的核心路径）。"""
     import threading
 
     from fastapi.testclient import TestClient
 
     runtime = _stream_runtime(tmp_path)
-    client = TestClient(create_app(runtime, api_token="t"))
+    client = api_client(create_app(runtime, api_token="t"))
     headers = {"Authorization": "Bearer t"}
     client.post("/v1/sessions", json={"id": "live-2"}, headers=headers)
     store = runtime.open_session("live-2")
@@ -183,10 +193,10 @@ def test_stream_follow_picks_up_new_events(tmp_path):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_stream_maps_missing_session_to_404(tmp_path):
+def test_stream_maps_missing_session_to_404(tmp_path, api_client):
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(_stream_runtime(tmp_path), api_token="t"))
+    client = api_client(create_app(_stream_runtime(tmp_path), api_token="t"))
     response = client.get("/v1/sessions/nope/stream",
                           headers={"Authorization": "Bearer t"})
     assert response.status_code == 404
@@ -195,11 +205,11 @@ def test_stream_maps_missing_session_to_404(tmp_path):
 # ---------- 任务端点 ----------
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_task_end_to_end_flow(tmp_path):
+def test_task_end_to_end_flow(tmp_path, api_client):
     """网关核心链路：创建任务 → 轮询状态 → 拉取日志 → 列表。"""
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
+    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
     headers = {"Authorization": "Bearer t"}
 
     created = client.post("/v1/tasks",
@@ -225,10 +235,10 @@ def test_task_end_to_end_flow(tmp_path):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_task_stop_and_not_found(tmp_path):
+def test_task_stop_and_not_found(tmp_path, api_client):
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
+    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
     headers = {"Authorization": "Bearer t"}
 
     assert client.get("/v1/tasks/missing", headers=headers).status_code == 404
@@ -253,10 +263,78 @@ def test_task_stop_and_not_found(tmp_path):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
-def test_task_rejects_empty_command(tmp_path):
+def test_task_rejects_empty_command(tmp_path, api_client):
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
+    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
     response = client.post("/v1/tasks", json={"command": "   "},
                            headers={"Authorization": "Bearer t"})
     assert response.status_code == 400
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_stream_does_not_skip_event_at_replay_boundary(tmp_path, monkeypatch, api_client):
+    runtime = _stream_runtime(tmp_path)
+    runtime.create_session('boundary')
+    store = runtime.open_session('boundary')
+    tail = store.tail_events
+    def snapshot_then_append(offset=0, **kwargs):
+        snapshot = tail(offset, **kwargs)
+        if kwargs.get('strict'):
+            store.append_message({'role': 'user', 'content': 'boundary-marker'})
+        return snapshot
+    monkeypatch.setattr(store, 'tail_events', snapshot_then_append)
+    monkeypatch.setattr(runtime, 'open_session', lambda sid: store)
+    client = api_client(create_app(runtime, api_token='t', task_root=tmp_path / 'tasks'))
+    response = client.get('/v1/sessions/boundary/stream',
+                          params={'poll': 0.05, 'follow_seconds': 0.1},
+                          headers={'Authorization': 'Bearer t'})
+    assert response.text.count('boundary-marker') == 1
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_task_storage_root_does_not_change_workspace(tmp_path, monkeypatch, api_client):
+    monkeypatch.setenv('HARNESS_TASK_ROOT', str(tmp_path / 'records'))
+    workspace = tmp_path / 'project'
+    workspace.mkdir()
+    client = api_client(create_app(FakeRuntime(), api_token='t', workspace=workspace))
+    headers = {'Authorization': 'Bearer t'}
+    response = client.post('/v1/tasks', json={'command': 'echo workspace'}, headers=headers)
+    assert response.status_code == 201
+    record = response.json()['task']
+    assert record['cwd'] == str(workspace.resolve())
+    assert Path(record['log_path']).parent == tmp_path / 'records'
+    outside = client.post('/v1/tasks', json={'command': 'echo no', 'cwd': str(tmp_path)},
+                          headers=headers)
+    assert outside.status_code == 400
+    for _ in range(100):
+        state = client.get(f"/v1/tasks/{record['id']}", headers=headers).json()['task']
+        if state['status'] in ('succeeded', 'failed'):
+            break
+        time.sleep(0.01)
+    assert state['status'] == 'succeeded'
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_shutdown_stops_tasks_and_releases_log(tmp_path):
+    import json
+    from fastapi.testclient import TestClient
+
+    log = tmp_path / 'access.log'
+    app = create_app(FakeRuntime(), api_token='t', task_root=tmp_path / 'tasks',
+                     access_log_path=str(log))
+    with TestClient(app) as client:
+        record = client.post('/v1/tasks',
+                             json={'command': 'python -c "import time; time.sleep(30)"'},
+                             headers={'Authorization': 'Bearer t'}).json()['task']
+        for _ in range(100):
+            data = json.loads((tmp_path / 'tasks' / f"{record['id']}.json").read_text())
+            if data['status'] == 'running':
+                break
+            time.sleep(0.01)
+        assert data['status'] == 'running'
+    saved = json.loads((tmp_path / 'tasks' / f"{record['id']}.json").read_text())
+    assert saved['status'] == 'cancelled'
+    assert saved['exit_code'] is not None
+    # Windows refuses this rename if a FileHandler still owns the file.
+    log.rename(tmp_path / 'released.log')

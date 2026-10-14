@@ -53,16 +53,24 @@ def format_event(event: dict) -> str:
 class GatewayClient:
     """Thin httpx wrapper over the Harness HTTP API."""
 
-    def __init__(self, base_url: str, token: str) -> None:
+    def __init__(self, base_url: str, token: str, transport=None) -> None:
         self.base_url = base_url.rstrip('/')
+        # transport：注入 httpx.ASGITransport/MockTransport 供测试使用
         self.http = httpx.Client(
             base_url=self.base_url,
             headers={'Authorization': f'Bearer {token}'},
             timeout=httpx.Timeout(600.0, connect=10.0),
+            transport=transport,
         )
         self.session_id: str | None = None
         self._stream_stop = threading.Event()
         self._stream_thread: threading.Thread | None = None
+        self._stream_response: httpx.Response | None = None
+        self._stream_lock = threading.Lock()
+
+    @property
+    def streaming(self) -> bool:
+        return self._stream_thread is not None and self._stream_thread.is_alive()
 
     # ---------- sessions ----------
 
@@ -92,35 +100,45 @@ class GatewayClient:
         if not self.session_id:
             print('  [stream] no active session; use /new first')
             return False
-        if self._stream_thread and self._stream_thread.is_alive():
-            self.stop_stream()
-        self._stream_stop.clear()
+        self.stop_stream()
+        stop = threading.Event()
+        self._stream_stop = stop
+        session_id = self.session_id
 
         def consume() -> None:
             try:
-                with self.http.stream(
-                    'GET', f'/v1/sessions/{self.session_id}/stream',
-                    params={'poll': 0.3},
-                ) as response:
-                    event_name = 'event'
-                    for line in response.iter_lines():
-                        if self._stream_stop.is_set():
-                            break
-                        if not line:
-                            continue
-                        if line.startswith('event:'):
-                            event_name = line[6:].strip()
-                        elif line.startswith('data:'):
-                            try:
+                after = 0
+                while not stop.is_set():
+                    with self.http.stream(
+                        'GET', f'/v1/sessions/{session_id}/stream',
+                        params={'poll': 0.3, 'follow_seconds': 5, 'after': after},
+                    ) as response:
+                        response.raise_for_status()
+                        with self._stream_lock:
+                            if stop.is_set():
+                                break
+                            self._stream_response = response
+                        for line in response.iter_lines():
+                            if stop.is_set():
+                                break
+                            if line.startswith('data:'):
                                 event = json.loads(line[5:].strip())
-                            except json.JSONDecodeError:
-                                continue
-                            print(format_event(event))
-                            event_name = 'event'
-                        # ':' heartbeat comments are ignored
-            except httpx.HTTPError as exc:
-                if not self._stream_stop.is_set():
+                                if 'seq' in event:
+                                    after = event['seq']
+                                    print(format_event(event))
+                                elif 'detail' in event:
+                                    print(f"  [stream] {event['detail']}")
+                                    return
+                        with self._stream_lock:
+                            self._stream_response = None
+                        if stop.is_set():
+                            break
+            except (httpx.HTTPError, httpx.StreamError, json.JSONDecodeError) as exc:
+                if not stop.is_set():
                     print(f'  [stream] disconnected: {exc}')
+            finally:
+                with self._stream_lock:
+                    self._stream_response = None
 
         self._stream_thread = threading.Thread(target=consume, daemon=True)
         self._stream_thread.start()
@@ -128,9 +146,22 @@ class GatewayClient:
 
     def stop_stream(self) -> None:
         self._stream_stop.set()
+        with self._stream_lock:
+            response = self._stream_response
+        if response is not None:
+            response.close()
         if self._stream_thread:
-            self._stream_thread.join(timeout=3)
+            self._stream_thread.join(timeout=6)
+            if self._stream_thread.is_alive():
+                raise RuntimeError('previous stream is still closing; try again shortly')
             self._stream_thread = None
+
+    def close(self) -> None:
+        self.stop_stream()
+        try:
+            self.http.close()
+        except AttributeError:
+            pass   # 注入的测试传输（ASGITransport）无同步 close
 
     # ---------- tasks ----------
 
@@ -160,6 +191,19 @@ class GatewayClient:
         response.raise_for_status()
         return response.text
 
+    # ---------- 远程权限审批 ----------
+
+    def pending_permissions(self) -> list[dict]:
+        response = self.http.get('/v1/permissions')
+        response.raise_for_status()
+        return response.json()['pending']
+
+    def resolve_permission(self, req_id: str, allow: bool) -> dict:
+        response = self.http.post(
+            f'/v1/permissions/{req_id}/resolve', json={'allow': allow})
+        response.raise_for_status()
+        return response.json()['request']
+
 
 def _print_task(task: dict) -> None:
     started = time.strftime('%H:%M:%S', time.localtime(task['started_at'])) \
@@ -170,7 +214,7 @@ def _print_task(task: dict) -> None:
 
 def repl(client: GatewayClient) -> int:
     print('gateway sim ready — /new /sessions /use /stream /run /status /logs '
-          '/stop /quit, or type a message')
+          '/stop /perms /approve /quit, or type a message')
     while True:
         try:
             line = input('\n[gw] > ').strip()
@@ -196,7 +240,10 @@ def repl(client: GatewayClient) -> int:
                     client.session_id = argument
                     print(f'  active session: {argument}')
                 elif command == '/stream':
-                    if client.start_stream():
+                    if client.streaming:
+                        client.stop_stream()
+                        print('  [stream] stopped')
+                    elif client.start_stream():
                         print(f"  [stream] following {client.session_id} "
                               f"(re-run to stop)")
                 elif command == '/run':
@@ -217,6 +264,22 @@ def repl(client: GatewayClient) -> int:
                     print(client.task_logs(task_id, lines))
                 elif command == '/stop':
                     print('  stopped' if client.stop_task(argument) else '')
+                elif command == '/perms':
+                    pending = client.pending_permissions()
+                    if not pending:
+                        print('  (no pending permission requests)')
+                    for req in pending:
+                        print(f"  {req['req_id']}  {req['tool']}  "
+                              f"{req['reason'][:60]}")
+                        print(f"    → /approve {req['req_id']} y|n")
+                elif command == '/approve':
+                    tokens = argument.split()
+                    if len(tokens) != 2 or tokens[1] not in ('y', 'n'):
+                        print('  usage: /approve <req_id> y|n')
+                        continue
+                    record = client.resolve_permission(
+                        tokens[0], tokens[1] == 'y')
+                    print(f"  {record['req_id']} → {record['status']}")
                 else:
                     print(f'  unknown command: {command}')
             else:
@@ -227,7 +290,7 @@ def repl(client: GatewayClient) -> int:
                 if exc.response.headers.get('content-type', '').startswith('application/json') \
                 else exc.response.text[:200]
             print(f'  [error] {exc.response.status_code} {detail}')
-        except (httpx.HTTPError, RuntimeError, KeyError) as exc:
+        except (httpx.HTTPError, RuntimeError, KeyError, ValueError) as exc:
             print(f'  [error] {exc}')
     client.stop_stream()
     return 0
@@ -246,7 +309,10 @@ def main(argv=None) -> int:
     except httpx.HTTPError as exc:
         print(f'cannot reach API at {args.url}: {exc}')
         return 1
-    return repl(client)
+    try:
+        return repl(client)
+    finally:
+        client.close()
 
 
 if __name__ == '__main__':

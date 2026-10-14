@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 import secrets
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from harness_sdk import HarnessClient
 from agent_runtime import SessionAlreadyExistsError
 from session_store import SessionReplayError
 from task_manager import TaskManager
+from hooks import GATE as permission_gate
 
 try:
     from pydantic import BaseModel, Field
@@ -39,8 +42,13 @@ if BaseModel is not None:
         cwd: str | None = None
 
 
+    class ResolvePermissionRequest(BaseModel):
+        allow: bool
+        by: str = Field(default='remote', min_length=1)
+
+
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
-               access_log_path: str | None = None, task_root=None):
+               access_log_path: str | None = None, task_root=None, workspace=None):
     """Create the HTTP application without starting background services."""
     try:
         from fastapi import FastAPI, HTTPException, Request
@@ -65,23 +73,36 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                      or Path.cwd() / ".cache" / "os_tasks")
     tasks = TaskManager(
         task_base,
-        allowed_root=os.getenv("HARNESS_TASK_ROOT") or Path.cwd(),
+        allowed_root=workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd(),
     )
+    # 服务器模式：权限审批走远程端点（消息网关轮询 /v1/permissions）；
+    # CLI 入口不经过 create_app，保持 console 后端不受影响。
+    permission_gate.backend = 'remote'
 
-    app = FastAPI(title="Harness Agent API", version="1.0")
-
-    logger = logging.getLogger(f"harness.api.access.{id(app)}")
+    logger = logging.Logger("harness.api.access", level=logging.INFO)
     access_log_path = access_log_path or os.getenv(
         "HARNESS_API_LOG", ".cache/api/api-access.log"
     )
-    if access_log_path:
-        log_path = Path(access_log_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
+    @asynccontextmanager
+    async def lifespan(app):
+        handler = None
+        try:
+            if access_log_path:
+                log_path = Path(access_log_path)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                handler = logging.FileHandler(log_path, encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                logger.addHandler(handler)
+            yield
+        finally:
+            try:
+                await asyncio.to_thread(tasks.close)
+            finally:
+                if handler is not None:
+                    logger.removeHandler(handler)
+                    handler.close()
+
+    app = FastAPI(title="Harness Agent API", version="1.0", lifespan=lifespan)
 
     request_times: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
@@ -170,15 +191,14 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             return (f"event: {event.get('type', 'event')}\n"
                     f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
 
-        def follow():
+        async def follow():
             try:
-                history = store.read_events()
+                history, offset = await asyncio.to_thread(store.tail_events, strict=True)
             except SessionReplayError as exc:
                 yield ("event: stream_error\ndata: "
                        + json.dumps({"detail": str(exc)}, ensure_ascii=False)
                        + "\n\n")
                 return
-            offset = store.path.stat().st_size
             for event in history:
                 if int(event.get("seq", 0)) > after:
                     yield render(event)
@@ -188,10 +208,11 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             deadline = time.monotonic() + follow_budget if follow_budget else None
             last_beat = time.monotonic()
             while True:
-                fresh, offset = store.tail_events(offset)
+                fresh, offset = await asyncio.to_thread(store.tail_events, offset)
                 for event in fresh:
-                    last_beat = time.monotonic()
-                    yield render(event)
+                    if int(event.get("seq", 0)) > after:
+                        last_beat = time.monotonic()
+                        yield render(event)
                 now = time.monotonic()
                 if deadline is not None and now >= deadline:
                     yield "event: done\ndata: {}\n\n"
@@ -199,7 +220,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 if now - last_beat >= 15:
                     yield ": ping\n\n"
                     last_beat = now
-                time.sleep(poll)
+                await asyncio.sleep(poll)
 
         return StreamingResponse(
             follow(), media_type="text/event-stream",
@@ -243,6 +264,25 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
         return PlainTextResponse(tasks.tail_logs(task_id, tail))
+
+    @app.get("/v1/permissions")
+    def list_permissions(limit: int = 20):
+        """Pending 审批请求 + 最近历史（消息网关轮询后推送给人工决议）。"""
+        return {
+            "pending": [req.to_dict() for req in permission_gate.pending()],
+            "recent": [req.to_dict() for req in permission_gate.history(limit)],
+        }
+
+    @app.post("/v1/permissions/{req_id}/resolve")
+    def resolve_permission(req_id: str, request: ResolvePermissionRequest):
+        try:
+            record = permission_gate.resolve(req_id, request.allow, by=request.by)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="permission request not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"request": record.to_dict()}
 
     @app.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):

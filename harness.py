@@ -92,13 +92,16 @@ def format_session_list(limit: int = 20) -> str:
     for path in rows:
         store = SessionEventStore.open(path)
         title = store.session_title()
-        if title == '(untitled session)' and not generated:
+        # 无持久化标题时：派生标题不可用，或会话包含工具调用（legacy 会话值得
+        # 一次 LLM 标题），则生成并持久化。generated 确保单次列表最多生成 1 个。
+        if store.saved_session_title() is None and not generated:
             history = store.rebuild_openai_history()
-            if _has_session_title_source(history):
+            if title == '(untitled session)' or _has_session_title_source(history):
                 generated = True
-                title = generate_session_title(history)
-                if title != '(untitled session)':
-                    store.append_session_title(title)
+                new_title = generate_session_title(history)
+                if new_title != '(untitled session)':
+                    store.append_session_title(new_title)
+                    title = new_title
         lines.append(f'  {store.session_id}  {title}  events={store.last_seq}  '
                      f'updated={time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))}')
     return '\n'.join(lines)

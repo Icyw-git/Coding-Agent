@@ -104,6 +104,9 @@ class SessionEventStore:
             title = _useful_title_line(content)
             if title:
                 return title
+        # 最终回退：首条用户消息原文（短也无妨，比 "(untitled session)" 更有辨识度）
+        if user_messages:
+            return user_messages[0][:60]
         return "(untitled session)"
 
     def saved_session_title(self) -> str | None:
@@ -178,12 +181,13 @@ class SessionEventStore:
             events.append(event)
         return events
 
-    def tail_events(self, offset: int = 0) -> tuple[list[dict], int]:
+    def tail_events(self, offset: int = 0, *, strict: bool = False) -> tuple[list[dict], int]:
         """Incrementally read complete JSONL events from a byte offset.
 
         Returns (events, new_offset). A trailing partial line (mid-write) is
         left unconsumed until it is completed, so a live tailer never sees
         torn events. Corrupt lines are skipped to keep the tail resilient.
+        ``strict=True`` validates an initial snapshot from offset zero.
         """
         if offset < 0:
             offset = 0
@@ -195,6 +199,7 @@ class SessionEventStore:
         if not chunk:
             return [], offset
         events = []
+        expected_seq = 1
         lines = chunk.split(b'\n')
         lines.pop()   # trailing piece: complete only when chunk ended with \n
         for raw in lines:
@@ -203,8 +208,14 @@ class SessionEventStore:
                 continue
             try:
                 event = json.loads(raw)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if strict:
+                    raise SessionReplayError('invalid JSONL event in snapshot') from exc
                 continue   # torn/corrupt line: skip, keep the tail alive
+            if strict:
+                if not isinstance(event, dict) or event.get('seq') != expected_seq:
+                    raise SessionReplayError('invalid event sequence in snapshot')
+                expected_seq += 1
             if isinstance(event, dict):
                 events.append(event)
         return events, offset
@@ -321,6 +332,15 @@ class SessionEventStore:
 
 def _useful_title_line(content: str) -> str | None:
     """Choose a useful single-line fallback, ignoring short acknowledgments."""
+    # 压缩转储/系统注入类消息整条跳过：它们的正文行（如 '- read completed'）
+    # 不是会话主题，逐行筛选会把碎片误当标题。
+    content_head = ' '.join(content.split()).casefold()
+    if content_head.startswith((
+        'tool results executed before compaction:',
+        '[compacted]',
+        '[reactive compact]',
+    )):
+        return None
     for line in content.splitlines():
         line = " ".join(line.split()).strip()
         normalized = line.casefold()
@@ -340,5 +360,8 @@ def _useful_title_line(content: str) -> str | None:
         words = normalized.split()
         if len(words) >= 4 and len(set(words)) == 1:
             continue
+        # 单行消息：整行就是标题本身，不截断；多行才限长
+        if len([l for l in content.splitlines() if l.strip()]) == 1:
+            return line
         return line[:60]
     return None

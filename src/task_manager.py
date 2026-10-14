@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -30,7 +31,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-TERMINAL_STATUSES = {'succeeded', 'failed', 'cancelled'}
+TERMINAL_STATUSES = {'succeeded', 'failed', 'cancelled', 'interrupted'}
 ACTIVE_STATUSES = {'queued', 'running'}
 
 
@@ -39,7 +40,7 @@ class TaskRecord:
     id: str
     command: str
     cwd: str
-    status: str                 # queued | running | succeeded | failed | cancelled
+    status: str                 # queued | running | succeeded | failed | cancelled | interrupted
     created_at: float
     started_at: float | None = None
     ended_at: float | None = None
@@ -53,7 +54,7 @@ class TaskManager:
     """Create, observe, and stop background commands with persisted state."""
 
     def __init__(self, root, allowed_root=None) -> None:
-        self.root = root if isinstance(root, Path) else Path(root)
+        self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.allowed_root = (
             Path(allowed_root).resolve() if allowed_root else None
@@ -61,6 +62,8 @@ class TaskManager:
         self._lock = threading.RLock()
         self._tasks: dict[str, TaskRecord] = {}
         self._procs: dict[str, subprocess.Popen] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._closed = False
         self._load_all()
 
     # ---------- public API ----------
@@ -80,9 +83,13 @@ class TaskManager:
             log_path=str(self.root / f'{task_id}.log'),
         )
         with self._lock:
+            if self._closed:
+                raise RuntimeError('task manager is closed')
             self._tasks[task_id] = record
             self._save(record)
-        threading.Thread(target=self._run, args=(record,), daemon=True).start()
+            thread = threading.Thread(target=self._run, args=(record,), daemon=True)
+            self._threads[task_id] = thread
+            thread.start()
         return record
 
     def get(self, task_id: str) -> TaskRecord:
@@ -99,21 +106,42 @@ class TaskManager:
         return records[:max(1, limit)]
 
     def stop(self, task_id: str) -> TaskRecord:
-        """Cancel a running task; killing the process tree best-effort."""
+        """Cancel a queued task or terminate an owned running process tree."""
         with self._lock:
             record = self._tasks.get(task_id)
             if record is None:
                 raise KeyError(task_id)
             if record.status not in ACTIVE_STATUSES:
                 raise RuntimeError(f'task {task_id} is not running')
+            proc = self._procs.get(task_id)
+            if proc is not None:
+                try:
+                    self._kill_tree(proc)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise RuntimeError('could not terminate task process tree') from exc
             record.status = 'cancelled'
             record.ended_at = time.time()
             record.detail = 'cancelled by request'
             self._save(record)
-            proc = self._procs.get(task_id)
-        if proc is not None:
-            self._kill_tree(proc)
         return record
+
+    def close(self) -> None:
+        """Stop owned tasks and wait for their logs and final records to flush."""
+        with self._lock:
+            self._closed = True
+            active = [r.id for r in self._tasks.values() if r.status in ACTIVE_STATUSES]
+            errors = []
+            for task_id in active:
+                try:
+                    self.stop(task_id)
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+            threads = [thread for task_id, thread in self._threads.items()
+                       if self._tasks[task_id].status not in ACTIVE_STATUSES]
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise RuntimeError('; '.join(errors))
 
     def tail_logs(self, task_id: str, lines: int = 200) -> str:
         """Return the last N lines of a task's combined output."""
@@ -141,22 +169,30 @@ class TaskManager:
         return base
 
     def _run(self, record: TaskRecord) -> None:
-        with self._lock:
-            record.status = 'running'
-            record.started_at = time.time()
-            self._save(record)
+        proc = None
         try:
-            with open(record.log_path, 'w', encoding='utf-8') as handle:
-                handle.write(f'$ {record.command}\n[cwd] {record.cwd}\n')
-                handle.flush()
-                proc = subprocess.Popen(
-                    record.command, cwd=record.cwd, shell=True,
-                    stdout=handle, stderr=subprocess.STDOUT,
-                )
-                with self._lock:
+            # Cancellation cannot interleave between the check, spawn and registration.
+            with self._lock:
+                if record.status != 'queued':
+                    return
+                handle = open(record.log_path, 'w', encoding='utf-8')
+                try:
+                    handle.write(f'$ {record.command}\n[cwd] {record.cwd}\n')
+                    handle.flush()
+                    proc = subprocess.Popen(
+                        record.command, cwd=record.cwd, shell=True,
+                        stdout=handle, stderr=subprocess.STDOUT,
+                        start_new_session=os.name != 'nt',
+                    )
                     record.pid = proc.pid
                     self._procs[record.id] = proc
+                    record.status = 'running'
+                    record.started_at = time.time()
                     self._save(record)
+                except Exception:
+                    handle.close()
+                    raise
+            with handle:
                 code = proc.wait()
                 handle.write(f'\n[exit {code}]\n')
             with self._lock:
@@ -167,31 +203,38 @@ class TaskManager:
                     record.status = 'succeeded' if code == 0 else 'failed'
                 self._save(record)
         except Exception as exc:   # spawn failures (bad cwd, OS errors)
+            if proc is not None and proc.poll() is None:
+                self._kill_tree(proc)
             with self._lock:
                 self._procs.pop(record.id, None)
-                record.status = 'failed'
-                record.ended_at = time.time()
-                record.detail = f'{type(exc).__name__}: {exc}'
+                if record.status not in TERMINAL_STATUSES:
+                    record.status = 'failed'
+                    record.ended_at = time.time()
+                    record.detail = f'{type(exc).__name__}: {exc}'
                 self._save(record)
+        finally:
+            with self._lock:
+                self._threads.pop(record.id, None)
 
     @staticmethod
     def _kill_tree(proc: subprocess.Popen) -> None:
         """Kill the process and its children (cmd.exe spawns intermediaries)."""
         if proc.poll() is not None:
             return
-        try:
-            if os.name == 'nt' and proc.pid:
-                subprocess.run(
-                    ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                    capture_output=True, check=False,
-                )
-            else:
-                proc.terminate()
-        except OSError:
+        if os.name == 'nt':
+            result = subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                capture_output=True, check=False, timeout=10,
+            )
+            if result.returncode != 0 and proc.poll() is None:
+                raise RuntimeError('could not terminate task process tree')
+        else:
             try:
-                proc.kill()
-            except OSError:
+                # SIGKILL 在 Windows 的 signal 模块上不存在，用 POSIX 数值兜底
+                os.killpg(proc.pid, getattr(signal, 'SIGKILL', 9))
+            except ProcessLookupError:
                 pass
+        proc.wait(timeout=10)
 
     def _save(self, record: TaskRecord) -> None:
         path = self.root / f'{record.id}.json'
@@ -218,9 +261,9 @@ class TaskManager:
             except (OSError, json.JSONDecodeError, TypeError):
                 continue   # foreign/corrupt file: not one of ours, skip it
             if record.status in ACTIVE_STATUSES:
-                # The process died with the previous server instance.
-                record.status = 'failed'
-                record.ended_at = record.ended_at or time.time()
-                record.detail = 'interrupted by server restart'
+                # An unclean exit loses ownership; a saved PID may already be reused.
+                # Do not claim the command exited or kill an unverified process.
+                record.status = 'interrupted'
+                record.detail = 'process state unknown after server restart; check before rerunning'
                 self._save(record)
             self._tasks[record.id] = record

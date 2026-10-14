@@ -18,6 +18,19 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_side_channels(monkeypatch):
+    """这些测试只脚本化「主循环」的 LLM 调用。load_memories / extract_memories /
+    consolidate_memories / generate_session_title 是同一 client 上的副通道调用，
+    会按序消费脚本响应队列，导致工具流程断言全部错位——一律打桩。"""
+    monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
+    monkeypatch.setattr(harness, 'extract_memories', lambda pre_compress: None)
+    monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
+    monkeypatch.setattr(harness, 'generate_session_title',
+                        lambda messages: '(untitled session)')
 
 
 # ---------- logger：统一输出带时间戳的调试日志，方便排查 ----------
