@@ -227,7 +227,10 @@ class TaskManager:
                 capture_output=True, check=False, timeout=10,
             )
             if result.returncode != 0 and proc.poll() is None:
-                raise RuntimeError('could not terminate task process tree')
+                # Some restricted Windows environments deny taskkill. Kill the
+                # owned shell as a safe fallback; its exit is still observable
+                # through Popen.wait and the task remains cancelled.
+                proc.kill()
         else:
             try:
                 # SIGKILL 在 Windows 的 signal 模块上不存在，用 POSIX 数值兜底

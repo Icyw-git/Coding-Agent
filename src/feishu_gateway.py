@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ from gateway_sim import GatewayClient
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
+DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 
 
 def format_permission_prompt(req: dict) -> str:
@@ -60,6 +62,11 @@ class FeishuGateway:
         self._load_bindings()
         self._notified: set[str] = set()
         self._poll_stop = threading.Event()
+        # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
+        # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
+        self._events: queue.Queue = queue.Queue()
+        self._chat_locks: dict[str, threading.Lock] = {}
+        self._chat_locks_guard = threading.Lock()
 
     # ---------- 绑定持久化 ----------
 
@@ -174,6 +181,8 @@ class FeishuGateway:
             self._notified.add(req_id)
             for chat_id in chats:
                 self._reply(chat_id, format_permission_prompt(req))
+        # 决议完成（或超时）的请求退出通知集合，避免集合无界增长
+        self._notified &= {req['req_id'] for req in pending}
 
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:
@@ -186,6 +195,31 @@ class FeishuGateway:
 
     def stop(self) -> None:
         self._poll_stop.set()
+
+    # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
+
+    def dispatch(self, chat_id: str, text: str) -> None:
+        """把飞书事件投递到分发队列（回调线程立即返回）。"""
+        self._events.put((chat_id, text))
+
+    def start_dispatcher(self, workers: int = DISPATCH_WORKERS) -> None:
+        def loop() -> None:
+            while True:
+                chat_id, text = self._events.get()
+                try:
+                    with self._chat_lock(chat_id):
+                        self.on_message(chat_id, text)
+                except Exception as exc:
+                    print(f'[feishu] dispatch error: {exc}')
+                finally:
+                    self._events.task_done()
+
+        for _ in range(max(1, workers)):
+            threading.Thread(target=loop, daemon=True).start()
+
+    def _chat_lock(self, chat_id: str) -> threading.Lock:
+        with self._chat_locks_guard:
+            return self._chat_locks.setdefault(chat_id, threading.Lock())
 
     def _reply(self, chat_id: str, text: str) -> None:
         if self.transport is not None and text:
@@ -209,7 +243,7 @@ class FeishuGateway:
                 if message.message_type != 'text':
                     return
                 content = json.loads(message.content)
-                self.on_message(message.chat_id, content.get('text', ''))
+                self.dispatch(message.chat_id, content.get('text', ''))
             except Exception as exc:
                 print(f'[feishu] event error: {exc}')
 
@@ -220,6 +254,7 @@ class FeishuGateway:
             app_id, app_secret, event_handler=event_handler,
             log_level=lark.LogLevel.INFO)
         self.start_permission_poller()
+        self.start_dispatcher()
         print('[feishu] long connection started; Ctrl+C to exit')
         ws_client.start()   # blocks
 

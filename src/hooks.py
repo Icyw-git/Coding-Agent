@@ -41,7 +41,9 @@ class PermissionRequest:
 
 
 class PermissionGate:
-    """登记请求并等待决议；双后端 + 超时熔断 + 完整审批历史。"""
+    """登记请求并等待决议；双后端 + 超时熔断 + 审批历史（有界）。"""
+
+    MAX_HISTORY = 200   # 已决议请求的保留上限，防止长驻服务器无限积累
 
     def __init__(self, timeout: float | None = None) -> None:
         self.timeout = float(
@@ -63,7 +65,24 @@ class PermissionGate:
         )
         with self._lock:
             self._requests[req.req_id] = req
+            self._prune_history()
         return req
+
+    def _prune_history(self) -> None:
+        """超过上限时淘汰最老的已决议记录（pending 的永不淘汰）。"""
+        excess = len(self._requests) - self.MAX_HISTORY
+        if excess <= 0:
+            return
+        resolved = sorted(
+            (req for req in self._requests.values() if req.status != 'pending'),
+            key=lambda r: r.created_at)
+        for req in resolved[:excess]:
+            self._requests.pop(req.req_id, None)
+
+    def clear(self) -> None:
+        """清空全部请求历史（测试隔离辅助）。"""
+        with self._lock:
+            self._requests.clear()
 
     def pending(self) -> list[PermissionRequest]:
         with self._lock:
