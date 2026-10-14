@@ -64,18 +64,23 @@ class FeishuGateway:
         self._poll_stop = threading.Event()
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
-        self._events: queue.Queue = queue.Queue()
+        self._events: queue.Queue = queue.Queue(maxsize=1000)
         self._chat_locks: dict[str, threading.Lock] = {}
         self._chat_locks_guard = threading.Lock()
+        self._dispatch_stop = threading.Event()
+        self._dispatch_threads: list[threading.Thread] = []
 
     # ---------- 绑定持久化 ----------
 
     def _load_bindings(self) -> None:
         if self.bindings_path.exists():
             try:
-                self.bindings = json.loads(
-                    self.bindings_path.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError):
+                loaded = json.loads(self.bindings_path.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict) and all(
+                        isinstance(key, str) and isinstance(value, str)
+                        for key, value in loaded.items()):
+                    self.bindings = loaded
+            except (OSError, json.JSONDecodeError, TypeError):
                 self.bindings = {}
 
     def _save_bindings(self) -> None:
@@ -101,8 +106,7 @@ class FeishuGateway:
             self._save_bindings()
             self._reply(chat_id, f'已创建会话 {session_id}')
         try:
-            self.api.session_id = session_id
-            reply = self.api.send(text)
+            reply = self.api.send(text, session_id=session_id)
             self._reply(chat_id, f'{reply}')
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
@@ -195,27 +199,55 @@ class FeishuGateway:
 
     def stop(self) -> None:
         self._poll_stop.set()
+        self._dispatch_stop.set()
+        for _ in self._dispatch_threads:
+            try:
+                self._events.put_nowait(None)
+            except queue.Full:
+                break
+        for thread in self._dispatch_threads:
+            thread.join(timeout=3)
+        self._dispatch_threads.clear()
 
     # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
 
     def dispatch(self, chat_id: str, text: str) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
-        self._events.put((chat_id, text))
+        try:
+            self._events.put_nowait((chat_id, text))
+        except queue.Full:
+            self._reply(chat_id, '当前消息较多，请稍后重试')
 
     def start_dispatcher(self, workers: int = DISPATCH_WORKERS) -> None:
+        if self._dispatch_threads:
+            return
+        self._dispatch_stop.clear()
         def loop() -> None:
-            while True:
-                chat_id, text = self._events.get()
+            while not self._dispatch_stop.is_set():
                 try:
-                    with self._chat_lock(chat_id):
+                    item = self._events.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    self._events.task_done()
+                    break
+                chat_id, text = item
+                try:
+                    # Approval must be able to unblock a turn holding the chat lock.
+                    if text.lstrip().lower().startswith('/approve '):
                         self.on_message(chat_id, text)
+                    else:
+                        with self._chat_lock(chat_id):
+                            self.on_message(chat_id, text)
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
                     self._events.task_done()
 
         for _ in range(max(1, workers)):
-            threading.Thread(target=loop, daemon=True).start()
+            thread = threading.Thread(target=loop, daemon=True)
+            self._dispatch_threads.append(thread)
+            thread.start()
 
     def _chat_lock(self, chat_id: str) -> threading.Lock:
         with self._chat_locks_guard:
@@ -260,6 +292,8 @@ class FeishuGateway:
 
 
 def main(argv=None) -> int:
+    from dotenv import load_dotenv
+    load_dotenv()   # 与 harness 共用项目根的 .env（FEISHU_*/HARNESS_* 都可放这里）
     app_id = os.getenv('FEISHU_APP_ID', '')
     app_secret = os.getenv('FEISHU_APP_SECRET', '')
     token = os.getenv('HARNESS_API_TOKEN', '')

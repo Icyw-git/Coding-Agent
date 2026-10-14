@@ -99,14 +99,14 @@ class PermissionGate:
         """远程决议一个 pending 请求并唤醒等待方。未知 id / 已决议 → 异常。"""
         with self._lock:
             req = self._requests.get(req_id)
-        if req is None:
-            raise KeyError(req_id)
-        if req.status != 'pending':
-            raise RuntimeError(f'request {req_id} already {req.status}')
-        req.status = 'approved' if allow else 'denied'
-        req.resolved_by = by
-        req._event.set()
-        return req
+            if req is None:
+                raise KeyError(req_id)
+            if req.status != 'pending':
+                raise RuntimeError(f'request {req_id} already {req.status}')
+            req.status = 'approved' if allow else 'denied'
+            req.resolved_by = by
+            req._event.set()
+            return req
 
     # ---------- 决议入口（permission_hook 调用） ----------
 
@@ -115,8 +115,10 @@ class PermissionGate:
         req = self.request(tool, args, reason)
         if self.backend == 'remote':
             signalled = req._event.wait(self.timeout)
-            if not signalled and req.status == 'pending':
-                req.status, req.resolved_by = 'timeout', 'gate'
+            if not signalled:
+                with self._lock:
+                    if req.status == 'pending':
+                        req.status, req.resolved_by = 'timeout', 'gate'
         else:
             self._decide_console(req)
         allowed = req.status == 'approved'

@@ -116,6 +116,50 @@ def test_unknown_command_reports_error(gateway):
     assert '未知命令' in fake.last()
 
 
+def test_messages_use_explicit_chat_session_without_shared_client_state(tmp_path):
+    class API:
+        def __init__(self):
+            self.calls = []
+
+        def create_session(self):
+            raise AssertionError('bindings are pre-created')
+
+        def send(self, content, session_id=None):
+            self.calls.append((content, session_id))
+            return session_id
+
+    api = API()
+    fake = FakeTransport()
+    gw = FeishuGateway(api, transport=fake, bindings_path=tmp_path / 'bindings.json')
+    gw.bindings.update({'a': 'session-a', 'b': 'session-b'})
+    threads = [threading.Thread(target=gw.on_message, args=(chat, 'hello'))
+               for chat in ('a', 'b')]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(api.calls, key=lambda row: row[1]) == [
+        ('hello', 'session-a'), ('hello', 'session-b')]
+
+
+def test_approval_dispatch_bypasses_chat_lock(tmp_path):
+    class API:
+        def pending_permissions(self): return []
+
+    gw = FeishuGateway(API(), bindings_path=tmp_path / 'bindings.json')
+    called = threading.Event()
+    gw.on_message = lambda chat_id, text: called.set()
+    lock = gw._chat_lock('c1')
+    lock.acquire()
+    try:
+        gw.start_dispatcher(workers=1)
+        gw.dispatch('c1', '/approve req y')
+        assert called.wait(1), 'approval was blocked by the chat lock'
+    finally:
+        lock.release()
+        gw.stop()
+
+
 def _drain_stale_permissions():
     """清理全局 gate 中上次测试遗留的 pending 请求（测试隔离）。"""
     for stale in permission_gate.pending():

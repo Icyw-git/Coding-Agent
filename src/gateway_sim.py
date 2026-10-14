@@ -85,11 +85,12 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['sessions']
 
-    def send(self, content: str) -> str:
-        if not self.session_id:
+    def send(self, content: str, session_id: str | None = None) -> str:
+        session_id = session_id or self.session_id
+        if not session_id:
             raise RuntimeError('no active session; use /new first')
         response = self.http.post(
-            f'/v1/sessions/{self.session_id}/messages',
+            f'/v1/sessions/{session_id}/messages',
             json={'content': content},
         )
         response.raise_for_status()
@@ -297,6 +298,8 @@ def repl(client: GatewayClient) -> int:
 
 
 def main(argv=None) -> int:
+    from dotenv import load_dotenv
+    load_dotenv()   # 与 harness 共用项目根的 .env
     parser = argparse.ArgumentParser(description='Harness message-gateway simulator')
     parser.add_argument('--url', default=os.getenv('HARNESS_API_URL', 'http://127.0.0.1:8000'))
     parser.add_argument('--token', default=os.getenv('HARNESS_API_TOKEN', ''))
