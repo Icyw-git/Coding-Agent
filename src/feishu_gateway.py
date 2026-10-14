@@ -59,6 +59,7 @@ class FeishuGateway:
         self.transport = transport          # 需实现 send_text(chat_id, text)
         self.bindings_path = Path(bindings_path or BINDINGS_PATH)
         self.bindings: dict[str, str] = {}   # chat_id → session_id
+        self._bindings_lock = threading.RLock()
         self._load_bindings()
         self._notified: set[str] = set()
         self._poll_stop = threading.Event()
@@ -84,10 +85,13 @@ class FeishuGateway:
                 self.bindings = {}
 
     def _save_bindings(self) -> None:
-        self.bindings_path.parent.mkdir(parents=True, exist_ok=True)
-        self.bindings_path.write_text(
-            json.dumps(self.bindings, ensure_ascii=False, indent=2),
-            encoding='utf-8')
+        with self._bindings_lock:
+            snapshot = dict(self.bindings)
+            self.bindings_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.bindings_path.with_suffix('.tmp')
+            temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
+                            encoding='utf-8')
+            os.replace(temp, self.bindings_path)
 
     # ---------- 消息入口（可测试核心） ----------
 
@@ -207,7 +211,8 @@ class FeishuGateway:
                 break
         for thread in self._dispatch_threads:
             thread.join(timeout=3)
-        self._dispatch_threads.clear()
+        self._dispatch_threads = [thread for thread in self._dispatch_threads
+                                  if thread.is_alive()]
 
     # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
 
@@ -219,6 +224,8 @@ class FeishuGateway:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
     def start_dispatcher(self, workers: int = DISPATCH_WORKERS) -> None:
+        self._dispatch_threads = [thread for thread in self._dispatch_threads
+                                  if thread.is_alive()]
         if self._dispatch_threads:
             return
         self._dispatch_stop.clear()
