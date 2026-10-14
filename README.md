@@ -92,6 +92,7 @@ python entrypoint.py --resume <session_id>
 
 ```bash
 python -m pip install -r requirements.txt
+python -m pip install -r requirements-api.txt
 uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
 ```
 

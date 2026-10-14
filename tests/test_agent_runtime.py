@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime import AgentRuntime
+from agent_runtime import AgentRuntime, SessionAlreadyExistsError
 from session_store import SessionEventStore
 
 
@@ -48,6 +48,14 @@ def test_runtime_rejects_invalid_explicit_session_id(tmp_path):
 
     with pytest.raises(ValueError, match="Invalid session ID"):
         runtime.create_session("..\\outside")
+
+
+def test_runtime_rejects_duplicate_session_id(tmp_path):
+    runtime = _runtime(tmp_path, lambda *_args, **_kwargs: "unused")
+    runtime.create_session("same")
+
+    with pytest.raises(SessionAlreadyExistsError, match="already exists"):
+        runtime.create_session("same")
 
 
 def test_runtime_uses_resolver_for_session_ids(tmp_path):

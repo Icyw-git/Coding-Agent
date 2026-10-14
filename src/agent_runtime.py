@@ -22,6 +22,10 @@ class AgentResult:
     content: str
 
 
+class SessionAlreadyExistsError(ValueError):
+    """Raised when a caller tries to create an existing session ID."""
+
+
 class AgentRuntime:
     """Coordinate persisted sessions and invoke a supplied agent turn runner."""
 
@@ -44,9 +48,13 @@ class AgentRuntime:
         session_id = session_id or uuid.uuid4().hex
         if not session_id.replace("-", "").replace("_", "").isalnum():
             raise ValueError("Invalid session ID")
-        store = self._session_store_cls(self._sessions_dir, session_id=session_id)
-        store.append("session_created")
-        return store.session_id
+        with self._session_lock(session_id):
+            path = self._sessions_dir / f"session_{session_id}.jsonl"
+            if path.exists():
+                raise SessionAlreadyExistsError(f"Session {session_id} already exists")
+            store = self._session_store_cls(self._sessions_dir, session_id=session_id)
+            store.append("session_created")
+            return store.session_id
 
     def send(self, session_id: str, content: str) -> AgentResult:
         """Append a user message, run one turn, and return the assistant content."""

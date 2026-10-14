@@ -20,6 +20,9 @@ class FakeRuntime:
 
     def create_session(self, session_id=None):
         session_id = session_id or "api-session"
+        if session_id in self.sessions:
+            from agent_runtime import SessionAlreadyExistsError
+            raise SessionAlreadyExistsError(session_id)
         self.sessions[session_id] = []
         return session_id
 
@@ -68,3 +71,14 @@ def test_api_maps_missing_session_to_404():
     client = TestClient(create_app(FakeRuntime()))
     response = client.get("/v1/sessions/missing")
     assert response.status_code == 404
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_maps_duplicate_session_to_409():
+    from fastapi.testclient import TestClient
+
+    runtime = FakeRuntime()
+    client = TestClient(create_app(runtime))
+    assert client.post("/v1/sessions", json={"id": "same"}).status_code == 201
+    response = client.post("/v1/sessions", json={"id": "same"})
+    assert response.status_code == 409

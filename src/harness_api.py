@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from typing import Any
 
 from harness_sdk import HarnessClient
+from agent_runtime import SessionAlreadyExistsError
 
 
 def create_app(runtime=None):
@@ -18,7 +18,7 @@ def create_app(runtime=None):
     except ImportError as exc:  # optional dependency for CLI-only installs
         raise RuntimeError(
             "FastAPI support requires optional dependencies; install with "
-            "`pip install -e .[api]` or `pip install fastapi uvicorn`."
+            "`pip install -r requirements-api.txt`."
         ) from exc
 
     client = HarnessClient(runtime or _default_runtime())
@@ -35,6 +35,8 @@ def create_app(runtime=None):
     def create_session(request: CreateSessionRequest):
         try:
             session = client.sessions.create(request.id)
+        except SessionAlreadyExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"id": session.id, "history": session.history}
