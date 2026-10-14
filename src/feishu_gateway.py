@@ -19,9 +19,10 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
     HARNESS_API_URL / HARNESS_API_TOKEN Agent API 地址与令牌
 
 聊天命令（@机器人 发送）：
-    /new [id] /sessions /cd [dir] /run <cmd> /status [id] /logs <id> /stop <id>
-    /perms /approve [req_id] y|n /quit(解绑)
+    /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
+    /logs <id> /stop <id> /perms /approve [req_id] y|n /quit(解绑)
     y / n          —— 快捷决议最早的待审批请求（无需输 ID）
+    /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
     /cd <dir>      —— 切换该聊天的任务执行目录（/run 生效）
     其余文本 → 作为消息发给绑定的 agent 会话
 """
@@ -130,11 +131,8 @@ class LarkTransport:
         if not response.success():
             raise RuntimeError(f'feishu update failed: {response.code} {response.msg}')
 
-    def send_markdown(self, chat_id: str, md_text: str) -> None:
-        """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
-        卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest, CreateMessageRequestBody)
+    @staticmethod
+    def _markdown_card(md_text: str) -> str:
         content = markdown_to_card_md(md_text)
         if len(content) > CARD_MD_LIMIT:
             content = content[:CARD_MD_LIMIT] + '\n…[内容过长已截断]'
@@ -142,19 +140,41 @@ class LarkTransport:
             'config': {'wide_screen_mode': True},
             'elements': [{'tag': 'markdown', 'content': content}],
         }
+        return json.dumps(card, ensure_ascii=False)
+
+    def send_markdown(self, chat_id: str, md_text: str) -> str | None:
+        """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
+        卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody)
         request = CreateMessageRequest.builder() \
             .receive_id_type('chat_id') \
             .request_body(
                 CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
                 .msg_type('interactive')
-                .content(json.dumps(card, ensure_ascii=False))
+                .content(self._markdown_card(md_text))
                 .build()
             ).build()
         response = self._client.im.v1.message.create(request)
         if not response.success():
             raise RuntimeError(
                 f'feishu card send failed: {response.code} {response.msg}')
+        data = getattr(response, 'data', None)
+        return getattr(data, 'message_id', None) if data else None
+
+    def update_markdown(self, message_id: str, md_text: str) -> None:
+        """Update an existing interactive card in place."""
+        from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
+        request = UpdateMessageRequest.builder().message_id(message_id).request_body(
+            UpdateMessageRequestBody.builder()
+            .msg_type('interactive')
+            .content(self._markdown_card(md_text)).build()
+        ).build()
+        response = self._client.im.v1.message.update(request)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu card update failed: {response.code} {response.msg}')
 
 
 class FeishuGateway:
@@ -241,31 +261,53 @@ class FeishuGateway:
             self._reply(chat_id, f'[error] {exc}')
 
     def _send_agent_reply(self, chat_id: str, session_id: str, text: str) -> None:
-        """Stream into one editable text message when the transport supports it."""
-        updater = getattr(self.transport, 'update_text', None)
+        """Stream into one editable Markdown card when supported."""
+        updater = getattr(self.transport, 'update_markdown', None)
+        sender = getattr(self.transport, 'send_markdown', None)
+        fallback_sender = getattr(self.transport, 'send_text', None)
+        if not updater or not sender:
+            updater = getattr(self.transport, 'update_text', None)
+            sender = getattr(self.transport, 'send_text', None) if updater else None
         message_id = None
         parts = []
         last_update = 0.0
+        stream_failed = False
 
         def on_delta(part: str) -> None:
-            nonlocal message_id, last_update
+            nonlocal message_id, last_update, stream_failed
             parts.append(part)
+            if stream_failed or not updater:
+                return
             now = time.monotonic()
             if updater and now - last_update >= 0.6:
-                if message_id is None:
-                    message_id = self.transport.send_text(chat_id, ''.join(parts) or '生成中…')
-                if message_id:
-                    updater(message_id, ''.join(parts))
-                    last_update = now
+                try:
+                    if message_id is None:
+                        message_id = sender(chat_id, ''.join(parts) or '生成中…')
+                    if message_id:
+                        updater(message_id, ''.join(parts))
+                        last_update = now
+                except Exception as exc:
+                    stream_failed = True
+                    print(f'[feishu] stream update failed, falling back: {exc}')
 
         try:
             reply = self.api.send_stream(text, session_id=session_id, on_delta=on_delta)
         except (AttributeError, NotImplementedError):
             reply = self.api.send(text, session_id=session_id)
-        if message_id and updater:
-            updater(message_id, reply)
-        else:
-            self._reply(chat_id, reply)
+        if message_id and updater and not stream_failed:
+            try:
+                updater(message_id, reply)
+                return
+            except Exception as exc:
+                print(f'[feishu] final card update failed, falling back: {exc}')
+                stream_failed = True
+        if stream_failed and fallback_sender:
+            try:
+                fallback_sender(chat_id, reply)
+                return
+            except Exception:
+                pass
+        self._reply(chat_id, reply)
 
     # ---------- 快捷审批 ----------
 
@@ -298,6 +340,27 @@ class FeishuGateway:
                 lines = [f"{row['id'][:12]}  events={row['events']}  "
                          f"{row['title']}" for row in rows]
                 self._reply(chat_id, '\n'.join(lines) or '(no sessions)')
+            elif command == '/use':
+                if not argument:
+                    self._reply(chat_id, '用法: /use <会话ID前缀>'
+                                          '\n（/sessions 可查，前缀唯一即可）')
+                    return
+                rows = self.api.list_sessions(limit=100)
+                hits = [row for row in rows
+                        if row['id'].startswith(argument)]
+                if not hits:
+                    self._reply(chat_id, f'未找到以 {argument!r} 开头的会话')
+                    return
+                if len(hits) > 1:
+                    lines = [f"{row['id'][:12]}  {row['title']}"
+                             for row in hits[:5]]
+                    self._reply(chat_id, '前缀有歧义，候选:\n' + '\n'.join(lines))
+                    return
+                with self._bindings_lock:
+                    self.bindings[chat_id] = hits[0]['id']
+                    self._save_bindings()
+                self._reply(chat_id, f"已切换到会话 {hits[0]['id']}"
+                                     f"\n标题: {hits[0]['title']}")
             elif command == '/cd':
                 if not argument:
                     current = self._chat_cwd.get(chat_id, '(默认：服务器工作区)')

@@ -44,7 +44,8 @@ def api_app(tmp_path):
         sessions_dir=tmp_path / 'sessions',
     )
     return create_app(runtime, api_token='t',
-                      task_root=tmp_path / 'tasks', workspace=tmp_path)
+                      task_root=tmp_path / 'tasks', workspace=tmp_path,
+                      rate_limit=10000)
 
 
 def _sync_asgi_transport(app):
@@ -332,6 +333,101 @@ def test_reply_prefers_card_and_falls_back_to_text():
     gw.transport = bad
     gw._reply('c1', '回退文本')
     assert not bad.cards and bad.texts
+
+
+def test_stream_reply_uses_one_markdown_card_and_finalizes():
+    """流式回复创建并更新同一张卡片，最终结果只保留一条消息。"""
+    class StreamApi:
+        def send_stream(self, content, session_id=None, on_delta=None):
+            on_delta('**第一段**')
+            on_delta('\n- 第二段')
+            return '**第一段**\n- 第二段'
+
+    class CardTransport:
+        def __init__(self):
+            self.created = []
+            self.updated = []
+            self.texts = []
+
+        def send_markdown(self, chat_id, text):
+            self.created.append((chat_id, text))
+            return 'msg-1'
+
+        def update_markdown(self, message_id, text):
+            self.updated.append((message_id, text))
+
+        def send_text(self, chat_id, text):
+            self.texts.append((chat_id, text))
+
+    transport = CardTransport()
+    gateway = FeishuGateway(StreamApi(), transport=transport)
+    gateway._send_agent_reply('chat-1', 'session-1', 'hello')
+    assert transport.created == [('chat-1', '**第一段**')]
+    assert transport.updated == [
+        ('msg-1', '**第一段**'),
+        ('msg-1', '**第一段**\n- 第二段'),
+    ]
+    assert transport.texts == []
+
+
+def test_stream_card_update_failure_does_not_fail_generation():
+    """卡片更新失败时仍完成生成，并补发纯文本结果。"""
+    class StreamApi:
+        def send_stream(self, content, session_id=None, on_delta=None):
+            on_delta('partial')
+            return 'final answer'
+
+    class BrokenTransport:
+        def __init__(self):
+            self.texts = []
+
+        def send_markdown(self, chat_id, text):
+            return 'msg-1'
+
+        def update_markdown(self, message_id, text):
+            raise RuntimeError('temporary failure')
+
+        def send_text(self, chat_id, text):
+            self.texts.append((chat_id, text))
+
+    transport = BrokenTransport()
+    gateway = FeishuGateway(StreamApi(), transport=transport)
+    gateway._send_agent_reply('chat-1', 'session-1', 'hello')
+    assert transport.texts == [('chat-1', 'final answer')]
+
+
+def test_use_command_switches_binding(api_app, tmp_path):
+    """/use <前缀>：唯一命中→重绑；歧义→候选列表；未命中→报错。"""
+    api = gateway_sim.GatewayClient(
+        'http://test', 't', transport=_sync_asgi_transport(api_app))
+    fake = FakeTransport()
+    gw = feishu_gateway.FeishuGateway(api, transport=fake,
+                                      bindings_path=tmp_path / 'bindings.json')
+    sid_a = api.create_session('dup-1')
+    sid_b = api.create_session('dup-2')
+    sid_c = api.create_session()          # 自动 ID，构造唯一前缀用
+    fake.sent.clear()
+
+    # 空参数 → 用法提示
+    gw.on_message('c1', '/use')
+    assert any('用法' in text for _, text in fake.sent)
+
+    # 未命中
+    gw.on_message('c1', '/use zzzz')
+    assert any('未找到' in text for _, text in fake.sent)
+
+    # 歧义：dup- 前缀同时命中两个
+    gw.on_message('c1', '/use dup-')
+    assert any('歧义' in text for _, text in fake.sent)
+
+    # 唯一前缀命中 → 重绑到 sid_c
+    prefix = next(sid_c[:k] for k in range(1, len(sid_c) + 1)
+                  if not sid_a.startswith(sid_c[:k])
+                  and not sid_b.startswith(sid_c[:k]))
+    gw.on_message('c1', f'/use {prefix}')
+    assert any('已切换到会话' in text for _, text in fake.sent)
+    assert gw.bindings['c1'] == sid_c
+    api.close()
 
 
 def test_user_allowlist_blocks_strangers(api_app, tmp_path, monkeypatch):

@@ -224,7 +224,8 @@ def test_task_end_to_end_flow(tmp_path, api_client):
     """网关核心链路：创建任务 → 轮询状态 → 拉取日志 → 列表。"""
     from fastapi.testclient import TestClient
 
-    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
+    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks",
+                                   rate_limit=10000))
     headers = {"Authorization": "Bearer t"}
 
     created = client.post("/v1/tasks",
@@ -253,7 +254,8 @@ def test_task_end_to_end_flow(tmp_path, api_client):
 def test_task_stop_and_not_found(tmp_path, api_client):
     from fastapi.testclient import TestClient
 
-    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
+    client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks",
+                                   rate_limit=10000))
     headers = {"Authorization": "Bearer t"}
 
     assert client.get("/v1/tasks/missing", headers=headers).status_code == 404
