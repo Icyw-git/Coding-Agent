@@ -283,7 +283,9 @@ def test_lark_transport_sends_text(monkeypatch):
 def test_markdown_to_card_md_conversions():
     """lark_md 转换：标题→加粗、水平线→空行、无序列表→•；代码块原样。"""
     from feishu_gateway import markdown_to_card_md
-    md = '# 标题\n## 二级\n- 甲\n* 乙\n---\n```py\n# 注释\n- 保留\n```\n正文'
+    md = ('# 标题\n## 二级\n- 甲\n* 乙\n---\n'
+          '| 状态 | 结果 |\n|---|---|\n| ok | 完成 |\n'
+          '```py\n# 注释\n- 保留\n```\n正文')
     out = markdown_to_card_md(md)
     lines = out.splitlines()
     assert lines[0] == '**标题**'
@@ -291,6 +293,7 @@ def test_markdown_to_card_md_conversions():
     assert lines[2] == '• 甲'
     assert lines[3] == '• 乙'
     assert lines[4] == ''          # 水平线
+    assert '状态: ok；结果: 完成' in out
     assert '# 注释' in out          # 代码块内不转换
     assert '- 保留' in out
     assert lines[-1] == '正文'
@@ -302,6 +305,18 @@ def test_markdown_to_card_md_conversions():
         content = content[:CARD_MD_LIMIT] + '\n…[内容过长已截断]'
     assert len(content) <= CARD_MD_LIMIT + 20
     assert content.endswith('…[内容过长已截断]')
+
+
+def test_markdown_card_uses_lark_md_element():
+    """飞书旧版交互卡片必须把 Markdown 放在 div.text/lark_md 中。"""
+    import json
+    from feishu_gateway import LarkTransport
+
+    card = json.loads(LarkTransport._markdown_card('**加粗**\n- 项目'))
+    element = card['elements'][0]
+    assert element['tag'] == 'div'
+    assert element['text']['tag'] == 'lark_md'
+    assert element['text']['content'] == '**加粗**\n• 项目'
 
 
 def test_reply_prefers_card_and_falls_back_to_text():

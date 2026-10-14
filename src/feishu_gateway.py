@@ -68,28 +68,48 @@ def markdown_to_card_md(md_text: str) -> str:
     lines = md_text.splitlines()
     out = []
     in_code = False
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if line.strip().startswith('```'):
             in_code = not in_code
             out.append(line)
+            i += 1
             continue
         if in_code:
             out.append(line)
+            i += 1
             continue
         stripped = line.lstrip()
         indent = line[:len(line) - len(stripped)]
+        # lark_md does not render GitHub tables. Turn a table into compact
+        # labelled rows so the information remains readable in a card.
+        if ('|' in stripped and i + 1 < len(lines)
+                and re.match(r'^\s*\|?\s*:?-{3,}', lines[i + 1])):
+            headers = [cell.strip() for cell in stripped.strip('|').split('|')]
+            i += 2  # consume header and separator
+            while i < len(lines) and '|' in lines[i] and lines[i].strip():
+                values = [cell.strip() for cell in lines[i].strip().strip('|').split('|')]
+                pairs = [f'{h}: {v}' for h, v in zip(headers, values)]
+                out.append(f'{indent}• ' + '；'.join(pairs))
+                i += 1
+            continue
         m = re.match(r'^(#{1,6})\s+(.*)$', stripped)
         if m:   # 标题 → 加粗行
             out.append(f'{indent}**{m.group(2).strip()}**')
+            i += 1
             continue
         if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):   # 水平线 → 空行
             out.append('')
+            i += 1
             continue
         m = re.match(r'^[-*+]\s+(.*)$', stripped)
         if m:   # 无序列表 → 符号列表
             out.append(f'{indent}• {m.group(1)}')
+            i += 1
             continue
         out.append(line)
+        i += 1
     return '\n'.join(out)
 
 
@@ -138,7 +158,13 @@ class LarkTransport:
             content = content[:CARD_MD_LIMIT] + '\n…[内容过长已截断]'
         card = {
             'config': {'wide_screen_mode': True},
-            'elements': [{'tag': 'markdown', 'content': content}],
+            # Legacy interactive cards use lark_md under a div element.
+            # Sending a top-level `markdown` element succeeds but renders
+            # markdown markers literally in Feishu clients.
+            'elements': [{
+                'tag': 'div',
+                'text': {'tag': 'lark_md', 'content': content},
+            }],
         }
         return json.dumps(card, ensure_ascii=False)
 
