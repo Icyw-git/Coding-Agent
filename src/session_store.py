@@ -264,7 +264,7 @@ class SessionEventStore:
                 events.append(event)
         return events, offset
 
-    def rebuild_openai_history(self) -> list[dict]:
+    def rebuild_openai_history(self, *, recover_pending: bool = False) -> list[dict]:
         """Rebuild the current compacted OpenAI history from the append-only event stream."""
         messages = []
         for event in self.read_events():
@@ -281,8 +281,44 @@ class SessionEventStore:
                 messages = [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
             elif event_type == "rewind":
                 messages = self._rewound_history(event)
+            elif event_type == "tool_recovery":
+                messages = self.close_interrupted_tools(messages)
+        if recover_pending:
+            recovered = self.close_interrupted_tools(messages)
+            self.validate_openai_history(recovered)
+            if recovered != messages:
+                self.append('tool_recovery')
+                messages = recovered
         self.validate_openai_history(messages, allow_pending=True)
         return messages
+
+    @staticmethod
+    def close_interrupted_tools(messages: list[dict]) -> list[dict]:
+        """Close missing tool results without claiming success or repeating tools."""
+        result = []
+        pending = {}
+
+        def close_pending():
+            for call_id in pending:
+                result.append({
+                    'role': 'tool', 'tool_call_id': call_id,
+                    'content': ('Error: Tool execution was interrupted; no result was recorded. '
+                                'The outcome is unknown. Verify current state before retrying '
+                                'any operation with side effects.'),
+                })
+            pending.clear()
+
+        for message in messages:
+            if message.get('role') != 'tool':
+                close_pending()
+            result.append(message)
+            if message.get('role') == 'assistant':
+                for call in message.get('tool_calls') or []:
+                    pending[call['id']] = call
+            elif message.get('role') == 'tool':
+                pending.pop(message.get('tool_call_id'), None)
+        close_pending()
+        return result
 
     def _rewound_history(self, event: dict) -> list[dict]:
         """回溯事件：用 checkpoint 的 messages 快照替换此前历史，并标注回滚点。"""

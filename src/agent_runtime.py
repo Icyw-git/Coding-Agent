@@ -67,7 +67,7 @@ class AgentRuntime:
             raise ValueError("message content must be a non-empty string")
         with self._session_lock(session_id):
             store = self._open_session(session_id)
-            messages = store.rebuild_openai_history()
+            messages = store.rebuild_openai_history(recover_pending=True)
             message = {"role": "user", "content": content}
             messages.append(message)
             store.append_message(message)

@@ -522,7 +522,13 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     返回 (name, args, tool 消息 dict)。主循环与 teammate 共用同一条安全/兜底路径。
     hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。"""
     name = tool_call.function.name
-    args = json.loads(tool_call.function.arguments)
+    try:
+        args = json.loads(tool_call.function.arguments)
+        if not isinstance(args, dict):
+            raise ValueError('tool arguments must be a JSON object')
+    except (TypeError, ValueError) as exc:
+        return name, {}, {'role': 'tool', 'tool_call_id': tool_call.id,
+                          'content': f'Error: invalid tool arguments: {exc}'}
     if registry is None:
         registry = tool_registry
     if hooks:
@@ -991,7 +997,13 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
             recovery_state.has_escalated=True
             print('  [length] escalating max_tokens and requesting continuation')
-            messages.append({'role':'user','content':recovery.CONTINUATION_PROMPT})
+            completed = SessionEventStore.close_interrupted_tools(messages)
+            for tool_result in completed[len(messages):]:
+                session_store.append_message(tool_result)
+            messages[:] = completed
+            continuation = {'role':'user','content':recovery.CONTINUATION_PROMPT}
+            messages.append(continuation)
+            session_store.append_message(continuation)
             continue
 
 
@@ -1095,7 +1107,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
 def resume_agent_loop(session_path: Path):
     """Resume a persisted OpenAI session without automatically repeating pending tools."""
     session_store = SessionEventStore.open(session_path)
-    messages = session_store.rebuild_openai_history()
+    messages = session_store.rebuild_openai_history(recover_pending=True)
     recovery_message = session_store.recovery_message()
     if recovery_message:
         messages.append(recovery_message)
@@ -1203,7 +1215,7 @@ def run_repl(initial_messages:list, session_store=None):
                     else:
                         path = resolve_session_path(identifier)
                     candidate = SessionEventStore.open(path)
-                    history = candidate.rebuild_openai_history()
+                    history = candidate.rebuild_openai_history(recover_pending=True)
                     summary = candidate.session_summary()
                     if summary['workspace']:
                         set_workspace(summary['workspace'])
@@ -1232,13 +1244,14 @@ def run_repl(initial_messages:list, session_store=None):
                 continue
             handle_command(line,messages,session_store)
             continue
+        messages[:] = session_store.rebuild_openai_history(recover_pending=True)
         messages.append({'role':'user','content':line})
         session_store.append_message(messages[-1])
         try:
             agent_loop(messages,session_store=session_store)
         except KeyboardInterrupt:
             print('\n[会话已中断]')
-        messages[:]=session_store.rebuild_openai_history()
+        messages[:]=session_store.rebuild_openai_history(recover_pending=True)
 
 
 if __name__ == '__main__':
