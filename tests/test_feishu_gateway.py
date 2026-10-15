@@ -528,7 +528,7 @@ def test_reply_prefers_card_and_falls_back_to_text():
 def test_stream_reply_uses_one_markdown_card_and_finalizes():
     """流式回复创建并更新同一张卡片，最终结果只保留一条消息。"""
     class StreamApi:
-        def send_stream(self, content, session_id=None, on_delta=None):
+        def send_stream(self, content, session_id=None, on_delta=None, on_progress=None):
             on_delta('**第一段**')
             on_delta('\n- 第二段')
             return '**第一段**\n- 第二段'
@@ -563,7 +563,7 @@ def test_stream_reply_uses_one_markdown_card_and_finalizes():
 def test_stream_card_update_failure_does_not_fail_generation():
     """卡片更新失败时仍完成生成，并补发纯文本结果。"""
     class StreamApi:
-        def send_stream(self, content, session_id=None, on_delta=None):
+        def send_stream(self, content, session_id=None, on_delta=None, on_progress=None):
             on_delta('partial')
             return 'final answer'
 

@@ -10,6 +10,8 @@ import queue
 import threading
 import secrets
 import time
+import sys
+import traceback
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -19,7 +21,11 @@ from harness_sdk import HarnessClient
 from agent_runtime import SessionAlreadyExistsError
 from session_store import SessionReplayError
 from task_manager import TaskManager
+from turn_progress import TurnProgress
 from hooks import GATE as permission_gate
+
+STREAM_PROGRESS_INTERVAL = 5
+STREAM_DIAGNOSTIC_INTERVAL = 60
 
 try:
     from pydantic import BaseModel, Field
@@ -333,6 +339,10 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
 
         def run() -> None:
             try:
+                opener = getattr(runtime, 'open_session', None)
+                if opener is not None:
+                    store = opener(session_id)
+                    deltas.put(('source', (store, store.path.stat().st_size)))
                 response = client.messages.create(
                     session_id, request.content,
                     on_delta=lambda text: deltas.put(("delta", text)),
@@ -345,19 +355,39 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             finally:
                 deltas.put(("close", finished))
 
-        threading.Thread(target=run, daemon=True).start()
+        worker = threading.Thread(target=run, daemon=True, name='agent-api-turn')
+        worker.start()
 
         def events():
+            progress = TurnProgress()
+            last_progress = last_diagnostic = time.monotonic()
+            yield f"event: progress\ndata: {json.dumps(progress.snapshot())}\n\n"
             while True:
-                kind, payload = deltas.get()
-                if kind == "delta":
+                try:
+                    kind, payload = deltas.get(timeout=STREAM_PROGRESS_INTERVAL)
+                except queue.Empty:
+                    kind, payload = 'heartbeat', None
+                if kind == 'source':
+                    progress.follow(*payload)
+                elif kind == "delta":
                     yield f"event: delta\ndata: {json.dumps({'text': payload}, ensure_ascii=False)}\n\n"
                 elif kind == "done":
                     yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 elif kind == "error":
                     yield f"event: error\ndata: {json.dumps({'detail': payload}, ensure_ascii=False)}\n\n"
-                else:
+                elif kind == 'close':
                     return
+                now = time.monotonic()
+                if kind not in ('done', 'error') and now - last_progress >= STREAM_PROGRESS_INTERVAL:
+                    status = progress.snapshot()
+                    yield f"event: progress\ndata: {json.dumps(status)}\n\n"
+                    last_progress = now
+                    if now - last_diagnostic >= STREAM_DIAGNOSTIC_INTERVAL:
+                        frame = sys._current_frames().get(worker.ident)
+                        if frame is not None:
+                            logger.warning('agent turn still running session=%s progress=%s\n%s',
+                                           session_id, status, ''.join(traceback.format_stack(frame)))
+                        last_diagnostic = now
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",

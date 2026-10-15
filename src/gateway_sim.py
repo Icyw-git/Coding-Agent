@@ -106,12 +106,13 @@ class GatewayClient:
         return response.json()['content']
 
     def send_stream(self, content: str, session_id: str | None = None,
-                    on_delta=None) -> str:
+                    on_delta=None, on_progress=None) -> str:
         """Run a turn over the message SSE endpoint and return final text."""
         session_id = session_id or self.session_id
         if not session_id:
             raise RuntimeError('no active session; use /new first')
         final = ''
+        completed = False
         with self.http.stream('POST', f'/v1/sessions/{session_id}/messages/stream',
                               json={'content': content}) as response:
             response.raise_for_status()
@@ -128,8 +129,13 @@ class GatewayClient:
                             on_delta(text)
                     elif event == 'done':
                         final = payload.get('content', final)
+                        completed = True
+                    elif event == 'progress' and on_progress:
+                        on_progress(payload)
                     elif event == 'error':
                         raise RuntimeError(payload.get('detail', 'stream failed'))
+        if not completed:
+            raise RuntimeError('回复流提前结束，任务状态未知；请先检查状态，避免重复执行。')
         return final
 
     def start_stream(self) -> bool:

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import threading
 import time
@@ -30,6 +29,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from process_utils import kill_process_tree
 
 TERMINAL_STATUSES = {'succeeded', 'failed', 'cancelled', 'interrupted'}
 ACTIVE_STATUSES = {'queued', 'running'}
@@ -219,25 +219,7 @@ class TaskManager:
     @staticmethod
     def _kill_tree(proc: subprocess.Popen) -> None:
         """Kill the process and its children (cmd.exe spawns intermediaries)."""
-        if proc.poll() is not None:
-            return
-        if os.name == 'nt':
-            result = subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                capture_output=True, check=False, timeout=10,
-            )
-            if result.returncode != 0 and proc.poll() is None:
-                # Some restricted Windows environments deny taskkill. Kill the
-                # owned shell as a safe fallback; its exit is still observable
-                # through Popen.wait and the task remains cancelled.
-                proc.kill()
-        else:
-            try:
-                # SIGKILL 在 Windows 的 signal 模块上不存在，用 POSIX 数值兜底
-                os.killpg(proc.pid, getattr(signal, 'SIGKILL', 9))
-            except ProcessLookupError:
-                pass
-        proc.wait(timeout=10)
+        kill_process_tree(proc)
 
     def _save(self, record: TaskRecord) -> None:
         path = self.root / f'{record.id}.json'

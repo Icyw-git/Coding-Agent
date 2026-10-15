@@ -155,7 +155,7 @@ def test_posix_stop_signals_process_group(monkeypatch):
     proc = Mock(pid=123)
     proc.poll.return_value = None
     killpg = Mock()
-    monkeypatch.setattr('task_manager.os', SimpleNamespace(name='posix', killpg=killpg))
+    monkeypatch.setattr('process_utils.os', SimpleNamespace(name='posix', killpg=killpg))
     TaskManager._kill_tree(proc)
     killpg.assert_called_once_with(123, getattr(signal, 'SIGKILL', 9))
     proc.wait.assert_called_once_with(timeout=10)

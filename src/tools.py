@@ -5,8 +5,10 @@ import ast
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, List
+from process_utils import kill_process_tree
 
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 from cron_scheduler import schedule_job, cancel_job, cron_lock, scheduled_jobs
@@ -402,6 +404,9 @@ TOOLS=[{
 
 }]
 
+BASH_TIMEOUT = 120
+
+
 def run_bash(command:str, cwd: str = None)->str:
 
     dangerous=["rm -rf /","sudo","shutdown","reboot","> /dev/"]
@@ -409,8 +414,22 @@ def run_bash(command:str, cwd: str = None)->str:
         return "Error: Dangerous command, please do not execute"
     try:
         base = cwd or str(_h().WORKDIR)
-        r=subprocess.run(command,shell=True,cwd=base,capture_output=True,timeout=120)
-        raw=(r.stdout or b"")+(r.stderr or b"")
+        # A descendant can keep a PIPE open after cmd.exe exits. A temporary
+        # output file lets the timeout bound execution without waiting for EOF.
+        with tempfile.TemporaryFile() as output:
+            proc = subprocess.Popen(command, shell=True, cwd=base,
+                                    stdout=output, stderr=subprocess.STDOUT,
+                                    start_new_session=os.name != 'nt')
+            try:
+                proc.wait(timeout=BASH_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                kill_process_tree(proc)
+                return f'Error: Command timeout({BASH_TIMEOUT}s); process termination requested.'
+            except BaseException:
+                kill_process_tree(proc)
+                raise
+            output.seek(0)
+            raw = output.read(200000)
         try:
             out=raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -419,7 +438,7 @@ def run_bash(command:str, cwd: str = None)->str:
         out=out.replace('\ufffd','?')  # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
         return out[:50000] if out else "No output"
     except subprocess.TimeoutExpired:
-        return "Error: Command timeout(120s)"
+        return 'Error: Timed out while terminating command; process state unknown.'
     except (FileNotFoundError,OSError) as e:
         return f'Error:{e}'
 
@@ -432,7 +451,7 @@ def safe_path(p: str, cwd: str = None) -> Path:
 
 def _capture_checkpoint(path: Path) -> None:
     """把「写入前」的内容交给当前活跃 checkpoint 节点；无活跃 manager 时静默跳过。"""
-    manager = getattr(_h(), 'CHECKPOINT_MANAGER', None)
+    manager = _h().active_checkpoint_manager()
     if manager is not None:
         manager.capture_pre_image(path)
 

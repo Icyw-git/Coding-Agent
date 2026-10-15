@@ -356,7 +356,8 @@ def _loop_env(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'CHECKPOINT_DIR', tmp_path / 'checkpoints')
     monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
     monkeypatch.setattr(harness, 'TRANSCRIPT_DIR', tmp_path / 'transcripts')
-    monkeypatch.setattr(harness, 'CHECKPOINT_MANAGER', None)
+    from contextvars import ContextVar
+    monkeypatch.setattr(harness, '_checkpoint_manager', ContextVar('test_checkpoint', default=None))
     monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
     monkeypatch.setattr(harness, 'extract_memories', lambda messages: None)
     monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
@@ -384,7 +385,7 @@ def test_agent_loop_records_nodes_and_rewind_restores_file(tmp_path, monkeypatch
     assert harness.agent_loop(messages, session_store=session_store) == 'done'
     assert (workspace / 'a.txt').read_text(encoding='utf-8') == 'v2'
 
-    manager = harness.CHECKPOINT_MANAGER
+    manager = harness.get_checkpoint_manager(session_store)
     nodes = manager.list()
     assert len(nodes) == 2, nodes                 # 两次循环迭代各一个节点
     assert {row['status'] for row in nodes} == {'sealed'}
@@ -415,19 +416,22 @@ def test_agent_loop_checkpoint_tool_labels_valid_turn_node(tmp_path, monkeypatch
 
     assert harness.agent_loop(messages, session_store=session_store) == 'noted'
 
-    manual = [row for row in harness.CHECKPOINT_MANAGER.list() if row['trigger'] == 'manual']
+    manager = harness.get_checkpoint_manager(session_store)
+    manual = [row for row in manager.list() if row['trigger'] == 'manual']
     assert len(manual) == 1 and manual[0]['label'] == 'before refactor'
     # checkpoint 工具结果以 role=tool 回填，history 里没有孤儿 tool 消息
     history = session_store.rebuild_openai_history()
     assert 'Checkpoint created: ' in json.dumps(history, ensure_ascii=False)
     harness.SessionEventStore.validate_openai_history(history)
-    assert harness.rewind_to(messages, session_store, harness.CHECKPOINT_MANAGER,
+    assert harness.rewind_to(messages, session_store, manager,
                              manual[0]['cp_id']) is True
     harness.SessionEventStore.validate_openai_history(messages)
 
 
 def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
     """命令层：/checkpoints、/checkpoint、/rewind --yes 的动作与副作用。"""
+    from test_context_manage import FakeCompletions, make_text_response, make_tool_response
+
     harness, workspace = _loop_env(tmp_path, monkeypatch)
     (workspace / 'a.txt').write_text('v1', encoding='utf-8')
     session_store = harness.SessionEventStore(harness.SESSIONS_DIR)
@@ -441,17 +445,25 @@ def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
     harness.handle_command('/checkpoint before refactor', messages, session_store)
     manual = [row for row in manager.list() if row['trigger'] == 'manual']
     assert len(manual) == 1 and manual[0]['label'] == 'before refactor'
+    assert manual[0]['status'] == 'sealed'
 
-    manager.capture_pre_image(workspace / 'a.txt')
-    (workspace / 'a.txt').write_text('broken', encoding='utf-8')
-    manager.seal()
+    fake = FakeCompletions([
+        make_tool_response([('c1', 'write', json.dumps({'path': 'a.txt', 'content': 'broken'}))]),
+        make_text_response('done'),
+    ])
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fake.create)
+    harness.agent_loop(messages, session_store=session_store)
+    harness.wait_for_housekeeping()
+    manager = harness.get_checkpoint_manager(session_store)
+    changed = next(row for row in manager.list() if row['files'])
+    assert manager.get(changed['cp_id'])['parent_id'] == manual[0]['cp_id']
 
     harness.handle_command('/rewind last --yes', messages, session_store)
 
     assert (workspace / 'a.txt').read_text(encoding='utf-8') == 'v1'
-    assert messages[-1]['content'].startswith('[Rewound to ' + manual[0]['cp_id'])
+    assert messages[-1]['content'].startswith('[Rewound to ' + changed['cp_id'])
     assert any(event['type'] == 'rewind' for event in session_store.read_events())
-    assert manager.head() == manual[0]['cp_id']
+    assert harness.get_checkpoint_manager(session_store).head() == changed['cp_id']
 
 
 def _index_rows(ws):

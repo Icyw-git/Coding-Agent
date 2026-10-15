@@ -5,6 +5,8 @@ import openai
 import json
 import time
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -371,7 +373,7 @@ CHECKPOINT_KEEP_LABELED=True     # 带 label 的显式节点不被 GC
 CHECKPOINT_CAPTURE_FILES=True    # 关闭后退化为纯会话回溯
 CHECKPOINT_IGNORE=['.cache','.git','.worktrees','.mailbox','__pycache__','.pytest_cache']
 CHECKPOINT_SECRETS=['.env','*.pem','*_rsa']
-CHECKPOINT_MANAGER=None          # 当前活跃 manager；tools 的 write/edit 通过 _h() 读取它抓 pre-image
+_checkpoint_manager = ContextVar('checkpoint_manager', default=None)
 
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=1
@@ -573,9 +575,8 @@ def _record_compaction(session_store, compacted_messages, strategy):
 # ============================================================
 
 def get_checkpoint_manager(session_store):
-    """按 session 复用 manager，并把它暴露给 tools.run_write/run_edit 抓 pre-image。"""
-    global CHECKPOINT_MANAGER
-    manager=CHECKPOINT_MANAGER
+    """Reuse the manager within this turn, without sharing it across sessions."""
+    manager = active_checkpoint_manager()
     if (manager is None or manager.session_id != session_store.session_id
             or manager.workspace != WORKDIR):
         manager=CheckpointManager(
@@ -586,8 +587,25 @@ def get_checkpoint_manager(session_store):
             ignore=CHECKPOINT_IGNORE,
             secrets=CHECKPOINT_SECRETS,
         )
-        CHECKPOINT_MANAGER=manager
     return manager
+
+
+def active_checkpoint_manager():
+    return _checkpoint_manager.get()
+
+
+@contextmanager
+def _isolated_checkpoint_context():
+    token = _checkpoint_manager.set(None)
+    try:
+        yield
+    finally:
+        try:
+            manager = active_checkpoint_manager()
+            if manager is not None:
+                _safe_checkpoint(manager.seal)
+        finally:
+            _checkpoint_manager.reset(token)
 
 
 def _safe_checkpoint(action,*args,**kwargs):
@@ -779,6 +797,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         label=' '.join(parts[1:])
         cp_id=_safe_checkpoint(manager.begin_turn,messages,session_store,label=label,trigger='manual')
         if cp_id:
+            _safe_checkpoint(manager.seal)
             print(f"  已创建快照{('：' + label) if label else ''}。用 /rewind head 回溯。")
 
     elif command=='/rewind':
@@ -886,6 +905,7 @@ def _stream_completion(create_kwargs, on_delta):
         choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
 
 
+@_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None):
     """Run one OpenAI session, recording an append-only event stream for recovery."""
     if session_store is None:
@@ -906,7 +926,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
     memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
-    checkpoint_manager=get_checkpoint_manager(session_store) # 节点按 session 复用；tools 的 write/edit 通过它抓 pre-image
+    checkpoint_manager = get_checkpoint_manager(session_store)
+    _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
 
     while True:
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取

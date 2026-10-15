@@ -294,6 +294,7 @@ class FeishuGateway:
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
         self._events: queue.Queue = queue.Queue(maxsize=1000)
+        self._approval_events: queue.Queue = queue.Queue(maxsize=1000)
         self._chat_locks: dict[str, threading.Lock] = {}
         self._chat_locks_guard = threading.Lock()
         self._dispatch_stop = threading.Event()
@@ -380,27 +381,53 @@ class FeishuGateway:
         last_update = 0.0
         stream_failed = False
 
-        def on_delta(part: str) -> None:
+        def update_partial(text: str) -> None:
             nonlocal message_id, last_update, stream_failed
-            parts.append(part)
             if stream_failed or not updater:
                 return
             now = time.monotonic()
             if updater and now - last_update >= 0.6:
                 try:
                     if message_id is None:
-                        message_id = sender(chat_id, ''.join(parts) or '生成中…')
+                        message_id = sender(chat_id, text or '生成中…')
                     if message_id:
-                        updater(message_id, ''.join(parts))
+                        updater(message_id, text)
                         last_update = now
                 except Exception as exc:
                     stream_failed = True
                     print(f'[feishu] stream update failed, falling back: {exc}')
 
+        def on_delta(part: str) -> None:
+            parts.append(part)
+            update_partial(''.join(parts))
+
+        def on_progress(status: dict) -> None:
+            elapsed = status.get('elapsed', 0)
+            if status.get('phase') == 'tool':
+                label = f"正在执行 {status.get('tool') or '工具'}（{status.get('tool_elapsed', 0)} 秒）"
+            else:
+                label = '正在处理'
+            update_partial(f'{label} · 已耗时 {elapsed} 秒\n\n' + ''.join(parts))
+
         try:
-            reply = self.api.send_stream(text, session_id=session_id, on_delta=on_delta)
-        except (AttributeError, NotImplementedError):
-            reply = self.api.send(text, session_id=session_id)
+            streamer = getattr(self.api, 'send_stream', None)
+            if streamer is not None:
+                reply = streamer(text, session_id=session_id, on_delta=on_delta,
+                                 on_progress=on_progress)
+            else:
+                reply = self.api.send(text, session_id=session_id)
+        except Exception as exc:
+            print(f'[feishu] agent reply failed: {exc}')
+            failed = f'处理未完成：{exc}\n请先核实任务状态，再决定是否重试。\n\n' + ''.join(parts)
+            if message_id and updater:
+                try:
+                    updater(message_id, failed)
+                    return
+                except Exception as update_exc:
+                    print(f'[feishu] failure card update failed: {update_exc}')
+            self._reply(chat_id, failed)
+            return
+        reply = reply or '本轮已结束，未生成文本回复。'
         if message_id and updater and not stream_failed:
             try:
                 updater(message_id, reply)
@@ -743,11 +770,6 @@ class FeishuGateway:
     def stop(self) -> None:
         self._poll_stop.set()
         self._dispatch_stop.set()
-        for _ in self._dispatch_threads:
-            try:
-                self._events.put_nowait(None)
-            except queue.Full:
-                break
         for thread in self._dispatch_threads:
             thread.join(timeout=3)
         self._dispatch_threads.clear()
@@ -757,8 +779,13 @@ class FeishuGateway:
     def dispatch(self, chat_id: str, text: str,
                  sender_id: str | None = None) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
+        norm = unicodedata.normalize('NFKC', text or '').strip().lower()
+        is_approval = (norm.split()[:1] == ['/approve'] or
+                       (re.fullmatch(r'(y|n)(\d{0,2})', norm) is not None
+                        and bool(self._chat_pending.get(chat_id))))
+        events = self._approval_events if is_approval else self._events
         try:
-            self._events.put_nowait((chat_id, text, sender_id))
+            events.put_nowait((chat_id, text, sender_id))
         except queue.Full:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
@@ -766,19 +793,24 @@ class FeishuGateway:
         if self._dispatch_threads:
             return
         self._dispatch_stop.clear()
-        def loop() -> None:
+        def loop(events, approval=False) -> None:
             while not self._dispatch_stop.is_set():
                 try:
-                    item = self._events.get(timeout=0.5)
+                    item = events.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if item is None:
-                    self._events.task_done()
-                    break
                 chat_id, text, sender_id = item
                 try:
-                    # Approval must be able to unblock a turn holding the chat lock.
-                    if text.lstrip().lower().startswith('/approve '):
+                    if approval:
+                        if self.allowed_users is not None and sender_id not in self.allowed_users:
+                            continue
+                        norm = unicodedata.normalize('NFKC', text or '').strip().lower()
+                        # A queued shortcut must never turn into an agent request if
+                        # another approval has already cleared the pending list.
+                        if (re.fullmatch(r'(y|n)(\d{0,2})', norm)
+                                and not self._chat_pending.get(chat_id)):
+                            self._reply(chat_id, '没有待审批请求，可能已处理或已过期。')
+                            continue
                         self.on_message(chat_id, text, sender_id=sender_id)
                     else:
                         with self._chat_lock(chat_id):
@@ -786,10 +818,11 @@ class FeishuGateway:
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
-                    self._events.task_done()
+                    events.task_done()
 
-        for _ in range(max(1, workers)):
-            thread = threading.Thread(target=loop, daemon=True)
+        queues = [(self._events, False)] * max(1, workers) + [(self._approval_events, True)]
+        for events, approval in queues:
+            thread = threading.Thread(target=loop, args=(events, approval), daemon=True)
             self._dispatch_threads.append(thread)
             thread.start()
 
