@@ -646,13 +646,14 @@ def test_user_allowlist_blocks_strangers(api_app, tmp_path, monkeypatch):
 
 
 def test_cd_switches_task_directory(gateway, tmp_path):
-    """/cd 设置该聊天的任务目录，/run 自动携带；无 /cd 时用默认。"""
+    """/cd 创建或切换会话工作区，/run 自动携带。"""
     gw, fake = gateway
     workdir = tmp_path / 'projA'
     workdir.mkdir()
 
     gw.on_message('c1', f'/cd {workdir}')
-    assert '任务目录已切换' in fake.last()
+    assert str(workdir) in fake.last()
+    assert gw.api.get_workspace(gw.bindings['c1']) == str(workdir)
 
     gw.on_message('c1', '/run echo from-proj-a')
     assert '任务已创建' in fake.last()

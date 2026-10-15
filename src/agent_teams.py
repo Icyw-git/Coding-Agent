@@ -240,13 +240,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
     if name in active_teammates:
         return f'Teammate {name} already exists'
 
+    import harness  # Lazy import: harness imports this module during startup.
+
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"Send results via send_message to 'lead'.")
 
     def run(): # 团队成员线程运行函数
         """团队成员线程运行函数，用于执行任务。"""
-        import harness   # 懒导入避免循环导入（harness 顶层已 import agent_teams）
         messages = [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': prompt},
@@ -340,7 +341,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
     active_teammates[name] = True # 标记为活跃，等待主线程唤醒
-    threading.Thread(target=run, daemon=True).start() # 启动线程
+    from workspace_context import use_workspace
+    workspace = harness.get_workdir()
+
+    def run_in_workspace():
+        with use_workspace(workspace):
+            run()
+
+    threading.Thread(target=run_in_workspace, daemon=True).start()
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role}"
 

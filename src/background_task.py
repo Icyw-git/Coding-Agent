@@ -1,5 +1,7 @@
 import json
 import threading
+from pathlib import Path
+from workspace_context import current_workspace, use_workspace
 
 _bg_counter=0
 background_tasks:dict[str,dict]={}
@@ -43,9 +45,12 @@ def start_background_task(tool_call,registry:dict)->str: #启动后台任务，�
             'command':cmd,
         }
 
+    workspace = current_workspace(Path.cwd())
+
     def worker(): #后台任务线程函数
         try:
-            result=str(execute_tool(name,args,registry))
+            with use_workspace(workspace):
+                result=str(execute_tool(name,args,registry))
             status='completed'
         except Exception as exc:
             result=f'Error: background {name} failed: {exc}'

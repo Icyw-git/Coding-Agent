@@ -67,7 +67,18 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 
 列表每次展示最多 20 条，操作预览 5 分钟后失效。仍被任意飞书聊天绑定的会话不参与归档/删除，
 可先在对应聊天 `/quit` 解绑。API 会拒绝处理本进程正在执行任务的会话。
-飞书切换会话只恢复对话历史，不改变 Agent 的服务端执行工作区；`/cd` 仍仅影响 `/run` 任务目录。
+飞书 `/cd <目录>` 切换当前会话工作区，普通对话的文件工具、shell、提示词和 `/run` 使用同一目录；
+`/cd` 或 `/pwd` 查看当前目录。相对路径基于当前会话工作区，支持带引号的空格路径。
+`/new` 保留当前工作区，`/resume` 恢复所选会话目录；目录保存在会话日志中，重启后仍有效。
+工作区必须存在并位于服务端 `HARNESS_WORKSPACE`（默认启动目录）下；目录失效时拒绝执行，
+可用绝对路径重新 `/cd`。Agent 正在执行当前回合时暂不允许切换目录，其他会话不受影响；
+已启动的后台任务继续使用启动时的目录。
+会话日志、快照、记忆和任务的存储位置仍由服务端配置管理，不随 `/cd` 移动。
+
+API 使用 `GET /v1/sessions/{id}/workspace` 查看、`PUT /v1/sessions/{id}/workspace`
+（请求体 `{"path":"子目录"}`）切换；创建会话时也可传 `workspace`。
+SDK 对应 `client.sessions.workspace(id)`、`client.sessions.change_workspace(id, path)`，
+以及 `client.sessions.create(workspace=path)`。
 
 审批消息使用独立处理通道；即使普通消息处理线程全部占用，仍可通过审批卡片、
 `/approve y|n` 或 `y/n` 回复解除等待，用户白名单同样生效。

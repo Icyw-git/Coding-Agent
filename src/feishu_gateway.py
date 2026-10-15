@@ -25,7 +25,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
-    /cd <dir>      —— 切换该聊天的任务执行目录（/run 生效）
+    /cd <dir>      —— 切换当前会话工作区（对话与 /run 同时生效）
     其余文本 → 作为消息发给绑定的 agent 会话
 """
 
@@ -287,8 +287,6 @@ class FeishuGateway:
         self._poll_stop = threading.Event()
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
-        # 每聊天的任务工作目录（/cd 设置，/run 使用；对话 agent 的工作区不受影响）
-        self._chat_cwd: dict[str, str] = {}
         self._session_choices: dict[str, list[dict]] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
@@ -561,7 +559,8 @@ class FeishuGateway:
             '/delete                查看可永久删除的归档',
             '/delete select <序号...>  多选后预览删除',
             '/confirm、/cancel      确认或取消待执行操作',
-            '/cd [dir]              查看/切换任务执行目录（/run 生效）',
+            '/cd [dir]              查看/切换当前会话工作区',
+            '/pwd                   查看当前会话工作区',
             '/run <命令>            在任务目录执行命令',
             '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
             '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
@@ -583,11 +582,13 @@ class FeishuGateway:
             elif command in ('/help', '/?', '/'):
                 self._reply(chat_id, self._help_text())
             elif command == '/new':
-                session_id = self.api.create_session(argument or None)
+                previous = self.bindings.get(chat_id)
+                workspace = self.api.get_workspace(previous) if previous else None
+                session_id = self.api.create_session(argument or None, workspace=workspace)
                 with self._bindings_lock:
                     self.bindings[chat_id] = session_id
                     self._save_bindings()
-                self._reply(chat_id, '已创建新会话，后续消息将在这里继续。')
+                self._reply(chat_id, '已创建新会话，工作区保持不变。')
             elif command == '/sessions' or command == '/resume' and not argument:
                 self._show_sessions(chat_id, self.api.list_sessions(limit=100))
             elif command in ('/use', '/resume'):
@@ -612,26 +613,37 @@ class FeishuGateway:
                     self._reply(chat_id, '匹配有歧义，请从候选会话中选择序号。')
                     self._show_sessions(chat_id, hits, include_empty=True)
                     return
+                workspace = self.api.get_workspace(hits[0]['id'])
                 with self._bindings_lock:
                     self.bindings[chat_id] = hits[0]['id']
                     self._save_bindings()
                 self._reply(chat_id, f"已切换到会话\n主题: {hits[0]['title']}"
-                                     f"\n记录的工作区: {hits[0].get('workspace') or '未记录'}"
-                                     '\n仅切换对话；Agent 执行目录仍由服务端配置。')
-            elif command == '/cd':
-                if not argument:
-                    current = self._chat_cwd.get(chat_id, '(默认：服务器工作区)')
-                    self._reply(chat_id, f'当前任务目录: {current}')
+                                     f"\n工作区: {workspace}")
+            elif command in ('/cd', '/pwd'):
+                if command == '/pwd' and argument:
+                    self._reply(chat_id, '用法: /pwd')
                     return
-                self._chat_cwd[chat_id] = argument
-                self._reply(chat_id, f'任务目录已切换（下次 /run 生效，'
-                              f'由服务器校验）: {argument}')
+                session_id = self.bindings.get(chat_id)
+                if not session_id:
+                    session_id = self.api.create_session(workspace=argument or None)
+                    with self._bindings_lock:
+                        self.bindings[chat_id] = session_id
+                        self._save_bindings()
+                    self._reply(chat_id, f'当前工作区: {self.api.get_workspace(session_id)}'
+                                '\n已创建新会话，后续对话和 /run 使用此目录。')
+                    return
+                if not argument:
+                    self._reply(chat_id, f'当前工作区: {self.api.get_workspace(session_id)}')
+                    return
+                workspace = self.api.set_workspace(session_id, argument)
+                self._reply(chat_id, f'工作区已切换: {workspace}\n后续对话和 /run 使用此目录。')
             elif command == '/run':
                 if not argument:
                     self._reply(chat_id, '用法: /run <命令>')
                     return
-                task = self.api.create_task(
-                    argument, cwd=self._chat_cwd.get(chat_id))
+                session_id = self.bindings.get(chat_id)
+                cwd = self.api.get_workspace(session_id) if session_id else None
+                task = self.api.create_task(argument, cwd=cwd)
                 where = f"\n目录: {task['cwd']}" if task.get('cwd') else ''
                 self._reply(chat_id, f"任务已创建 {task['id']} "
                               f"({task['status']}){where}")
@@ -675,11 +687,15 @@ class FeishuGateway:
                 with self._bindings_lock:
                     self.bindings.pop(chat_id, None)
                     self._save_bindings()
-                self._chat_cwd.pop(chat_id, None)
                 self._reply(chat_id, '会话绑定已解除')
             else:
                 self._reply(chat_id,
                             f'未知命令: {command}\n\n' + self._help_text())
+        except httpx.HTTPStatusError as exc:
+            detail = (exc.response.json().get('detail', '')
+                      if exc.response.headers.get('content-type', '').startswith('application/json')
+                      else exc.response.text[:200])
+            self._reply(chat_id, f'操作未完成: {detail}')
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
 

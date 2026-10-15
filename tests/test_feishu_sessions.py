@@ -20,7 +20,8 @@ def environment(tmp_path):
     store.record_workspace(tmp_path)
     store.append('message', ts=100, message={'role': 'user', 'content': '检查测试失败原因'})
     api = GatewayClient('http://test', 't', transport=_sync_asgi_transport(
-        create_app(runtime, api_token='t', task_root=tmp_path / 'tasks', rate_limit=10000)))
+        create_app(runtime, api_token='t', task_root=tmp_path / 'tasks', workspace=tmp_path,
+                   rate_limit=10000)))
     transport = FakeTransport()
     gw = FeishuGateway(api, transport=transport, bindings_path=tmp_path / 'bindings.json')
     yield runtime, api, gw, transport
@@ -35,7 +36,7 @@ def test_list_search_and_switch_uses_names(environment):
     assert '工作区' in transport.last()
     gw.on_message('chat', '/resume 1')
     assert gw.bindings['chat'] == 'old'
-    assert '仅切换对话' in transport.last()
+    assert f'工作区: {runtime.get_workspace("old")}' in transport.last()
 
 
 def test_explicit_search_keeps_empty_candidates(environment):

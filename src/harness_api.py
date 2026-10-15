@@ -18,7 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from harness_sdk import HarnessClient
-from agent_runtime import SessionAlreadyExistsError
+from agent_runtime import AgentRuntime, SessionAlreadyExistsError
 from session_store import SessionReplayError
 from task_manager import TaskManager
 from turn_progress import TurnProgress
@@ -39,6 +39,7 @@ except ImportError:  # Keep CLI-only installs importable without API dependencie
 if BaseModel is not None:
     class CreateSessionRequest(BaseModel):
         id: str | None = Field(default=None, min_length=1)
+        workspace: str | None = Field(default=None, min_length=1)
 
 
     class SendMessageRequest(BaseModel):
@@ -47,6 +48,10 @@ if BaseModel is not None:
     class SessionActionRequest(BaseModel):
         action: str
         session: dict
+
+
+    class WorkspaceRequest(BaseModel):
+        path: str = Field(min_length=1)
 
 
     class CreateTaskRequest(BaseModel):
@@ -88,6 +93,8 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         task_base,
         allowed_root=workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd(),
     )
+    if isinstance(runtime, AgentRuntime):
+        runtime.configure_workspace_root(tasks.allowed_root)
     # 服务器模式：权限审批走远程端点（消息网关轮询 /v1/permissions）；
     # CLI 入口不经过 create_app，保持 console 后端不受影响。
     permission_gate.backend = 'remote'
@@ -171,7 +178,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     @app.post("/v1/sessions", status_code=201)
     def create_session(request: CreateSessionRequest):
         try:
-            session = client.sessions.create(request.id)
+            session = client.sessions.create(request.id, workspace=request.workspace)
         except SessionAlreadyExistsError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -205,6 +212,26 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     @app.get("/v1/sessions")
     def list_sessions(limit: int = 20):
         return {"sessions": runtime.list_sessions(limit)}
+
+    @app.get('/v1/sessions/{session_id}/workspace')
+    def get_workspace(session_id: str):
+        try:
+            return {'workspace': runtime.get_workspace(session_id)}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put('/v1/sessions/{session_id}/workspace')
+    def set_workspace(session_id: str, request: WorkspaceRequest):
+        try:
+            return {'workspace': runtime.set_workspace(session_id, request.path)}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v1/sessions/{session_id}/stream")
     def stream_session(session_id: str, after: int = 0, poll: float = 0.3,

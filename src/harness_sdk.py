@@ -7,10 +7,12 @@ from typing import Protocol
 
 
 class RuntimeClient(Protocol):
-    def create_session(self, session_id: str | None = None) -> str: ...
+    def create_session(self, session_id: str | None = None, *, workspace: str | None = None) -> str: ...
     def send(self, session_id: str, content: str, on_delta=None): ...
     def history(self, session_id: str) -> list[dict]: ...
     def list_sessions(self, limit: int = 20) -> list[dict]: ...
+    def get_workspace(self, session_id: str) -> str: ...
+    def set_workspace(self, session_id: str, path: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -29,8 +31,9 @@ class Sessions:
     def __init__(self, runtime: RuntimeClient) -> None:
         self._runtime = runtime
 
-    def create(self, session_id: str | None = None) -> Session:
-        identifier = self._runtime.create_session(session_id)
+    def create(self, session_id: str | None = None, *, workspace: str | None = None) -> Session:
+        identifier = (self._runtime.create_session(session_id) if workspace is None
+                      else self._runtime.create_session(session_id, workspace=workspace))
         return Session(id=identifier, history=[])
 
     def get(self, session_id: str) -> Session:
@@ -38,6 +41,12 @@ class Sessions:
 
     def list(self, limit: int = 20) -> list[dict]:
         return self._runtime.list_sessions(limit)
+
+    def workspace(self, session_id: str) -> str:
+        return self._runtime.get_workspace(session_id)
+
+    def change_workspace(self, session_id: str, path: str) -> str:
+        return self._runtime.set_workspace(session_id, path)
 
 
 class Messages:

@@ -74,8 +74,8 @@ class GatewayClient:
 
     # ---------- sessions ----------
 
-    def create_session(self, session_id: str | None = None) -> str:
-        response = self.http.post('/v1/sessions', json={'id': session_id})
+    def create_session(self, session_id: str | None = None, *, workspace: str | None = None) -> str:
+        response = self.http.post('/v1/sessions', json={'id': session_id, 'workspace': workspace})
         response.raise_for_status()
         self.session_id = response.json()['id']
         return self.session_id
@@ -84,6 +84,16 @@ class GatewayClient:
         response = self.http.get('/v1/sessions', params={'limit': limit})
         response.raise_for_status()
         return response.json()['sessions']
+
+    def get_workspace(self, session_id: str) -> str:
+        response = self.http.get(f'/v1/sessions/{session_id}/workspace')
+        response.raise_for_status()
+        return response.json()['workspace']
+
+    def set_workspace(self, session_id: str, path: str) -> str:
+        response = self.http.put(f'/v1/sessions/{session_id}/workspace', json={'path': path})
+        response.raise_for_status()
+        return response.json()['workspace']
 
     def list_archives(self) -> list[dict]:
         response = self.http.get('/v1/session-archives')

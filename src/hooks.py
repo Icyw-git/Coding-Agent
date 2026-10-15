@@ -173,7 +173,8 @@ def permission_hook(tool:str,args:dict):
     elif tool in ["read", "write", "edit"]:
         path=args.get('path','')
         try:
-            inside=(_h().WORKDIR / path).resolve().is_relative_to(_h().WORKDIR)
+            workspace = _h().get_workdir()
+            inside=(workspace / path).resolve().is_relative_to(workspace)
         except (OSError, ValueError):
             inside=False
         if not inside:
@@ -196,7 +197,7 @@ def large_output_hook(tool:str,args:dict,output:str):
 
 
 def context_injection_hook(query:str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {_h().WORKDIR}\033[0m")
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {_h().get_workdir()}\033[0m")
     return None
 
 

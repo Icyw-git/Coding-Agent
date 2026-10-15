@@ -14,6 +14,7 @@ from typing import Optional, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from workspace_context import current_workspace, use_workspace
 from background_task import (should_run_background, start_background_task, collect_background_results,
                              background_lock, background_tasks)
 import recovery
@@ -46,6 +47,12 @@ import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/
 
 load_dotenv()
 WORKDIR = Path(os.getcwd()).resolve()
+
+
+def get_workdir() -> Path:
+    return current_workspace(WORKDIR)
+
+
 SKILLS_DIR=WORKDIR/"skills"
 scan_skills()   # 扫描技能目录 → SKILL_REGISTRY（skill_system 内）
 
@@ -309,12 +316,12 @@ PROMPT_SECTIONS={
 def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身份、工具、工作目录、记忆、技能、规则等
     sections=[]
     sections.append(PROMPT_SECTIONS['identity_main'].format(
-        workdir=context.get('workspace',WORKDIR)
+        workdir=context.get('workspace',get_workdir())
     ))
     tools=','.join(context.get('enabled_tools',[]))
     if tools:
         sections.append(f'Available tools:{tools}.')
-    sections.append(f'Working directory:{context.get("workspace",WORKDIR)}.')
+    sections.append(f'Working directory:{context.get("workspace",get_workdir())}.')
 
     memories=context.get('memories','')
     if memories:
@@ -325,8 +332,7 @@ def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身�
     sections.append(PROMPT_SECTIONS['rules_main'])
     return '\n\n'.join(sections)
 
-_last_context_key=None # 缓存键，用于判断是否需要重新组装系统提示
-_last_prompt=None # 缓存系统提示，用于判断是否需要重新组装系统提示
+_prompt_cache = ContextVar('prompt_cache', default=None)
 
 # ============================================================
 # 全局配置集中区
@@ -380,13 +386,13 @@ MAX_REACTIVE_RETRIES=1
 
 
 def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没有改变，直接返回缓存的系统提示，否则重新组装系统提示
-    global _last_context_key,_last_prompt
     key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
-    if key==_last_context_key and _last_prompt:
+    cached = _prompt_cache.get()
+    if cached is not None and cached[0] == key:
         print("  \033[90m[cache hit] system prompt unchanged\033[0m")
-        return _last_prompt
-    _last_context_key=key
-    _last_prompt=assemble_system_prompt(context)
+        return cached[1]
+    prompt = assemble_system_prompt(context)
+    _prompt_cache.set((key, prompt))
 
     loaded=['identity','tools','workspace','rules']
     if context.get('memories'):
@@ -394,7 +400,7 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
     if context.get('skills'):
         loaded.append('skills')
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
-    return _last_prompt
+    return prompt
 
 def update_context(context:dict,messages:list)->dict: # 更新上下文，包含工具、工作目录、记忆、技能等
     memories=''
@@ -405,7 +411,7 @@ def update_context(context:dict,messages:list)->dict: # 更新上下文，包含
     skills=list_skills()
     return {
         'enabled_tools':list(tool_registry.keys()),
-        'workspace':str(WORKDIR),
+        'workspace':str(get_workdir()),
         'memories':memories,
         'skills':skills,
     }
@@ -417,9 +423,9 @@ def build_system()->str: #暴露给外部调用，返回系统提示
 
 def build_sub_system()->str:
     return (
-        PROMPT_SECTIONS['identity_sub'].format(workdir=WORKDIR) +
+        PROMPT_SECTIONS['identity_sub'].format(workdir=get_workdir()) +
         '\n\n' +
-        PROMPT_SECTIONS['rules_sub'].format(workdir=WORKDIR) +
+        PROMPT_SECTIONS['rules_sub'].format(workdir=get_workdir()) +
         '\n\n' +
         PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills())
     )
@@ -578,9 +584,9 @@ def get_checkpoint_manager(session_store):
     """Reuse the manager within this turn, without sharing it across sessions."""
     manager = active_checkpoint_manager()
     if (manager is None or manager.session_id != session_store.session_id
-            or manager.workspace != WORKDIR):
+            or manager.workspace != get_workdir()):
         manager=CheckpointManager(
-            CHECKPOINT_DIR,WORKDIR,session_store.session_id,
+            CHECKPOINT_DIR,get_workdir(),session_store.session_id,
             max_nodes=CHECKPOINT_MAX_NODES,
             keep_labeled=CHECKPOINT_KEEP_LABELED,
             capture_files=CHECKPOINT_CAPTURE_FILES,
@@ -598,7 +604,8 @@ def active_checkpoint_manager():
 def _isolated_checkpoint_context():
     token = _checkpoint_manager.set(None)
     try:
-        yield
+        with use_workspace(get_workdir()):
+            yield
     finally:
         try:
             manager = active_checkpoint_manager()
@@ -913,7 +920,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         for initial_message in messages:
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
-    session_store.record_workspace(WORKDIR)
+    session_store.record_workspace(get_workdir())
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -1167,6 +1174,7 @@ def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
         resolve_session_path=resolve_session_path,
         checkpoints_dir=CHECKPOINT_DIR,
         before_session_change=before_session_change,
+        workspace=WORKDIR,
     )
 
 

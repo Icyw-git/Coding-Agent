@@ -413,7 +413,7 @@ def run_bash(command:str, cwd: str = None)->str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command, please do not execute"
     try:
-        base = cwd or str(_h().WORKDIR)
+        base = cwd or str(_h().get_workdir())
         # A descendant can keep a PIPE open after cmd.exe exits. A temporary
         # output file lets the timeout bound execution without waiting for EOF.
         with tempfile.TemporaryFile() as output:
@@ -443,9 +443,10 @@ def run_bash(command:str, cwd: str = None)->str:
         return f'Error:{e}'
 
 def safe_path(p: str, cwd: str = None) -> Path:
-    base = Path(cwd) if cwd else _h().WORKDIR
+    workspace = _h().get_workdir()
+    base = Path(cwd) if cwd else workspace
     path = (base / p).resolve()
-    if not path.is_relative_to(_h().WORKDIR):
+    if not path.is_relative_to(workspace):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
@@ -491,12 +492,12 @@ def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
 
 def run_glob(pattern: str) -> str:
     try:
-        base = Path(_h().WORKDIR)
+        base = _h().get_workdir()
         if '**' in pattern:
-            matches = [p for p in base.rglob(pattern) if p.is_file() and p.resolve().is_relative_to(_h().WORKDIR)]
+            matches = [p for p in base.rglob(pattern) if p.is_file() and p.resolve().is_relative_to(base)]
         else:
-            matches = [p for p in base.glob(pattern) if p.is_file() and p.resolve().is_relative_to(_h().WORKDIR)]
-        results = sorted(str(p.relative_to(_h().WORKDIR)) for p in matches)
+            matches = [p for p in base.glob(pattern) if p.is_file() and p.resolve().is_relative_to(base)]
+        results = sorted(str(p.relative_to(base)) for p in matches)
         return "\n".join(results) if results else "(no matches)"
     except Exception as e:
         return f"Error: {e}"

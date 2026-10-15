@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Type
+from workspace_context import resolve_workspace, use_workspace
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class AgentRuntime:
         resolve_session_path: Callable[[str], Path] | None = None,
         checkpoints_dir: Path | None = None,
         before_session_change: Callable | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self._run_turn = run_turn
         self._session_store_cls = session_store_cls
@@ -47,8 +49,15 @@ class AgentRuntime:
         self._before_session_change = before_session_change
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
+        self._default_workspace = Path(workspace or Path.cwd()).resolve()
+        self._workspace_root: Path | None = None
 
-    def create_session(self, session_id: str | None = None) -> str:
+    def configure_workspace_root(self, root: Path) -> None:
+        """Constrain remote workspaces during application setup."""
+        self._default_workspace = resolve_workspace(root, base=Path.cwd())
+        self._workspace_root = self._default_workspace
+
+    def create_session(self, session_id: str | None = None, *, workspace: str | None = None) -> str:
         """Create an empty persisted session and return its identifier."""
         session_id = session_id or uuid.uuid4().hex
         if not session_id.replace("-", "").replace("_", "").isalnum():
@@ -57,9 +66,33 @@ class AgentRuntime:
             path = self._sessions_dir / f"session_{session_id}.jsonl"
             if path.exists():
                 raise SessionAlreadyExistsError(f"Session {session_id} already exists")
+            directory = resolve_workspace(workspace if workspace is not None else self._default_workspace,
+                                          base=self._default_workspace, allowed_root=self._workspace_root)
             store = self._session_store_cls(self._sessions_dir, session_id=session_id)
             store.append("session_created")
+            store.record_workspace(directory)
             return store.session_id
+
+    def _workspace_for(self, store) -> Path:
+        saved = store.session_summary()['workspace']
+        return resolve_workspace(saved or self._default_workspace,
+                                 base=self._default_workspace, allowed_root=self._workspace_root)
+
+    def get_workspace(self, session_id: str) -> str:
+        return str(self._workspace_for(self._open_session(session_id)))
+
+    def set_workspace(self, session_id: str, path: str) -> str:
+        lock = self._session_lock(session_id)
+        if not lock.acquire(blocking=False):
+            raise RuntimeError('会话正在执行任务，请稍后切换工作区')
+        try:
+            store = self._open_session(session_id)
+            base = Path(store.session_summary()['workspace'] or self._default_workspace)
+            workspace = resolve_workspace(path, base=base, allowed_root=self._workspace_root)
+            store.record_workspace(workspace)
+            return str(workspace)
+        finally:
+            lock.release()
 
     def send(self, session_id: str, content: str, on_delta=None) -> AgentResult:
         """Append a user message, run one turn, and return the assistant content."""
@@ -67,14 +100,17 @@ class AgentRuntime:
             raise ValueError("message content must be a non-empty string")
         with self._session_lock(session_id):
             store = self._open_session(session_id)
+            workspace = self._workspace_for(store)
+            store.record_workspace(workspace)
             messages = store.rebuild_openai_history(recover_pending=True)
             message = {"role": "user", "content": content}
             messages.append(message)
             store.append_message(message)
-            if on_delta is None:
-                result = self._run_turn(messages, session_store=store)
-            else:
-                result = self._run_turn(messages, session_store=store, on_delta=on_delta)
+            with use_workspace(workspace):
+                if on_delta is None:
+                    result = self._run_turn(messages, session_store=store)
+                else:
+                    result = self._run_turn(messages, session_store=store, on_delta=on_delta)
             return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:
