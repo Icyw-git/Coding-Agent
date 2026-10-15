@@ -1115,8 +1115,24 @@ def resume_agent_loop(session_path: Path):
     return agent_loop(messages, session_store=session_store)
 
 
-def create_runtime() -> AgentRuntime:
+_mcp_init_lock = threading.Lock()
+_mcp_initialized = False
+
+
+def initialize_mcp_tools() -> None:
+    """Register configured MCP tools once for all adapters in this process."""
+    global _mcp_initialized
+    with _mcp_init_lock:
+        if not _mcp_initialized:
+            TOOLS.extend(register_mcp_tools(tool_registry))
+            _mcp_initialized = True
+
+
+def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
     """Build the transport-independent runtime used by SDK and API adapters."""
+    if initialize_tools:
+        initialize_mcp_tools()
+
     def before_session_change():
         wait_for_housekeeping()
         with _housekeeping_lock:

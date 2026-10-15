@@ -31,7 +31,7 @@ def main(argv=None) -> int:
         daemon=True,
     ).start()
 
-    harness.TOOLS.extend(harness.register_mcp_tools(harness.tool_registry))
+    harness.initialize_mcp_tools()
     with harness.agent_lock:
         try:
             if args.resume:

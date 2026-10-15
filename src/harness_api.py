@@ -72,7 +72,8 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     if rate_limit < 1:
         raise ValueError("rate_limit must be at least 1")
 
-    runtime = runtime or _default_runtime()
+    owns_runtime = runtime is None
+    runtime = _default_runtime() if owns_runtime else runtime
     client = HarnessClient(runtime)
     # 独立命名空间：.cache/tasks 已被 task_system（agent TODO 列表）占用
     task_base = Path(task_root or os.getenv("HARNESS_TASK_ROOT")
@@ -91,6 +92,8 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     )
     @asynccontextmanager
     async def lifespan(app):
+        if owns_runtime:
+            import harness
         handler = None
         try:
             if access_log_path:
@@ -99,10 +102,16 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 handler = logging.FileHandler(log_path, encoding="utf-8")
                 handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
                 logger.addHandler(handler)
+            if owns_runtime:
+                await asyncio.to_thread(harness.initialize_mcp_tools)
             yield
         finally:
             try:
-                await asyncio.to_thread(tasks.close)
+                try:
+                    await asyncio.to_thread(tasks.close)
+                finally:
+                    if owns_runtime:
+                        await asyncio.to_thread(harness.shutdown_mcp)
             finally:
                 if handler is not None:
                     logger.removeHandler(handler)
@@ -375,4 +384,4 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
 def _default_runtime():
     import harness
 
-    return harness.create_runtime()
+    return harness.create_runtime(initialize_tools=False)

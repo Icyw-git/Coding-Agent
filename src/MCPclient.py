@@ -11,38 +11,47 @@ class MCPclient: #进程间通信客户端
         self.args = args or []
         self.session: ClientSession = None
         self._tools: list[dict] = []
-        self._exit_stack = None # 异步上下文栈，用于清理子进程
+        self._session_task = None
+        self._stop = None
         self._timeout: float = 120   # MCP server 挂起时最多等 120s 抛错，避免永久阻塞
 
     async def connect(self, timeout: float = 120):
         self._timeout = timeout
+        ready = asyncio.get_running_loop().create_future()
+        self._stop = asyncio.Event()
+        self._session_task = asyncio.create_task(self._serve_session(ready))
+        try:
+            return await asyncio.shield(ready)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _serve_session(self, ready):
+        """Keep AnyIO context entry and exit in the same long-lived task."""
         server_params = StdioServerParameters(
             command=self.command,
             args=self.args
         )
-
-        self._exit_stack = AsyncExitStack()
         try:
-            # Enter and later close both context managers in this same task. Wrapping
-            # the whole setup in wait_for creates a child task, which violates AnyIO's
-            # cancel-scope ownership when the stack is closed during shutdown.
-            read, write = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)) # 进接 MCP server
-            self.session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)) # 创建 MCP session
-            await asyncio.wait_for(self.session.initialize(), timeout)
-            tools_result = await asyncio.wait_for(self.session.list_tools(), timeout)
-        except Exception:
-            await self.close()   # 中途失败也清理子进程，避免泄漏
-            raise
-        self._tools = []
-        for tool in tools_result.tools: # 遍历所有工具
-            self._tools.append({
-                'name': tool.name,
-                'description': tool.description,
-                'inputSchema': tool.input_schema,
-            })
-        return self._tools
+            async with AsyncExitStack() as stack:
+                read, write = await stack.enter_async_context(stdio_client(server_params))
+                self.session = await stack.enter_async_context(ClientSession(read, write))
+                await asyncio.wait_for(self.session.initialize(), self._timeout)
+                tools_result = await asyncio.wait_for(self.session.list_tools(), self._timeout)
+                self._tools = [
+                    {'name': tool.name, 'description': tool.description,
+                     'inputSchema': tool.input_schema}
+                    for tool in tools_result.tools
+                ]
+                ready.set_result(self._tools)
+                await self._stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            else:
+                raise
+        finally:
+            self.session = None
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         if not self.session:
@@ -58,6 +67,10 @@ class MCPclient: #进程间通信客户端
             return f'MCP error: {e}'
 
     async def close(self): # 关闭 MCP session
-        stack, self._exit_stack = self._exit_stack, None   # 幂等：重复调用不再 aclose 子进程
-        if stack:
-            await stack.aclose()
+        task = self._session_task
+        if task is not None:
+            self._stop.set()
+            try:
+                await task
+            finally:
+                self._session_task = None

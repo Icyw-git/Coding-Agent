@@ -96,6 +96,24 @@ HARNESS_UI=ansi
 
 请勿提交 `.env` 或任何真实 API 密钥；`.gitignore` 已默认忽略该文件。
 
+MCP 配置文件使用 JSON 数组，例如：
+
+```json
+[
+  {
+    "name": "fetch",
+    "command": "D:/Anaconda_envs/envs/aitest01_py310/python.exe",
+    "args": ["-m", "mcp_server_fetch"]
+  }
+]
+```
+
+示例需要在对应环境安装 `mcp-server-fetch`。仅支持通过本地命令启动的 stdio MCP。
+CLI 启动、默认 SDK 客户端创建、FastAPI 服务启动都会加载相同配置；
+飞书通过 API 使用这些工具，无需在网关重复配置。同一进程只注册一次，修改配置后需重启 Agent 服务。
+API 在启动完成前连接 MCP，关闭时清理连接；外部注入 runtime 的工具生命周期由调用方管理。
+启动日志 `[mcp] fetch: ... tool(s)` 表示连接成功，失败的服务会输出原因并跳过。
+
 ### 3. 安装 Python 依赖
 
 ```bash
