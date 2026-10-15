@@ -1,0 +1,73 @@
+entries=36
+2026-10-15T13:04:04+08:00 | DeepSeek 网页/API 部分中断（DeepSeek Web/API Partially Unavailable）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 对话服务(Chatservice), DeepSeek V4.1 Flash API服务(API Service), DeepSeek V4 Pro API服务(API Service)</p>
+2026-10-12T14:57:54+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), 对话服务(Chatservice)</p>
+2026-10-12T12:16:54+08:00 | - DeepSeek 网页=部分中断（DeepSeek Web Partially Unavailable）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 对话服务(Chatservice)</p>
+2026-10-08T15:08:01+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 对话服务(Chatservice), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-10-02T05:34:35+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), 对话服务(Chatservice), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-09-24T07:08:50+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), DeepSeek V4 Pro API服务(API Service), 对话服务(Chatservice)</p>
+2026-09-23T15:44:58+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), DeepSeek V4 Pro API服务(API Service), 对话服务(Chatservice)</p>
+2026-09-20T16:58:46+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), 对话服务(Chatservice)</p>
+2026-09-17T16:53:37+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), 对话服务(Chatservice)</p>
+2026-09-15T19:39:42+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), 对话服务(Chatservice), 上传文件服务(File Upload Service), 搜索服务(Search Service), DeepSeek V4 Pro API服务(API 
+2026-09-15T17:29:32+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-09-15T05:30:00+08:00 | DeepSeek 网页/API 部分中断（DeepSeek Web/API Partially Unavailable）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 对话服务(Chatservice), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-09-02T14:25:45+08:00 | DeepSeek 网页/API 部分中断（DeepSeek Web/API partially unavailable)
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service), 对话服务(Chatservice)</p>
+2026-08-22T10:17:04+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-21T15:10:06+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-19T14:34:14+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), DeepSeek V4 Pro API服务(API Service)</p>
+2026-08-19T11:18:17+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-18T15:42:00+08:00 | 搜索服务异常（Search service error）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 搜索服务(Search Service)</p>
+2026-08-14T14:40:51+08:00 | 搜索服务异常（Search service error）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 搜索服务(Search Service)</p>
+2026-08-14T11:14:41+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service)</p>
+2026-08-10T17:44:39+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-10T15:51:13+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-07T14:40:29+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-07T11:10:34+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-07T11:09:49+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-04T21:30:41+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-04T12:20:49+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-08-04T11:20:11+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service), DeepSeek V4 Pro API服务(API Service)</p>
+2026-08-03T13:58:37+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service)</p>
+2026-07-31T17:34:25+08:00 | API 服务性能下降（API Service performance impacted）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-07-31T15:44:05+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service), 对话服务(Chatservice)</p>
+2026-07-30T13:56:42+08:00 | DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service)</p>
+2026-07-29T18:28:52+08:00 | 搜索服务异常（Search service error）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 搜索服务(Search Service)</p>
+2026-07-28T16:51:55+08:00 | API服务异常(API service partially unavailable)
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-07-24T14:49:13+08:00 | DeepSeek API 性能下降（DeepSeek API Degraded Performance）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> DeepSeek V4 Pro API服务(API Service), DeepSeek V4.1 Flash API服务(API Service)</p>
+2026-07-22T17:05:03+08:00 | DeepSeek 网页端搜索不可用（DeepSeek Web Search Service Unavailable）
+    <p><strong>Status:</strong> resolved</p><p>本次问题已解决，服务已恢复。 The incident has been resolved and service has been restored.</p><p><strong>Affected components:</strong> 对话服务(Chatservice)</p>

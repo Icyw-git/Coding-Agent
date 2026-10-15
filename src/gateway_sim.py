@@ -85,6 +85,15 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['sessions']
 
+    def list_archives(self) -> list[dict]:
+        response = self.http.get('/v1/session-archives')
+        response.raise_for_status()
+        return response.json()['sessions']
+
+    def manage_session(self, action: str, row: dict) -> None:
+        response = self.http.post('/v1/session-actions', json={'action': action, 'session': row})
+        response.raise_for_status()
+
     def send(self, content: str, session_id: str | None = None) -> str:
         session_id = session_id or self.session_id
         if not session_id:

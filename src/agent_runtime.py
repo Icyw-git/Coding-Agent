@@ -35,11 +35,16 @@ class AgentRuntime:
         session_store_cls: Type,
         sessions_dir: Path,
         resolve_session_path: Callable[[str], Path] | None = None,
+        checkpoints_dir: Path | None = None,
+        before_session_change: Callable | None = None,
     ) -> None:
         self._run_turn = run_turn
         self._session_store_cls = session_store_cls
         self._sessions_dir = Path(sessions_dir)
         self._resolve_session_path = resolve_session_path
+        from session_cleanup import SessionArchive
+        self.archive = SessionArchive(self._sessions_dir, checkpoints_dir or self._sessions_dir.parent / 'checkpoints')
+        self._before_session_change = before_session_change
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
 
@@ -60,8 +65,8 @@ class AgentRuntime:
         """Append a user message, run one turn, and return the assistant content."""
         if not isinstance(content, str) or not content.strip():
             raise ValueError("message content must be a non-empty string")
-        store = self._open_session(session_id)
         with self._session_lock(session_id):
+            store = self._open_session(session_id)
             messages = store.rebuild_openai_history()
             message = {"role": "user", "content": content}
             messages.append(message)
@@ -89,19 +94,36 @@ class AgentRuntime:
         for path in paths:
             try:
                 store = self._session_store_cls.open(path)
-                title = store.session_title()
                 summary = store.session_summary()
             except (OSError, ValueError):
                 continue   # unreadable/corrupt log: leave it out of the listing
-            rows.append({
-                'id': store.session_id,
-                'title': title,
-                'events': store.last_seq,
-                'created': summary['created'],
-                'updated': summary['updated'],
-            })
+            rows.append(summary)
         rows.sort(key=lambda row: (row['updated'], row['id']), reverse=True)
         return rows[:limit]
+
+    def manage_session(self, action: str, row: dict):
+        if action not in ('archive', 'restore', 'delete'):
+            raise ValueError('未知会话操作')
+        session_id = row.get('id')
+        if (not isinstance(session_id, str) or not session_id
+                or not session_id.replace('-', '').replace('_', '').isalnum()):
+            raise ValueError('无效的会话标识')
+        lock = self._session_lock(row['id'])
+        if not lock.acquire(blocking=False):
+            raise RuntimeError('会话正在执行任务，请稍后重试')
+        try:
+            if self._before_session_change:
+                self._before_session_change()
+            if action == 'restore':
+                if row not in self.archive.list():
+                    raise ValueError('归档已变化，请重新选择')
+                self.archive.restore(row['id'])
+            elif action == 'archive':
+                self.archive.archive(row, '')
+            else:
+                self.archive.delete(row, '')
+        finally:
+            lock.release()
 
     def _open_session(self, session_id: str):
         if self._resolve_session_path is not None:

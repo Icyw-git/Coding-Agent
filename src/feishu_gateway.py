@@ -281,6 +281,8 @@ class FeishuGateway:
         self._chat_pending: dict[str, list[str]] = {}
         # 每聊天的任务工作目录（/cd 设置，/run 使用；对话 agent 的工作区不受影响）
         self._chat_cwd: dict[str, str] = {}
+        self._session_choices: dict[str, list[dict]] = {}
+        self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
         self._events: queue.Queue = queue.Queue(maxsize=1000)
@@ -343,7 +345,7 @@ class FeishuGateway:
             with self._bindings_lock:
                 self.bindings[chat_id] = session_id
                 self._save_bindings()
-            self._reply(chat_id, f'已创建会话 {session_id}')
+            self._reply(chat_id, '已创建新会话。')
         try:
             self._send_agent_reply(chat_id, session_id, text)
         except Exception as exc:
@@ -418,19 +420,111 @@ class FeishuGateway:
         self._forget_pending(req_id)
         self._reply(chat_id, permission_result(record))
 
+    @staticmethod
+    def _session_rows_text(rows):
+        from datetime import datetime
+        lines = []
+        for index, row in enumerate(rows, 1):
+            timestamp = datetime.fromtimestamp(row.get('updated', 0)).strftime('%m-%d %H:%M')
+            lines.append(f"{index}. {row['title']}\n工作区: {row.get('workspace') or '未记录'} · {timestamp}")
+            if row.get('preview') and row['preview'] != row['title']:
+                lines.append(f"最近: {row['preview']}")
+        return '\n\n'.join(lines)
+
+    def _show_sessions(self, chat_id, rows, *, include_empty=False):
+        rows = [row for row in rows if include_empty or row.get('preview') != '尚无任务'][:20]
+        self._session_choices[chat_id] = rows
+        self._reply(chat_id, self._session_rows_text(rows) + '\n\n/resume <序号> 切换；也可输入主题或目录搜索。'
+                    if rows else '暂无有任务内容的会话。')
+
+    def _manage_sessions(self, chat_id, command, argument):
+        if command == '/cancel':
+            self._session_confirmation.pop(chat_id, None)
+            self._reply(chat_id, '已取消。')
+            return
+        if command == '/confirm':
+            pending = self._session_confirmation.pop(chat_id, None)
+            if not pending or time.monotonic() - pending[2] > 300:
+                self._reply(chat_id, '没有有效的待确认操作，请重新选择。')
+                return
+            action, rows, _ = pending
+            if action == 'delete' and argument != '删除':
+                self._reply(chat_id, '未执行删除，请重新选择后输入 /confirm 删除。')
+                return
+            completed = 0
+            for row in rows:
+                if row['id'] in self.bindings.values():
+                    self._reply(chat_id, f"跳过 {row['title']}：仍被聊天使用，请先 /quit 解绑。")
+                    continue
+                try:
+                    self.api.manage_session(action, row)
+                    completed += 1
+                except Exception:
+                    self._reply(chat_id, f"未处理 {row['title']}：记录可能已变化，请刷新列表后重试。")
+            verb = {'archive': '归档', 'restore': '恢复', 'delete': '永久删除'}[action]
+            self._reply(chat_id, f'已{verb} {completed} 个会话。' +
+                        ('删除不可恢复。' if action == 'delete' else '项目文件未改动。'))
+            return
+        # A selection is tied to the exact list and action shown in this chat.
+        if argument.startswith('select '):
+            listing = getattr(self, '_archive_choices', {}).get(chat_id)
+            if not listing or listing[0] != command or time.monotonic() - listing[3] > 300:
+                self._reply(chat_id, '请先刷新归档或删除列表。')
+                return
+            indices = argument.split()[1:]
+            rows = listing[2]
+            if not indices or any(not n.isdigit() or not 1 <= int(n) <= len(rows) for n in indices):
+                self._reply(chat_id, '请输入列表中的序号，例如 select 1 3。')
+                return
+            selected = [rows[i] for i in sorted({int(n) - 1 for n in indices})]
+            self._session_confirmation[chat_id] = (listing[1], selected, time.monotonic())
+            confirmation = '/confirm 删除（不可恢复）' if listing[1] == 'delete' else '/confirm'
+            self._reply(chat_id, '待处理会话：\n' + self._session_rows_text(selected)
+                        + f'\n\n确认: {confirmation}\n取消: /cancel')
+            return
+        from session_cleanup import cleanup_candidates
+        if command == '/delete':
+            if argument:
+                self._reply(chat_id, '用法: /delete，或 /delete select <序号...>')
+                return
+            action, rows = 'delete', self.api.list_archives()
+        elif argument == 'restore':
+            action, rows = 'restore', self.api.list_archives()
+        else:
+            if argument not in ('', 'empty', 'all') and not (argument.isascii() and argument.isdigit()
+                                                                         and 1 <= int(argument) <= 36500):
+                self._reply(chat_id, '用法: /archive [天数|empty|all|restore]')
+                return
+            action, rows = 'archive', self.api.list_sessions(limit=1000)
+            if argument != 'all':
+                rows = cleanup_candidates(rows, '', days=int(argument) if argument.isdigit() else 30,
+                                          empty_only=argument == 'empty')
+        rows = [row for row in rows if row['id'] not in self.bindings.values()][:20]
+        if not hasattr(self, '_archive_choices'):
+            self._archive_choices = {}
+        self._archive_choices[chat_id] = (command, action, rows, time.monotonic())
+        self._session_confirmation.pop(chat_id, None)
+        self._reply(chat_id, self._session_rows_text(rows) + f'\n\n{command} select <序号...> 多选。'
+                    if rows else '没有符合条件的会话。当前绑定的会话不可处理；/archive all 查看其他会话。')
+
     def _help_text(self) -> str:
         return '\n'.join([
             '可用命令:',
             '/new [id]              新建会话并绑定到本聊天',
             '/sessions              查看最近会话列表',
-            '/use <前缀>            切换会话（ID 前缀唯一即可）',
+            '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
+            '/archive [天数|empty|all|restore]  选择归档或恢复会话',
+            '/archive select <序号...>  多选后预览归档或恢复',
+            '/delete                查看可永久删除的归档',
+            '/delete select <序号...>  多选后预览删除',
+            '/confirm、/cancel      确认或取消待执行操作',
             '/cd [dir]              查看/切换任务执行目录（/run 生效）',
             '/run <命令>            在任务目录执行命令',
             '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
             '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
             '/stop <任务id>         终止任务',
             '/perms                 查看待审批请求',
-            '/approve [请求id] y|n  审批（省略 id 决议最早一条）',
+            '/approve y|n           审批最早一条待审批操作',
             '/quit                  解除会话绑定',
             'y / n、y2 / n2         快捷审批（也可直接点审批卡片按钮）',
             '其余文本 → 作为消息发给当前绑定的 agent 会话',
@@ -441,40 +535,46 @@ class FeishuGateway:
         command = parts[0].lower()
         argument = parts[1].strip() if len(parts) > 1 else ''
         try:
-            if command in ('/help', '/?'):
+            if command in ('/archive', '/delete', '/confirm', '/cancel'):
+                self._manage_sessions(chat_id, command, argument)
+            elif command in ('/help', '/?', '/'):
                 self._reply(chat_id, self._help_text())
             elif command == '/new':
                 session_id = self.api.create_session(argument or None)
                 with self._bindings_lock:
                     self.bindings[chat_id] = session_id
                     self._save_bindings()
-                self._reply(chat_id, f'已创建并绑定会话 {session_id}')
-            elif command == '/sessions':
-                rows = self.api.list_sessions(limit=10)
-                lines = [f"{row['id'][:12]}  events={row['events']}  "
-                         f"{row['title']}" for row in rows]
-                self._reply(chat_id, '\n'.join(lines) or '(no sessions)')
-            elif command == '/use':
+                self._reply(chat_id, '已创建新会话，后续消息将在这里继续。')
+            elif command == '/sessions' or command == '/resume' and not argument:
+                self._show_sessions(chat_id, self.api.list_sessions(limit=100))
+            elif command in ('/use', '/resume'):
                 if not argument:
                     self._reply(chat_id, '用法: /use <会话ID前缀>'
                                           '\n（/sessions 可查，前缀唯一即可）')
                     return
                 rows = self.api.list_sessions(limit=100)
-                hits = [row for row in rows
-                        if row['id'].startswith(argument)]
+                if command == '/resume' and argument.isdigit() and chat_id in self._session_choices:
+                    index = int(argument) - 1
+                    choices = self._session_choices[chat_id]
+                    selected = choices[index]['id'] if 0 <= index < len(choices) else None
+                    hits = [row for row in rows if row['id'] == selected]
+                else:
+                    hits = [row for row in rows if row['id'].startswith(argument)
+                            or command == '/resume' and argument.casefold() in ' '.join(str(row.get(k) or '') for k in
+                                ('title', 'workspace', 'preview')).casefold()]
                 if not hits:
-                    self._reply(chat_id, f'未找到以 {argument!r} 开头的会话')
+                    self._reply(chat_id, f'未找到匹配 {argument!r} 的会话')
                     return
                 if len(hits) > 1:
-                    lines = [f"{row['id'][:12]}  {row['title']}"
-                             for row in hits[:5]]
-                    self._reply(chat_id, '前缀有歧义，候选:\n' + '\n'.join(lines))
+                    self._reply(chat_id, '匹配有歧义，请从候选会话中选择序号。')
+                    self._show_sessions(chat_id, hits, include_empty=True)
                     return
                 with self._bindings_lock:
                     self.bindings[chat_id] = hits[0]['id']
                     self._save_bindings()
-                self._reply(chat_id, f"已切换到会话 {hits[0]['id']}"
-                                     f"\n标题: {hits[0]['title']}")
+                self._reply(chat_id, f"已切换到会话\n主题: {hits[0]['title']}"
+                                     f"\n记录的工作区: {hits[0].get('workspace') or '未记录'}"
+                                     '\n仅切换对话；Agent 执行目录仍由服务端配置。')
             elif command == '/cd':
                 if not argument:
                     current = self._chat_cwd.get(chat_id, '(默认：服务器工作区)')

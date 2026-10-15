@@ -169,7 +169,7 @@ class SlashCompleter(Completer):
         command, argument = parse_command(text)
         if command == '/archive':
             for value, description in (('30', '30 天未活跃'), ('90', '90 天未活跃'),
-                                       ('empty', '仅空会话'), ('restore', '恢复已归档会话')):
+                                       ('all', '全部非当前会话'), ('empty', '仅空会话'), ('restore', '恢复已归档会话')):
                 if value.startswith(argument):
                     yield Completion(value, start_position=-len(argument), display_meta=description)
         elif command == '/help':

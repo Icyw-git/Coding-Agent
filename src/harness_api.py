@@ -38,6 +38,10 @@ if BaseModel is not None:
     class SendMessageRequest(BaseModel):
         content: str = Field(min_length=1)
 
+    class SessionActionRequest(BaseModel):
+        action: str
+        session: dict
+
 
     class CreateTaskRequest(BaseModel):
         command: str = Field(min_length=1)
@@ -158,6 +162,22 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"id": session.id, "history": session.history}
+
+    @app.get('/v1/session-archives')
+    def list_archives():
+        return {'sessions': runtime.archive.list()}
+
+    @app.post('/v1/session-actions')
+    def session_action(request: SessionActionRequest):
+        try:
+            runtime.manage_session(request.action, request.session)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {'status': 'ok'}
 
     @app.get("/v1/sessions/{session_id}")
     def get_session(session_id: str):

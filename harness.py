@@ -714,6 +714,8 @@ def handle_command(line:str,messages:list,session_store)->None:
             session_rows(limit=None, include_empty=True), session_store.session_id,
             days=int(argument) if argument.isdigit() else 30,
             empty_only=argument == 'empty'))
+        if argument == 'all' and not deleting:
+            rows = session_rows(limit=None, include_empty=True)
         rows = [row for row in rows if row['id'] != session_store.session_id]
         selected = choose_cleanup_sessions(rows, restore=restoring, delete=deleting)
         selected_rows = [row for row in rows if row['id'] in selected]
@@ -1103,11 +1105,19 @@ def resume_agent_loop(session_path: Path):
 
 def create_runtime() -> AgentRuntime:
     """Build the transport-independent runtime used by SDK and API adapters."""
+    def before_session_change():
+        wait_for_housekeeping()
+        with _housekeeping_lock:
+            if any(thread.is_alive() for thread in _housekeeping_threads):
+                raise RuntimeError('会话后台整理尚未结束，请稍后重试')
+
     return AgentRuntime(
         run_turn=agent_loop,
         session_store_cls=SessionEventStore,
         sessions_dir=SESSIONS_DIR,
         resolve_session_path=resolve_session_path,
+        checkpoints_dir=CHECKPOINT_DIR,
+        before_session_change=before_session_change,
     )
 
 
