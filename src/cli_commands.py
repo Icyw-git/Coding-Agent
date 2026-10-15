@@ -1,0 +1,82 @@
+"""Slash-command metadata shared by REPL dispatch and help output."""
+
+from dataclasses import dataclass
+from difflib import get_close_matches
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    aliases: tuple[str, ...]
+    arguments: str
+    description: str
+    group: str
+
+    @property
+    def usage(self) -> str:
+        return f'{self.name} {self.arguments}'.rstrip()
+
+
+COMMANDS = (
+    Command('/help', ('/?',), '[命令]', '显示帮助；如 /help rewind', '常用'),
+    Command('/new', ('/n',), '[会话ID]', '开始新会话，保留当前工作区', '会话'),
+    Command('/resume', ('/r',), '<会话ID或前缀>', '恢复已有会话；不带参数时列出会话', '会话'),
+    Command('/sessions', ('/s',), '', '列出最近会话', '会话'),
+    Command('/status', (), '', '查看当前会话与运行状态', '常用'),
+    Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
+    Command('/cd', (), '[路径]', '切换工作区；不带参数时查看路径', '工作区'),
+    Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
+    Command('/checkpoint', ('/cp',), '[标签]', '创建手动快照', '快照'),
+    Command('/rewind', (), '[ID|last|head] [--force] [--session] [--yes]',
+            '预览并确认回溯；--session 仅恢复会话，--force 允许覆盖冲突', '快照'),
+    Command('/checkpoint-gc', (), '', '清理旧快照', '快照'),
+    Command('/quit', ('/exit',), '', '退出；会话自动保存', '常用'),
+)
+
+_BY_NAME = {name: command for command in COMMANDS
+            for name in (command.name, *command.aliases)}
+
+
+def parse_command(line: str) -> tuple[str, str]:
+    """Preserve argument text (notably Windows paths and checkpoint labels)."""
+    parts = line.strip().split(maxsplit=1)
+    name = parts[0].lower() if parts else '/help'
+    if name == '/':
+        name = '/help'
+    command = _BY_NAME.get(name)
+    return (command.name if command else name, parts[1] if len(parts) > 1 else '')
+
+
+def command_error(name: str, argument: str) -> str | None:
+    command = _BY_NAME.get(name)
+    if command is None:
+        matches = get_close_matches(name, _BY_NAME, n=1, cutoff=0.6)
+        hint = f' 你是否想输入 {matches[0]}？' if matches else ''
+        return f'未知命令：{name}。{hint} 输入 / 查看可用命令。'
+    if not command.arguments and argument:
+        return f'{name} 不接受参数。用法：{command.usage}'
+    if name == '/rewind':
+        parts = argument.split()
+        unknown = [p for p in parts if p.startswith('--')
+                   and p not in ('--force', '--session', '--yes')]
+        if unknown or len([p for p in parts if not p.startswith('--')]) > 1:
+            return f'参数无效。用法：{command.usage}'
+    return None
+
+
+def format_command_help(argument: str = '') -> str:
+    if argument:
+        name, _ = parse_command('/' + argument.lstrip('/'))
+        command = _BY_NAME.get(name)
+        if command is None:
+            return command_error(name, '')
+        aliases = ', '.join(command.aliases) or '无'
+        return f'  {command.usage}\n  {command.description}\n  别名：{aliases}'
+    lines = ['  直接输入消息开始对话；/help <命令> 查看用法。']
+    for group in ('常用', '会话', '工作区', '快照'):
+        lines.append(f'\n  {group}')
+        for command in COMMANDS:
+            if command.group == group:
+                aliases = f" ({', '.join(command.aliases)})" if command.aliases else ''
+                lines.append(f'    {command.usage}{aliases}\n      {command.description}')
+    return '\n'.join(lines)

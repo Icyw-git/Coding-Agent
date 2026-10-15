@@ -37,6 +37,7 @@ from mcp_bridge import register_mcp_tools, shutdown_mcp
 from session_store import SessionEventStore, SessionReplayError
 from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
+from cli_commands import parse_command, command_error, format_command_help
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 
 
@@ -647,13 +648,18 @@ def _confirm(prompt:str)->bool:
 
 def handle_command(line:str,messages:list,session_store)->None:
     """REPL 里的 /命令；回溯需要调用方已持有 agent_lock。"""
-    parts=line.split()
-    command=parts[0].lower()
-    manager=get_checkpoint_manager(session_store)
-    command = {
-        '/s': '/sessions', '/p': '/pwd', '/w': '/pwd',
-        '/cps': '/checkpoints', '/cp': '/checkpoint',
-    }.get(command, command)
+    command, argument = parse_command(line)
+    error = command_error(command, argument)
+    if error:
+        print(f'  {error}')
+        return
+    parts = [command, *argument.split()]
+    if command == '/help':
+        print(format_command_help(argument))
+        return
+    manager = (get_checkpoint_manager(session_store)
+               if command in ('/checkpoints', '/checkpoint', '/rewind', '/checkpoint-gc')
+               else None)
 
     if command=='/checkpoints':
         print(format_checkpoint_list(manager))
@@ -672,7 +678,10 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f'  workspace: {WORKDIR}')
             return
         try:
-            print(f'  workspace: {set_workspace(" ".join(parts[1:]))}')
+            path = argument
+            if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+                path = path[1:-1]
+            print(f'  workspace: {set_workspace(path)}')
         except ValueError as exc:
             print(f'  [workspace] {exc}')
 
@@ -1045,26 +1054,42 @@ def run_repl(initial_messages:list, session_store=None):
         for message in messages:
             session_store.append_message(message)
     print(f'[session log:{session_store.path}]')
-    print('  \033[90mshortcuts: /s sessions  /r <id> resume  /n [id] new  /p pwd  /cd <path> '
-          '/status /checkpoints /checkpoint [label] '
-          '/rewind <id|last|head> [--force] [--session] [--yes] /checkpoint-gc\033[0m')
+    print(f'  工作区：{WORKDIR}')
+    print('  输入消息开始对话；/ 查看命令，/resume 恢复会话，/quit 退出。')
+
+    from cli_input import create_reader
+
+    def session_choices():
+        for path in list_session_paths(100):
+            store = SessionEventStore.open(path)
+            yield store.session_id, store.saved_session_title() or store.session_id
+
+    read_line = create_reader(lambda: WORKDIR, session_choices)
 
     while True:
         try:
-            line=input('\n> ').strip()
+            line=read_line('\n> ').strip()
         except (EOFError,KeyboardInterrupt):
             print('\n[会话已结束]')
             break
         if not line:
             continue
         if line.startswith('/') or line == 'cd' or line.startswith('cd '):
-            command = line.split()[0].lower()
+            if line == 'cd' or line.startswith('cd '):
+                line = '/' + line
+            command, argument = parse_command(line)
+            error = command_error(command, argument)
+            if error:
+                print(f'  {error}')
+                continue
+            line = f'{command} {argument}'.rstrip()
             if command in ('/exit','/quit'):
                 break
             if command in ('/r', '/resume'):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    print('  usage: /r <session_id>')
+                    print(format_session_list())
+                    print('  用 /resume <会话ID或唯一前缀> 恢复会话。')
                     continue
                 try:
                     identifier = parts[1]
@@ -1096,9 +1121,6 @@ def run_repl(initial_messages:list, session_store=None):
                 session_store.append('session_created')
                 messages = []
                 print(f'  [session] new {session_store.session_id}')
-                continue
-            if command == 'cd':
-                handle_command('/cd' + line[2:], messages, session_store)
                 continue
             handle_command(line,messages,session_store)
             continue

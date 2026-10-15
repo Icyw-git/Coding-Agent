@@ -21,7 +21,8 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 聊天命令（@机器人 发送）：
     /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
     /logs <id> /stop <id> /perms /approve [req_id] y|n /quit(解绑)
-    y / n          —— 快捷决议最早的待审批请求（无需输 ID）
+    审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
+    y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
     /cd <dir>      —— 切换该聊天的任务执行目录（/run 生效）
     其余文本 → 作为消息发给绑定的 agent 会话
@@ -46,14 +47,19 @@ PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 
 
-def format_permission_prompt(req: dict) -> str:
-    """审批提醒文案：人工只需回复 /approve <id> y|n。"""
+def format_permission_prompt(req: dict, index: int | None = None) -> str:
+    """审批提醒文案：点卡片按钮，或直接回复 y / n（多条时 y2、n2 按序号选）。"""
     preview = str(req.get('args', ''))[:160]
-    return (f"⚠ 需要审批 [{req['req_id']}]\n"
-            f"工具: {req['tool']}\n"
-            f"原因: {req['reason']}\n"
+    head = '⚠ 需要审批' + (f' #{index}' if index else '') \
+        + f" · {req.get('tool', '?')}"
+    if index in (None, 1):
+        tail = '回复 y（允许）或 n（拒绝）'
+    else:
+        tail = f'回复 y{index}（允许）或 n{index}（拒绝）'
+    return (f"{head}\n"
+            f"原因: {req.get('reason', '')}\n"
             f"参数: {preview}\n"
-            f"回复 /approve {req['req_id']} y（允许）或 n（拒绝）")
+            f"{tail}（也可直接点按钮）")
 
 
 CARD_MD_LIMIT = 24000   # 飞书卡片 JSON 上限约 30KB，留余量
@@ -205,6 +211,46 @@ class LarkTransport:
             raise RuntimeError(
                 f'feishu card update failed: {response.code} {response.msg}')
 
+    def send_approval_card(self, chat_id: str, prompt_md: str,
+                           req_id: str) -> str | None:
+        """带【允许/拒绝】按钮的审批卡片；按钮 value 携带 req_id，
+        点击后走 card.action.trigger 回调决议，无需用户打字。"""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody)
+        card = {
+            'config': {'wide_screen_mode': True},
+            'elements': [
+                {'tag': 'markdown',
+                 'content': markdown_to_card_md(prompt_md)},
+                {'tag': 'hr'},
+                {'tag': 'action', 'actions': [
+                    {'tag': 'button',
+                     'text': {'tag': 'plain_text', 'content': '✅ 允许'},
+                     'type': 'primary',
+                     'value': {'approval': req_id, 'allow': True}},
+                    {'tag': 'button',
+                     'text': {'tag': 'plain_text', 'content': '⛔ 拒绝'},
+                     'type': 'danger',
+                     'value': {'approval': req_id, 'allow': False}},
+                ]},
+            ],
+        }
+        request = CreateMessageRequest.builder() \
+            .receive_id_type('chat_id') \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type('interactive')
+                .content(json.dumps(card, ensure_ascii=False))
+                .build()
+            ).build()
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu approval card failed: {response.code} {response.msg}')
+        data = getattr(response, 'data', None)
+        return getattr(data, 'message_id', None) if data else None
+
 
 class FeishuGateway:
     """核心编排：聊天绑定、命令分发、权限轮询。传输层可注入以便测试。"""
@@ -270,9 +316,12 @@ class FeishuGateway:
             print(f'[feishu] ignored message from unauthorized user '
                   f'{sender_id!r} in chat {chat_id!r}')
             return
-        # y/n 快捷审批：该聊天有待审批请求时，y/n 不再当作普通消息
-        if text.lower() in ('y', 'n') and self._chat_pending.get(chat_id):
-            self._resolve_chat_pending(chat_id, text.lower() == 'y')
+        # y/n 快捷审批：该聊天有待审批请求时，y/n 不再当作普通消息；
+        # y2 / n2 决议本聊天 FIFO 里第 2 条，依此类推
+        m = re.fullmatch(r'(y|n)(\d{0,2})', text.lower())
+        if m and self._chat_pending.get(chat_id):
+            index = int(m.group(2)) - 1 if m.group(2) else 0
+            self._resolve_chat_pending(chat_id, m.group(1) == 'y', index)
             return
         session_id = self.bindings.get(chat_id)
         if text.startswith('/'):
@@ -340,18 +389,23 @@ class FeishuGateway:
 
     # ---------- 快捷审批 ----------
 
-    def _resolve_chat_pending(self, chat_id: str, allow: bool) -> None:
-        """决议该聊天最早的待审批请求（免输 req_id）。"""
+    def _resolve_chat_pending(self, chat_id: str, allow: bool,
+                              index: int = 0) -> None:
+        """决议该聊天的第 index+1 条待审批（免输 req_id）。"""
         pending_ids = self._chat_pending.get(chat_id) or []
-        while pending_ids:
-            req_id = pending_ids.pop(0)
-            try:
-                record = self.api.resolve_permission(req_id, allow)
-            except Exception:
-                continue   # 已决议/超时的请求：跳过，试下一个
-            self._reply(chat_id, f"{record['req_id']} → {record['status']}")
+        if index >= len(pending_ids):
+            self._reply(chat_id, f'(没有第 {index + 1} 条待审批，试试 /perms)')
             return
-        self._reply(chat_id, '(没有可决议的待审批请求，试试 /perms 查看)')
+        req_id = pending_ids[index]
+        try:
+            record = self.api.resolve_permission(req_id, allow)
+        except Exception:
+            # 已决议/超时的请求：移出 FIFO，提示用户重新查看
+            pending_ids.remove(req_id)
+            self._reply(chat_id, '(该请求已失效或已决议，试试 /perms)')
+            return
+        self._forget_pending(req_id)
+        self._reply(chat_id, f"{record['req_id']} → {record['status']}")
 
     def _handle_command(self, chat_id: str, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -428,8 +482,8 @@ class FeishuGateway:
                 pending = self.api.pending_permissions()
                 if not pending:
                     self._reply(chat_id, '(无待审批请求)')
-                for req in pending:
-                    self._reply(chat_id, format_permission_prompt(req))
+                for i, req in enumerate(pending, 1):
+                    self._push_approval(chat_id, req, i)
             elif command == '/approve':
                 tokens = argument.split()
                 if tokens and tokens[-1] in ('y', 'n') and len(tokens) == 1:
@@ -471,12 +525,59 @@ class FeishuGateway:
                 fifo = self._chat_pending.setdefault(chat_id, [])
                 if req_id not in fifo:
                     fifo.append(req_id)
-                self._reply(chat_id, format_permission_prompt(req))
+                self._push_approval(chat_id, req, fifo.index(req_id) + 1)
         # 决议完成（或超时）的请求退出通知集合与各聊天 FIFO，避免无界增长
         pending_ids = {req['req_id'] for req in pending}
         self._notified &= pending_ids
         for chat_id, fifo in self._chat_pending.items():
             fifo[:] = [req_id for req_id in fifo if req_id in pending_ids]
+
+    def _push_approval(self, chat_id: str, req: dict, index: int) -> None:
+        """推送审批请求：优先带按钮的卡片，发送失败回退纯文本提示。"""
+        sender = getattr(self.transport, 'send_approval_card', None)
+        if sender:
+            try:
+                sender(chat_id, format_permission_prompt(req, index),
+                       req['req_id'])
+                return
+            except Exception as exc:
+                print(f'[feishu] approval card failed, fallback to text: {exc}')
+        self._reply(chat_id, format_permission_prompt(req, index))
+
+    def _forget_pending(self, req_id: str) -> None:
+        """决议完成后清理通知集合与各聊天的 FIFO。"""
+        self._notified.discard(req_id)
+        for fifo in self._chat_pending.values():
+            if req_id in fifo:
+                fifo.remove(req_id)
+
+    def handle_card_action(self, open_id: str | None, value: dict | None,
+                           message_id: str | None) -> tuple[str, bool]:
+        """审批卡片按钮回调：决议权限并原地更新卡片。
+
+        返回 (toast 文案, 是否成功)。open_id 受用户白名单约束——
+        群里任何能点按钮的人都算，必须过同一道闸。
+        """
+        if self.allowed_users is not None and open_id not in self.allowed_users:
+            return '⛔ 你没有审批权限', False
+        req_id = (value or {}).get('approval')
+        if not req_id:
+            return '⚠ 无效的审批按钮', False
+        allow = bool((value or {}).get('allow'))
+        try:
+            record = self.api.resolve_permission(req_id, allow)
+        except Exception as exc:
+            return f'⚠ 决议失败: {exc}', False
+        self._forget_pending(req_id)
+        verb = '允许' if allow else '拒绝'
+        updater = getattr(self.transport, 'update_markdown', None)
+        if updater and message_id:
+            try:
+                updater(message_id, f"**已{verb}** `{record['req_id']}`"
+                                    f"\n状态: {record['status']}")
+            except Exception as exc:
+                print(f'[feishu] approval card update failed: {exc}')
+        return f'已{verb} {record["status"]}', True
 
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:
@@ -590,8 +691,27 @@ class FeishuGateway:
             except Exception as exc:
                 print(f'[feishu] event error: {exc}')
 
+        def on_card_action(data) -> None:
+            """审批卡片按钮回调 → 决议权限，toast 反馈结果。"""
+            try:
+                text, ok = self.handle_card_action(
+                    getattr(data.event.operator, 'open_id', None),
+                    getattr(data.event.action, 'value', None),
+                    getattr(data.event.context, 'open_message_id', None))
+                from lark_oapi.event.callback.model.p2_card_action_trigger \
+                    import (CallBackToast, P2CardActionTriggerResponse)
+                response = P2CardActionTriggerResponse()
+                response.toast = CallBackToast()
+                response.toast.type = 'success' if ok else 'failed'
+                response.toast.content = text
+                return response
+            except Exception as exc:
+                print(f'[feishu] card action error: {exc}')
+                return None
+
         event_handler = (lark.EventDispatcherHandler.builder('', '')
                          .register_p2_im_message_receive_v1(on_lark_message)
+                         .register_p2_card_action_trigger(on_card_action)
                          .build())
         ws_client = lark.ws.Client(
             app_id, app_secret, event_handler=event_handler,

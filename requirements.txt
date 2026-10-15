@@ -1,6 +1,7 @@
 # Runtime dependencies
 openai>=1.0
 python-dotenv>=1.0
+prompt-toolkit>=3.0,<4
 
 # Test dependencies
 pytest>=8.0

@@ -193,7 +193,7 @@ def test_permission_approval_via_chat(gateway):
 
     # 轮询器推送提醒（直接调用核心方法验证格式）
     gw.poll_permissions()
-    assert req_id in fake.all_text()
+    assert 'bash' in fake.all_text()
     assert format_permission_prompt(
         {'req_id': req_id, 'tool': 'bash', 'reason': 'destructive',
          'args': {'command': 'del x'}}).startswith('⚠ 需要审批')
@@ -238,6 +238,158 @@ def test_permission_shortcut_y_n_without_id(gateway):
     fake.sent.clear()
     gw.on_message('c1', 'y')
     assert any('agent-reply-ok' in text for _, text in fake.sent)
+
+
+def test_indexed_y_n_resolves_by_position(gateway):
+    """y2/n2 决议本聊天 FIFO 里第 2 条；不带序号决议第 1 条。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    gw.on_message('c1', 'hi')
+    outcomes = []
+
+    def waiter():
+        outcomes.append(permission_gate.decide(
+            'bash', {'command': 'del x'}, 'destructive')[0])
+
+    threads = [threading.Thread(target=waiter, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for _ in range(100):
+        if len(permission_gate.pending()) >= 2:
+            break
+        time.sleep(0.02)
+    gw.poll_permissions()   # 两条都推送提醒并登记 FIFO
+
+    gw.on_message('c1', 'n2')   # 拒绝第 2 条
+    for thread in threads:
+        thread.join(timeout=2)
+    assert outcomes == [False]                   # 第 2 条被拒，第 1 条仍阻塞
+    assert len(permission_gate.pending()) == 1
+
+    gw.on_message('c1', 'y')    # 不带序号 → 决议第 1 条
+    for thread in threads:
+        thread.join(timeout=2)
+    for _ in range(50):
+        if not permission_gate.pending():
+            break
+        time.sleep(0.02)
+    assert sorted(outcomes) == [False, True]
+    assert permission_gate.pending() == []
+
+
+def test_approval_push_prefers_button_card(gateway):
+    """有 send_approval_card 的 transport 推送按钮卡片而非纯文本。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    gw.on_message('c1', 'hi')
+
+    class ApprovalTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.cards = []
+
+        def send_approval_card(self, chat_id, prompt_md, req_id):
+            self.cards.append((chat_id, prompt_md, req_id))
+            return 'om-1'
+
+    approval = ApprovalTransport()
+    gw.transport = approval
+    baseline = len(fake.sent)   # on_message('hi') 已产生的文本回复
+
+    results = {}
+
+    def waiter():
+        results['allowed'] = permission_gate.decide(
+            'bash', {'command': 'del x'}, 'destructive')[0]
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if permission_gate.pending():
+            break
+        time.sleep(0.02)
+    req_id = permission_gate.pending()[0].req_id
+
+    gw.poll_permissions()
+    assert approval.cards == [('c1', approval.cards[0][1], req_id)]
+    assert '回复 y（允许）或 n（拒绝）' in approval.cards[0][1]
+    assert len(fake.sent) == baseline   # 推送未走文本回退
+
+    gw.on_message('c1', 'y')        # 文本快捷键仍然生效
+    thread.join(timeout=2)
+    assert results['allowed'] is True
+
+
+def test_card_button_resolves_permission(gateway):
+    """按钮回调决议权限、清 FIFO、无按钮卡片时 toast 反馈结果。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    gw.on_message('c1', 'hi')
+    results = {}
+
+    def waiter():
+        results['allowed'] = permission_gate.decide(
+            'bash', {'command': 'del x'}, 'destructive')[0]
+
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if permission_gate.pending():
+            break
+        time.sleep(0.02)
+    req_id = permission_gate.pending()[0].req_id
+    gw.poll_permissions()
+
+    text, ok = gw.handle_card_action(
+        'ou_me', {'approval': req_id, 'allow': True}, 'om_1')
+    assert ok and '已允许' in text
+    thread.join(timeout=2)
+    assert results['allowed'] is True
+
+    # FIFO 已清理：y 恢复为普通消息
+    fake.sent.clear()
+    gw.on_message('c1', 'y')
+    assert any('agent-reply-ok' in text for _, text in fake.sent)
+
+
+def test_card_button_respects_allowlist(api_app, tmp_path, monkeypatch):
+    """白名单外的用户点按钮无效，权限请求保持 pending。"""
+    monkeypatch.setattr(permission_gate, 'backend', 'remote')
+    api = gateway_sim.GatewayClient(
+        'http://test', 't', transport=_sync_asgi_transport(api_app))
+    fake = FakeTransport()
+    gw = feishu_gateway.FeishuGateway(api, transport=fake,
+                                      bindings_path=tmp_path / 'bindings.json',
+                                      allowed_users={'ou_me'})
+    try:
+        _drain_stale_permissions()
+        results = {}
+
+        def waiter():
+            results['allowed'] = permission_gate.decide(
+                'bash', {'command': 'del x'}, 'destructive')[0]
+
+        thread = threading.Thread(target=waiter, daemon=True)
+        thread.start()
+        for _ in range(50):
+            if permission_gate.pending():
+                break
+            time.sleep(0.02)
+        req_id = permission_gate.pending()[0].req_id
+
+        text, ok = gw.handle_card_action(
+            'ou_stranger', {'approval': req_id, 'allow': True}, 'om_1')
+        assert not ok and '没有审批权限' in text
+        assert results == {}    # waiter 仍阻塞，未决议
+
+        text, ok = gw.handle_card_action(
+            'ou_me', {'approval': req_id, 'allow': False}, 'om_1')
+        assert ok
+        thread.join(timeout=2)
+        assert results['allowed'] is False
+    finally:
+        api.close()
+        monkeypatch.setattr(permission_gate, 'backend', 'console')
 
 
 def test_lark_transport_sends_text(monkeypatch):
