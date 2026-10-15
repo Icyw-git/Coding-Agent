@@ -79,7 +79,7 @@ class AgentRuntime:
 
     def history(self, session_id: str) -> list[dict]:
         """Return the replayable OpenAI history for a persisted session."""
-        return self._open_session(session_id).rebuild_openai_history()
+        return self._open_session(session_id).rebuild_openai_history(repair_gaps=True)
 
     def open_session(self, session_id: str):
         """Open the persisted event store of an existing session (live tailing)."""

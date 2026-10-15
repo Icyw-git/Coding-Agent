@@ -264,7 +264,8 @@ class SessionEventStore:
                 events.append(event)
         return events, offset
 
-    def rebuild_openai_history(self, *, recover_pending: bool = False) -> list[dict]:
+    def rebuild_openai_history(self, *, recover_pending: bool = False,
+                               repair_gaps: bool = False) -> list[dict]:
         """Rebuild the current compacted OpenAI history from the append-only event stream."""
         messages = []
         for event in self.read_events():
@@ -283,6 +284,9 @@ class SessionEventStore:
                 messages = self._rewound_history(event)
             elif event_type == "tool_recovery":
                 messages = self.close_interrupted_tools(messages)
+        if repair_gaps and not recover_pending:
+            # Read-only views repair old gaps, but an active tail may still be executing.
+            messages = self.close_interrupted_tools(messages, close_tail=False)
         if recover_pending:
             recovered = self.close_interrupted_tools(messages)
             self.validate_openai_history(recovered)
@@ -293,7 +297,7 @@ class SessionEventStore:
         return messages
 
     @staticmethod
-    def close_interrupted_tools(messages: list[dict]) -> list[dict]:
+    def close_interrupted_tools(messages: list[dict], *, close_tail: bool = True) -> list[dict]:
         """Close missing tool results without claiming success or repeating tools."""
         result = []
         pending = {}
@@ -317,7 +321,8 @@ class SessionEventStore:
                     pending[call['id']] = call
             elif message.get('role') == 'tool':
                 pending.pop(message.get('tool_call_id'), None)
-        close_pending()
+        if close_tail:
+            close_pending()
         return result
 
     def _rewound_history(self, event: dict) -> list[dict]:

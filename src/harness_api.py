@@ -331,6 +331,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 deltas.put(("done", {"session_id": response.session_id,
                                      "content": response.content}))
             except Exception as exc:
+                logger.exception('streamed agent turn failed session=%s', session_id)
                 deltas.put(("error", str(exc)))
             finally:
                 deltas.put(("close", finished))
