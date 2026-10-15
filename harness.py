@@ -99,28 +99,23 @@ def set_workspace(path: str) -> Path:
     return WORKDIR
 
 
+def session_rows(limit: int = 100) -> list[dict]:
+    rows = []
+    for path in list_session_paths(limit):
+        try:
+            rows.append(SessionEventStore.open(path).session_summary())
+        except (OSError, SessionReplayError) as exc:
+            print(f'  [session] 无法读取 {path.stem}: {exc}')
+    return rows
+
+
 def format_session_list(limit: int = 20) -> str:
-    rows = list_session_paths(limit)
+    from cli_input import session_label
+
+    rows = session_rows(limit)
     if not rows:
         return '  (no saved sessions)'
-    lines = []
-    generated = False
-    for path in rows:
-        store = SessionEventStore.open(path)
-        title = store.session_title()
-        # 无持久化标题时：派生标题不可用，或会话包含工具调用（legacy 会话值得
-        # 一次 LLM 标题），则生成并持久化。generated 确保单次列表最多生成 1 个。
-        if store.saved_session_title() is None and not generated:
-            history = store.rebuild_openai_history()
-            if title == '(untitled session)' or _has_session_title_source(history):
-                generated = True
-                new_title = generate_session_title(history)
-                if new_title != '(untitled session)':
-                    store.append_session_title(new_title)
-                    title = new_title
-        lines.append(f'  {store.session_id}  {title}  events={store.last_seq}  '
-                     f'updated={time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))}')
-    return '\n'.join(lines)
+    return '\n\n'.join(session_label(row) for row in rows)
 
 
 def generate_session_title(messages: list[dict]) -> str:
@@ -546,7 +541,8 @@ def get_checkpoint_manager(session_store):
     """按 session 复用 manager，并把它暴露给 tools.run_write/run_edit 抓 pre-image。"""
     global CHECKPOINT_MANAGER
     manager=CHECKPOINT_MANAGER
-    if manager is None or manager.session_id!=session_store.session_id:
+    if (manager is None or manager.session_id != session_store.session_id
+            or manager.workspace != WORKDIR):
         manager=CheckpointManager(
             CHECKPOINT_DIR,WORKDIR,session_store.session_id,
             max_nodes=CHECKPOINT_MAX_NODES,
@@ -682,6 +678,8 @@ def handle_command(line:str,messages:list,session_store)->None:
             if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
                 path = path[1:-1]
             print(f'  workspace: {set_workspace(path)}')
+            if session_store is not None:
+                session_store.record_workspace(WORKDIR)
         except ValueError as exc:
             print(f'  [workspace] {exc}')
 
@@ -737,7 +735,7 @@ def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store):
     try:
         if not session_store.saved_session_title():
             title = generate_session_title(messages_snapshot)
-            if title != '(untitled session)':
+            if title != '(untitled session)' and not session_store.saved_session_title():
                 session_store.append_session_title(title)
     except Exception as exc:
         print(f'  \033[33m[title] skipped: {exc}\033[0m')
@@ -803,6 +801,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         for initial_message in messages:
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
+    session_store.record_workspace(WORKDIR)
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -1051,18 +1050,22 @@ def run_repl(initial_messages:list, session_store=None):
     messages=[dict(m) for m in initial_messages]
     if session_store is None:
         session_store=SessionEventStore(SESSIONS_DIR)
+        session_store.record_workspace(WORKDIR)
         for message in messages:
             session_store.append_message(message)
+    else:
+        workspace = session_store.session_summary()['workspace']
+        if workspace:
+            set_workspace(workspace)
     print(f'[session log:{session_store.path}]')
     print(f'  工作区：{WORKDIR}')
     print('  输入消息开始对话；/ 查看命令，/resume 恢复会话，/quit 退出。')
 
-    from cli_input import create_reader
+    from cli_input import create_reader, choose_session
 
     def session_choices():
-        for path in list_session_paths(100):
-            store = SessionEventStore.open(path)
-            yield store.session_id, store.saved_session_title() or store.session_id
+        for row in session_rows():
+            yield row['id'], f"{row['title']} · {row['workspace'] or '工作目录未记录'} · {row['preview']}"
 
     read_line = create_reader(lambda: WORKDIR, session_choices)
 
@@ -1088,11 +1091,12 @@ def run_repl(initial_messages:list, session_store=None):
             if command in ('/r', '/resume'):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    print(format_session_list())
-                    print('  用 /resume <会话ID或唯一前缀> 恢复会话。')
-                    continue
-                try:
+                    identifier = choose_session(session_rows(), session_store.session_id)
+                    if identifier is None:
+                        continue
+                else:
                     identifier = parts[1]
+                try:
                     matches = [path for path in list_session_paths(100)
                                if SessionEventStore.open(path).session_id.startswith(identifier)]
                     if len(matches) == 1:
@@ -1102,9 +1106,17 @@ def run_repl(initial_messages:list, session_store=None):
                         continue
                     else:
                         path = resolve_session_path(identifier)
-                    session_store = SessionEventStore.open(path)
-                    messages = session_store.rebuild_openai_history()
+                    candidate = SessionEventStore.open(path)
+                    history = candidate.rebuild_openai_history()
+                    summary = candidate.session_summary()
+                    if summary['workspace']:
+                        set_workspace(summary['workspace'])
+                    else:
+                        print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
+                    session_store = candidate
+                    messages = history
                     print(f'  [session] resumed {session_store.session_id}')
+                    print(f"  主题：{summary['title']}\n  工作区：{WORKDIR}")
                 except (FileNotFoundError, ValueError, SessionReplayError) as exc:
                     print(f'  [session] {exc}')
                 continue
@@ -1119,6 +1131,7 @@ def run_repl(initial_messages:list, session_store=None):
                     continue
                 session_store = SessionEventStore(SESSIONS_DIR, session_id=requested)
                 session_store.append('session_created')
+                session_store.record_workspace(WORKDIR)
                 messages = []
                 print(f'  [session] new {session_store.session_id}')
                 continue

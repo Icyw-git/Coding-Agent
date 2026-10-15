@@ -209,7 +209,7 @@ def test_format_session_list_uses_saved_topic_for_acknowledgment_first_session(t
     assert '检查 checkpoint 回滚流程' in harness.format_session_list()
 
 
-def test_format_session_list_generates_and_persists_legacy_title(tmp_path, monkeypatch):
+def test_format_session_list_never_calls_model_or_mutates_legacy_session(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
     store = harness.SessionEventStore(tmp_path, session_id='legacy-tool')
     store.append_message({'role': 'user', 'content': 'x'})
@@ -224,12 +224,16 @@ def test_format_session_list_generates_and_persists_legacy_title(tmp_path, monke
     })
     store.append_message({'role': 'tool', 'tool_call_id': 'call-1', 'content': '2'})
     store.append_message({'role': 'assistant', 'content': 'The command printed 2 successfully.'})
-    monkeypatch.setattr(harness, 'generate_session_title', lambda _messages: '验证 bash 命令输出')
+    def unexpected(_messages):
+        pytest.fail('listing must not call the model')
+    monkeypatch.setattr(harness, 'generate_session_title', unexpected)
+    before = store.path.read_bytes()
 
     listing = harness.format_session_list()
 
-    assert '验证 bash 命令输出' in listing
-    assert store.saved_session_title() == '验证 bash 命令输出'
+    assert 'legacy-tool' in listing
+    assert '未记录' in listing
+    assert store.path.read_bytes() == before
 
 
 def test_generate_session_title_does_not_call_model_for_empty_session(monkeypatch):

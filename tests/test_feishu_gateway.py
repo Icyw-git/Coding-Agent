@@ -202,7 +202,8 @@ def test_permission_approval_via_chat(gateway):
     gw.on_message('c1', f'/approve {req_id} y')
     thread.join(timeout=2)
     assert results['allowed'] is True
-    assert f'{req_id} → approved' in fake.last()
+    assert '已允许' in fake.last()
+    assert req_id not in fake.all_text()
 
     # 同一请求不会重复推送
     calls_before = len(fake.sent)
@@ -232,7 +233,7 @@ def test_permission_shortcut_y_n_without_id(gateway):
     gw.on_message('c1', 'y')   # 不带 req_id
     thread.join(timeout=2)
     assert results['allowed'] is True
-    assert '→ approved' in fake.last()
+    assert '已允许' in fake.last()
 
     # 没有待审批时，y 当作普通消息发给 agent
     fake.sent.clear()

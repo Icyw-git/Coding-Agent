@@ -123,12 +123,13 @@ class PermissionGate:
             self._decide_console(req)
         allowed = req.status == 'approved'
         message = f'{req.status} [{req.req_id}] {tool}: {reason}'
-        print(f'  \033[{"32" if allowed else "31"}m[permission] {message}\033[0m')
+        status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}[req.status]
+        print(f'  \033[{"32" if allowed else "31"}m[permission] {status} · {tool}: {reason}\033[0m')
         return allowed, message
 
     def _decide_console(self, req: PermissionRequest) -> bool:
         print(f"\n\033[33m⚠  {req.reason}\033[0m")
-        print(f"   Tool: {req.tool}({req.args})  [{req.req_id}]")
+        print(f"   操作: {req.tool}({req.args})")
         try:
             choice = input('Allow? (y/n) ').strip().lower()
         except (EOFError, KeyboardInterrupt):

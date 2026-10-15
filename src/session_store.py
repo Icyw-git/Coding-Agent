@@ -82,6 +82,38 @@ class SessionEventStore:
         """Persist a short human-readable topic for session listings."""
         return self.append("session_title", title=title)
 
+    def record_workspace(self, workspace: Path) -> None:
+        """Record changes only; browsing a legacy session must not invent its cwd."""
+        value = str(Path(workspace).resolve())
+        if self.session_summary()['workspace'] != value:
+            self.append('workspace_changed', workspace=value)
+
+    def session_summary(self) -> dict:
+        """Local listing metadata; never calls a model or replays checkpoints."""
+        events = self.read_events()
+        workspace = None
+        title = None
+        prompts = []
+        for event in events:
+            if event.get('workspace'):
+                workspace = str(event['workspace'])
+            if event.get('type') == 'session_title' and event.get('title'):
+                title = str(event['title'])
+            message = event.get('message') or {}
+            content = message.get('content')
+            if (event.get('type') == 'message' and message.get('role') == 'user'
+                    and isinstance(content, str) and content.strip()):
+                prompts.append(' '.join(content.split()))
+        return {
+            'id': self.session_id,
+            'title': title or next((p[:80] for p in prompts if _useful_title_line(p)),
+                                  prompts[0][:80] if prompts else '新会话'),
+            'workspace': workspace,
+            'preview': prompts[-1][:160] if prompts else '尚无任务',
+            'events': len(events),
+            'updated': events[-1]['ts'] if events else 0,
+        }
+
     def session_title(self) -> str:
         """Return the saved topic, or derive one from the first user message for older logs."""
         title = self.saved_session_title()

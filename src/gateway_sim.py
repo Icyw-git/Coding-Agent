@@ -299,18 +299,24 @@ def repl(client: GatewayClient) -> int:
                     pending = client.pending_permissions()
                     if not pending:
                         print('  (no pending permission requests)')
-                    for req in pending:
-                        print(f"  {req['req_id']}  {req['tool']}  "
+                    for index, req in enumerate(pending, 1):
+                        print(f"  #{index}  {req['tool']}  "
                               f"{req['reason'][:60]}")
-                        print(f"    → /approve {req['req_id']} y|n")
+                        print(f"    参数: {req.get('args', {})}")
+                        print(f"    → /approve {index} y|n")
                 elif command == '/approve':
                     tokens = argument.split()
-                    if len(tokens) != 2 or tokens[1] not in ('y', 'n'):
-                        print('  usage: /approve <req_id> y|n')
+                    if len(tokens) not in (1, 2) or tokens[-1] not in ('y', 'n'):
+                        print('  用法: /approve [序号] y|n；/perms 查看待审批操作')
+                        continue
+                    pending = client.pending_permissions()
+                    index = int(tokens[0]) - 1 if len(tokens) == 2 else 0
+                    if not 0 <= index < len(pending):
+                        print('  无对应的待审批操作，请用 /perms 查看')
                         continue
                     record = client.resolve_permission(
-                        tokens[0], tokens[1] == 'y')
-                    print(f"  {record['req_id']} → {record['status']}")
+                        pending[index]['req_id'], tokens[-1] == 'y')
+                    print(f"  {'已允许' if record['status'] == 'approved' else '已拒绝'} · {record['tool']}")
                 else:
                     print(f'  unknown command: {command}')
             else:

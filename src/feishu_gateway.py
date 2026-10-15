@@ -20,7 +20,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 聊天命令（@机器人 发送）：
     /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
-    /logs <id> /stop <id> /perms /approve [req_id] y|n /quit(解绑)
+    /logs <id> /stop <id> /perms /approve y|n /quit(解绑)
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
@@ -45,6 +45,12 @@ from gateway_sim import GatewayClient
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
+
+
+def permission_result(record: dict) -> str:
+    status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}.get(
+        record['status'], '审批已处理')
+    return f"{status} · {record.get('tool', '操作')}\n原因: {record.get('reason', '')}"
 
 
 def format_permission_prompt(req: dict, index: int | None = None) -> str:
@@ -405,7 +411,7 @@ class FeishuGateway:
             self._reply(chat_id, '(该请求已失效或已决议，试试 /perms)')
             return
         self._forget_pending(req_id)
-        self._reply(chat_id, f"{record['req_id']} → {record['status']}")
+        self._reply(chat_id, permission_result(record))
 
     def _handle_command(self, chat_id: str, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -491,11 +497,12 @@ class FeishuGateway:
                     self._resolve_chat_pending(chat_id, tokens[0] == 'y')
                     return
                 if len(tokens) != 2 or tokens[1] not in ('y', 'n'):
-                    self._reply(chat_id, '用法: /approve [req_id] y|n'
-                                          '\n（省略 req_id 时决议最早的一条）')
+                    self._reply(chat_id, '用法: /approve y|n，或直接回复 y/n'
+                                          '\n多条待审批时，用 y2/n2 选择第 2 条；/perms 查看操作内容。')
                     return
                 record = self.api.resolve_permission(tokens[0], tokens[1] == 'y')
-                self._reply(chat_id, f"{record['req_id']} → {record['status']}")
+                self._forget_pending(record['req_id'])
+                self._reply(chat_id, permission_result(record))
             elif command == '/quit':
                 with self._bindings_lock:
                     self.bindings.pop(chat_id, None)
@@ -567,17 +574,17 @@ class FeishuGateway:
         try:
             record = self.api.resolve_permission(req_id, allow)
         except Exception as exc:
-            return f'⚠ 决议失败: {exc}', False
+            print(f'[feishu] approval failed: {exc}')
+            return '⚠ 操作未能完成，请用 /perms 查看最新审批状态', False
         self._forget_pending(req_id)
         verb = '允许' if allow else '拒绝'
         updater = getattr(self.transport, 'update_markdown', None)
         if updater and message_id:
             try:
-                updater(message_id, f"**已{verb}** `{record['req_id']}`"
-                                    f"\n状态: {record['status']}")
+                updater(message_id, permission_result(record))
             except Exception as exc:
                 print(f'[feishu] approval card update failed: {exc}')
-        return f'已{verb} {record["status"]}', True
+        return f'已{verb}', True
 
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:

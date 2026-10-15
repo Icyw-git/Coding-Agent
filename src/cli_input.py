@@ -2,12 +2,45 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
 from cli_commands import COMMANDS, parse_command
+
+
+def session_label(row):
+    updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['updated']))
+    return (f"  {row['title']}\n"
+            f"    工作区：{row['workspace'] or '未记录（旧会话）'}\n"
+            f"    最近任务：{row['preview']}\n"
+            f"    {updated}  ID={row['id']}  events={row['events']}")
+
+
+def choose_session(rows, current_id=None):
+    """Select by recognizable context, not an opaque identifier."""
+    if not rows:
+        print('  (no saved sessions)')
+        return None
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print('\n\n'.join(session_label(row) for row in rows))
+        print('  用 /resume <会话ID或唯一前缀> 恢复会话。')
+        return None
+    from prompt_toolkit.shortcuts import radiolist_dialog
+
+    try:
+        return radiolist_dialog(
+            title='恢复会话',
+            text='方向键选择，空格选中，Tab 切换按钮，Enter 确认；取消不会切换会话。',
+            values=[(row['id'], ('[当前]\n' if row['id'] == current_id else '')
+                     + session_label(row)) for row in rows],
+            default=current_id if any(row['id'] == current_id for row in rows) else None,
+            ok_text='恢复', cancel_text='取消',
+        ).run()
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 
 class SlashCompleter(Completer):

@@ -8,7 +8,7 @@ import pytest
 from hooks import PermissionGate
 
 
-def test_console_backend_approve_and_deny(monkeypatch):
+def test_console_backend_approve_and_deny(monkeypatch, capsys):
     gate = PermissionGate()
     monkeypatch.setattr('builtins.input', lambda prompt='': 'y')
     allowed, message = gate.decide('bash', {'command': 'del x'}, 'destructive')
@@ -17,6 +17,7 @@ def test_console_backend_approve_and_deny(monkeypatch):
     monkeypatch.setattr('builtins.input', lambda prompt='': 'n')
     allowed, _ = gate.decide('bash', {'command': 'rd x'}, 'destructive')
     assert not allowed
+    assert 'perm_' not in capsys.readouterr().out
 
 
 def test_console_eof_denies_instead_of_crashing(monkeypatch):
