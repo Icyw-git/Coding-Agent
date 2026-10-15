@@ -69,17 +69,35 @@ def validate_runtime_config(environ=None) -> None:
 
 def list_session_paths(limit: int | None = 20) -> list[Path]:
     """Return logs ordered by conversational activity, not filesystem mtime."""
-    if not SESSIONS_DIR.is_dir():
-        return []
-    sessions = []
-    for path in SESSIONS_DIR.glob('session_*.jsonl'):
+    return [SESSIONS_DIR / f"session_{row['id']}.jsonl"
+            for row in _session_catalog()][:limit]
+
+
+_session_summary_cache = {}
+
+
+def _session_catalog():
+    """Reuse summaries until the log changes; timestamps only invalidate cache."""
+    paths = list(SESSIONS_DIR.glob('session_*.jsonl'))
+    live = {path.resolve() for path in paths}
+    for path in list(_session_summary_cache):
+        if path not in live:
+            del _session_summary_cache[path]
+    rows = []
+    for path in paths:
+        key = path.resolve()
         try:
-            summary = SessionEventStore.open(path).session_summary()
-        except (OSError, SessionReplayError):
-            continue
-        sessions.append((summary['updated'], path))
-    sessions.sort(key=lambda item: (item[0], item[1].name), reverse=True)
-    return [path for _, path in sessions][:limit]
+            info = path.stat()
+            signature = (info.st_mtime_ns, info.st_size, info.st_ino)
+            cached = _session_summary_cache.get(key)
+            if cached is None or cached[0] != signature:
+                summary = SessionEventStore.open(path).session_summary()
+                _session_summary_cache[key] = (signature, summary)
+            rows.append(dict(_session_summary_cache[key][1]))
+        except (OSError, SessionReplayError) as exc:
+            _session_summary_cache.pop(key, None)
+            print(f'  [session] 无法读取 {path.stem}: {exc}')
+    return sorted(rows, key=lambda row: (row['updated'], row['id']), reverse=True)
 
 
 def resolve_session_path(session_id: str) -> Path:
@@ -108,12 +126,7 @@ def set_workspace(path: str) -> Path:
 
 def session_rows(limit: int | None = 100, *, include_empty: bool = False,
                  workspace: Path | None = None, query: str = '') -> list[dict]:
-    rows = []
-    for path in list_session_paths(None):
-        try:
-            rows.append(SessionEventStore.open(path).session_summary())
-        except (OSError, SessionReplayError) as exc:
-            print(f'  [session] 无法读取 {path.stem}: {exc}')
+    rows = _session_catalog()
     from cli_input import filter_session_rows
     return filter_session_rows(rows, workspace=workspace, include_empty=include_empty,
                                query=query)[:limit]
@@ -632,7 +645,11 @@ def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='a
         print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
         return False
 
-    plan=manager.restore(cp_id,force=force,scope=scope)
+    try:
+        plan=manager.restore(cp_id,force=force,scope=scope)
+    except CheckpointError as exc:
+        print(f'  [rewind] {exc}')
+        return False
     if report:
         print(format_restore_report(plan))
     if not plan['ok']:
@@ -770,7 +787,7 @@ def handle_command(line:str,messages:list,session_store)->None:
             return
 
         # 先预览（plan_restore 不落盘），再确认执行
-        preview=_safe_checkpoint(manager.plan_restore,cp_id)
+        preview=_safe_checkpoint(manager.plan_restore,cp_id,scope=scope)
         if preview is None:
             return
         preview['scope']=scope

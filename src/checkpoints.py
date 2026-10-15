@@ -180,6 +180,7 @@ class CheckpointManager:
             'label': label,
             'trigger': trigger,
             'session_id': self.session_id,
+            'workspace': str(self.workspace),
             'through_seq': getattr(session_store, 'last_seq', None),
             'parent_id': self._state.get('current_head'),
             'status': 'open',
@@ -334,15 +335,24 @@ class CheckpointManager:
                 cursor = None
         return [cp_id]
 
-    def plan_restore(self, cp_id: str) -> dict:
+    def plan_restore(self, cp_id: str, *, scope: str = 'all') -> dict:
         """不落盘：算出将执行的文件动作、冲突与不可恢复项。"""
         meta = self.get(cp_id)
         chain = self._chain_to_head(cp_id)
+        if scope != 'session':
+            for node_id in chain:
+                workspace = self.get(node_id).get('workspace')
+                if not workspace or Path(workspace).resolve() != self.workspace:
+                    raise CheckpointError(
+                        '快照工作区不匹配或旧快照未记录工作区；'
+                        '禁止恢复文件，可用 --session 仅恢复会话。')
         # chain 是 head → target：迭代过程中后写入的 source 来自更早的节点，
         # 因此最终 source[key] 是「该节点开始时」应恢复的那份 pre-image。
         source: dict[str, tuple] = {}
         post_hashes: dict[str, str] = {}
         for node_id in chain:
+            if scope == 'session':
+                break
             try:
                 node_meta = self.get(node_id)
             except CheckpointError:
@@ -394,7 +404,7 @@ class CheckpointManager:
             'actions': actions,
             'conflicts': conflicts,
             'unverified': unverified,
-            'drift': self._drift_files(meta, touched),
+            'drift': self._drift_files(meta, touched) if scope != 'session' else [],
             'side_effects': self.side_effects(),
         }
 
@@ -424,7 +434,7 @@ class CheckpointManager:
 
     def restore(self, cp_id: str, *, force: bool = False, scope: str = 'all') -> dict:
         """执行回溯。scope='session' 时只回滚会话（不动文件）。"""
-        plan = self.plan_restore(cp_id)
+        plan = self.plan_restore(cp_id, scope=scope)
         plan['scope'] = scope
         plan['applied'] = []
         if scope != 'session':

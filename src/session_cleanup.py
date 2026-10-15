@@ -54,8 +54,12 @@ class SessionArchive:
     def list(self):
         if not self.root.exists():
             return []
-        rows = [SessionEventStore.open(path).session_summary()
-                for path in self.root.glob('*/session_*.jsonl')]
+        rows = []
+        for path in self.root.glob('*/session_*.jsonl'):
+            try:
+                rows.append(SessionEventStore.open(path).session_summary())
+            except (OSError, ValueError) as exc:
+                print(f'  无法读取归档 {path.parent.name}，已跳过：{exc}')
         return sorted(rows, key=lambda row: row['updated'], reverse=True)
 
     def restore(self, session_id):
