@@ -99,20 +99,25 @@ def set_workspace(path: str) -> Path:
     return WORKDIR
 
 
-def session_rows(limit: int = 100) -> list[dict]:
+def session_rows(limit: int = 100, *, include_empty: bool = False,
+                 workspace: Path | None = None, query: str = '') -> list[dict]:
     rows = []
     for path in list_session_paths(limit):
         try:
             rows.append(SessionEventStore.open(path).session_summary())
         except (OSError, SessionReplayError) as exc:
             print(f'  [session] 无法读取 {path.stem}: {exc}')
-    return rows
+    from cli_input import filter_session_rows
+    return filter_session_rows(rows, workspace=workspace, include_empty=include_empty,
+                               query=query)
 
 
 def format_session_list(limit: int = 20) -> str:
     from cli_input import session_label
 
-    rows = session_rows(limit)
+    rows = session_rows(max(100, limit), include_empty=False, workspace=WORKDIR)[:limit]
+    if not rows:
+        rows = session_rows(max(100, limit), include_empty=False)[:limit]
     if not rows:
         return '  (no saved sessions)'
     return '\n\n'.join(session_label(row) for row in rows)
@@ -1064,7 +1069,7 @@ def run_repl(initial_messages:list, session_store=None):
     from cli_input import create_reader, choose_session
 
     def session_choices():
-        for row in session_rows():
+        for row in session_rows(workspace=WORKDIR):
             yield row['id'], f"{row['title']} · {row['workspace'] or '工作目录未记录'} · {row['preview']}"
 
     read_line = create_reader(lambda: WORKDIR, session_choices)
@@ -1091,19 +1096,21 @@ def run_repl(initial_messages:list, session_store=None):
             if command in ('/r', '/resume'):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    identifier = choose_session(session_rows(), session_store.session_id)
+                    identifier = choose_session(session_rows(), session_store.session_id, WORKDIR)
                     if identifier is None:
                         continue
                 else:
                     identifier = parts[1]
                 try:
-                    matches = [path for path in list_session_paths(100)
-                               if SessionEventStore.open(path).session_id.startswith(identifier)]
+                    rows = session_rows(include_empty=False, query=identifier)
+                    matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
                     if len(matches) == 1:
                         path = matches[0]
                     elif len(matches) > 1:
-                        print('  [session] id prefix is ambiguous')
-                        continue
+                        selected = choose_session(rows, session_store.session_id)
+                        if selected is None:
+                            continue
+                        path = resolve_session_path(selected)
                     else:
                         path = resolve_session_path(identifier)
                     candidate = SessionEventStore.open(path)

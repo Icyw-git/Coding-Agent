@@ -11,36 +11,143 @@ from prompt_toolkit.completion import Completer, Completion
 from cli_commands import COMMANDS, parse_command
 
 
+def relative_time(timestamp, now=None):
+    if not timestamp:
+        return '未知时间'
+    elapsed = max(0, int((time.time() if now is None else now) - timestamp))
+    if elapsed < 60:
+        return '刚刚'
+    if elapsed < 3600:
+        return f'{elapsed // 60} 分钟前'
+    if elapsed < 86400:
+        return f'{elapsed // 3600} 小时前'
+    if elapsed < 604800:
+        return f'{elapsed // 86400} 天前'
+    return time.strftime('%Y-%m-%d', time.localtime(timestamp))
+
+
 def session_label(row):
-    updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['updated']))
-    return (f"  {row['title']}\n"
-            f"    工作区：{row['workspace'] or '未记录（旧会话）'}\n"
-            f"    最近任务：{row['preview']}\n"
-            f"    {updated}  ID={row['id']}  events={row['events']}")
+    workspace = row['workspace'] or '工作目录未记录'
+    title = row['title'] or '未命名任务'
+    preview = row.get('preview') or ''
+    recent = '' if preview == title else preview
+    lines = [f'  {title}', f'    工作区：{workspace}']
+    if recent:
+        lines.append(f'    最近：{recent}')
+    lines.append(f"    {relative_time(row.get('updated', 0))}")
+    return '\n'.join(lines)
 
 
-def choose_session(rows, current_id=None):
+def filter_session_rows(rows, workspace=None, include_empty=False, query=''):
+    query = query.strip().casefold()
+    filtered = []
+    for row in rows:
+        if not include_empty and row.get('preview') == '尚无任务':
+            continue
+        haystack = ' '.join(str(row.get(key, '')) for key in
+                            ('title', 'preview', 'workspace')).casefold()
+        if query and query not in haystack and not row['id'].startswith(query):
+            continue
+        filtered.append(row)
+    if workspace:
+        return [row for row in filtered if row.get('workspace') == str(workspace)]
+    return filtered
+
+
+def choose_session(rows, current_id=None, workspace=None):
     """Select by recognizable context, not an opaque identifier."""
     if not rows:
         print('  (no saved sessions)')
         return None
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print('\n\n'.join(session_label(row) for row in rows))
-        print('  用 /resume <会话ID或唯一前缀> 恢复会话。')
+        print('  用 /resume <主题、目录或会话 ID 前缀> 恢复会话。')
         return None
-    from prompt_toolkit.shortcuts import radiolist_dialog
-
+    picker = SessionPicker(rows, current_id, workspace)
     try:
-        return radiolist_dialog(
-            title='恢复会话',
-            text='方向键选择，空格选中，Tab 切换按钮，Enter 确认；取消不会切换会话。',
-            values=[(row['id'], ('[当前]\n' if row['id'] == current_id else '')
-                     + session_label(row)) for row in rows],
-            default=current_id if any(row['id'] == current_id for row in rows) else None,
-            ok_text='恢复', cancel_text='取消',
-        ).run()
+        return picker.application.run()
     except (EOFError, KeyboardInterrupt):
         return None
+
+
+class SessionPicker:
+    """Search stays focused while arrows move the selection and Enter resumes."""
+
+    def __init__(self, rows, current_id=None, workspace=None, **application_kwargs):
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.widgets import TextArea
+
+        self.rows = rows
+        self.workspace = workspace
+        self.current_id = current_id
+        self.show_all = workspace is None
+        self.index = 0
+        self.search = TextArea(height=1, prompt='搜索：', multiline=False)
+        self.search.buffer.on_text_changed += self._reset_selection
+        self.content = FormattedTextControl(self._render)
+        bindings = KeyBindings()
+
+        @bindings.add('up')
+        def previous(event):
+            self.index = max(0, self.index - 1)
+
+        @bindings.add('down')
+        def following(event):
+            self.index = min(max(0, len(self.visible()) - 1), self.index + 1)
+
+        @bindings.add('enter')
+        def accept(event):
+            rows = self.visible()
+            if rows:
+                event.app.exit(result=rows[self.index]['id'])
+
+        @bindings.add('escape')
+        @bindings.add('c-c')
+        @bindings.add('c-d')
+        def cancel(event):
+            event.app.exit(result=None)
+
+        @bindings.add('c-a')
+        def toggle_scope(event):
+            self.show_all = not self.show_all
+            self.index = 0
+
+        root = HSplit([
+            Window(FormattedTextControl('恢复会话 · ↑↓ 选择 · Enter 恢复 · Esc 取消 · Ctrl+A 切换工作区范围'), height=1),
+            self.search,
+            Window(self.content, wrap_lines=True),
+        ])
+        self.application = Application(layout=Layout(root, focused_element=self.search),
+                                       key_bindings=bindings, full_screen=True,
+                                       **application_kwargs)
+
+    def _reset_selection(self, buffer):
+        self.index = 0
+
+    def visible(self):
+        rows = filter_session_rows(self.rows, query=self.search.text)
+        if not self.show_all:
+            rows = [row for row in rows if row.get('workspace') == str(self.workspace)]
+        return rows
+
+    def _render(self):
+        rows = self.visible()
+        scope = '全部工作区' if self.show_all else str(self.workspace)
+        output = [('', f'范围：{scope} · {len(rows)} 个会话\n\n')]
+        if not rows:
+            return output + [('', '没有匹配的会话；可清空搜索或按 Ctrl+A 查看全部工作区。')]
+        # Keep the selection visible without rendering an unbounded list.
+        start = max(0, self.index - 2)
+        for index in range(start, min(len(rows), start + 5)):
+            row = rows[index]
+            label = session_label(row).lstrip()
+            marker = '› ' if index == self.index else '  '
+            current = ' [当前]' if row['id'] == self.current_id else ''
+            output.append(('reverse' if index == self.index else '', marker + label + current + '\n\n'))
+        return output
 
 
 class SlashCompleter(Completer):

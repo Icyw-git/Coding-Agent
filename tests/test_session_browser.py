@@ -28,7 +28,7 @@ def test_resume_restores_workspace(tmp_path, monkeypatch, capsys):
     saved.record_workspace(workspace)
     saved.append_message({'role': 'user', 'content': '检查代码质量'})
     initial = SessionEventStore(tmp_path, session_id='initial')
-    monkeypatch.setattr(cli_input, 'choose_session', lambda rows, current: 'saved')
+    monkeypatch.setattr(cli_input, 'choose_session', lambda rows, current, workspace: 'saved')
     commands = iter(['/resume', '/quit'])
     monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: next(commands))
     harness.run_repl([], initial)
@@ -59,13 +59,12 @@ def test_missing_workspace_does_not_switch_session(tmp_path, monkeypatch, capsys
 
 def test_picker_cancel_keeps_current_session(tmp_path, monkeypatch):
     import cli_input
-    import prompt_toolkit.shortcuts
     from types import SimpleNamespace
 
     monkeypatch.setattr(cli_input.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(cli_input.sys.stdout, 'isatty', lambda: True)
-    monkeypatch.setattr(prompt_toolkit.shortcuts, 'radiolist_dialog',
-                        lambda **kwargs: SimpleNamespace(run=lambda: None))
+    monkeypatch.setattr(cli_input, 'SessionPicker',
+                        lambda *args: SimpleNamespace(application=SimpleNamespace(run=lambda: None)))
     store = SessionEventStore(tmp_path)
     store.record_workspace(tmp_path)
     assert cli_input.choose_session([store.session_summary()]) is None
@@ -82,3 +81,40 @@ def test_title_is_automatically_generated_after_turn(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
     harness._post_turn_housekeeping(messages, messages, store)
     assert store.session_summary()['title'] == '会话切换代码审查'
+
+
+def test_compact_labels_and_filtering():
+    from cli_input import filter_session_rows, session_label, relative_time
+
+    row = dict(id='internal-id', title='修复代码', preview='修复代码',
+               workspace='D:/project', updated=10, events=99)
+    empty = dict(row, id='empty', title='新会话', preview='尚无任务')
+    label = session_label(row)
+    assert label.count('修复代码') == 1
+    assert 'internal-id' not in label and 'events' not in label
+    assert filter_session_rows([row, empty]) == [row]
+    assert filter_session_rows([row], query='project') == [row]
+    assert filter_session_rows([row], workspace='other') == []
+    assert relative_time(100, now=120) == '刚刚'
+    assert relative_time(100, now=220) == '2 分钟前'
+
+
+def test_picker_search_and_enter(tmp_path):
+    import asyncio
+    from cli_input import SessionPicker
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    rows = [dict(id='first', title='修复代码', preview='修复代码', workspace=str(tmp_path), updated=10),
+            dict(id='second', title='检查测试', preview='检查测试', workspace='other', updated=20)]
+
+    async def exercise():
+        with create_pipe_input() as pipe:
+            picker = SessionPicker(rows, workspace=tmp_path, input=pipe, output=DummyOutput())
+            assert [row['id'] for row in picker.visible()] == ['first']
+            task = asyncio.create_task(picker.application.run_async())
+            pipe.send_bytes(b'\x01')  # toggle all workspaces
+            pipe.send_text('检查\r')
+            assert await asyncio.wait_for(task, timeout=3) == 'second'
+
+    asyncio.run(exercise())
