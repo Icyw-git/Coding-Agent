@@ -135,7 +135,13 @@ class LarkTransport:
         self._client = lark.Client.builder() \
             .app_id(app_id).app_secret(app_secret).build()
 
+    @staticmethod
+    def validate_chat_id(chat_id: str) -> None:
+        if not isinstance(chat_id, str) or not chat_id.startswith('oc_') or len(chat_id) <= 3:
+            raise ValueError('飞书聊天目标必须是 oc_ 开头的 chat_id，不能使用用户或测试 ID')
+
     def send_text(self, chat_id: str, text: str) -> str | None:
+        self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
         request = CreateMessageRequest.builder() \
@@ -185,6 +191,7 @@ class LarkTransport:
     def send_markdown(self, chat_id: str, md_text: str) -> str | None:
         """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
         卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
+        self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
         request = CreateMessageRequest.builder() \
@@ -223,6 +230,7 @@ class LarkTransport:
                            req_id: str) -> str | None:
         """带【允许/拒绝】按钮的审批卡片；按钮 value 携带 req_id，
         点击后走 card.action.trigger 回调决议，无需用户打字。"""
+        self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
         card = {
@@ -301,6 +309,14 @@ class FeishuGateway:
                         isinstance(key, str) and isinstance(value, str)
                         for key, value in loaded.items()):
                     self.bindings = loaded
+                    validator = getattr(self.transport, 'validate_chat_id', None)
+                    if validator:
+                        for chat_id in list(self.bindings):
+                            try:
+                                validator(chat_id)
+                            except ValueError:
+                                self.bindings.pop(chat_id)
+                                print(f'[feishu] ignored invalid saved chat binding: {chat_id!r}')
             except (OSError, json.JSONDecodeError, TypeError):
                 self.bindings = {}
 
@@ -658,7 +674,10 @@ class FeishuGateway:
                 fifo = self._chat_pending.setdefault(chat_id, [])
                 if req_id not in fifo:
                     fifo.append(req_id)
-                self._push_approval(chat_id, req, fifo.index(req_id) + 1)
+                try:
+                    self._push_approval(chat_id, req, fifo.index(req_id) + 1)
+                except Exception as exc:
+                    print(f'[feishu] approval notification failed for chat {chat_id!r}: {exc}')
         # 决议完成（或超时）的请求退出通知集合与各聊天 FIFO，避免无界增长
         pending_ids = {req['req_id'] for req in pending}
         self._notified &= pending_ids
