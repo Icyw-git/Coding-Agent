@@ -81,27 +81,27 @@ class AgentRuntime:
         return self._open_session(session_id)
 
     def list_sessions(self, limit: int = 20) -> list[dict]:
-        """Summarize persisted sessions, most recently updated first."""
+        """Summarize sessions ordered by last user/assistant message time."""
         if not self._sessions_dir.is_dir():
             return []
-        paths = sorted(
-            self._sessions_dir.glob('session_*.jsonl'),
-            key=lambda path: path.stat().st_mtime, reverse=True,
-        )[:limit]
+        paths = self._sessions_dir.glob('session_*.jsonl')
         rows = []
         for path in paths:
             try:
                 store = self._session_store_cls.open(path)
                 title = store.session_title()
+                summary = store.session_summary()
             except (OSError, ValueError):
                 continue   # unreadable/corrupt log: leave it out of the listing
             rows.append({
                 'id': store.session_id,
                 'title': title,
                 'events': store.last_seq,
-                'updated': path.stat().st_mtime,
+                'created': summary['created'],
+                'updated': summary['updated'],
             })
-        return rows
+        rows.sort(key=lambda row: (row['updated'], row['id']), reverse=True)
+        return rows[:limit]
 
     def _open_session(self, session_id: str):
         if self._resolve_session_path is not None:

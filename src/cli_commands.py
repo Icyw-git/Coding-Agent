@@ -77,6 +77,6 @@ def format_command_help(argument: str = '') -> str:
         lines.append(f'\n  {group}')
         for command in COMMANDS:
             if command.group == group:
-                aliases = f" ({', '.join(command.aliases)})" if command.aliases else ''
-                lines.append(f'    {command.usage}{aliases}\n      {command.description}')
+                description = command.description.split('；', 1)[0]
+                lines.append(f'    {command.name:<16} {description}')
     return '\n'.join(lines)

@@ -94,6 +94,8 @@ class SessionEventStore:
         workspace = None
         title = None
         prompts = []
+        created = events[0]['ts'] if events else 0
+        last_message = None
         for event in events:
             if event.get('workspace'):
                 workspace = str(event['workspace'])
@@ -101,6 +103,8 @@ class SessionEventStore:
                 title = str(event['title'])
             message = event.get('message') or {}
             content = message.get('content')
+            if event.get('type') == 'message' and message.get('role') in ('user', 'assistant'):
+                last_message = event['ts']
             if (event.get('type') == 'message' and message.get('role') == 'user'
                     and isinstance(content, str) and content.strip()):
                 prompts.append(' '.join(content.split()))
@@ -111,7 +115,10 @@ class SessionEventStore:
             'workspace': workspace,
             'preview': prompts[-1][:160] if prompts else '尚无任务',
             'events': len(events),
-            'updated': events[-1]['ts'] if events else 0,
+            'created': created,
+            # Empty sessions use creation time; metadata and tool events never
+            # advance the last conversational activity timestamp.
+            'updated': last_message if last_message is not None else created,
         }
 
     def session_title(self) -> str:

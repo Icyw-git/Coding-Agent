@@ -67,6 +67,6 @@ def test_repl_resume_new_and_exit_aliases(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(harness, 'format_session_list', lambda: 'saved-session')
     harness.run_repl([], session_store=initial)
     output = capsys.readouterr().out
-    assert 'resumed saved-session' in output
-    assert 'new next-session' in output
+    assert '已恢复：previous message' in output
+    assert '已开始新会话' in output
     assert (tmp_path / 'session_next-session.jsonl').is_file()

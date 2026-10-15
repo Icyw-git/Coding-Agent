@@ -436,7 +436,7 @@ def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
     manager = harness.get_checkpoint_manager(session_store)
 
     harness.handle_command('/checkpoints', messages, session_store)
-    assert '(no checkpoints)' in capsys.readouterr().out
+    assert '暂无快照' in capsys.readouterr().out
 
     harness.handle_command('/checkpoint before refactor', messages, session_store)
     manual = [row for row in manager.list() if row['trigger'] == 'manual']

@@ -67,12 +67,19 @@ def validate_runtime_config(environ=None) -> None:
         )
 
 
-def list_session_paths(limit: int = 20) -> list[Path]:
-    """Return the most recently modified persisted session logs."""
+def list_session_paths(limit: int | None = 20) -> list[Path]:
+    """Return logs ordered by conversational activity, not filesystem mtime."""
     if not SESSIONS_DIR.is_dir():
         return []
-    sessions = SESSIONS_DIR.glob('session_*.jsonl')
-    return sorted(sessions, key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+    sessions = []
+    for path in SESSIONS_DIR.glob('session_*.jsonl'):
+        try:
+            summary = SessionEventStore.open(path).session_summary()
+        except (OSError, SessionReplayError):
+            continue
+        sessions.append((summary['updated'], path))
+    sessions.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    return [path for _, path in sessions][:limit]
 
 
 def resolve_session_path(session_id: str) -> Path:
@@ -102,14 +109,14 @@ def set_workspace(path: str) -> Path:
 def session_rows(limit: int = 100, *, include_empty: bool = False,
                  workspace: Path | None = None, query: str = '') -> list[dict]:
     rows = []
-    for path in list_session_paths(limit):
+    for path in list_session_paths(None):
         try:
             rows.append(SessionEventStore.open(path).session_summary())
         except (OSError, SessionReplayError) as exc:
             print(f'  [session] 无法读取 {path.stem}: {exc}')
     from cli_input import filter_session_rows
     return filter_session_rows(rows, workspace=workspace, include_empty=include_empty,
-                               query=query)
+                               query=query)[:limit]
 
 
 def format_session_list(limit: int = 20) -> str:
@@ -220,11 +227,15 @@ def format_status(session_store) -> str:
         cron_count = len(scheduled_jobs)
     with background_lock:
         background_count = len(background_tasks)
+    activity = [f'{count} 个{label}' for label, count in (
+        ('任务', len(list_tasks())), ('定时任务', cron_count),
+        ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
     return (
-        f'  session={session_store.session_id} events={session_store.last_seq}\n'
-        f'  model={os.getenv("LLM_MODEL_ID", "(not configured)")} workspace={WORKDIR}\n'
-        f'  checkpoints={len(manager.list(limit=10_000))} tasks={len(list_tasks())} '
-        f'cron={cron_count} background={background_count} teammates={len(active_teammates)}'
+        f"  会话：{session_store.session_summary()['title']}\n"
+        f'  工作区：{WORKDIR}\n'
+        f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
+        f'  快照：{len(manager.list(limit=10_000))} 个\n'
+        f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
     )
 
 
@@ -576,32 +587,31 @@ def _snapshot_path(manager, cp_id:str)->Path:
 def format_checkpoint_list(manager)->str:
     rows=manager.list()
     if not rows:
-        return '  (no checkpoints)'
+        return '  暂无快照。用 /checkpoint 创建，或在执行任务时自动生成。'
     head=manager.head()
     lines=[]
     for row in rows:
         mark='*' if row['cp_id']==head else ' '
-        label=f" {row['label']}" if row.get('label') else ''
-        lines.append(f"  {mark} {row['cp_id']}  {row['status']:<6} {row['trigger']:<6} "
-                     f"files={len(row['files'])}{label}")
+        label = row.get('label') or ('手动快照' if row['trigger'] == 'manual' else '任务快照')
+        status = ' · 尚未完成' if row['status'] == 'open' else ''
+        current = ' · 当前' if mark == '*' else ''
+        lines.append(f"  {label}{current}{status} · {len(row['files'])} 个文件\n"
+                     f"    /rewind {row['cp_id']}")
     return '\n'.join(lines)
 
 
 def format_restore_report(plan:dict)->str:
-    lines=[f"  \033[36m[rewind] {plan['cp_id']}"
-           f"{(' ' + plan['label']) if plan.get('label') else ''} "
-           f"(chain={len(plan['chain'])}, scope={plan.get('scope','all')})\033[0m"]
+    scope = '仅会话' if plan.get('scope') == 'session' else '会话与文件'
+    lines = [f"  回溯预览：{plan.get('label') or plan['cp_id']} · {scope}"]
     for entry in plan['actions']:
         lines.append(f"    {entry['action']:<9} {entry['path']}  ({entry['reason']})")
-    for title,items in (('conflicts',plan['conflicts']),
-                        ('unverified (节点未 seal，无法校验)',plan['unverified']),
-                        ('unrestorable by bash/external',plan['drift'])):
+    for title,items in (('存在冲突',plan['conflicts']),
+                        ('快照尚未完成，无法校验',plan['unverified']),
+                        ('命令或外部改动，无法自动恢复',plan['drift'])):
         if items:
-            lines.append(f"    \033[33m{title}: {', '.join(items[:10])}\033[0m")
-    side=plan['side_effects']
-    lines.append(f"    \033[90mnot rolled back: memories={side['memories']} "
-                 f"crons={side['crons_file']} tasks={side['tasks']} "
-                 f"worktrees={side['worktrees']} background={side['background_tasks']}\033[0m")
+            remaining = f'（另有 {len(items) - 10} 项）' if len(items) > 10 else ''
+            lines.append(f"    \033[33m{title}: {', '.join(items[:10])}{remaining}\033[0m")
+    lines.append('    注意：记忆、定时任务、任务进程和 worktree 不随回溯撤销。')
     if not plan['ok']:
         lines.append(f"    \033[31m{plan['reason']}\033[0m")
     return '\n'.join(lines)
@@ -634,9 +644,8 @@ def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='a
                                  snapshot_path=str(_snapshot_path(manager, cp_id)),
                                 restored_files=plan['applied'])
     messages[:]=session_store.rebuild_openai_history()
-    applied=', '.join(plan['applied']) if plan['applied'] else '(no file change)'
-    print(f"  \033[36m[rewind] {cp_id} applied: {applied}\033[0m")
-    print(f"  \033[36m[rewind] session history restored to {cp_id}\033[0m")
+    applied = ', '.join(plan['applied']) if plan['applied'] else '无文件改动'
+    print(f"  已恢复会话 · {applied}")
     return True
 
 
@@ -672,17 +681,17 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(format_session_list())
 
     elif command == '/pwd':
-        print(f'  workspace: {WORKDIR}')
+        print(f'  工作区：{WORKDIR}')
 
     elif command == '/cd':
         if len(parts) < 2:
-            print(f'  workspace: {WORKDIR}')
+            print(f'  工作区：{WORKDIR}')
             return
         try:
             path = argument
             if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
                 path = path[1:-1]
-            print(f'  workspace: {set_workspace(path)}')
+            print(f'  工作区：{set_workspace(path)}')
             if session_store is not None:
                 session_store.record_workspace(WORKDIR)
         except ValueError as exc:
@@ -692,7 +701,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         label=' '.join(parts[1:])
         cp_id=_safe_checkpoint(manager.begin_turn,messages,session_store,label=label,trigger='manual')
         if cp_id:
-            print(f"  \033[36m[checkpoint] {cp_id}{(' ' + label) if label else ''}\033[0m")
+            print(f"  已创建快照{('：' + label) if label else ''}。用 /rewind head 回溯。")
 
     elif command=='/rewind':
         ref=next((p for p in parts[1:] if not p.startswith('--')),'last')
@@ -717,15 +726,15 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f"  \033[33m[rewind] 未执行任何改动；确认可覆盖后重试 "
                   f"/rewind {cp_id} --force\033[0m")
             return
-        if '--yes' not in parts and not _confirm('Apply rewind?'):
-            print('  [rewind] cancelled')
+        if '--yes' not in parts and not _confirm('确认回溯？'):
+            print('  已取消回溯，未执行改动。')
             return
         _safe_checkpoint(rewind_to,messages,session_store,manager,cp_id,
                          force=force,scope=scope,report=False)
 
     elif command=='/checkpoint-gc':
         removed=manager.gc()
-        print(f"  \033[36m[checkpoint] gc removed {len(removed)} node(s)\033[0m")
+        print(f"  已清理 {len(removed)} 个旧快照。" if removed else '  无需清理快照。')
 
     else:
         print(f"  unknown command: {command}")
@@ -1062,7 +1071,7 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
-    print(f'[session log:{session_store.path}]')
+    print(f"  会话：{session_store.session_summary()['title']}")
     print(f'  工作区：{WORKDIR}')
     print('  输入消息开始对话；/ 查看命令，/resume 恢复会话，/quit 退出。')
 
@@ -1122,8 +1131,7 @@ def run_repl(initial_messages:list, session_store=None):
                         print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
                     session_store = candidate
                     messages = history
-                    print(f'  [session] resumed {session_store.session_id}')
-                    print(f"  主题：{summary['title']}\n  工作区：{WORKDIR}")
+                    print(f"  已恢复：{summary['title']}\n  工作区：{WORKDIR}")
                 except (FileNotFoundError, ValueError, SessionReplayError) as exc:
                     print(f'  [session] {exc}')
                 continue
@@ -1140,7 +1148,7 @@ def run_repl(initial_messages:list, session_store=None):
                 session_store.append('session_created')
                 session_store.record_workspace(WORKDIR)
                 messages = []
-                print(f'  [session] new {session_store.session_id}')
+                print('  已开始新会话，工作区保持不变。')
                 continue
             handle_command(line,messages,session_store)
             continue
