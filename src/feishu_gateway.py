@@ -38,11 +38,14 @@ import re
 import threading
 import time
 import unicodedata
+import secrets
 from pathlib import Path
 
 import httpx
 
 from gateway_sim import GatewayClient
+from session_views import group_sessions, session_details
+from feishu_sessions import PAGE_SIZE, list_card, detail_card
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
@@ -191,6 +194,12 @@ class LarkTransport:
     def send_markdown(self, chat_id: str, md_text: str) -> str | None:
         """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
         卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
+        return self._send_card(chat_id, self._markdown_card(md_text))
+
+    def send_session_card(self, chat_id: str, card: dict) -> str | None:
+        return self._send_card(chat_id, json.dumps(card, ensure_ascii=False))
+
+    def _send_card(self, chat_id: str, content: str) -> str | None:
         self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
@@ -200,7 +209,7 @@ class LarkTransport:
                 CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
                 .msg_type('interactive')
-                .content(self._markdown_card(md_text))
+                .content(content)
                 .build()
             ).build()
         response = self._client.im.v1.message.create(request)
@@ -288,6 +297,7 @@ class FeishuGateway:
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
         self._session_choices: dict[str, list[dict]] = {}
+        self._session_views: dict[str, tuple] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
@@ -353,7 +363,7 @@ class FeishuGateway:
             return
         session_id = self.bindings.get(chat_id)
         if norm.startswith('/'):
-            self._handle_command(chat_id, norm)
+            self._handle_command(chat_id, norm, sender_id=sender_id)
             return
         if not session_id:
             session_id = self.api.create_session()
@@ -462,10 +472,10 @@ class FeishuGateway:
         self._reply(chat_id, permission_result(record))
 
     @staticmethod
-    def _session_rows_text(rows):
+    def _session_rows_text(rows, start=0):
         from datetime import datetime
         lines = []
-        for index, row in enumerate(rows, 1):
+        for index, row in enumerate(rows, start + 1):
             timestamp = datetime.fromtimestamp(row.get('updated', 0)).strftime('%m-%d %H:%M')
             lines.append(f"{index}. {row['title']}\n工作区: {row.get('workspace') or '未记录'} · {timestamp}")
             if row.get('preview') and row['preview'] != row['title']:
@@ -473,10 +483,75 @@ class FeishuGateway:
         return '\n\n'.join(lines)
 
     def _show_sessions(self, chat_id, rows, *, include_empty=False):
-        rows = [row for row in rows if include_empty or row.get('preview') != '尚无任务'][:20]
+        current = self.bindings.get(chat_id)
+        rows = [row for row in rows if include_empty or row.get('preview') != '尚无任务'
+                or row['id'] == current]
+        rows = [row for _, group in group_sessions(rows) for row in group]
         self._session_choices[chat_id] = rows
-        self._reply(chat_id, self._session_rows_text(rows) + '\n\n/resume <序号> 切换；也可输入主题或目录搜索。'
-                    if rows else '暂无有任务内容的会话。')
+        self._session_views.pop(chat_id, None)
+        if not rows:
+            self._reply(chat_id, '暂无有任务内容的会话。')
+            return
+        token = secrets.token_urlsafe(12)
+        self._session_views[chat_id] = (token, rows, time.monotonic())
+        self._send_session_view(chat_id, list_card(rows, token, current),
+                                self._session_rows_text(rows[:PAGE_SIZE])
+                                + '\n\n/resume <序号或关键词> 切换；/sessions 2 查看下一页。')
+
+    def _send_session_view(self, chat_id, card, fallback):
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] session card failed, fallback to text: {exc}')
+        self._reply(chat_id, fallback)
+
+    def _switch_session(self, chat_id, row):
+        workspace = self.api.get_workspace(row['id'])
+        with self._bindings_lock:
+            self.bindings[chat_id] = row['id']
+            self._save_bindings()
+        self._session_confirmation.pop(chat_id, None)
+        self._reply(chat_id, f"已切换到会话\n主题: {row['title']}\n工作区: {workspace}")
+
+    def _handle_session_action(self, chat_id, value, sender_id):
+        if self.allowed_users is not None and sender_id not in self.allowed_users:
+            return
+        view = self._session_views.get(chat_id)
+        if not view or view[0] != value.get('session_view') or time.monotonic() - view[2] > 600:
+            self._reply(chat_id, '会话列表已失效，请重新 /sessions。')
+            return
+        token, rows, _ = view
+        index, action = value.get('index'), value.get('action')
+        if type(index) is not int or index < 0:
+            return
+        current = self.bindings.get(chat_id)
+        if action == 'page' and index < (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE:
+            start = index * PAGE_SIZE
+            self._send_session_view(chat_id, list_card(rows, token, current, index),
+                                    self._session_rows_text(rows[start:start + PAGE_SIZE], start=start)
+                                    + '\n\n/resume <序号> 切换；/sessions <页码> 翻页。')
+        elif action in ('switch', 'details') and index < len(rows):
+            try:
+                # Re-read the session: archiving/deleting after listing must not
+                # make an old card switch to a nonexistent session.
+                if action == 'switch':
+                    self._switch_session(chat_id, rows[index])
+                else:
+                    self.api.get_workspace(rows[index]['id'])
+                    latest = next((row for row in self.api.list_sessions(limit=1000)
+                                   if row['id'] == rows[index]['id']), rows[index])
+                    fallback = '\n\n'.join(f'{label}: {text}' for label, text in session_details(latest, current))
+                    reply = markdown_to_card_md(latest.get('last_assistant') or '尚无文字回复')
+                    self._send_session_view(chat_id, detail_card(latest, token, index, current,
+                                                                reply_markdown=reply), fallback)
+            except Exception as exc:
+                self._reply(chat_id, '无法打开此会话，请重新 /sessions 查看有效会话。')
+                print(f'[feishu] session action failed: {exc}')
+        else:
+            self._reply(chat_id, '没有这一页，请重新 /sessions 查看会话列表。')
 
     def _manage_sessions(self, chat_id, command, argument):
         if command == '/cancel':
@@ -552,7 +627,7 @@ class FeishuGateway:
         return '\n'.join([
             '可用命令:',
             '/new [id]              新建会话并绑定到本聊天',
-            '/sessions              查看最近会话列表',
+            '/sessions [页码]       会话卡片列表、详情与切换',
             '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
             '/archive [天数|empty|all|restore]  选择归档或恢复会话',
             '/archive select <序号...>  多选后预览归档或恢复',
@@ -572,7 +647,7 @@ class FeishuGateway:
             '其余文本 → 作为消息发给当前绑定的 agent 会话',
         ])
 
-    def _handle_command(self, chat_id: str, text: str) -> None:
+    def _handle_command(self, chat_id: str, text: str, sender_id: str | None = None) -> None:
         parts = text.split(maxsplit=1)
         command = parts[0].lower()
         argument = parts[1].strip() if len(parts) > 1 else ''
@@ -590,13 +665,22 @@ class FeishuGateway:
                     self._save_bindings()
                 self._reply(chat_id, '已创建新会话，工作区保持不变。')
             elif command == '/sessions' or command == '/resume' and not argument:
-                self._show_sessions(chat_id, self.api.list_sessions(limit=100))
+                if command == '/sessions' and argument.isdigit() and int(argument) > 0:
+                    view = self._session_views.get(chat_id)
+                    if view:
+                        self._handle_session_action(chat_id, {'session_view': view[0], 'action': 'page',
+                                                             'index': int(argument) - 1},
+                                                    sender_id)
+                    else:
+                        self._reply(chat_id, '请先 /sessions 打开会话列表。')
+                else:
+                    self._show_sessions(chat_id, self.api.list_sessions(limit=1000))
             elif command in ('/use', '/resume'):
                 if not argument:
                     self._reply(chat_id, '用法: /use <会话ID前缀>'
                                           '\n（/sessions 可查，前缀唯一即可）')
                     return
-                rows = self.api.list_sessions(limit=100)
+                rows = self.api.list_sessions(limit=1000)
                 if command == '/resume' and argument.isdigit() and chat_id in self._session_choices:
                     index = int(argument) - 1
                     choices = self._session_choices[chat_id]
@@ -613,12 +697,7 @@ class FeishuGateway:
                     self._reply(chat_id, '匹配有歧义，请从候选会话中选择序号。')
                     self._show_sessions(chat_id, hits, include_empty=True)
                     return
-                workspace = self.api.get_workspace(hits[0]['id'])
-                with self._bindings_lock:
-                    self.bindings[chat_id] = hits[0]['id']
-                    self._save_bindings()
-                self._reply(chat_id, f"已切换到会话\n主题: {hits[0]['title']}"
-                                     f"\n工作区: {workspace}")
+                self._switch_session(chat_id, hits[0])
             elif command in ('/cd', '/pwd'):
                 if command == '/pwd' and argument:
                     self._reply(chat_id, '用法: /pwd')
@@ -747,14 +826,28 @@ class FeishuGateway:
                 fifo.remove(req_id)
 
     def handle_card_action(self, open_id: str | None, value: dict | None,
-                           message_id: str | None) -> tuple[str, bool]:
-        """审批卡片按钮回调：决议权限并原地更新卡片。
+                           message_id: str | None, chat_id: str | None = None) -> tuple[str, bool]:
+        """Card callbacks: resolve approvals directly; queue session navigation.
 
         返回 (toast 文案, 是否成功)。open_id 受用户白名单约束——
         群里任何能点按钮的人都算，必须过同一道闸。
         """
         if self.allowed_users is not None and open_id not in self.allowed_users:
-            return '⛔ 你没有审批权限', False
+            return ('⛔ 你没有会话操作权限' if (value or {}).get('session_view')
+                    else '⛔ 你没有审批权限'), False
+        if (value or {}).get('session_view'):
+            view = self._session_views.get(chat_id)
+            if not view or view[0] != value['session_view'] or time.monotonic() - view[2] > 600:
+                return '会话列表已失效，请重新 /sessions', False
+            index, action = value.get('index'), value.get('action')
+            limit = ((len(view[1]) + PAGE_SIZE - 1) // PAGE_SIZE if action == 'page' else len(view[1]))
+            if action not in ('page', 'details', 'switch') or type(index) is not int or not 0 <= index < limit:
+                return '无效的会话按钮，请重新 /sessions', False
+            try:
+                self._events.put_nowait((chat_id, value, open_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理会话操作…', True
         req_id = (value or {}).get('approval')
         if not req_id:
             return '⚠ 无效的审批按钮', False
@@ -830,7 +923,10 @@ class FeishuGateway:
                         self.on_message(chat_id, text, sender_id=sender_id)
                     else:
                         with self._chat_lock(chat_id):
-                            self.on_message(chat_id, text, sender_id=sender_id)
+                            if isinstance(text, dict):
+                                self._handle_session_action(chat_id, text, sender_id)
+                            else:
+                                self.on_message(chat_id, text, sender_id=sender_id)
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
@@ -893,12 +989,13 @@ class FeishuGateway:
                 print(f'[feishu] event error: {exc}')
 
         def on_card_action(data) -> None:
-            """审批卡片按钮回调 → 决议权限，toast 反馈结果。"""
+            """卡片按钮回调：快速返回提示，会话操作交给分发线程。"""
             try:
                 text, ok = self.handle_card_action(
                     getattr(data.event.operator, 'open_id', None),
                     getattr(data.event.action, 'value', None),
-                    getattr(data.event.context, 'open_message_id', None))
+                    getattr(data.event.context, 'open_message_id', None),
+                    chat_id=getattr(data.event.context, 'open_chat_id', None))
                 from lark_oapi.event.callback.model.p2_card_action_trigger \
                     import (CallBackToast, P2CardActionTriggerResponse)
                 response = P2CardActionTriggerResponse()

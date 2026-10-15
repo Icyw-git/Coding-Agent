@@ -2,28 +2,14 @@
 
 import os
 import sys
-import time
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
 from cli_commands import COMMANDS, parse_command
-
-
-def relative_time(timestamp, now=None):
-    if not timestamp:
-        return '未知时间'
-    elapsed = max(0, int((time.time() if now is None else now) - timestamp))
-    if elapsed < 60:
-        return '刚刚'
-    if elapsed < 3600:
-        return f'{elapsed // 60} 分钟前'
-    if elapsed < 86400:
-        return f'{elapsed // 3600} 小时前'
-    if elapsed < 604800:
-        return f'{elapsed // 86400} 天前'
-    return time.strftime('%Y-%m-%d', time.localtime(timestamp))
+from session_views import (display_text, group_sessions, relative_time,
+                           session_details, session_status)
 
 
 def session_label(row):
@@ -76,18 +62,24 @@ class SessionPicker:
     def __init__(self, rows, current_id=None, workspace=None, **application_kwargs):
         from prompt_toolkit.application import Application
         from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout import HSplit, VSplit, Layout, Window, ConditionalContainer
+        from prompt_toolkit.filters import Condition
         from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import TextArea
 
         self.rows = rows
         self.workspace = workspace
         self.current_id = current_id
-        self.show_all = workspace is None
+        self.show_all = True
+        self.filter_index = 0
+        self.filters = ('全部', '当前', '历史', '空会话')
         self.index = 0
         self.search = TextArea(height=1, prompt='搜索：', multiline=False)
         self.search.buffer.on_text_changed += self._reset_selection
         self.content = FormattedTextControl(self._render)
+        self.list_window = Window(self.content, wrap_lines=False, width=Dimension(weight=3))
         bindings = KeyBindings()
 
         @bindings.add('up')
@@ -97,6 +89,19 @@ class SessionPicker:
         @bindings.add('down')
         def following(event):
             self.index = min(max(0, len(self.visible()) - 1), self.index + 1)
+
+        @bindings.add('tab')
+        @bindings.add('s-tab')
+        def change_filter(event):
+            step = -1 if event.key_sequence[0].key == 's-tab' else 1
+            self.filter_index = (self.filter_index + step) % len(self.filters)
+            self.index = 0
+
+        @bindings.add('pageup')
+        @bindings.add('pagedown')
+        def move_page(event):
+            step = -8 if event.key_sequence[0].key == 'pageup' else 8
+            self.index = min(max(0, len(self.visible()) - 1), max(0, self.index + step))
 
         @bindings.add('enter')
         def accept(event):
@@ -112,14 +117,28 @@ class SessionPicker:
 
         @bindings.add('c-a')
         def toggle_scope(event):
-            self.show_all = not self.show_all
+            if self.workspace is not None:
+                self.show_all = not self.show_all
             self.index = 0
 
+        wide = Condition(lambda: self.application.output.get_size().columns >= 100)
+        details = Window(FormattedTextControl(self._render_details), wrap_lines=True,
+                         width=Dimension(weight=2))
         root = HSplit([
-            Window(FormattedTextControl('恢复会话 · ↑↓ 选择 · Enter 恢复 · Esc 取消 · Ctrl+A 切换工作区范围'), height=1),
+            Window(FormattedTextControl('会话管理   按工作区分组'), height=1, style='class:heading'),
+            Window(FormattedTextControl(self._render_filters), height=1),
             self.search,
-            Window(self.content, wrap_lines=True),
+            Window(height=1, char='─'),
+            VSplit([self.list_window,
+                    ConditionalContainer(Window(width=1, char='│'), wide),
+                    ConditionalContainer(details, wide)]),
+            Window(height=1, char='─'),
+            Window(FormattedTextControl('↑↓ 选择 · Enter 切换 · Tab 筛选 · Ctrl+A 当前/全部目录 · Esc 返回'), height=1),
         ])
+        application_kwargs.setdefault('style', Style.from_dict({
+            'heading': 'bold', 'group': 'ansibrightblack', 'selected': 'bg:ansiblue ansiwhite bold',
+            'muted': 'ansibrightblack', 'tab': 'reverse bold',
+        }))
         self.application = Application(layout=Layout(root, focused_element=self.search),
                                        key_bindings=bindings, full_screen=True,
                                        **application_kwargs)
@@ -128,26 +147,78 @@ class SessionPicker:
         self.index = 0
 
     def visible(self):
-        rows = filter_session_rows(self.rows, query=self.search.text)
+        rows = filter_session_rows(self.rows, include_empty=True, query=self.search.text)
         if not self.show_all:
             rows = [row for row in rows if row.get('workspace') == str(self.workspace)]
-        return rows
+        if self.filter_index:
+            status = self.filters[self.filter_index]
+            rows = [row for row in rows if session_status(row, self.current_id) == status]
+        return [row for _, group in group_sessions(rows) for row in group]
+
+    def _render_filters(self):
+        rows = filter_session_rows(self.rows, include_empty=True, query=self.search.text,
+                                   workspace=None if self.show_all else self.workspace)
+        output = []
+        for index, label in enumerate(self.filters):
+            count = len(rows) if index == 0 else sum(session_status(row, self.current_id) == label for row in rows)
+            output.append(('class:tab' if index == self.filter_index else '', f' {label} {count} '))
+        return output
 
     def _render(self):
         rows = self.visible()
         scope = '全部工作区' if self.show_all else str(self.workspace)
-        output = [('', f'范围：{scope} · {len(rows)} 个会话\n\n')]
+        output = [('class:muted', f'范围：{display_text(scope)} · {len(rows)} 个会话\n')]
         if not rows:
             return output + [('', '没有匹配的会话；可清空搜索或按 Ctrl+A 查看全部工作区。')]
-        # Keep the selection visible without rendering an unbounded list.
-        start = max(0, self.index - 2)
-        for index in range(start, min(len(rows), start + 5)):
+        self.index = min(self.index, len(rows) - 1)
+        height = self.list_window.render_info.window_height if self.list_window.render_info else 16
+        # Each visible row may need a group heading; this fits even a short terminal.
+        count = max(1, (height - 3) // 2)
+        start = max(0, min(self.index - count // 2, len(rows) - count))
+        width = self.list_window.render_info.window_width if self.list_window.render_info else 70
+        output.append(('class:muted', fit_cells('  会话', max(8, width - 18), pad=True) + '状态    最近活跃\n'))
+        previous_group = None
+        for index in range(start, min(len(rows), start + count)):
             row = rows[index]
-            label = session_label(row).lstrip()
+            group = row.get('workspace') or '工作目录未记录'
+            if group != previous_group:
+                total = sum(item.get('workspace') == row.get('workspace') for item in rows)
+                output.append(('class:group', fit_cells(f'{group}  ({total})', width) + '\n'))
+                previous_group = group
             marker = '› ' if index == self.index else '  '
-            current = ' [当前]' if row['id'] == self.current_id else ''
-            output.append(('reverse' if index == self.index else '', marker + label + current + '\n\n'))
+            status = session_status(row, self.current_id)
+            suffix = f' {fit_cells(status, 6, pad=True)} {fit_cells(relative_time(row.get("updated", 0)), 10, pad=True)}'
+            title_width = max(1, width - text_width(suffix) - 2)
+            title = fit_cells(row.get('title') or '新会话', title_width, pad=True)
+            output.append(('class:selected' if index == self.index else '', marker + title + suffix + '\n'))
         return output
+
+    def _render_details(self):
+        rows = self.visible()
+        if not rows:
+            return [('', '  会话详情\n\n  选择会话查看最近任务与回复。')]
+        row = rows[min(self.index, len(rows) - 1)]
+        output = [('class:heading', '  会话详情\n\n')]
+        for label, value in session_details(row, self.current_id):
+            output.extend([('class:muted', f'{label}\n'), ('', display_text(value) + '\n\n')])
+        return output
+
+
+def text_width(text):
+    from prompt_toolkit.utils import get_cwidth
+    return get_cwidth(text)
+
+
+def fit_cells(text, width, pad=False):
+    text = ' '.join(display_text(text).split())
+    if text_width(text) > width:
+        clipped = ''
+        for char in text:
+            if text_width(clipped + char) > max(0, width - 1):
+                break
+            clipped += char
+        text = clipped + '…'
+    return text + ' ' * max(0, width - text_width(text)) if pad else text
 
 
 class SlashCompleter(Completer):

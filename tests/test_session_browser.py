@@ -1,4 +1,5 @@
 from session_store import SessionEventStore
+import pytest
 
 
 def test_summary_records_workspace_changes_and_task(tmp_path):
@@ -15,7 +16,8 @@ def test_summary_records_workspace_changes_and_task(tmp_path):
     assert store.rebuild_openai_history() == [{'role': 'user', 'content': '修复 CLI 会话选择器'}]
 
 
-def test_resume_restores_workspace(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('command', ['/resume', '/sessions'])
+def test_resume_restores_workspace(tmp_path, monkeypatch, capsys, command):
     import harness
     import cli_input
 
@@ -29,7 +31,7 @@ def test_resume_restores_workspace(tmp_path, monkeypatch, capsys):
     saved.append_message({'role': 'user', 'content': '检查代码质量'})
     initial = SessionEventStore(tmp_path, session_id='initial')
     monkeypatch.setattr(cli_input, 'choose_session', lambda rows, current, workspace: 'saved')
-    commands = iter(['/resume', '/quit'])
+    commands = iter([command, '/quit'])
     monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: next(commands))
     harness.run_repl([], initial)
     assert harness.WORKDIR == workspace.resolve()
@@ -111,6 +113,8 @@ def test_picker_search_and_enter(tmp_path):
     async def exercise():
         with create_pipe_input() as pipe:
             picker = SessionPicker(rows, workspace=tmp_path, input=pipe, output=DummyOutput())
+            assert [row['id'] for row in picker.visible()] == ['second', 'first']
+            picker.show_all = False
             assert [row['id'] for row in picker.visible()] == ['first']
             task = asyncio.create_task(picker.application.run_async())
             pipe.send_bytes(b'\x01')  # toggle all workspaces

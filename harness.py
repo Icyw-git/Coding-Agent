@@ -1239,10 +1239,11 @@ def run_repl(initial_messages:list, session_store=None):
             line = f'{command} {argument}'.rstrip()
             if command in ('/exit','/quit'):
                 break
-            if command in ('/r', '/resume'):
+            if command in ('/r', '/resume', '/sessions'):
                 parts = line.split(maxsplit=1)
                 if len(parts) != 2:
-                    identifier = choose_session(session_rows(), session_store.session_id, WORKDIR)
+                    identifier = choose_session(session_rows(limit=None, include_empty=True),
+                                                session_store.session_id, WORKDIR)
                     if identifier is None:
                         continue
                 else:

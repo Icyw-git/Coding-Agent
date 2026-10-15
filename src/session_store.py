@@ -96,6 +96,7 @@ class SessionEventStore:
         prompts = []
         created = events[0]['ts'] if events else 0
         last_message = None
+        last_user = last_assistant = ''
         for event in events:
             if event.get('workspace'):
                 workspace = str(event['workspace'])
@@ -105,6 +106,11 @@ class SessionEventStore:
             content = message.get('content')
             if event.get('type') == 'message' and message.get('role') in ('user', 'assistant'):
                 last_message = event['ts']
+                if isinstance(content, str) and content.strip():
+                    if message['role'] == 'user':
+                        last_user = content.strip()[:1000]
+                    else:
+                        last_assistant = content.strip()[:2000]
             if (event.get('type') == 'message' and message.get('role') == 'user'
                     and isinstance(content, str) and content.strip()):
                 prompts.append(' '.join(content.split()))
@@ -114,6 +120,8 @@ class SessionEventStore:
                                   prompts[0][:80] if prompts else '新会话'),
             'workspace': workspace,
             'preview': prompts[-1][:160] if prompts else '尚无任务',
+            'last_user': last_user,
+            'last_assistant': last_assistant,
             'events': len(events),
             'created': created,
             # Empty sessions use creation time; metadata and tool events never
