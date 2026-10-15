@@ -120,6 +120,28 @@ def test_unknown_command_reports_error(gateway):
     assert '未知命令' in fake.last()
 
 
+def test_help_and_unknown_include_command_list(gateway):
+    """/help 列出全部命令；未知命令回复自动附带命令清单。"""
+    gw, fake = gateway
+    gw.on_message('c1', '/help')
+    assert '可用命令' in fake.last()
+    assert '/use' in fake.last() and '/perms' in fake.last()
+
+    gw.on_message('c1', '/nope')
+    assert '未知命令: /nope' in fake.last()
+    assert '可用命令' in fake.last()
+
+
+def test_fullwidth_input_normalized_for_commands(gateway):
+    """中文输入法的全角斜杠/问号归一为半角后再路由命令。"""
+    gw, fake = gateway
+    gw.on_message('c1', '／use zzzz')   # 全角斜杠 → 命令而非 agent 消息
+    assert any('未找到' in text for _, text in fake.sent)
+
+    gw.on_message('c1', '/？')          # 全角问号 → help
+    assert '可用命令' in fake.last()
+
+
 def test_messages_use_explicit_chat_session_without_shared_client_state(tmp_path):
     class API:
         def __init__(self):

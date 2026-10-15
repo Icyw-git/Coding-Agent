@@ -19,8 +19,9 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
     HARNESS_API_URL / HARNESS_API_TOKEN Agent API 地址与令牌
 
 聊天命令（@机器人 发送）：
+    /help             命令清单（未知命令也会自动附带）
     /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
-    /logs <id> /stop <id> /perms /approve y|n /quit(解绑)
+    /logs <id> /stop <id> /perms /approve [req_id] y|n /quit(解绑)
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
@@ -36,6 +37,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -322,16 +324,19 @@ class FeishuGateway:
             print(f'[feishu] ignored message from unauthorized user '
                   f'{sender_id!r} in chat {chat_id!r}')
             return
+        # 全角归一化（NFKC）：中文输入法的 ／use、／？、Ｙ２ 统一转半角再路由；
+        # 发给 agent 的普通消息仍用原文，不受影响
+        norm = unicodedata.normalize('NFKC', text)
         # y/n 快捷审批：该聊天有待审批请求时，y/n 不再当作普通消息；
         # y2 / n2 决议本聊天 FIFO 里第 2 条，依此类推
-        m = re.fullmatch(r'(y|n)(\d{0,2})', text.lower())
+        m = re.fullmatch(r'(y|n)(\d{0,2})', norm.lower())
         if m and self._chat_pending.get(chat_id):
             index = int(m.group(2)) - 1 if m.group(2) else 0
             self._resolve_chat_pending(chat_id, m.group(1) == 'y', index)
             return
         session_id = self.bindings.get(chat_id)
-        if text.startswith('/'):
-            self._handle_command(chat_id, text)
+        if norm.startswith('/'):
+            self._handle_command(chat_id, norm)
             return
         if not session_id:
             session_id = self.api.create_session()
@@ -413,12 +418,32 @@ class FeishuGateway:
         self._forget_pending(req_id)
         self._reply(chat_id, permission_result(record))
 
+    def _help_text(self) -> str:
+        return '\n'.join([
+            '可用命令:',
+            '/new [id]              新建会话并绑定到本聊天',
+            '/sessions              查看最近会话列表',
+            '/use <前缀>            切换会话（ID 前缀唯一即可）',
+            '/cd [dir]              查看/切换任务执行目录（/run 生效）',
+            '/run <命令>            在任务目录执行命令',
+            '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
+            '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
+            '/stop <任务id>         终止任务',
+            '/perms                 查看待审批请求',
+            '/approve [请求id] y|n  审批（省略 id 决议最早一条）',
+            '/quit                  解除会话绑定',
+            'y / n、y2 / n2         快捷审批（也可直接点审批卡片按钮）',
+            '其余文本 → 作为消息发给当前绑定的 agent 会话',
+        ])
+
     def _handle_command(self, chat_id: str, text: str) -> None:
         parts = text.split(maxsplit=1)
         command = parts[0].lower()
         argument = parts[1].strip() if len(parts) > 1 else ''
         try:
-            if command == '/new':
+            if command in ('/help', '/?'):
+                self._reply(chat_id, self._help_text())
+            elif command == '/new':
                 session_id = self.api.create_session(argument or None)
                 with self._bindings_lock:
                     self.bindings[chat_id] = session_id
@@ -510,7 +535,8 @@ class FeishuGateway:
                 self._chat_cwd.pop(chat_id, None)
                 self._reply(chat_id, '会话绑定已解除')
             else:
-                self._reply(chat_id, f'未知命令: {command}')
+                self._reply(chat_id,
+                            f'未知命令: {command}\n\n' + self._help_text())
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
 
