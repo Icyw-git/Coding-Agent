@@ -469,3 +469,72 @@ def test_handle_command_checkpoint_and_rewind(tmp_path, monkeypatch, capsys):
 def _index_rows(ws):
     path = ws / '.cache' / 'checkpoints' / 'sid' / 'index.jsonl'
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+# ---------- _git_baseline：单次 git 查询（v2→v1 行转换）回归 ----------
+
+import subprocess
+
+
+def _git_run(path, *args):
+    result = subprocess.run(['git', *args], cwd=path, check=True,
+                            capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def _git_init(path):
+    _git_run(path, 'init', '-q')
+    _git_run(path, 'config', 'user.email', 't@t')
+    _git_run(path, 'config', 'user.name', 't')
+
+
+def test_git_baseline_covers_add_modify_delete_rename(ws):
+    _git_init(ws)
+    (ws / 'tracked.txt').write_text('v1', encoding='utf-8')
+    (ws / 'old.txt').write_text('bye', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    (ws / 'added.txt').write_text('new', encoding='utf-8')       # 新增
+    (ws / 'tracked.txt').write_text('v2', encoding='utf-8')      # 修改
+    (ws / 'old.txt').unlink()                                    # 删除
+    _git_run(ws, 'mv', 'tracked.txt', 'renamed.txt')             # 重命名（暂存）
+
+    baseline = _mgr(ws)._git_baseline()
+    assert baseline['head'] == _git_run(ws, 'rev-parse', 'HEAD')
+    status = baseline['status']
+    assert '?? added.txt' in status
+    assert ' D old.txt' in status
+    assert any(line.startswith('R') and line.endswith('renamed.txt')
+               for line in status)   # 重命名行（v1 兼容 XY+空格+新路径）
+    # 原文件不再出现（重命名后旧名不留在工作区状态里）
+    assert not any(line.endswith('tracked.txt') for line in status)
+
+
+def test_git_baseline_non_git_dir(ws):
+    baseline = _mgr(ws)._git_baseline()   # tmp workspace 不是 git 仓库
+    assert baseline == {'head': '', 'status': []}
+
+
+def test_drift_files_with_merged_baseline(ws):
+    """v2 转换后的基线与 live v1 对比仍能识别外部改动。
+
+    基线为空（完全干净的树）时 _drift_files 本来就跳过（既有语义），
+    所以先放一个未跟踪文件让基线非空。
+    """
+    _git_init(ws)
+    (ws / 'a.txt').write_text('init', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    (ws / 'base.txt').write_text('begin 时已存在', encoding='utf-8')
+
+    store = SessionEventStore(ws / '.cache' / 'sessions', session_id='sid')
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs(), store)
+
+    (ws / 'outside.txt').write_text('external change', encoding='utf-8')
+    drift = mgr._drift_files(mgr.get(cp_id), touched=set())
+    assert 'outside.txt' in drift
+    assert 'base.txt' not in drift       # begin 前已存在 → 在基线里，不算 drift
+    assert 'a.txt' not in drift          # 未动的文件不算 drift
+    assert not any('.cache' in name for name in drift)   # 忽略名单生效

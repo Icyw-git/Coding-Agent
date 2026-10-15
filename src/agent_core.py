@@ -112,24 +112,70 @@ def list_memory_files() -> list:  # 列出所有记忆文件
     return results
 
 
-def select_relevant_memories(messages: list, max_items: int = 5) -> list:
-    files = list_memory_files()
-    if not files:
-        return []
+def _recent_user_text(messages: list, max_chars: int = 2000) -> str:
+    """最近 ≤3 条用户消息拼接（记忆召回的依据：偏好/约束都出现在用户输入里）。"""
     recent_texts = []
     for msg in reversed(messages):
-        if msg.get('role') == 'user':  # 只考虑用户消息，因为只有用户消息才会包含记忆
+        if msg.get('role') == 'user':
             content = msg.get('content', '')
-            if isinstance(content, list):  # 处理包含多个文本的消息
+            if isinstance(content, list):
                 content = " ".join(
                     str(getattr(b, "text", "")) for b in content
                     if getattr(b, "type", None) == "text"
                 )
             if isinstance(content, str):
                 recent_texts.append(content)
-            if len(recent_texts) >= 3:  # 最多考虑最近3条消息
+            if len(recent_texts) >= 3:
                 break
-    recent = ' '.join(reversed(recent_texts))[:2000]  # 最近3条消息，最多2000个字符
+    return ' '.join(reversed(recent_texts))[:max_chars]
+
+
+def _local_tokens(text: str) -> list[str]:
+    """中文按 CJK 二元组、英文/数字按长度≥3 的词切分（小写）。
+
+    中文没有空格分词，二元组是无需词典的召回手段；纯单字命中噪声太大，
+    由打分阈值过滤。
+    """
+    tokens = [raw.lower() for raw in re.findall(r'[A-Za-z0-9_]+', text)
+              if len(raw) >= 3]
+    for run in re.findall(r'[\u4e00-\u9fff]+', text):
+        for i in range(len(run) - 1):
+            tokens.append(run[i:i + 2])
+    return tokens
+
+
+def local_relevant_memories(messages: list, files: list | None = None,
+                            max_items: int = 5) -> list:
+    """本地记忆筛选：零网络往返，覆盖中英文。
+
+    打分 = 2×ASCII 词命中 + 1×中文二元组命中（去重），阈值 ≥2：
+    单个英文关键词即可命中（信息量大），中文需要至少两个二元组
+    （例如「简短」+「回答」），避免常见字偶然撞车。
+    """
+    if files is None:
+        files = list_memory_files()
+    if not files:
+        return []
+    recent = _recent_user_text(messages)
+    if not recent.strip():
+        return []
+    tokens = set(_local_tokens(recent))
+    scored = []
+    for f in files:
+        haystack = (f['name'] + ' ' + f['description']).lower()
+        score = sum(2 if len(token) > 2 and token.isascii() else 1
+                    for token in tokens if token in haystack)
+        if score >= 2:
+            scored.append((score, f['filename']))
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [filename for _, filename in scored[:max_items]]
+
+
+def select_relevant_memories(messages: list, max_items: int = 5) -> list:
+    files = list_memory_files()
+    if not files:
+        return []
+    recent = _recent_user_text(messages)
     if not recent.strip():
         return []
 
@@ -168,23 +214,26 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
     except Exception:
         pass
 
-    keywords = [w.lower() for w in recent.split() if len(w) >= 3]  # fallback 关键词
-    selected = []
-    for f in files:
-        text = (f['name'] + ' ' + f['description']).lower()
-        if any(kw in text for kw in keywords):
-            selected.append(f['filename'])
-            if len(selected) >= max_items:
-                break
-    return selected
+    # LLM 不可用/返回异常时的 fallback：中文感知的本地筛选
+    # （不再用按空格拆词——中文没有空格，旧 fallback 对中文完全失效）
+    return local_relevant_memories(messages, files, max_items=max_items)
 
 
 def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
-    # HARNESS_LOAD_MEMORIES=0 可关闭记忆召回：它每条消息要走一次 LLM 筛选，
-    # 网关/无人值守场景对延迟敏感时可省掉这次往返。
+    # 召回策略 HARNESS_MEMORY_RECALL：
+    #   llm   默认——每条消息一次 LLM 筛选往返（旧行为，兼容）
+    #   local 本地中文关键词筛选，零网络往返（省 ~2s/轮，见 perf 分段 mem.load）
+    #   off   关闭召回
+    # HARNESS_LOAD_MEMORIES=0 仍生效（等价 off，向后兼容）。
     if os.getenv('HARNESS_LOAD_MEMORIES', '1') == '0':
         return ''
-    selected_files = select_relevant_memories(messages)
+    mode = os.getenv('HARNESS_MEMORY_RECALL', 'llm').strip().lower()
+    if mode == 'off':
+        return ''
+    if mode == 'local':
+        selected_files = local_relevant_memories(messages)
+    else:
+        selected_files = select_relevant_memories(messages)
     if not selected_files:
         return ''
     parts = ["<relevant_memories>"]

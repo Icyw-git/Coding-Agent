@@ -42,6 +42,7 @@ from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
 from cli_commands import parse_command, command_error, format_command_help
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
+from perf import segment as perf_segment, record as perf_record, reset as perf_reset
 
 
 
@@ -877,6 +878,8 @@ def wait_for_housekeeping(timeout: float = 30.0) -> None:
 
 def _stream_completion(create_kwargs, on_delta):
     """Collect a streamed completion while preserving the existing response shape."""
+    _t0 = time.perf_counter()
+    _ttfb_done = False
     stream = client.chat.completions.create(**create_kwargs, stream=True)
     text_parts = []
     tool_calls = {}
@@ -886,6 +889,9 @@ def _stream_completion(create_kwargs, on_delta):
         finish_reason = choice.finish_reason or finish_reason
         delta = choice.delta
         if getattr(delta, 'content', None):
+            if not _ttfb_done:   # 首个内容块到达 = 用户可看到首字的时刻
+                perf_record('llm.ttfb', time.perf_counter() - _t0)
+                _ttfb_done = True
             part = delta.content
             text_parts.append(part)
             on_delta(part)
@@ -915,6 +921,7 @@ def _stream_completion(create_kwargs, on_delta):
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None):
     """Run one OpenAI session, recording an append-only event stream for recovery."""
+    perf_reset()   # 分段计时清零（HARNESS_PERF=1 时生效）
     if session_store is None:
         session_store = SessionEventStore(SESSIONS_DIR)
         for initial_message in messages:
@@ -932,7 +939,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
-    memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
+    with perf_segment('mem.load'):
+        memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
 
@@ -991,7 +999,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             return _stream_completion(kwargs, on_delta)
 
         try: #错误恢复逻辑
-            response=recovery.with_retry(_create,recovery_state)
+            with perf_segment('llm.main'):
+                response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:

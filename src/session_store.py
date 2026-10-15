@@ -27,6 +27,9 @@ class SessionEventStore:
             self.session_id = session_id or uuid.uuid4().hex
             self.path = self.directory / f"session_{self.session_id}.jsonl"
         self._next_seq = self._read_last_seq() + 1
+        # 锁在初始化时解析一次（每次 append 都 resolve 约 10ms 开销）；
+        # 同路径的多实例仍从类级 _locks 取到同一把锁
+        self._lock = self._path_lock(self.path)
         self._known_size = self.path.stat().st_size if self.path.exists() else 0
 
     @classmethod
@@ -51,7 +54,7 @@ class SessionEventStore:
 
     def append(self, event_type: str, **payload) -> dict:
         self.directory.mkdir(parents=True, exist_ok=True)
-        with self._path_lock(self.path):
+        with self._lock:
             # Re-read under the path lock so separate store instances cannot reuse a sequence number.
             current_size = self.path.stat().st_size if self.path.exists() else 0
             if current_size != self._known_size:

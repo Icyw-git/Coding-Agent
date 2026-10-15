@@ -16,6 +16,8 @@ import time
 import uuid
 from pathlib import Path
 
+from perf import segment as perf_segment
+
 DEFAULT_IGNORE = ('.cache', '.git', '.worktrees', '.mailbox', '__pycache__', '.pytest_cache')
 DEFAULT_SECRETS = ('.env', '*.pem', '*_rsa')
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -36,10 +38,11 @@ def _sha256(path: Path) -> str:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f'.tmp{uuid.uuid4().hex[:6]}')
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    with perf_segment('cp.write'):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f'.tmp{uuid.uuid4().hex[:6]}')
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
 
 
 def _read_json(path: Path) -> dict:
@@ -170,6 +173,11 @@ class CheckpointManager:
 
     def begin_turn(self, messages: list, session_store=None, label: str = '', trigger: str = 'turn') -> str:
         """开一个节点并把活跃指针指向它；上一条未 seal 的节点会先被 seal。"""
+        with perf_segment('cp.begin_turn'):
+            return self._begin_turn(messages, session_store,
+                                    label=label, trigger=trigger)
+
+    def _begin_turn(self, messages: list, session_store=None, label: str = '', trigger: str = 'turn') -> str:
         if self._active:
             self.seal()
         cp_id = f"cp_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
@@ -251,6 +259,10 @@ class CheckpointManager:
 
     def seal(self) -> dict | None:
         """结束当前节点：记录每个快照文件写入后的 hash，供冲突检测使用。"""
+        with perf_segment('cp.seal'):
+            return self._seal()
+
+    def _seal(self) -> dict | None:
         if not self._active:
             return None
         cp_id, self._active = self._active, None
@@ -307,18 +319,45 @@ class CheckpointManager:
     # ---------- git 基线 ----------
 
     def _git(self, *args) -> str:
-        try:
-            result = subprocess.run(['git', *args], cwd=self.workspace,
-                                    capture_output=True, text=True, timeout=15)
-            return result.stdout.strip()
-        except Exception:
-            return ''
+        with perf_segment('cp.git'):
+            try:
+                result = subprocess.run(['git', *args], cwd=self.workspace,
+                                        capture_output=True, text=True, timeout=15)
+                return result.stdout.strip()
+            except Exception:
+                return ''
 
     def _git_baseline(self) -> dict:
-        return {
-            'head': self._git('rev-parse', 'HEAD'),
-            'status': sorted(self._git('status', '--porcelain').splitlines()),
-        }
+        """一次 git 进程同时取 HEAD 与工作区状态（原先是两次进程调用）。
+
+        `status --porcelain=v2 --branch` 的头行给出 branch.oid（=HEAD），
+        条目行转回 v1 行格式（`XY <path>`）——`_drift_files` 的基线对比
+        依赖 v1 行结构（line[3:] 取路径），不能直接存 v2 原文。
+        非 git 目录/命令失败时维持原行为：head=''、status=[]。
+        """
+        raw = self._git('status', '--porcelain=v2', '--branch')
+        head, status = '', []
+        for line in raw.splitlines():
+            if line.startswith('# branch.oid '):
+                head = line[len('# branch.oid '):]
+            elif line.startswith(('#', '!')):
+                continue   # 其余头行 / 被忽略文件
+            elif line.startswith('?'):
+                status.append('?? ' + line[2:])
+            elif line.startswith('1 '):
+                parts = line.split(None, 8)
+                if len(parts) == 9:
+                    # v2 用 '.' 表示未变一侧，v1 用空格
+                    status.append(f'{parts[1].replace(".", " ")} {parts[8]}')
+            elif line.startswith('2 '):   # 重命名：v2 用 <path>\t<origPath>
+                parts = line.split(None, 9)
+                if len(parts) == 10:
+                    status.append(f'{parts[1]} {parts[9].split(chr(9), 1)[0]}')
+            elif line.startswith('u '):
+                parts = line.split(None, 10)
+                if len(parts) == 11:
+                    status.append(f'{parts[1]} {parts[10]}')
+        return {'head': head, 'status': sorted(status)}
 
     # ---------- 回溯 ----------
 

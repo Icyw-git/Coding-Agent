@@ -161,3 +161,24 @@ def test_concurrent_store_instances_allocate_unique_sequences(tmp_path):
     assert sorted(sequences) == [1, 2]
     assert [event["seq"] for event in events] == [1, 2]
     assert sorted(message["content"] for message in first.rebuild_openai_history()) == ["one", "two"]
+
+
+def test_path_lock_shared_across_instances(tmp_path):
+    """同路径多实例共享同一把锁（锁在初始化时解析一次）。"""
+    s1 = SessionEventStore(tmp_path, session_id="locktest")
+    s2 = SessionEventStore(tmp_path, session_id="locktest")
+    assert s1._lock is s2._lock
+
+    # 并发 append 不允许重号（共享锁保证互斥）
+    import threading
+    def worker(store, n):
+        for _ in range(n):
+            store.append_message({"role": "user", "content": "x"})
+
+    threads = [threading.Thread(target=worker, args=(s, 20)) for s in (s1, s2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    seqs = [e["seq"] for e in s1.read_events()]
+    assert len(seqs) == len(set(seqs)) == 40
