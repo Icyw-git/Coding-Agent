@@ -228,7 +228,7 @@ def create_reader(workspace, sessions):
     return session.prompt
 
 
-def choose_cleanup_sessions(rows, *, restore=False):
+def choose_cleanup_sessions(rows, *, restore=False, delete=False):
     if not rows:
         print('  没有符合条件的会话。')
         return []
@@ -239,7 +239,8 @@ def choose_cleanup_sessions(rows, *, restore=False):
 
     try:
         return checkboxlist_dialog(
-            title='恢复归档' if restore else '归档旧会话（可恢复）',
+            title=('永久删除归档（不可恢复）' if delete else
+                   '恢复归档' if restore else '归档旧会话（可恢复）'),
             text='↑↓ 移动，空格多选，Tab 切换按钮，Enter 确认；不影响项目文件。',
             values=[(row['id'], session_label(row)) for row in rows],
             ok_text='选择完成', cancel_text='取消',

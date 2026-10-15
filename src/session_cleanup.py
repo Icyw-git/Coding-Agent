@@ -1,6 +1,8 @@
 """Recoverable session archival. Never touches workspace files."""
 
 import time
+import shutil
+import stat
 from pathlib import Path
 
 from session_store import SessionEventStore
@@ -77,3 +79,30 @@ class SessionArchive:
                     checkpoints.rename(archived_checkpoints)
                 raise
             target.rmdir()
+
+    def delete(self, row, current_id):
+        """Permanently remove one validated archive, never an active log."""
+        if row['id'] == current_id:
+            raise ValueError('不能删除当前会话')
+        log, checkpoints, target = self._paths(row['id'])
+        archived_log = target / log.name
+        with SessionEventStore._path_lock(log):
+            if log.exists() or checkpoints.exists():
+                raise ValueError('会话仍在使用中或存在同名记录，请先归档')
+            if not archived_log.is_file():
+                raise ValueError('归档不存在')
+            if SessionEventStore.open(archived_log).session_summary() != row:
+                raise ValueError('归档已更新，请重新选择')
+            # Reject links/junctions and unexpected data before recursive deletion.
+            # Every resolved target must remain within this exact archive folder.
+            for path in [target, *target.rglob('*')]:
+                info = path.lstat()
+                if (path.is_symlink() or getattr(info, 'st_file_attributes', 0)
+                        & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)):
+                    raise ValueError('归档包含链接，未执行删除')
+                if not path.resolve().is_relative_to(target):
+                    raise ValueError('归档路径超出目录，未执行删除')
+            allowed = {log.name, 'checkpoints'}
+            if any(path.name not in allowed for path in target.iterdir()):
+                raise ValueError('归档含有未知文件，未执行删除')
+            shutil.rmtree(target)

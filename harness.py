@@ -680,7 +680,7 @@ def handle_command(line:str,messages:list,session_store)->None:
     elif command == '/sessions':
         print(format_session_list())
 
-    elif command == '/archive':
+    elif command in ('/archive', '/delete'):
         from cli_input import choose_cleanup_sessions
         from session_cleanup import SessionArchive, cleanup_candidates
 
@@ -691,27 +691,38 @@ def handle_command(line:str,messages:list,session_store)->None:
                 print('  会话后台整理尚未结束，请稍后再清理。')
                 return
         archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
+        deleting = command == '/delete'
         restoring = argument == 'restore'
-        rows = (archive.list() if restoring else cleanup_candidates(
+        rows = (archive.list() if restoring or deleting else cleanup_candidates(
             session_rows(limit=None, include_empty=True), session_store.session_id,
             days=int(argument) if argument.isdigit() else 30,
             empty_only=argument == 'empty'))
-        selected = choose_cleanup_sessions(rows, restore=restoring)
+        rows = [row for row in rows if row['id'] != session_store.session_id]
+        selected = choose_cleanup_sessions(rows, restore=restoring, delete=deleting)
         selected_rows = [row for row in rows if row['id'] in selected]
         if not selected_rows:
             return
-        action = '恢复' if restoring else '归档'
+        action = '永久删除' if deleting else '恢复' if restoring else '归档'
         print(f'  将{action}以下会话（含关联快照）：')
         for row in selected_rows:
             print(f"    {row['title']} · {row['workspace'] or '目录未记录'}")
         print('  请确认其他 CLI/API 服务没有正在使用这些会话。')
-        if not _confirm(f'确认{action} {len(selected_rows)} 个会话？'):
+        if deleting:
+            try:
+                confirmed = input('  不可恢复。输入“删除”确认，其他输入取消：').strip() == '删除'
+            except (EOFError, KeyboardInterrupt):
+                confirmed = False
+        else:
+            confirmed = _confirm(f'确认{action} {len(selected_rows)} 个会话？')
+        if not confirmed:
             print('  已取消，未执行改动。')
             return
         completed = 0
         for row in selected_rows:
             try:
-                if restoring:
+                if deleting:
+                    archive.delete(row, session_store.session_id)
+                elif restoring:
                     archive.restore(row['id'])
                 else:
                     archive.archive(row, session_store.session_id)
@@ -719,6 +730,7 @@ def handle_command(line:str,messages:list,session_store)->None:
             except (OSError, ValueError) as exc:
                 print(f"  未处理 {row['title']}：{exc}")
         print(f'  已{action} {completed} 个会话。' + (
+            '记录及关联快照不可恢复，项目文件未改动。' if deleting else
             '用 /archive restore 可恢复；项目文件未改动。' if not restoring else '可用 /resume 继续会话。'))
 
     elif command == '/pwd':
