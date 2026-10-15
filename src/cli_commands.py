@@ -22,6 +22,7 @@ COMMANDS = (
     Command('/new', ('/n',), '[会话ID]', '开始新会话，保留当前工作区', '会话'),
     Command('/resume', ('/r',), '[会话ID或前缀]', '选择并恢复会话及其工作目录', '会话'),
     Command('/sessions', ('/s',), '', '列出最近会话', '会话'),
+    Command('/archive', (), '[天数|empty|restore]', '归档旧会话；默认 30 天，可筛选空会话或恢复归档', '会话'),
     Command('/status', (), '', '查看当前会话与运行状态', '常用'),
     Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
     Command('/cd', (), '[路径]', '切换工作区；不带参数时查看路径', '工作区'),
@@ -61,6 +62,9 @@ def command_error(name: str, argument: str) -> str | None:
                    and p not in ('--force', '--session', '--yes')]
         if unknown or len([p for p in parts if not p.startswith('--')]) > 1:
             return f'参数无效。用法：{command.usage}'
+    if name == '/archive' and argument:
+        if argument not in ('empty', 'restore') and not (argument.isascii() and argument.isdigit() and 1 <= int(argument) <= 36500):
+            return '用法：/archive [天数|empty|restore]，天数需为 1～36500。'
     return None
 
 

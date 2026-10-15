@@ -167,7 +167,12 @@ class SlashCompleter(Completer):
                                      display_meta=command.description)
             return
         command, argument = parse_command(text)
-        if command == '/help':
+        if command == '/archive':
+            for value, description in (('30', '30 天未活跃'), ('90', '90 天未活跃'),
+                                       ('empty', '仅空会话'), ('restore', '恢复已归档会话')):
+                if value.startswith(argument):
+                    yield Completion(value, start_position=-len(argument), display_meta=description)
+        elif command == '/help':
             for item in COMMANDS:
                 name = item.name.lstrip('/')
                 if name.startswith(argument.lstrip('/').lower()):
@@ -221,3 +226,23 @@ def create_reader(workspace, sessions):
     session = PromptSession(completer=SlashCompleter(workspace, sessions),
                             complete_while_typing=True)
     return session.prompt
+
+
+def choose_cleanup_sessions(rows, *, restore=False):
+    if not rows:
+        print('  没有符合条件的会话。')
+        return []
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print('  请在交互终端中选择会话；本次未执行任何改动。')
+        return []
+    from prompt_toolkit.shortcuts import checkboxlist_dialog
+
+    try:
+        return checkboxlist_dialog(
+            title='恢复归档' if restore else '归档旧会话（可恢复）',
+            text='↑↓ 移动，空格多选，Tab 切换按钮，Enter 确认；不影响项目文件。',
+            values=[(row['id'], session_label(row)) for row in rows],
+            ok_text='选择完成', cancel_text='取消',
+        ).run() or []
+    except (EOFError, KeyboardInterrupt):
+        return []
