@@ -52,6 +52,8 @@ class PermissionGate:
         self.backend = 'console'   # console | remote
         self._lock = threading.RLock()
         self._requests: dict[str, PermissionRequest] = {}
+        # 会话级白名单（审批分级）：键 f'{tool}:{klass}'，命中后同类操作免审
+        self._session_allows: set[str] = set()
 
     # ---------- 登记 / 查询（供 API 与测试使用） ----------
 
@@ -83,6 +85,7 @@ class PermissionGate:
         """清空全部请求历史（测试隔离辅助）。"""
         with self._lock:
             self._requests.clear()
+            self._session_allows.clear()
 
     def pending(self) -> list[PermissionRequest]:
         with self._lock:
@@ -95,8 +98,13 @@ class PermissionGate:
                           key=lambda r: r.created_at, reverse=True)
         return rows[:max(1, limit)]
 
-    def resolve(self, req_id: str, allow: bool, by: str = 'remote') -> PermissionRequest:
-        """远程决议一个 pending 请求并唤醒等待方。未知 id / 已决议 → 异常。"""
+    def resolve(self, req_id: str, allow: bool, by: str = 'remote',
+                scope: str | None = None, klass: str | None = None) -> PermissionRequest:
+        """远程决议一个 pending 请求并唤醒等待方。未知 id / 已决议 → 异常。
+
+        scope='session' 且 klass 非空、allow=True 时，把「本会话同类操作」
+        加入白名单（键 f'{tool}:{klass}'），之后同类审批自动通过。
+        """
         with self._lock:
             req = self._requests.get(req_id)
             if req is None:
@@ -105,8 +113,24 @@ class PermissionGate:
                 raise RuntimeError(f'request {req_id} already {req.status}')
             req.status = 'approved' if allow else 'denied'
             req.resolved_by = by
+            if allow and scope == 'session' and klass:
+                self._session_allows.add(f'{req.tool}:{klass}')
             req._event.set()
             return req
+
+    # ---------- 会话级白名单（审批分级） ----------
+
+    @staticmethod
+    def approval_class(tool: str, args: dict) -> str:
+        """同类判定：bash 按命令首词（rm/del/git…），其余工具按工具名。"""
+        if tool == 'bash':
+            command = str(args.get('command', '')).strip()
+            return command.split(None, 1)[0].casefold() if command else ''
+        return tool
+
+    def session_allows(self, tool: str, args: dict) -> bool:
+        with self._lock:
+            return f'{tool}:{self.approval_class(tool, args)}' in self._session_allows
 
     # ---------- 决议入口（permission_hook 调用） ----------
 
@@ -166,10 +190,13 @@ def permission_hook(tool:str,args:dict):
         if os.getenv('HARNESS_APPROVAL_ALL') == '1':
             reasons.append('all bash commands require approval')
         if reasons:
-            allowed, message = GATE.decide(tool, args, '; '.join(reasons))
-            if not allowed:
-                # 对模型的固定拒绝语（保持旧契约）；细节（req_id/原因）走日志打印
-                return 'Permission denied by user'
+            if GATE.session_allows(tool, args):
+                print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
+            else:
+                allowed, message = GATE.decide(tool, args, '; '.join(reasons))
+                if not allowed:
+                    # 对模型的固定拒绝语（保持旧契约）；细节（req_id/原因）走日志打印
+                    return 'Permission denied by user'
     elif tool in ["read", "write", "edit"]:
         path=args.get('path','')
         try:

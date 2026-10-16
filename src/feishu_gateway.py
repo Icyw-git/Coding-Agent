@@ -74,6 +74,14 @@ def format_permission_prompt(req: dict, index: int | None = None) -> str:
             f"{tail}（也可直接点按钮）")
 
 
+def approval_class(tool: str, args) -> str:
+    """与 hooks.PermissionGate.approval_class 同规则：bash 按命令首词判定同类。"""
+    if tool == 'bash':
+        command = str(args.get('command', '') if isinstance(args, dict) else args).strip()
+        return command.split(None, 1)[0].casefold() if command else ''
+    return tool
+
+
 CARD_MD_LIMIT = 24000   # 飞书卡片 JSON 上限约 30KB，留余量
 
 
@@ -237,12 +245,14 @@ class LarkTransport:
                 f'feishu card update failed: {response.code} {response.msg}')
 
     def send_approval_card(self, chat_id: str, prompt_md: str,
-                           req_id: str) -> str | None:
-        """带【允许/拒绝】按钮的审批卡片；按钮 value 携带 req_id，
-        点击后走 card.action.trigger 回调决议，无需用户打字。"""
+                           req: dict) -> str | None:
+        """带审批按钮的卡片；「本次会话允许同类」走 scope=session，
+        决议后同类操作（bash 按命令首词）在本会话内自动通过。"""
         self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
+        req_id = req['req_id']
+        klass = approval_class(str(req.get('tool', '?')), req.get('args') or {})
         card = {
             'config': {'wide_screen_mode': True},
             'elements': [
@@ -254,6 +264,11 @@ class LarkTransport:
                      'text': {'tag': 'plain_text', 'content': '✅ 允许'},
                      'type': 'primary',
                      'value': {'approval': req_id, 'allow': True}},
+                    {'tag': 'button',
+                     'text': {'tag': 'plain_text', 'content': '📌 本次会话允许同类'},
+                     'type': 'primary',
+                     'value': {'approval': req_id, 'allow': True,
+                               'scope': 'session', 'klass': klass}},
                     {'tag': 'button',
                      'text': {'tag': 'plain_text', 'content': '⛔ 拒绝'},
                      'type': 'danger',
@@ -824,8 +839,7 @@ class FeishuGateway:
         sender = getattr(self.transport, 'send_approval_card', None)
         if sender:
             try:
-                sender(chat_id, format_permission_prompt(req, index),
-                       req['req_id'])
+                sender(chat_id, format_permission_prompt(req, index), req)
                 return
             except Exception as exc:
                 print(f'[feishu] approval card failed, fallback to text: {exc}')
@@ -865,20 +879,24 @@ class FeishuGateway:
         if not req_id:
             return '⚠ 无效的审批按钮', False
         allow = bool((value or {}).get('allow'))
+        scope = (value or {}).get('scope')
+        klass = (value or {}).get('klass')
         try:
-            record = self.api.resolve_permission(req_id, allow)
+            record = self.api.resolve_permission(req_id, allow,
+                                                 scope=scope, klass=klass)
         except Exception as exc:
             print(f'[feishu] approval failed: {exc}')
             return '⚠ 操作未能完成，请用 /perms 查看最新审批状态', False
         self._forget_pending(req_id)
         verb = '允许' if allow else '拒绝'
+        session_note = '，本会话同类自动通过' if (allow and scope == 'session') else ''
         updater = getattr(self.transport, 'update_markdown', None)
         if updater and message_id:
             try:
-                updater(message_id, permission_result(record))
+                updater(message_id, permission_result(record) + session_note)
             except Exception as exc:
                 print(f'[feishu] approval card update failed: {exc}')
-        return f'已{verb}', True
+        return f'已{verb}{session_note}', True
 
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:

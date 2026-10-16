@@ -62,6 +62,8 @@ if BaseModel is not None:
     class ResolvePermissionRequest(BaseModel):
         allow: bool
         by: str = Field(default='remote', min_length=1)
+        scope: str | None = None     # 'session' = 本会话同类自动通过
+        klass: str | None = None     # 同类判定键（bash 命令首词）
 
 
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
@@ -340,7 +342,8 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     @app.post("/v1/permissions/{req_id}/resolve")
     def resolve_permission(req_id: str, request: ResolvePermissionRequest):
         try:
-            record = permission_gate.resolve(req_id, request.allow, by=request.by)
+            record = permission_gate.resolve(req_id, request.allow, by=request.by,
+                                             scope=request.scope, klass=request.klass)
         except KeyError as exc:
             raise HTTPException(
                 status_code=404, detail="permission request not found") from exc

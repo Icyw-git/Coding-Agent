@@ -302,7 +302,7 @@ def format_pending_approvals() -> str:
         reason = str(request.reason or '').strip() or '未提供原因'
         tool = str(request.tool or '未知操作')
         lines.append(f'    {index}. {tool} · {reason}')
-    lines.append('  请使用飞书 /approve 或对应审批卡片处理。')
+    lines.append('  请使用飞书 /approve 或审批卡片处理；CLI 可回复 /approvals <序号> y|n 决议。')
     return '\n'.join(lines)
 
 
@@ -780,7 +780,18 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
 
     elif command == '/approvals':
-        print(format_pending_approvals())
+        tokens = argument.split()
+        if tokens:
+            index, choice = int(tokens[0]) - 1, tokens[1]
+            pending = hooks.GATE.pending()
+            if not 0 <= index < len(pending):
+                print('  没有该序号的待审批操作；先运行 /approvals 查看列表。')
+                return
+            req = pending[index]
+            record = hooks.GATE.resolve(req.req_id, choice == 'y', by='cli')
+            print(f'  已决议：{record.status} · {req.tool}')
+        else:
+            print(format_pending_approvals())
 
     elif command == '/compact':
         if not messages:
@@ -794,7 +805,7 @@ def handle_command(line:str,messages:list,session_store)->None:
             return
         messages[:] = compacted
         _record_compaction(session_store, messages, 'manual')
-        session_store.append_message(messages[-1])
+        # compaction 事件回放时会重建 marker 消息本身，不能再追加同一条
         print(f'  已压缩会话上下文：{before} 条消息 → {len(messages)} 条。完整记录已保存。')
 
     elif command == '/sessions':

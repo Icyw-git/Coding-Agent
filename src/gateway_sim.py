@@ -254,9 +254,16 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['pending']
 
-    def resolve_permission(self, req_id: str, allow: bool) -> dict:
+    def resolve_permission(self, req_id: str, allow: bool,
+                           scope: str | None = None,
+                           klass: str | None = None) -> dict:
+        body: dict = {'allow': allow}
+        if scope:
+            body['scope'] = scope
+        if klass:
+            body['klass'] = klass
         response = self.http.post(
-            f'/v1/permissions/{req_id}/resolve', json={'allow': allow})
+            f'/v1/permissions/{req_id}/resolve', json=body)
         response.raise_for_status()
         return response.json()['request']
 

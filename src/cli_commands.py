@@ -29,7 +29,7 @@ COMMANDS = (
     Command('/compact', (), '', '压缩当前会话上下文并保留完整记录', '常用'),
     Command('/undo', (), '', '撤销最近一次已完成回合的文件和会话改动', '常用'),
     Command('/model', (), '', '查看当前模型配置', '常用'),
-    Command('/approvals', ('/perms',), '', '查看待审批操作（用序号审批）', '常用'),
+    Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '常用'),
     Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
     Command('/cd', (), '[路径]', '切换工作区；不带参数时查看路径', '工作区'),
     Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
@@ -71,6 +71,11 @@ def command_error(name: str, argument: str) -> str | None:
     if name == '/archive' and argument:
         if argument not in ('all', 'empty', 'restore') and not (argument.isascii() and argument.isdigit() and 1 <= int(argument) <= 36500):
             return '用法：/archive [天数|all|empty|restore]，天数需为 1～36500。'
+    if name == '/approvals' and argument:
+        tokens = argument.split()
+        if (len(tokens) != 2 or not tokens[0].isdigit()
+                or tokens[1] not in ('y', 'n')):
+            return '用法：/approvals [序号] y|n，序号见 /approvals 列表。'
     return None
 
 

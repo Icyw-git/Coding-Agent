@@ -312,8 +312,8 @@ def test_approval_push_prefers_button_card(gateway):
             super().__init__()
             self.cards = []
 
-        def send_approval_card(self, chat_id, prompt_md, req_id):
-            self.cards.append((chat_id, prompt_md, req_id))
+        def send_approval_card(self, chat_id, prompt_md, req):
+            self.cards.append((chat_id, prompt_md, req))
             return 'om-1'
 
     approval = ApprovalTransport()
@@ -335,7 +335,8 @@ def test_approval_push_prefers_button_card(gateway):
     req_id = permission_gate.pending()[0].req_id
 
     gw.poll_permissions()
-    assert approval.cards == [('c1', approval.cards[0][1], req_id)]
+    assert approval.cards == [('c1', approval.cards[0][1], approval.cards[0][2])]
+    assert approval.cards[0][2]['req_id'] == req_id
     assert '回复 y（允许）或 n（拒绝）' in approval.cards[0][1]
     assert len(fake.sent) == baseline   # 推送未走文本回退
 
