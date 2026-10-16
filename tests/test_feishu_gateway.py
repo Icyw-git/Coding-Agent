@@ -126,6 +126,7 @@ def test_help_and_unknown_include_command_list(gateway):
     gw.on_message('c1', '/help')
     assert '可用命令' in fake.last()
     assert '/use' in fake.last() and '/perms' in fake.last()
+    assert '/model' in fake.last() and '/approvals' in fake.last()
 
     gw.on_message('c1', '/nope')
     assert '未知命令: /nope' in fake.last()

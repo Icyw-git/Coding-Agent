@@ -44,3 +44,57 @@ def test_help_overview_keeps_flags_in_details_only():
 
     assert '--force' not in format_command_help()
     assert '--force' in format_command_help('rewind')
+
+
+def test_workspace_diff_reports_status_and_clean(monkeypatch, tmp_path):
+    import harness
+
+    monkeypatch.setattr(harness.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
+        returncode=0,
+        stdout=(' M src/app.py\n' if args[1] == 'status' else ' src/app.py | 2 +-\n'),
+    ))
+    output = harness.format_workspace_diff(tmp_path)
+    assert 'src/app.py' in output and '文件状态' in output
+
+    monkeypatch.setattr(harness.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
+        returncode=0, stdout='',
+    ))
+    assert '工作区干净' in harness.format_workspace_diff(tmp_path)
+
+
+def test_model_command_does_not_expose_api_key(monkeypatch, capsys):
+    import harness
+
+    monkeypatch.setenv('LLM_MODEL_ID', 'test-model')
+    monkeypatch.setenv('LLM_BASE_URL', 'https://example.test/v1')
+    monkeypatch.setenv('LLM_API_KEY', 'secret-value')
+    harness.handle_command('/model', [], None)
+    output = capsys.readouterr().out
+    assert 'test-model' in output and 'example.test' in output
+    assert 'secret-value' not in output
+
+
+def test_pending_approvals_hide_internal_ids(monkeypatch):
+    import harness
+
+    request = SimpleNamespace(req_id='perm_secret', tool='run_bash',
+                              reason='运行测试命令')
+    monkeypatch.setattr(harness.hooks.GATE, 'pending', lambda: [request])
+    output = harness.format_pending_approvals()
+    assert '运行测试命令' in output
+    assert 'run_bash' in output
+    assert 'perm_secret' not in output
+
+
+def test_manual_compact_replaces_history_and_records_event(monkeypatch, tmp_path, capsys):
+    import harness
+
+    store = harness.SessionEventStore(tmp_path, session_id='compact')
+    messages = [{'role': 'user', 'content': 'old request'}]
+    store.append_message(messages[0])
+    monkeypatch.setattr(harness, 'compact_history',
+                        lambda current: [{'role': 'user', 'content': '[Compacted]\n\nsummary'}])
+    harness.handle_command('/compact', messages, store)
+    assert messages == [{'role': 'user', 'content': '[Compacted]\n\nsummary'}]
+    assert any(event['type'] == 'compaction' for event in store.read_events())
+    assert '完整记录已保存' in capsys.readouterr().out

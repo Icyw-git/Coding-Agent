@@ -30,6 +30,11 @@ def test_invalid_arguments():
     assert command_error('/rewind', 'last head')
     assert command_error('/rewind', 'last --force --session --yes') is None
     assert '/sessions' in command_error('/sessons', '')
+    assert command_error('/diff', 'extra')
+    assert command_error('/undo', 'extra')
+    assert command_error('/model', 'extra')
+    assert parse_command('/perms') == ('/approvals', '')
+    assert command_error('/compact', 'extra')
 
 
 def test_help_does_not_initialize_checkpoints(monkeypatch, capsys):

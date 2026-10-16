@@ -644,6 +644,8 @@ class FeishuGateway:
             '/confirm、/cancel      确认或取消待执行操作',
             '/cd [dir]              查看/切换当前会话工作区',
             '/pwd                   查看当前会话工作区',
+            '/model                  查看当前模型配置',
+            '/approvals、/perms       查看待审批操作',
             '/run <命令>            在任务目录执行命令',
             '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
             '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
@@ -751,12 +753,15 @@ class FeishuGateway:
             elif command == '/stop':
                 task = self.api.stop_task(argument)
                 self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
-            elif command == '/perms':
+            elif command in ('/perms', '/approvals'):
                 pending = self.api.pending_permissions()
                 if not pending:
                     self._reply(chat_id, '(无待审批请求)')
                 for i, req in enumerate(pending, 1):
                     self._push_approval(chat_id, req, i)
+            elif command == '/model':
+                self._reply(chat_id, f"当前模型: {os.getenv('LLM_MODEL_ID', '未配置')}\n"
+                              f"服务地址: {os.getenv('LLM_BASE_URL', '默认地址')}")
             elif command == '/approve':
                 tokens = argument.split()
                 if tokens and tokens[-1] in ('y', 'n') and len(tokens) == 1:

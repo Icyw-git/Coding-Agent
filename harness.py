@@ -5,6 +5,7 @@ import openai
 import json
 import time
 import threading
+import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
 import sys
@@ -260,6 +261,49 @@ def format_status(session_store) -> str:
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
     )
+
+
+def format_workspace_diff(workspace=None, path='', *, max_chars=12000) -> str:
+    """Return a bounded, read-only view of the workspace changes."""
+    workspace = Path(workspace or get_workdir())
+    try:
+        scope = path.strip() or '.'
+        result = subprocess.run(
+            ['git', 'diff', 'HEAD', '--no-ext-diff', '--stat', '--', scope],
+            cwd=workspace, capture_output=True, text=True, timeout=15,
+        )
+        status = subprocess.run(
+            ['git', 'status', '--short', '--untracked-files=all'],
+            cwd=workspace, capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f'  无法读取工作区改动：{exc}'
+    if result.returncode != 0 or status.returncode != 0:
+        return '  当前工作区不是 Git 仓库，无法显示 diff。'
+    lines = []
+    if status.stdout.strip():
+        lines.append('  文件状态：')
+        lines.extend(f'    {line}' for line in status.stdout.splitlines())
+    if result.stdout.strip():
+        lines.append('  已跟踪文件统计：')
+        lines.extend(f'    {line}' for line in result.stdout.splitlines())
+    if not lines:
+        return '  工作区干净，没有未提交改动。'
+    return ('\n'.join(lines))[:max_chars]
+
+
+def format_pending_approvals() -> str:
+    """Show actionable approval context without exposing internal request IDs."""
+    pending = hooks.GATE.pending()
+    if not pending:
+        return '  没有待审批操作。'
+    lines = ['  待审批操作：']
+    for index, request in enumerate(pending, 1):
+        reason = str(request.reason or '').strip() or '未提供原因'
+        tool = str(request.tool or '未知操作')
+        lines.append(f'    {index}. {tool} · {reason}')
+    lines.append('  请使用飞书 /approve 或对应审批卡片处理。')
+    return '\n'.join(lines)
 
 
 def run_doctor() -> int:
@@ -708,6 +752,8 @@ def _confirm(prompt:str)->bool:
 def handle_command(line:str,messages:list,session_store)->None:
     """REPL 里的 /命令；回溯需要调用方已持有 agent_lock。"""
     command, argument = parse_command(line)
+    if command == '/undo':
+        command, argument = '/rewind', 'last --yes'
     error = command_error(command, argument)
     if error:
         print(f'  {error}')
@@ -725,6 +771,31 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/status':
         print(format_status(session_store))
+
+    elif command == '/diff':
+        print(format_workspace_diff())
+
+    elif command == '/model':
+        print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
+        print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
+
+    elif command == '/approvals':
+        print(format_pending_approvals())
+
+    elif command == '/compact':
+        if not messages:
+            print('  当前会话没有可压缩的内容。')
+            return
+        before = len(messages)
+        try:
+            compacted = compact_history(messages)
+        except Exception as exc:
+            print(f'  [compact] 压缩失败，原会话未改变：{exc}')
+            return
+        messages[:] = compacted
+        _record_compaction(session_store, messages, 'manual')
+        session_store.append_message(messages[-1])
+        print(f'  已压缩会话上下文：{before} 条消息 → {len(messages)} 条。完整记录已保存。')
 
     elif command == '/sessions':
         print(format_session_list())
