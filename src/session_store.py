@@ -119,8 +119,9 @@ class SessionEventStore:
                 prompts.append(' '.join(content.split()))
         return {
             'id': self.session_id,
-            'title': title or next((p[:80] for p in prompts if _useful_title_line(p)),
-                                  prompts[0][:80] if prompts else '新会话'),
+            'title': (title[:80] if title and _useful_title_line(title) else
+                      next((p[:80] for p in prompts if _useful_title_line(p)),
+                           '新会话')),
             'workspace': workspace,
             'preview': prompts[-1][:160] if prompts else '尚无任务',
             'last_user': last_user,

@@ -24,7 +24,7 @@ from task_manager import TaskManager
 from turn_progress import TurnProgress, format_duration
 from hooks import GATE as permission_gate
 
-STREAM_PROGRESS_INTERVAL = 1
+STREAM_PROGRESS_INTERVAL = float(os.getenv('HARNESS_PROGRESS_INTERVAL', '1'))
 STREAM_DIAGNOSTIC_INTERVAL = 60
 
 try:
@@ -397,7 +397,11 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         def events():
             progress = TurnProgress()
             last_progress = last_diagnostic = time.monotonic()
-            yield f"event: progress\ndata: {json.dumps(progress.snapshot())}\n\n"
+            last_marker = None
+            initial = progress.snapshot()
+            last_marker = (initial.get('phase'), initial.get('tool'),
+                           initial.get('elapsed_text'))
+            yield f"event: progress\ndata: {json.dumps(initial)}\n\n"
             while True:
                 try:
                     kind, payload = deltas.get(timeout=STREAM_PROGRESS_INTERVAL)
@@ -416,7 +420,12 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 now = time.monotonic()
                 if kind not in ('done', 'error') and now - last_progress >= STREAM_PROGRESS_INTERVAL:
                     status = progress.snapshot()
-                    yield f"event: progress\ndata: {json.dumps(status)}\n\n"
+                    # 内容没有变化（阶段/工具/秒数都相同）时不重复推送
+                    marker = (status.get('phase'), status.get('tool'),
+                              status.get('elapsed_text'))
+                    if marker != last_marker:
+                        yield f"event: progress\ndata: {json.dumps(status)}\n\n"
+                        last_marker = marker
                     last_progress = now
                     if now - last_diagnostic >= STREAM_DIAGNOSTIC_INTERVAL:
                         frame = sys._current_frames().get(worker.ident)

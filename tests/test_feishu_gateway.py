@@ -559,14 +559,14 @@ def test_stream_reply_uses_one_markdown_card_and_finalizes(monkeypatch):
     gateway = FeishuGateway(StreamApi(), transport=transport)
     gateway._send_agent_reply('chat-1', 'session-1', 'hello')
     assert transport.created == [('chat-1', '**第一段**')]
+    # 建卡即首帧；最终回复与最后一张部分更新相同 → 不再重复 PATCH
     assert transport.updated == [
-        ('msg-1', '**第一段**'),
         ('msg-1', '**第一段**\n- 第二段'),
     ]
     assert transport.texts == []
     assert 'previous_turn' not in perf.snapshot()
     assert perf.snapshot()['gw.first_card'][0] == 1
-    assert perf.snapshot()['gw.final_update'][0] == 1
+    assert 'gw.final_update' not in perf.snapshot()   # 内容相同不重复更新
 
 
 def test_stream_card_update_failure_does_not_fail_generation():

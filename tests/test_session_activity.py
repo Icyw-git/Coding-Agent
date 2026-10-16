@@ -26,6 +26,13 @@ def test_empty_session_uses_creation_time(tmp_path):
     assert store.session_summary()['updated'] == 100
 
 
+def test_generic_confirmation_is_not_a_session_title(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='generic')
+    store.append('session_title', ts=200, title='go')
+    store.append('message', ts=300, message={'role': 'user', 'content': 'x'})
+    assert store.session_summary()['title'] == '新会话'
+
+
 def test_cli_and_runtime_sort_before_limit_by_message_time(tmp_path, monkeypatch):
     import harness
     from agent_runtime import AgentRuntime

@@ -10,7 +10,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.data_structures import Size
 from session_store import SessionEventStore
-from session_views import group_sessions, session_status
+from session_views import absolute_time, group_sessions, session_status
 
 
 def rows():
@@ -68,7 +68,8 @@ def test_actual_terminal_render_adapts_to_width(width, has_details):
 
 def test_grouping_details_and_cjk_columns(tmp_path):
     assert [group for group, _ in group_sessions(rows())] == ['D:/project-b', 'D:/project-a']
-    assert [session_status(row, 'current') for row in rows()] == ['历史', '当前', '空会话']
+    assert [session_status(row, 'current') for row in rows()] == ['已保存', '当前', '空会话']
+    assert absolute_time(0) == '未知时间'
     assert text_width(fit_cells('中文会话主题' * 10, 18, pad=True)) == 18
     assert fit_cells('中文会话主题' * 10, 18).endswith('…')
     store = SessionEventStore(tmp_path)

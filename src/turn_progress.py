@@ -32,12 +32,10 @@ class TurnProgress:
                 elif event.get('type') == 'message' and event.get('message', {}).get('role') == 'tool':
                     self.tool = self.tool_started = None
         elapsed = max(0, time.monotonic() - self.started)
+        # 工具内部耗时只留在诊断日志；客户端只看总时钟与阶段
         return {
             'phase': 'tool' if self.tool else 'thinking',
             'tool': self.tool,
             'elapsed': int(elapsed),
             'elapsed_text': format_duration(elapsed),
-            # Keep tool timing internal for diagnostics; clients only need the
-            # overall turn clock and phase.
-            'tool_elapsed': max(0, int(time.time() - self.tool_started)) if self.tool_started else 0,
         }

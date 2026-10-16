@@ -44,6 +44,7 @@ from pathlib import Path
 import httpx
 
 from gateway_sim import GatewayClient
+from turn_progress import format_duration
 from perf import record as perf_record, reset as perf_reset
 from session_views import group_sessions, session_details
 from feishu_sessions import PAGE_SIZE, list_card, detail_card
@@ -52,15 +53,24 @@ BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json')
 PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 
+# 卡片更新的合流：多会话并发逐秒刷新时，同一网关实例内合并到全局
+# 最小间隔，避免飞书卡片 PATCH 接口被高频调用触发频控
+MIN_CARD_PATCH_INTERVAL = 0.45
+
 
 def _format_task_duration(task: dict) -> str:
+    """任务用时展示（统一 mm:ss / h:mm:ss）：
+    排队中 → 动态已用时（进行中）→ 总用时；旧记录缺 duration_ms 时按
+    started_at/ended_at 动态计算，升级后历史任务不会显示为空。"""
+    if not task.get('started_at'):
+        return '排队中' if task.get('status') == 'queued' else '未开始'
+    ended = task.get('ended_at')
     duration_ms = task.get('duration_ms')
     if duration_ms is None:
-        return '排队中' if task.get('status') == 'queued' else '进行中'
-    total = max(0, round(duration_ms / 1000))
-    minutes, seconds = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f'{hours:02d}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+        end = ended if ended is not None else time.time()
+        duration_ms = round((end - task['started_at']) * 1000)
+    text = format_duration(max(0, duration_ms) / 1000)
+    return text if ended is not None else f'{text}（进行中）'
 
 
 def permission_result(record: dict) -> str:
@@ -333,6 +343,7 @@ class FeishuGateway:
         self._chat_locks_guard = threading.Lock()
         self._dispatch_stop = threading.Event()
         self._dispatch_threads: list[threading.Thread] = []
+        self._last_card_patch = 0.0   # 实例级合流：多会话逐秒刷新共用一个节拍
 
     # ---------- 绑定持久化 ----------
 
@@ -402,6 +413,15 @@ class FeishuGateway:
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
 
+    def _card_patch_gate(self) -> bool:
+        """多会话并发时合并卡片更新：实例内最小间隔 0.45s，未到点跳过本拍
+        （下一秒的进度 tick 会补上最新状态）。"""
+        now = time.monotonic()
+        if now - self._last_card_patch < MIN_CARD_PATCH_INTERVAL:
+            return False
+        self._last_card_patch = now
+        return True
+
     def _send_agent_reply(self, chat_id: str, session_id: str, text: str) -> None:
         """Stream into one editable Markdown card when supported."""
         perf_reset()
@@ -415,12 +435,15 @@ class FeishuGateway:
         message_id = None
         parts = []
         last_update = 0.0
+        last_sent = None
         stream_failed = False
 
         def update_partial(text: str) -> None:
-            nonlocal message_id, last_update, stream_failed
+            nonlocal message_id, last_update, stream_failed, last_sent
             if stream_failed or not updater:
                 return
+            if text == last_sent:
+                return   # 内容与计时都没变化，不重复更新卡片
             now = time.monotonic()
             if updater and now - last_update >= 0.6:
                 try:
@@ -429,9 +452,10 @@ class FeishuGateway:
                         message_id = sender(chat_id, text or '生成中…')
                         # 首张卡片可见，可能仅包含处理进度。
                         perf_record('gw.first_card', time.perf_counter() - _t_entry)
-                    if message_id:
+                    elif self._card_patch_gate():
                         updater(message_id, text)
                         last_update = now
+                    last_sent = text
                 except Exception as exc:
                     stream_failed = True
                     print(f'[feishu] stream update failed, falling back: {exc}')
@@ -441,8 +465,13 @@ class FeishuGateway:
             update_partial(''.join(parts))
 
         def on_progress(status: dict) -> None:
-            elapsed = status.get('elapsed_text') or f"{status.get('elapsed', 0)} 秒"
-            update_partial(f'正在处理 · 已用时 {elapsed}\n\n' + ''.join(parts))
+            elapsed = status.get('elapsed_text') \
+                or format_duration(status.get('elapsed', 0))
+            if status.get('phase') == 'tool':
+                label = f"正在执行 {status.get('tool') or '工具'}"
+            else:
+                label = '正在处理'
+            update_partial(f'{label} · 已用时 {elapsed}\n\n' + ''.join(parts))
 
         try:
             streamer = getattr(self.api, 'send_stream', None)
@@ -467,6 +496,8 @@ class FeishuGateway:
         if duration:
             reply = f'{reply}\n\n已完成 · 总用时 {duration}'
         if message_id and updater and not stream_failed:
+            if reply == last_sent:
+                return   # 卡片已显示最终内容，无需重复 PATCH 或重发
             try:
                 _t_final = time.perf_counter()
                 updater(message_id, reply)
@@ -765,10 +796,10 @@ class FeishuGateway:
                     task = self.api.get_task(argument)
                     duration = _format_task_duration(task)
                     self._reply(chat_id, f"{task['id']} {task['status']} "
-                                          f"exit={task.get('exit_code')} 用时={duration}")
+                                          f"exit={task.get('exit_code')} 总用时={duration}")
                 else:
                     lines = [f"{t['id']} {t['status']} exit={t.get('exit_code')} "
-                             f"用时={_format_task_duration(t)}"
+                             f"总用时={_format_task_duration(t)}"
                              for t in self.api.list_tasks()[:10]]
                     self._reply(chat_id, '\n'.join(lines) or '(no tasks)')
             elif command == '/logs':

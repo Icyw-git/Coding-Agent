@@ -97,17 +97,69 @@ def test_feishu_marks_failed_partial_card_without_repeating_task(tmp_path):
 
 def test_feishu_shows_progress_then_replaces_it_with_final_answer(tmp_path):
     def stream(text, **kwargs):
-        kwargs['on_progress']({'phase': 'tool', 'tool': 'bash', 'elapsed': 12, 'tool_elapsed': 8})
+        kwargs['on_progress']({'phase': 'tool', 'tool': 'bash', 'elapsed': 12,
+                               'elapsed_text': '00:12'})
         return '最终答案'
 
     transport = CardTransport()
     gw = FeishuGateway(SimpleNamespace(send_stream=stream), transport=transport,
                         bindings_path=tmp_path / 'bindings.json')
     gw._send_agent_reply('chat', 'session', 'check')
-    assert '正在处理' in transport.created[0]
-    assert '工具' not in transport.created[0]
-    assert '已用时' in transport.created[0]
+    assert '正在执行 bash' in transport.created[0]
+    assert '00:12' in transport.created[0]
+    assert 'tool_elapsed' not in transport.created[0]
     assert transport.updated[-1] == '最终答案'
+
+
+def test_format_duration_boundaries():
+    from turn_progress import format_duration
+
+    assert format_duration(0) == '00:00'
+    assert format_duration(59) == '00:59'
+    assert format_duration(60) == '01:00'
+    assert format_duration(3599) == '59:59'
+    assert format_duration(3600) == '01:00:00'
+    assert format_duration(7326) == '02:02:06'
+
+
+def test_task_duration_display_compat_and_states():
+    from feishu_gateway import _format_task_duration
+
+    now = time.time()
+    assert _format_task_duration({'status': 'queued'}) == '排队中'
+    running = {'status': 'running', 'started_at': now - 100}
+    assert _format_task_duration(running) == '01:40（进行中）'
+    done = {'status': 'succeeded', 'started_at': now - 18,
+            'ended_at': now, 'duration_ms': 18000}
+    assert _format_task_duration(done) == '00:18'
+    # 旧记录没有 duration_ms：按 started_at/ended_at 动态计算
+    legacy = {'status': 'succeeded', 'started_at': now - 30, 'ended_at': now}
+    assert _format_task_duration(legacy) == '00:30'
+
+
+def test_progress_update_skips_identical_text(tmp_path):
+    def stream(text, **kwargs):
+        status = {'phase': 'thinking', 'elapsed': 0, 'elapsed_text': '00:00'}
+        kwargs['on_progress'](status)
+        kwargs['on_progress'](status)   # 同一秒重复推送 → 卡片不应重复更新
+        return '完成'
+
+    transport = CardTransport()
+    gw = FeishuGateway(SimpleNamespace(send_stream=stream), transport=transport,
+                        bindings_path=tmp_path / 'bindings.json')
+    gw._send_agent_reply('chat', 'session', 'check')
+    assert len(transport.created) == 1
+    assert transport.updated == ['完成']   # 只剩最终回复更新，进度未重复刷新
+
+
+def test_card_patch_gate_throttles_per_instance(tmp_path):
+    gw = FeishuGateway(SimpleNamespace(), transport=CardTransport(),
+                       bindings_path=tmp_path / 'bindings.json')
+    assert gw._card_patch_gate() is True
+    assert gw._card_patch_gate() is False   # 实例内最小间隔合并
+    other = FeishuGateway(SimpleNamespace(), transport=CardTransport(),
+                          bindings_path=tmp_path / 'bindings2.json')
+    assert other._card_patch_gate() is True   # 其他实例不受影响
 
 
 def test_shell_timeout_returns_without_waiting_for_child_output(tmp_path, monkeypatch):

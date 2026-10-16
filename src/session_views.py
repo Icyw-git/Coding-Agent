@@ -18,6 +18,12 @@ def relative_time(timestamp, now=None):
     return time.strftime('%Y-%m-%d', time.localtime(timestamp))
 
 
+def absolute_time(timestamp):
+    if not timestamp:
+        return '未知时间'
+    return time.strftime('%Y-%m-%d %H:%M', time.localtime(timestamp))
+
+
 def display_text(value):
     return ''.join(char for char in str(value or '')
                    if char in '\n\t' or (char.isprintable() and char != '\x7f'))
@@ -26,7 +32,7 @@ def display_text(value):
 def session_status(row, current_id=None):
     if row['id'] == current_id:
         return '当前'
-    return '空会话' if row.get('preview') == '尚无任务' else '历史'
+    return '空会话' if row.get('preview') == '尚无任务' else '已保存'
 
 
 def group_sessions(rows):
@@ -41,7 +47,7 @@ def session_details(row, current_id=None):
         ('主题', row.get('title') or '新会话'),
         ('状态', session_status(row, current_id)),
         ('工作区', row.get('workspace') or '工作目录未记录'),
-        ('最近活跃', relative_time(row.get('updated', 0))),
+        ('最近活跃', absolute_time(row.get('updated', 0))),
         ('最近任务', row.get('last_user') or row.get('preview') or '尚无任务'),
         ('最近回复', row.get('last_assistant') or '尚无文字回复'),
     ]

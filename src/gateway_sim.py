@@ -273,12 +273,23 @@ class GatewayClient:
 
 
 def _print_task(task: dict) -> None:
+    from turn_progress import format_duration
     started = time.strftime('%H:%M:%S', time.localtime(task['started_at'])) \
         if task.get('started_at') else '-'
     duration_ms = task.get('duration_ms')
-    duration = f'{duration_ms / 1000:.1f}s' if duration_ms is not None else '-'
+    if duration_ms is None:
+        if not task.get('started_at'):
+            duration = '排队中' if task.get('status') == 'queued' else '-'
+        else:
+            # 兼容旧记录：无 duration_ms 时按 started_at/ended_at 动态计算
+            end = task.get('ended_at') or time.time()
+            duration_ms = round((end - task['started_at']) * 1000)
+    if duration_ms is not None:
+        duration = format_duration(max(0, duration_ms) / 1000)
+        if not task.get('ended_at'):
+            duration += '（进行中）'
     print(f"  {task['id']}  {task['status']:<10} exit={task.get('exit_code')} "
-          f"用时={duration}  start={started}  {task['command'][:60]}")
+          f"总用时={duration}  start={started}  {task['command'][:60]}")
 
 
 def repl(client: GatewayClient) -> int:
