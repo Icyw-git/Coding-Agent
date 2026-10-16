@@ -889,7 +889,7 @@ def _stream_completion(create_kwargs, on_delta):
         finish_reason = choice.finish_reason or finish_reason
         delta = choice.delta
         if getattr(delta, 'content', None):
-            if not _ttfb_done:   # 首个内容块到达 = 用户可看到首字的时刻
+            if not _ttfb_done:   # 模型首个文本块到达；客户端显示延迟另计
                 perf_record('llm.ttfb', time.perf_counter() - _t0)
                 _ttfb_done = True
             part = delta.content
@@ -1224,7 +1224,7 @@ def run_repl(initial_messages:list, session_store=None):
     from cli_input import create_reader, choose_session
 
     def session_choices():
-        for row in session_rows(workspace=WORKDIR):
+        for row in session_rows(limit=None):
             yield row['id'], f"{row['title']} · {row['workspace'] or '工作目录未记录'} · {row['preview']}"
 
     read_line = create_reader(lambda: WORKDIR, session_choices)

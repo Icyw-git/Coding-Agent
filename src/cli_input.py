@@ -251,9 +251,10 @@ class SlashCompleter(Completer):
                                      display_meta=item.description)
         elif command == '/resume':
             for session_id, title in self.sessions():
-                if session_id.startswith(argument):
+                if (session_id.startswith(argument)
+                        or argument.casefold() in title.casefold()):
                     yield Completion(session_id, start_position=-len(argument),
-                                     display_meta=title)
+                                     display=display_text(title), display_meta='恢复会话')
         elif command == '/rewind':
             prefix = argument.split()[-1] if argument and not argument.endswith(' ') else ''
             used = argument.split()

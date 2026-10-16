@@ -12,39 +12,39 @@ cp.git/cp.write），相加前先看清楚包含关系。
 import os
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 
-ENABLED = os.getenv('HARNESS_PERF', '') == '1'
-_counts: dict[str, int] = {}
-_totals: dict[str, float] = {}
+_stats: ContextVar[dict[str, tuple[int, float]] | None] = ContextVar('perf_stats', default=None)
 
 
 @contextmanager
 def segment(name: str):
-    if not ENABLED:
+    if os.getenv('HARNESS_PERF', '') != '1':
         yield
         return
     t0 = time.perf_counter()
     try:
         yield
     finally:
-        _counts[name] = _counts.get(name, 0) + 1
-        _totals[name] = _totals.get(name, 0.0) + (time.perf_counter() - t0)
+        record(name, time.perf_counter() - t0)
 
 
 def record(name: str, seconds: float) -> None:
-    if not ENABLED:
+    if os.getenv('HARNESS_PERF', '') != '1':
         return
-    _counts[name] = _counts.get(name, 0) + 1
-    _totals[name] = _totals.get(name, 0.0) + seconds
+    # Copy on write also isolates child tasks that inherit the current context.
+    stats = dict(_stats.get() or {})
+    count, total = stats.get(name, (0, 0.0))
+    stats[name] = (count + 1, total + seconds)
+    _stats.set(stats)
 
 
 def reset() -> None:
-    _counts.clear()
-    _totals.clear()
+    _stats.set({})
 
 
 def snapshot() -> dict[str, tuple[int, float]]:
-    return {name: (_counts[name], _totals[name]) for name in _totals}
+    return dict(_stats.get() or {})
 
 
 def fmt(snapshot: dict[str, tuple[int, float]]) -> str:

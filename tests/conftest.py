@@ -28,9 +28,9 @@ def _restore_permission_backend():
     os.environ['HARNESS_MEMORY_RECALL'] = 'llm'
     os.environ.pop('HARNESS_LOAD_MEMORIES', None)
     os.environ['HARNESS_APPROVAL_TIMEOUT'] = '3'
-    permission_gate.timeout = 3   # GATE 在导入时已读走 timeout，setenv 来不及
     previous = permission_gate.backend
     previous_timeout = permission_gate.timeout
+    permission_gate.timeout = 3   # GATE 在导入时已读走 timeout，setenv 来不及
     try:
         yield
     finally:

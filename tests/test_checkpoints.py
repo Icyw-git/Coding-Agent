@@ -507,7 +507,7 @@ def test_git_baseline_covers_add_modify_delete_rename(ws):
     assert ' D old.txt' in status
     assert any(line.startswith('R') and line.endswith('renamed.txt')
                for line in status)   # 重命名行（v1 兼容 XY+空格+新路径）
-    # 原文件不再出现（重命名后旧名不留在工作区状态里）
+    # v1 重命名格式保留源路径，目标路径位于行尾。
     assert not any(line.endswith('tracked.txt') for line in status)
 
 
@@ -519,8 +519,7 @@ def test_git_baseline_non_git_dir(ws):
 def test_drift_files_with_merged_baseline(ws):
     """v2 转换后的基线与 live v1 对比仍能识别外部改动。
 
-    基线为空（完全干净的树）时 _drift_files 本来就跳过（既有语义），
-    所以先放一个未跟踪文件让基线非空。
+    已有未跟踪文件不应被重复提示，新增的外部文件应被识别。
     """
     _git_init(ws)
     (ws / 'a.txt').write_text('init', encoding='utf-8')
@@ -538,3 +537,32 @@ def test_drift_files_with_merged_baseline(ws):
     assert 'base.txt' not in drift       # begin 前已存在 → 在基线里，不算 drift
     assert 'a.txt' not in drift          # 未动的文件不算 drift
     assert not any('.cache' in name for name in drift)   # 忽略名单生效
+
+
+def test_existing_rename_is_not_drift(ws):
+    _git_init(ws)
+    (ws / 'old name.txt').write_text('init', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    _git_run(ws, 'mv', 'old name.txt', 'new name.txt')
+    mgr = _mgr(ws)
+    baseline = mgr._git_baseline()
+    assert baseline['status'] == sorted(mgr._git('status', '--porcelain').splitlines())
+    assert mgr._drift_files({'git': baseline}, touched=set()) == []
+
+
+def test_clean_baseline_detects_new_external_change(ws):
+    _git_init(ws)
+    (ws / 'tracked.txt').write_text('init', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    mgr = _mgr(ws)
+    baseline = mgr._git_baseline()
+    assert baseline['status'] == []
+    (ws / 'external.txt').write_text('external change', encoding='utf-8')
+    assert mgr._drift_files({'git': baseline}, touched=set()) == ['external.txt']
+
+
+def test_unborn_repository_has_no_head(ws):
+    _git_init(ws)
+    assert _mgr(ws)._git_baseline()['head'] == ''

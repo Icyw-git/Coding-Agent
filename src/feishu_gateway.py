@@ -44,7 +44,7 @@ from pathlib import Path
 import httpx
 
 from gateway_sim import GatewayClient
-from perf import record as perf_record
+from perf import record as perf_record, reset as perf_reset
 from session_views import group_sessions, session_details
 from feishu_sessions import PAGE_SIZE, list_card, detail_card
 
@@ -379,6 +379,7 @@ class FeishuGateway:
 
     def _send_agent_reply(self, chat_id: str, session_id: str, text: str) -> None:
         """Stream into one editable Markdown card when supported."""
+        perf_reset()
         _t_entry = time.perf_counter()
         updater = getattr(self.transport, 'update_markdown', None)
         sender = getattr(self.transport, 'send_markdown', None)
@@ -401,7 +402,7 @@ class FeishuGateway:
                     if message_id is None:
                         # 首建卡片用本次内容（进度路径下 parts 可能为空）
                         message_id = sender(chat_id, text or '生成中…')
-                        # 用户第一次看到回复内容的时刻（卡片创建耗时）
+                        # 首张卡片可见，可能仅包含处理进度。
                         perf_record('gw.first_card', time.perf_counter() - _t_entry)
                     if message_id:
                         updater(message_id, text)

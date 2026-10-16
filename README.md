@@ -118,7 +118,19 @@ MCP_SERVERS_FILE=.cache/mcp_servers.json
 
 # 可选：textual 或 ansi
 HARNESS_UI=ansi
+
+# 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
+HARNESS_MEMORY_RECALL=local
+
+# 可选：启用分段计时，启动前设置
+HARNESS_PERF=1
 ```
+
+`local` 使用中英文关键词匹配，语义召回能力与 `llm` 不同；不设置时保留 `llm`。
+旧开关 `HARNESS_LOAD_MEMORIES=0` 仍会关闭召回。
+性能统计可通过 `perf.snapshot()` 读取当前执行上下文的数据；不同请求独立统计，
+飞书网关与 API 服务也分别统计，尚未自动合并为端到端报告。
+嵌套分段存在包含关系，不能直接相加。
 
 请勿提交 `.env` 或任何真实 API 密钥；`.gitignore` 已默认忽略该文件。
 

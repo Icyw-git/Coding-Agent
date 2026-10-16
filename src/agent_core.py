@@ -120,14 +120,16 @@ def _recent_user_text(messages: list, max_chars: int = 2000) -> str:
             content = msg.get('content', '')
             if isinstance(content, list):
                 content = " ".join(
-                    str(getattr(b, "text", "")) for b in content
-                    if getattr(b, "type", None) == "text"
+                    str(b.get('text', '') if isinstance(b, dict) else getattr(b, 'text', ''))
+                    for b in content
+                    if (b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)) == 'text'
                 )
             if isinstance(content, str):
                 recent_texts.append(content)
             if len(recent_texts) >= 3:
                 break
-    return ' '.join(reversed(recent_texts))[:max_chars]
+    # Keep the latest question when older messages exceed the recall budget.
+    return ' '.join(reversed(recent_texts))[-max_chars:] if max_chars > 0 else ''
 
 
 def _local_tokens(text: str) -> list[str]:

@@ -135,3 +135,23 @@ def test_llm_failure_falls_back_to_local(memory_dir, monkeypatch):
     selected = agent_core.select_relevant_memories(
         [{'role': 'user', 'content': '回答保持简短'}])
     assert selected == ['style.md']
+
+
+def test_latest_question_survives_long_older_message():
+    files = [{'filename': 'feishu.md', 'name': 'feishu', 'description': '飞书网关审批配置'}]
+    messages = [
+        {'role': 'user', 'content': '旧背景' * 1000},
+        {'role': 'user', 'content': '飞书网关审批怎么配置？'},
+    ]
+    assert agent_core.local_relevant_memories(messages, files) == ['feishu.md']
+    assert len(agent_core._recent_user_text(messages)) == 2000
+
+
+def test_recall_reads_dict_text_blocks():
+    messages = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': '飞书网关审批'},
+        {'type': 'image_url', 'image_url': {'url': 'ignored'}},
+        SimpleNamespace(type='text', text='配置'),
+    ]}]
+    assert agent_core._recent_user_text(messages) == '飞书网关审批 配置'
+    assert agent_core._recent_user_text(messages, max_chars=0) == ''

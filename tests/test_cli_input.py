@@ -57,6 +57,19 @@ def test_noninteractive_reader_uses_input(monkeypatch):
     assert create_reader(lambda: Path.cwd(), lambda: []) is input
 
 
+def test_resume_completion_searches_human_context():
+    from prompt_toolkit.formatted_text import to_plain_text
+
+    label = '优化飞书回复 · D:\\Projects\\Gateway'
+    completer = SlashCompleter(lambda: Path.cwd(),
+                               lambda: [('abc123', label), ('def456', '数据库迁移')])
+    for query in ('飞书', 'gateway', 'abc'):
+        items = choices(completer, '/resume ' + query)
+        assert [item.text for item in items] == ['abc123']
+        assert to_plain_text(items[0].display) == label
+        assert items[0].start_position == -len(query)
+
+
 def test_prompt_session_tab_and_eof(tmp_path):
     import asyncio
 

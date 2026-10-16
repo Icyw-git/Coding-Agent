@@ -52,6 +52,12 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+def _v1_path(path: str) -> str:
+    # Porcelain v2 leaves spaces unquoted; v1 quotes them. Other escapes are
+    # already supplied by Git in both formats.
+    return f'"{path}"' if ' ' in path and not path.startswith('"') else path
+
+
 class CheckpointManager:
     """一个 session 对应一个 manager；节点按 <base_dir>/<session_id>/<cp_id>/ 落盘。"""
 
@@ -323,7 +329,7 @@ class CheckpointManager:
             try:
                 result = subprocess.run(['git', *args], cwd=self.workspace,
                                         capture_output=True, text=True, timeout=15)
-                return result.stdout.strip()
+                return result.stdout.rstrip('\r\n')
             except Exception:
                 return ''
 
@@ -340,23 +346,26 @@ class CheckpointManager:
         for line in raw.splitlines():
             if line.startswith('# branch.oid '):
                 head = line[len('# branch.oid '):]
+                if head == '(initial)':
+                    head = ''
             elif line.startswith(('#', '!')):
                 continue   # 其余头行 / 被忽略文件
             elif line.startswith('?'):
-                status.append('?? ' + line[2:])
+                status.append('?? ' + _v1_path(line[2:]))
             elif line.startswith('1 '):
                 parts = line.split(None, 8)
                 if len(parts) == 9:
                     # v2 用 '.' 表示未变一侧，v1 用空格
-                    status.append(f'{parts[1].replace(".", " ")} {parts[8]}')
+                    status.append(f'{parts[1].replace(".", " ")} {_v1_path(parts[8])}')
             elif line.startswith('2 '):   # 重命名：v2 用 <path>\t<origPath>
                 parts = line.split(None, 9)
                 if len(parts) == 10:
-                    status.append(f'{parts[1]} {parts[9].split(chr(9), 1)[0]}')
+                    path, original = parts[9].split('\t', 1)
+                    status.append(f'{parts[1].replace(".", " ")} {_v1_path(original)} -> {_v1_path(path)}')
             elif line.startswith('u '):
                 parts = line.split(None, 10)
                 if len(parts) == 11:
-                    status.append(f'{parts[1]} {parts[10]}')
+                    status.append(f'{parts[1]} {_v1_path(parts[10])}')
         return {'head': head, 'status': sorted(status)}
 
     # ---------- 回溯 ----------
@@ -450,11 +459,12 @@ class CheckpointManager:
     def _drift_files(self, meta: dict, touched: set) -> list[str]:
         """bash / 外部改动导致、且不在 checkpoint 清单里的文件（只提示，不恢复）。"""
         baseline = set((meta.get('git') or {}).get('status') or [])
-        if not baseline:
-            return []
         drift = []
         for line in sorted(set(self._git('status', '--porcelain').splitlines()) - baseline):
-            name = line[3:].strip().strip('"')
+            name = line[3:]
+            if 'R' in line[:2] or 'C' in line[:2]:
+                name = name.split(' -> ', 1)[-1]
+            name = name.strip().strip('"')
             if name and name not in touched and not self._is_ignored(name):
                 drift.append(name)
         return drift
