@@ -104,8 +104,9 @@ def test_feishu_shows_progress_then_replaces_it_with_final_answer(tmp_path):
     gw = FeishuGateway(SimpleNamespace(send_stream=stream), transport=transport,
                         bindings_path=tmp_path / 'bindings.json')
     gw._send_agent_reply('chat', 'session', 'check')
-    assert '正在执行 bash' in transport.created[0]
-    assert '12 秒' in transport.created[0]
+    assert '正在处理' in transport.created[0]
+    assert '工具' not in transport.created[0]
+    assert '已用时' in transport.created[0]
     assert transport.updated[-1] == '最终答案'
 
 

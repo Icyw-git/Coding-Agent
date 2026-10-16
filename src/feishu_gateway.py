@@ -53,6 +53,16 @@ PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 
 
+def _format_task_duration(task: dict) -> str:
+    duration_ms = task.get('duration_ms')
+    if duration_ms is None:
+        return '排队中' if task.get('status') == 'queued' else '进行中'
+    total = max(0, round(duration_ms / 1000))
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+
+
 def permission_result(record: dict) -> str:
     status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}.get(
         record['status'], '审批已处理')
@@ -431,12 +441,8 @@ class FeishuGateway:
             update_partial(''.join(parts))
 
         def on_progress(status: dict) -> None:
-            elapsed = status.get('elapsed', 0)
-            if status.get('phase') == 'tool':
-                label = f"正在执行 {status.get('tool') or '工具'}（{status.get('tool_elapsed', 0)} 秒）"
-            else:
-                label = '正在处理'
-            update_partial(f'{label} · 已耗时 {elapsed} 秒\n\n' + ''.join(parts))
+            elapsed = status.get('elapsed_text') or f"{status.get('elapsed', 0)} 秒"
+            update_partial(f'正在处理 · 已用时 {elapsed}\n\n' + ''.join(parts))
 
         try:
             streamer = getattr(self.api, 'send_stream', None)
@@ -457,6 +463,9 @@ class FeishuGateway:
             self._reply(chat_id, failed)
             return
         reply = reply or '本轮已结束，未生成文本回复。'
+        duration = getattr(self.api, 'last_duration', None)
+        if duration:
+            reply = f'{reply}\n\n已完成 · 总用时 {duration}'
         if message_id and updater and not stream_failed:
             try:
                 _t_final = time.perf_counter()
@@ -754,10 +763,12 @@ class FeishuGateway:
             elif command == '/status':
                 if argument:
                     task = self.api.get_task(argument)
+                    duration = _format_task_duration(task)
                     self._reply(chat_id, f"{task['id']} {task['status']} "
-                                          f"exit={task.get('exit_code')}")
+                                          f"exit={task.get('exit_code')} 用时={duration}")
                 else:
-                    lines = [f"{t['id']} {t['status']} exit={t.get('exit_code')}"
+                    lines = [f"{t['id']} {t['status']} exit={t.get('exit_code')} "
+                             f"用时={_format_task_duration(t)}"
                              for t in self.api.list_tasks()[:10]]
                     self._reply(chat_id, '\n'.join(lines) or '(no tasks)')
             elif command == '/logs':

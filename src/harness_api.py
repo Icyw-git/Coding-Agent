@@ -21,10 +21,10 @@ from harness_sdk import HarnessClient
 from agent_runtime import AgentRuntime, SessionAlreadyExistsError
 from session_store import SessionReplayError
 from task_manager import TaskManager
-from turn_progress import TurnProgress
+from turn_progress import TurnProgress, format_duration
 from hooks import GATE as permission_gate
 
-STREAM_PROGRESS_INTERVAL = 5
+STREAM_PROGRESS_INTERVAL = 1
 STREAM_DIAGNOSTIC_INTERVAL = 60
 
 try:
@@ -368,6 +368,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         finished = object()
 
         def run() -> None:
+            started = time.monotonic()
             try:
                 opener = getattr(runtime, 'open_session', None)
                 if opener is not None:
@@ -377,11 +378,16 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                     session_id, request.content,
                     on_delta=lambda text: deltas.put(("delta", text)),
                 )
+                duration_ms = round((time.monotonic() - started) * 1000)
                 deltas.put(("done", {"session_id": response.session_id,
-                                     "content": response.content}))
+                                     "content": response.content,
+                                     "duration_ms": duration_ms,
+                                     "duration": format_duration(duration_ms / 1000)}))
             except Exception as exc:
                 logger.exception('streamed agent turn failed session=%s', session_id)
-                deltas.put(("error", str(exc)))
+                deltas.put(("error", {'detail': str(exc),
+                                       'duration_ms': round((time.monotonic() - started) * 1000),
+                                       'duration': format_duration(time.monotonic() - started)}))
             finally:
                 deltas.put(("close", finished))
 

@@ -3,6 +3,14 @@
 import time
 
 
+def format_duration(seconds: float) -> str:
+    """Compact elapsed time for progress and completion messages."""
+    total = max(0, int(seconds))
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+
+
 class TurnProgress:
     def __init__(self):
         self.started = time.monotonic()
@@ -23,9 +31,13 @@ class TurnProgress:
                     self.tool_started = event.get('ts')
                 elif event.get('type') == 'message' and event.get('message', {}).get('role') == 'tool':
                     self.tool = self.tool_started = None
+        elapsed = max(0, time.monotonic() - self.started)
         return {
             'phase': 'tool' if self.tool else 'thinking',
             'tool': self.tool,
-            'elapsed': int(time.monotonic() - self.started),
+            'elapsed': int(elapsed),
+            'elapsed_text': format_duration(elapsed),
+            # Keep tool timing internal for diagnostics; clients only need the
+            # overall turn clock and phase.
             'tool_elapsed': max(0, int(time.time() - self.tool_started)) if self.tool_started else 0,
         }

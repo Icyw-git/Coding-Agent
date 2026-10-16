@@ -35,6 +35,12 @@ TERMINAL_STATUSES = {'succeeded', 'failed', 'cancelled', 'interrupted'}
 ACTIVE_STATUSES = {'queued', 'running'}
 
 
+def _duration_ms(record: 'TaskRecord') -> int | None:
+    if record.started_at is None or record.ended_at is None:
+        return None
+    return max(0, round((record.ended_at - record.started_at) * 1000))
+
+
 @dataclass
 class TaskRecord:
     id: str
@@ -44,6 +50,7 @@ class TaskRecord:
     created_at: float
     started_at: float | None = None
     ended_at: float | None = None
+    duration_ms: int | None = None
     exit_code: int | None = None
     pid: int | None = None
     log_path: str = ''
@@ -121,6 +128,7 @@ class TaskManager:
                     raise RuntimeError('could not terminate task process tree') from exc
             record.status = 'cancelled'
             record.ended_at = time.time()
+            record.duration_ms = _duration_ms(record)
             record.detail = 'cancelled by request'
             self._save(record)
         return record
@@ -199,6 +207,7 @@ class TaskManager:
                 self._procs.pop(record.id, None)
                 record.exit_code = code
                 record.ended_at = time.time()
+                record.duration_ms = _duration_ms(record)
                 if record.status not in TERMINAL_STATUSES:
                     record.status = 'succeeded' if code == 0 else 'failed'
                 self._save(record)
@@ -210,6 +219,7 @@ class TaskManager:
                 if record.status not in TERMINAL_STATUSES:
                     record.status = 'failed'
                     record.ended_at = time.time()
+                    record.duration_ms = _duration_ms(record)
                     record.detail = f'{type(exc).__name__}: {exc}'
                 self._save(record)
         finally:

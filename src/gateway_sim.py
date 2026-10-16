@@ -122,6 +122,8 @@ class GatewayClient:
         if not session_id:
             raise RuntimeError('no active session; use /new first')
         final = ''
+        self.last_duration_ms = None
+        self.last_duration = None
         completed = False
         with self.http.stream('POST', f'/v1/sessions/{session_id}/messages/stream',
                               json={'content': content}) as response:
@@ -139,6 +141,8 @@ class GatewayClient:
                             on_delta(text)
                     elif event == 'done':
                         final = payload.get('content', final)
+                        self.last_duration_ms = payload.get('duration_ms')
+                        self.last_duration = payload.get('duration')
                         completed = True
                     elif event == 'progress' and on_progress:
                         on_progress(payload)
@@ -271,8 +275,10 @@ class GatewayClient:
 def _print_task(task: dict) -> None:
     started = time.strftime('%H:%M:%S', time.localtime(task['started_at'])) \
         if task.get('started_at') else '-'
+    duration_ms = task.get('duration_ms')
+    duration = f'{duration_ms / 1000:.1f}s' if duration_ms is not None else '-'
     print(f"  {task['id']}  {task['status']:<10} exit={task.get('exit_code')} "
-          f"start={started}  {task['command'][:60]}")
+          f"用时={duration}  start={started}  {task['command'][:60]}")
 
 
 def repl(client: GatewayClient) -> int:
