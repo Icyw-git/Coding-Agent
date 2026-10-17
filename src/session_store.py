@@ -266,6 +266,22 @@ class SessionEventStore:
                 if e.get('type') == 'tool_compacted'
                 and e.get('tool_call_id') and e.get('placeholder')}
 
+    def usage_totals(self) -> dict:
+        """聚合会话内全部 usage 事件（tokens 埋点），跨重启准确。
+
+        cached_seen 表示供应商是否回传过缓存命中字段——区分「0 命中」与
+        「不可观测」，命中率展示依赖它。"""
+        totals = {'prompt': 0, 'completion': 0, 'cached': 0, 'total': 0,
+                  'calls': 0, 'cached_seen': False}
+        for event in self.read_events():
+            if event.get('type') != 'usage':
+                continue
+            for key in ('prompt', 'completion', 'cached', 'total'):
+                totals[key] += int(event.get(key, 0) or 0)
+            totals['calls'] += 1
+            totals['cached_seen'] = totals['cached_seen'] or bool(event.get('cached_seen'))
+        return totals
+
     def append_checkpoint(self, checkpoint_id: str, through_seq: int | None = None, *,
                           label: str = "", trigger: str = "turn") -> dict:
         """记录一个可回溯节点；快照本体在 .cache/checkpoints/<id>/ 下，不进事件流。"""

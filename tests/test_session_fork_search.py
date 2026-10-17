@@ -138,30 +138,55 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     assert '[tokens] 本轮 120 · 会话累计 120 · 缓存命中 96%' in out
     assert 'tokens：120' in harness.format_status(store)   # /status 显示会话累计
     assert '缓存命中 96%' in harness.format_status(store)
+    # 埋点持久化：usage 事件写入事件流（prompt/completion/cached/cached_seen 明细）
+    events = [e for e in store.read_events() if e.get('type') == 'usage']
+    assert events and events[0]['prompt'] == 100 and events[0]['completion'] == 20
+    assert events[0]['cached'] == 96 and events[0]['cached_seen']
+    # 跨重启：新 store 实例从事件聚合，累计与命中率不变
+    reopened = SessionEventStore.open(store.path)
+    totals = reopened.usage_totals()
+    assert totals['total'] == 120 and totals['cached'] == 96 and totals['cached_seen']
+    assert 'tokens：120' in harness.format_status(reopened)
+    assert '缓存命中 96%' in harness.format_status(reopened)
 
 
-def test_record_usage_collects_cached_tokens():
+def test_parse_usage_collects_cached_tokens():
     from types import SimpleNamespace as NS
 
-    harness._usage_by_session.clear()
-    try:
-        # OpenAI 嵌套字段
-        openai_usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
-                          prompt_tokens_details=NS(cached_tokens=80))
-        assert harness._record_usage('sess-cache', openai_usage) == 120
-        # DeepSeek 扁平字段
-        ds_usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
-                      prompt_cache_hit_tokens=60)
-        harness._record_usage('sess-cache', ds_usage)
-        bucket = harness._usage_by_session['sess-cache']
-        assert bucket['cached'] == 140 and bucket['cached_seen']
-        assert '70%' in harness._cache_hit_rate_line(bucket)   # 140 / 200（cached ⊆ prompt）
-        # 供应商未回传 cached 字段 → 不显示（未知 ≠ 0）
-        harness._record_usage('sess-plain', NS(prompt_tokens=50, completion_tokens=10,
-                                               total_tokens=60))
-        assert harness._cache_hit_rate_line(harness._usage_by_session['sess-plain']) == ''
-    finally:
-        harness._usage_by_session.clear()
+    # OpenAI 嵌套字段
+    openai_usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                      prompt_tokens_details=NS(cached_tokens=80))
+    detail = harness._parse_usage(openai_usage)
+    assert detail == {'prompt': 100, 'completion': 20, 'total': 120,
+                      'cached': 80, 'cached_seen': True}
+    # DeepSeek 扁平字段
+    ds = harness._parse_usage(NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                                 prompt_cache_hit_tokens=60))
+    assert ds['cached'] == 60 and ds['cached_seen']
+    # 聚合口径：cached ⊆ prompt，命中率 = cached / prompt
+    bucket = {'prompt': 200, 'cached': 140, 'cached_seen': True}
+    assert '70%' in harness._cache_hit_rate_line(bucket)   # 140 / 200
+    # 供应商未回传 cached 字段 → 不显示（未知 ≠ 0）
+    plain = harness._parse_usage(NS(prompt_tokens=50, completion_tokens=10, total_tokens=60))
+    assert plain['cached'] == 0 and not plain['cached_seen']
+    assert harness._cache_hit_rate_line(plain) == ''
+    # 缺失 usage / 全零 → None（不产生垃圾事件）
+    assert harness._parse_usage(None) is None
+    assert harness._parse_usage(NS(prompt_tokens=0, completion_tokens=0, total_tokens=0)) is None
+
+
+def test_usage_totals_aggregates_events(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='agg')
+    store.append('usage', prompt=100, completion=20, cached=80, total=120, cached_seen=True)
+    store.append('message', message={'role': 'user', 'content': 'x'})   # 干扰事件
+    store.append('usage', prompt=50, completion=10, total=60)           # 无 cached 字段
+    totals = store.usage_totals()
+    assert totals == {'prompt': 150, 'completion': 30, 'cached': 80,
+                      'total': 180, 'calls': 2, 'cached_seen': True}
+    # 空会话 / 无 usage 事件 → 全零且不可观测
+    empty = SessionEventStore(tmp_path, session_id='none')
+    assert empty.usage_totals() == {'prompt': 0, 'completion': 0, 'cached': 0,
+                                    'total': 0, 'calls': 0, 'cached_seen': False}
 
 
 def test_compaction_tail_survives_replay(tmp_path):

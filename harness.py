@@ -287,8 +287,7 @@ def format_status(session_store) -> str:
         ('任务', len(list_tasks())), ('定时任务', cron_count),
         ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
     summary = session_store.session_summary()
-    with _usage_lock:
-        usage = dict(_usage_by_session.get(session_store.session_id, {}))
+    usage = session_store.usage_totals()   # 从 usage 事件聚合，跨重启准确
     usage_line = (f'\n  tokens：{_fmt_tokens(usage["total"])}'
                   f'（输入 {_fmt_tokens(usage["prompt"])} · 输出 {_fmt_tokens(usage["completion"])}）'
                   f'{_cache_hit_rate_line(usage)}'
@@ -1063,10 +1062,6 @@ def wait_for_housekeeping(timeout: float = 30.0) -> None:
         thread.join(timeout=max(0.0, deadline - time.time()))
 
 
-_usage_lock = threading.Lock()
-_usage_by_session: dict[str, dict] = {}   # session_id -> {'prompt','completion','total'} 进程内累计
-
-
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f'{n / 1_000_000:.2f}M'
@@ -1075,34 +1070,24 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def _record_usage(session_id: str, usage) -> int:
-    """把一次 LLM 调用的 usage 累计进会话账本，返回本次 total（缺失时静默跳过）。
+def _parse_usage(usage) -> dict | None:
+    """解析一次 LLM 调用的 usage（缺失/无效时返回 None）。
 
     同时采集缓存命中 token：OpenAI 为 prompt_tokens_details.cached_tokens，
     DeepSeek 为扁平字段 prompt_cache_hit_tokens —— 没有它命中率不可观测。"""
     if not usage:
-        return 0
+        return None
     prompt = int(getattr(usage, 'prompt_tokens', 0) or 0)
     completion = int(getattr(usage, 'completion_tokens', 0) or 0)
     total = int(getattr(usage, 'total_tokens', 0) or prompt + completion)
     if total <= 0:
-        return 0
+        return None
     details = getattr(usage, 'prompt_tokens_details', None)
     cached = getattr(details, 'cached_tokens', None) if details is not None else None
     if cached is None:
         cached = getattr(usage, 'prompt_cache_hit_tokens', None)
-    cached_seen = cached is not None
-    cached = int(cached or 0)
-    with _usage_lock:
-        bucket = _usage_by_session.setdefault(
-            session_id, {'prompt': 0, 'completion': 0, 'total': 0,
-                         'cached': 0, 'cached_seen': False})
-        bucket['prompt'] += prompt
-        bucket['completion'] += completion
-        bucket['total'] += total
-        bucket['cached'] += cached
-        bucket['cached_seen'] = bucket['cached_seen'] or cached_seen
-    return total
+    return {'prompt': prompt, 'completion': completion, 'total': total,
+            'cached': int(cached or 0), 'cached_seen': cached is not None}
 
 
 def _cache_hit_rate_line(bucket: dict) -> str:
@@ -1191,6 +1176,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
     turn_tokens=0 #本回合累计 tokens（含工具轮次）
+    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末写 usage 事件）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1264,8 +1250,12 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             with perf_segment('llm.main'):
                 response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
-            turn_tokens += _record_usage(session_store.session_id,
-                                         getattr(response, 'usage', None))
+            detail=_parse_usage(getattr(response, 'usage', None))
+            if detail:
+                turn_tokens += detail['total']
+                for _k in ('prompt','completion','cached','total'):
+                    turn_usage[_k] += detail[_k]
+                turn_usage['cached_seen'] = turn_usage['cached_seen'] or detail['cached_seen']
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 reactive_retries+=1
@@ -1319,10 +1309,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 else:
                     print(message.content)
             if turn_tokens:
-                with _usage_lock:
-                    cum = dict(_usage_by_session.get(session_store.session_id, {}))
+                # 埋点：本回合 usage 持久化为事件（跨重启可聚合，命中率可事后分析）
+                session_store.append('usage', **turn_usage)
+                cum = session_store.usage_totals()
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
-                      f'会话累计 {_fmt_tokens(cum.get("total", 0))}'
+                      f'会话累计 {_fmt_tokens(cum["total"])}'
                       f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
