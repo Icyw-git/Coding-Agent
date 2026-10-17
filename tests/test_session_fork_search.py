@@ -102,6 +102,47 @@ def test_agent_loop_streams_without_duplicate_print(tmp_path, monkeypatch, capsy
     assert 'task done' not in out     # 最终打印被抑制，无双份
 
 
+def test_compaction_tail_survives_replay(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='tail')
+    store.append_message({'role': 'user', 'content': '早期问题'})
+    store.append_compaction('早期摘要', 'manual', tail=[
+        {'role': 'user', 'content': '最近的问题'},
+        {'role': 'assistant', 'content': '最近的回答'},
+    ])
+    history = store.rebuild_openai_history()
+    assert history[0]['content'] == '[Compacted]\n\n早期摘要'
+    assert [m['content'] for m in history[1:]] == ['最近的问题', '最近的回答']
+    # 旧事件（无 tail 字段）回放不受影响
+    store.append('compaction', summary='纯摘要', strategy='auto',
+                 replaces_through_seq=store.last_seq)
+    history2 = store.rebuild_openai_history()
+    assert history2 == [{'role': 'user', 'content': '[Compacted]\n\n纯摘要'}]
+
+
+def test_record_compaction_writes_tail(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='rec')
+    harness._record_compaction(store, [
+        {'role': 'user', 'content': '[Reactive compact]\n\n摘要内容'},
+        {'role': 'user', 'content': '最近的问题'},
+        {'role': 'assistant', 'content': 'tail 回复'},
+    ], 'reactive')
+    event = store.read_events()[-1]
+    assert event['type'] == 'compaction' and event['summary'] == '摘要内容'
+    assert event['tail'] == [{'role': 'user', 'content': '最近的问题'},
+                             {'role': 'assistant', 'content': 'tail 回复'}]
+
+
+def test_inject_memories_appends_tail_system_message():
+    from agent_core import inject_memories
+    messages = [{'role': 'user', 'content': '问题'}]
+    out = inject_memories(messages, '<relevant_memories>记忆</relevant_memories>',
+                          '系统提示')
+    assert out[0] == {'role': 'system', 'content': '系统提示'}
+    assert out[1] == {'role': 'user', 'content': '问题'}   # 历史不被改写
+    assert out[-1]['role'] == 'system' and '记忆' in out[-1]['content']
+    assert messages[0]['content'] == '问题'                # 不污染原列表
+
+
 def test_last_user_skips_noise_input(tmp_path):
     store = SessionEventStore(tmp_path, session_id='noise')
     store.append_message({'role': 'user', 'content': 'x'})

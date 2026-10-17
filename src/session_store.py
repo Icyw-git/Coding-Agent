@@ -242,11 +242,13 @@ class SessionEventStore:
             arguments=tool_call.function.arguments,
         )
 
-    def append_compaction(self, summary: str, strategy: str) -> dict:
+    def append_compaction(self, summary: str, strategy: str, tail: list | None = None) -> dict:
+        """tail：压缩时保留的最近工作现场（消息列表），回放时还原在摘要之后。"""
         return self.append(
             "compaction",
             summary=summary,
             strategy=strategy,
+            tail=list(tail or []),
             replaces_through_seq=self._next_seq - 1,
         )
 
@@ -363,6 +365,12 @@ class SessionEventStore:
                 if not isinstance(summary, str):
                     raise SessionReplayError(f"invalid compaction event at seq {event.get('seq')}")
                 messages = [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+                # compact_history/reactive_compact 保留的最近工作现场（旧事件无
+                # tail 字段则只有摘要）；事件本身源自 JSONL，浅重建即可
+                tail = event.get("tail")
+                if isinstance(tail, list):
+                    messages.extend(m for m in tail
+                                    if isinstance(m, dict) and m.get('role'))
             elif event_type == "rewind":
                 messages = self._rewound_history(event)
             elif event_type == "tool_recovery":

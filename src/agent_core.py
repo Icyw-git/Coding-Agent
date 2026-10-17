@@ -551,13 +551,19 @@ def summarize_history(messages):  # 总结对话记录，返回总结内容
     return (response.choices[0].message.content or "(empty summary)").strip()
 
 
-def compact_history(messages):  # 使用 llm 进行对话记录压缩，返回压缩后的消息
+def compact_history(messages):  # 使用 llm 进行对话记录压缩：摘要 + 保留最近几轮原文
+    # 对齐 Codex 手感：压缩后保留最近工作现场（对话不断层），更早内容进摘要。
+    # tail 会写入 compaction 事件（见 _record_compaction），回放时完整还原。
     transcript_path = write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
     summary = summarize_history(messages)
-    # The request builder owns the system message. Keeping it out of canonical history
-    # avoids duplicating system prompts after a compaction or a replay.
-    return [{'role': 'user', 'content': f'[Compacted]\n\n{summary}'}]
+    tail_start = max(0, len(messages) - 6)
+    # 尾部起点不能是孤儿工具结果（其 assistant 已被裁掉）
+    while tail_start < len(messages) and _is_tool_result_message(messages[tail_start]):
+        tail_start += 1
+    result = [{'role': 'user', 'content': f'[Compacted]\n\n{summary}'}]
+    result.extend(messages[tail_start:])
+    return result
 
 
 def reactive_compact(messages):  # 保存完整对话记录，保留最近五条消息，返回压缩后的消息
@@ -573,14 +579,13 @@ def reactive_compact(messages):  # 保存完整对话记录，保留最近五条
 
 
 def inject_memories(messages, memories_content, system=None):
-    """记忆注入（返回副本，不污染 messages）：只往第一条 user 消息追加记忆；
-    system 非空时前置 system 消息。"""
+    """记忆注入（返回副本，不污染 messages）：记忆块作为独立的 system 消息
+    追加在请求末尾。主前缀（system + 全部历史）保持逐字稳定，供应商前缀
+    缓存（KV 复用）可跨轮命中——若改写第一条 user 消息（旧行为），每轮
+    召回结果变化都会作废整个前缀，多轮对话越长越亏。"""
     request_messages = messages.copy()
-    if memories_content:
-        for i, m in enumerate(request_messages):
-            if m.get('role') == 'user' and isinstance(m.get('content'), str):
-                request_messages[i] = {**m, 'content': memories_content + '\n\n' + m['content']}
-                break
     if system:
         request_messages = [{'role': 'system', 'content': system}] + request_messages
+    if memories_content:
+        request_messages.append({'role': 'system', 'content': memories_content})
     return request_messages

@@ -398,9 +398,6 @@ def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身�
         sections.append(f'Available tools:{tools}.')
     sections.append(f'Working directory:{context.get("workspace",get_workdir())}.')
 
-    memories=context.get('memories','')
-    if memories:
-        sections.append(f'Relevant memories:\n{memories}')
     skills=context.get('skills','')
     if skills:
         sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
@@ -477,18 +474,14 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return prompt
 
-def update_context(context:dict,messages:list)->dict: # 更新上下文，包含工具、工作目录、记忆、技能等
-    memories=''
-    if MEMORY_INDEX.exists():
-        content=MEMORY_INDEX.read_text(encoding='utf-8',errors='replace').strip()
-        if content:
-            memories=content
-    skills=list_skills()
+def update_context(context:dict,messages:list)->dict: # 更新上下文：工具、工作目录、技能
+    # ⚠ 记忆不再进 system prompt：housekeeping 每轮更新 MEMORY_INDEX，若嵌在
+    # system 里，请求前缀每轮逐字变化，供应商前缀缓存（KV 复用）全失效。
+    # 记忆由 inject_memories 作为请求末尾的独立 system 消息注入。
     return {
         'enabled_tools':list(tool_registry.keys()),
         'workspace':str(get_workdir()),
-        'memories':memories,
-        'skills':skills,
+        'skills':list_skills(),
     }
 
 
@@ -592,7 +585,7 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None): #压�
     else:
         messages = micro_compact(messages)
     if estimate_size(messages) > CONTEXT_LIMIT:
-        print("[auto compact]")
+        print("  [compact] 上下文接近上限，已自动压缩历史（完整记录已保存）")
         messages = compact_history(messages)
         if on_compact:
             on_compact(messages, 'auto')
@@ -648,7 +641,17 @@ def _record_compaction(session_store, compacted_messages, strategy):
         if summary.startswith(prefix):
             summary = summary[len(prefix):]
             break
-    session_store.append_compaction(summary, strategy)
+    # tail（压缩保留的最近工作现场）一并写入事件：此前 reactive 压缩保留的
+    # 最近 5 条只活在当前进程，重启回放后消失（只剩摘要）。
+    tail = []
+    marker_seen = False
+    for message in compacted_messages:
+        if (not marker_seen and message.get('role') == 'user'
+                and str(message.get('content', '')).startswith('[')):
+            marker_seen = True   # 摘要 marker 本身不入 tail
+            continue
+        tail.append(message)
+    session_store.append_compaction(summary, strategy, tail=tail)
 
 
 # ============================================================
@@ -1155,7 +1158,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 reactive_retries+=1
-                print('[reactive compact]')
+                print('  [compact] 请求超限，已自动压缩历史并重试（完整记录已保存）')
                 messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
                 _record_compaction(session_store, messages, 'reactive')
                 skip_micro_rounds=3

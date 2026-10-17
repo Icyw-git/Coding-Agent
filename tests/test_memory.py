@@ -110,11 +110,13 @@ def test_agent_loop_memory_injection():
         # 60s 余量：Windows 上新写入文件的首次读取可能被 AV 实时扫描卡住数秒。
         harness.wait_for_housekeeping(60)
 
-        # 主调用（calls[1]）应包含注入的记忆，且与原任务在同一 user 消息
+        # 主调用（calls[1]）：记忆块注入为请求末尾的独立 system 消息（保前缀缓存稳定），
+        # 原 user 消息保持原样
+        tail_system = [m for m in fake.calls[1] if m.get('role') == 'system'][-1]
+        assert '<relevant_memories>' in tail_system['content'], "记忆块未注入"
+        assert 'Body text.' in tail_system['content'], "记忆内容未注入"
         first_user = next(m for m in fake.calls[1] if m.get('role') == 'user')
-        assert '<relevant_memories>' in first_user['content'], "记忆块未注入"
-        assert 'Body text.' in first_user['content'], "记忆内容未注入"
-        assert 'do it' in first_user['content'], "原任务被覆盖"
+        assert first_user['content'] == 'do it', "原任务被覆盖"
         # 注入不能污染 messages：calls[1] 的 tool/assistant 结构保持合法
         tcm.assert_valid_openai_msgs(fake.calls[1], "injected")
 
