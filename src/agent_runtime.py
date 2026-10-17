@@ -137,6 +137,25 @@ class AgentRuntime:
         rows.sort(key=lambda row: (row['updated'], row['id']), reverse=True)
         return rows[:limit]
 
+    def search_sessions(self, query: str, limit: int = 10) -> list[dict]:
+        """跨会话内容搜索（含命中片段），按最近优先。"""
+        return self._session_store_cls.search_all(self._sessions_dir, query, limit)
+
+    def fork_session(self, session_id: str, upto_seq: int | None = None) -> str:
+        """从既有会话分叉出新会话（原会话不动），返回新会话 ID。"""
+        source = self.open_session(session_id)
+        forked = self._session_store_cls.fork(source, upto_seq=upto_seq)
+        return forked.session_id
+
+    def rename_session(self, session_id: str, title: str) -> str:
+        """设置会话主题（覆盖自动生成的标题），返回生效后的标题。"""
+        title = (title or '').strip()
+        if not title:
+            raise ValueError('标题不能为空')
+        store = self._open_session(session_id)
+        store.append_session_title(title[:80])
+        return store.session_summary()['title']
+
     def manage_session(self, action: str, row: dict):
         if action not in ('archive', 'restore', 'delete'):
             raise ValueError('未知会话操作')

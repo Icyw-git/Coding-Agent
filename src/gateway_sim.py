@@ -258,6 +258,24 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['pending']
 
+    def search_sessions(self, q: str, limit: int = 10) -> list[dict]:
+        response = self.http.get('/v1/sessions/search',
+                                 params={'q': q, 'limit': limit})
+        response.raise_for_status()
+        return response.json()['sessions']
+
+    def fork_session(self, session_id: str, upto_seq: int | None = None) -> str:
+        response = self.http.post(f'/v1/sessions/{session_id}/fork',
+                                  json={'upto_seq': upto_seq})
+        response.raise_for_status()
+        return response.json()['session_id']
+
+    def rename_session(self, session_id: str, title: str) -> str:
+        response = self.http.post(f'/v1/sessions/{session_id}/title',
+                                  json={'title': title})
+        response.raise_for_status()
+        return response.json()['title']
+
     def resolve_permission(self, req_id: str, allow: bool,
                            scope: str | None = None,
                            klass: str | None = None) -> dict:

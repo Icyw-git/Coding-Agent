@@ -66,6 +66,14 @@ if BaseModel is not None:
         klass: str | None = None     # 同类判定键（bash 命令首词）
 
 
+    class ForkSessionRequest(BaseModel):
+        upto_seq: int | None = None  # 复制到的事件序号（缺省=全部）
+
+
+    class RenameSessionRequest(BaseModel):
+        title: str = Field(min_length=1)  # 新会话主题
+
+
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
                access_log_path: str | None = None, task_root=None, workspace=None):
     """Create the HTTP application without starting background services."""
@@ -202,6 +210,40 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except (OSError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {'status': 'ok'}
+
+    @app.get("/v1/sessions/search")
+    def search_sessions(q: str, limit: int = 10):
+        """跨会话内容搜索：命中会话（摘要 + 片段），按最近优先。
+
+        必须注册在 /v1/sessions/{session_id} 之前，否则 'search' 会被当成
+        会话 ID 吃掉。
+        """
+        try:
+            rows = client.sessions.search(q, limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"sessions": rows}
+
+    @app.post("/v1/sessions/{session_id}/fork")
+    def fork_session(session_id: str, request: ForkSessionRequest):
+        try:
+            new_id = client.sessions.fork(session_id, request.upto_seq)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"session_id": new_id}
+
+    @app.post("/v1/sessions/{session_id}/title")
+    def rename_session(session_id: str, request: RenameSessionRequest):
+        """设置会话主题；404=会话不存在，400=标题为空。"""
+        try:
+            title = client.sessions.rename(session_id, request.title)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"title": title}
 
     @app.get("/v1/sessions/{session_id}")
     def get_session(session_id: str):

@@ -1,6 +1,6 @@
 """Small, mobile-friendly session cards; all actions use server-side snapshots."""
 
-from session_views import absolute_time, display_text, session_details, session_status
+from session_views import display_text, relative_time, session_details, session_status
 
 PAGE_SIZE = 5
 
@@ -27,7 +27,7 @@ def list_card(rows, token, current_id=None, page=0):
             elements.append(_text(f'工作区 · {workspace[:200]}'))
             previous_group = workspace
         elements.append(_text(f'{index + 1}. {row["title"][:80]}\n'
-                              f'{session_status(row, current_id)} · 最近活跃 {absolute_time(row.get("updated", 0))}'))
+                              f'{session_status(row, current_id)} · 最近活跃 {relative_time(row.get("updated"))}'))
         elements.append({'tag': 'action', 'actions': [
             _button('查看详情', token, 'details', index),
             _button('切换到此会话', token, 'switch', index, True),

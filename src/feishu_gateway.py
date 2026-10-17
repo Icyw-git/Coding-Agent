@@ -701,6 +701,10 @@ class FeishuGateway:
             '/pwd                   查看当前会话工作区',
             '/model                  查看当前模型配置',
             '/approvals、/perms       查看待审批操作',
+            '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
+            '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
+            '/find <关键词>           跨会话搜索历史内容',
+            '/rename <新主题>        设置当前会话主题',
             '/run <命令>            在任务目录执行命令',
             '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
             '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
@@ -729,8 +733,8 @@ class FeishuGateway:
                     self.bindings[chat_id] = session_id
                     self._save_bindings()
                 self._reply(chat_id, '已创建新会话，工作区保持不变。')
-            elif command == '/sessions' or command == '/resume' and not argument:
-                if command == '/sessions' and argument.isdigit() and int(argument) > 0:
+            elif command == '/sessions':
+                if argument.isdigit() and int(argument) > 0:
                     view = self._session_views.get(chat_id)
                     if view:
                         self._handle_session_action(chat_id, {'session_view': view[0], 'action': 'page',
@@ -742,8 +746,15 @@ class FeishuGateway:
                     self._show_sessions(chat_id, self.api.list_sessions(limit=1000))
             elif command in ('/use', '/resume'):
                 if not argument:
+                    if command == '/resume':
+                        rows = self.api.list_sessions(limit=1)
+                        if not rows:
+                            self._reply(chat_id, '还没有任何会话，直接发消息即可创建。')
+                            return
+                        self._switch_session(chat_id, rows[0])   # /resume 直达最近会话
+                        return
                     self._reply(chat_id, '用法: /use <会话ID前缀>'
-                                          '\n（/sessions 可查，前缀唯一即可）')
+                                          '\n（/sessions 可查，前缀唯一即可；/resume 直达最近会话）')
                     return
                 rows = self.api.list_sessions(limit=1000)
                 if command == '/resume' and argument.isdigit() and chat_id in self._session_choices:
@@ -819,6 +830,40 @@ class FeishuGateway:
             elif command == '/model':
                 self._reply(chat_id, f"当前模型: {os.getenv('LLM_MODEL_ID', '未配置')}\n"
                               f"服务地址: {os.getenv('LLM_BASE_URL', '默认地址')}")
+            elif command == '/fork':
+                sid = self.bindings.get(chat_id)
+                if not sid:
+                    self._reply(chat_id, '当前聊天没有绑定会话；先发消息或 /resume。')
+                    return
+                upto = int(argument) if argument.strip().isdigit() else None
+                try:
+                    new_id = self.api.fork_session(sid, upto)
+                except Exception as exc:
+                    self._reply(chat_id, f'[fork] 分叉失败: {exc}')
+                    return
+                with self._bindings_lock:
+                    self.bindings[chat_id] = new_id
+                    self._save_bindings()
+                self._reply(chat_id, f'已分叉出新会话 {new_id}（原会话 {sid[:12]} 保留），已切换。')
+            elif command == '/find':
+                if not argument:
+                    self._reply(chat_id, '用法: /find <关键词>（跨会话搜索历史内容）')
+                    return
+                rows = self.api.search_sessions(argument, limit=5)
+                if not rows:
+                    self._reply(chat_id, f'没有包含「{argument}」的会话。')
+                    return
+                from turn_progress import relative_time
+                lines = [f"{row['id'][:12]} · {relative_time(row.get('updated'))} · "
+                         f"{row['title']}\n    {row.get('matched', '')}" for row in rows]
+                self._reply(chat_id, '\n\n'.join(lines))
+            elif command == '/rename':
+                sid = self.bindings.get(chat_id)
+                if not sid:
+                    self._reply(chat_id, '当前聊天没有绑定会话；先发消息或 /resume。')
+                    return
+                title = self.api.rename_session(sid, argument.strip())
+                self._reply(chat_id, f'会话主题已设置为：{title}')
             elif command == '/approve':
                 tokens = argument.split()
                 if tokens and tokens[-1] in ('y', 'n') and len(tokens) == 1:

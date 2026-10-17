@@ -12,6 +12,11 @@ class SessionReplayError(ValueError):
     """Raised when a session event stream is invalid before its final line."""
 
 
+# 纯确认语不配当会话标题（generate_session_title 的忽略清单同源）
+_GENERIC_ACKS = {'go', 'ok', 'okay', 'yes', 'y', '嗯', '行', '好的',
+                 '继续', 'continue', 'do it', 'start'}
+
+
 class SessionEventStore:
     """The recovery source of truth; transcript snapshots remain separate exports."""
 
@@ -100,6 +105,7 @@ class SessionEventStore:
         created = events[0]['ts'] if events else 0
         last_message = None
         last_user = last_assistant = ''
+        last_useful_user = ''
         for event in events:
             if event.get('workspace'):
                 workspace = str(event['workspace'])
@@ -111,20 +117,37 @@ class SessionEventStore:
                 last_message = event['ts']
                 if isinstance(content, str) and content.strip():
                     if message['role'] == 'user':
-                        last_user = content.strip()[:1000]
+                        stripped = content.strip()
+                        last_user = stripped[:1000]
+                        # 「最近任务」跳过纯确认语/单字符噪声，露出最后一条有效输入
+                        if stripped.casefold() not in _GENERIC_ACKS and len(stripped) > 1:
+                            last_useful_user = stripped[:1000]
                     else:
                         last_assistant = content.strip()[:2000]
             if (event.get('type') == 'message' and message.get('role') == 'user'
                     and isinstance(content, str) and content.strip()):
                 prompts.append(' '.join(content.split()))
+        # session_title 事件是正式生成的标题（LLM/用户设置）：非系统注入、
+        # 非纯确认语（'go'/'好的'/…——显式宣告本会话无好标题）时直接采用。
+        # _useful_title_line 的最短长度规则只约束从 prompts 提取的 fallback；
+        # 兜底链最后保留 prompts[0]（第一条用户消息比 '新会话' 有信息量）。
+        system_junk = bool(title) and title.lstrip().startswith(('[', '<'))
+        title_is_ack = bool(title) and title.strip().casefold() in _GENERIC_ACKS
+        meaningful = [p for p in prompts
+                      if p.casefold() not in _GENERIC_ACKS]
+        if title and not system_junk and not title_is_ack:
+            chosen = title[:80]
+        elif title_is_ack:
+            chosen = '新会话'
+        else:
+            chosen = next((p[:80] for p in meaningful if _useful_title_line(p)),
+                          meaningful[0][:80] if meaningful else '新会话')
         return {
             'id': self.session_id,
-            'title': (title[:80] if title and _useful_title_line(title) else
-                      next((p[:80] for p in prompts if _useful_title_line(p)),
-                           '新会话')),
+            'title': chosen,
             'workspace': workspace,
             'preview': prompts[-1][:160] if prompts else '尚无任务',
-            'last_user': last_user,
+            'last_user': last_useful_user or last_user,
             'last_assistant': last_assistant,
             'events': len(events),
             'created': created,
@@ -425,6 +448,75 @@ class SessionEventStore:
                 + ". Verify current state before repeating any operation with side effects.</recovery>"
             ),
         }
+
+    # ---------- 分叉与跨会话搜索 ----------
+
+    FORK_EVENT_TYPES = ('message', 'compaction', 'session_title', 'workspace_changed')
+
+    @classmethod
+    def fork(cls, source: 'SessionEventStore', upto_seq: int | None = None,
+             session_id: str | None = None) -> 'SessionEventStore':
+        """从源会话分叉出新会话：复制 ≤upto_seq 的可重放事件，原会话不动。
+
+        checkpoint/rewind/tool_started 等与旧会话绑定的管理事件不复制；
+        截断处的孤儿工具消息由 rebuild 的 repair 逻辑闭合。标题原样保留
+        （追加后缀会被 _useful_title_line 的最短长度规则打回）。
+        """
+        new = cls(source.directory, session_id=session_id)
+        if new.path.exists():
+            raise FileExistsError(f'fork target already exists: {new.session_id}')
+        for event in source.read_events():
+            if upto_seq is not None and event.get('seq', 0) > upto_seq:
+                break
+            etype = event.get('type')
+            if etype not in cls.FORK_EVENT_TYPES:
+                continue
+            payload = {key: value for key, value in event.items()
+                       if key not in ('v', 'seq', 'session_id', 'type', 'ts')}
+            new.append(etype, **payload)
+        new.rebuild_openai_history()   # 触发孤儿修复与历史校验
+        return new
+
+    @classmethod
+    def search_all(cls, directory: Path, query: str, limit: int = 10) -> list[dict]:
+        """跨会话内容搜索：按最近优先返回命中会话（摘要 + 命中片段）。
+
+        先对原始文本做一次粗筛（避免逐文件全量 JSON 解析），命中后再
+        解析事件并定位首个命中的 user/assistant 消息片段。
+        """
+        needle = query.strip().casefold()
+        if not needle:
+            return []
+        hits: list[dict] = []
+        for path in sorted(Path(directory).glob('session_*.jsonl'),
+                           key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                if needle not in path.read_text(encoding='utf-8', errors='ignore').casefold():
+                    continue
+                store = cls.open(path)
+            except (OSError, ValueError):
+                continue
+            snippet = None
+            for event in store.read_events():
+                if event.get('type') != 'message':
+                    continue
+                message = event.get('message') or {}
+                content = message.get('content')
+                if isinstance(content, str):
+                    folded = content.casefold()
+                    pos = folded.find(needle)
+                    if pos >= 0:
+                        role = message.get('role', '?')
+                        snippet = f"{role}: {content[max(0, pos - 40):pos + 80]}".strip()
+                        break
+            if snippet is None:
+                continue
+            summary = store.session_summary()
+            summary['matched'] = ' '.join(snippet.split())[:160]
+            hits.append(summary)
+            if len(hits) >= limit:
+                break
+        return hits
 
 
 def _useful_title_line(content: str) -> str | None:

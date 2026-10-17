@@ -808,6 +808,26 @@ def handle_command(line:str,messages:list,session_store)->None:
         # compaction 事件回放时会重建 marker 消息本身，不能再追加同一条
         print(f'  已压缩会话上下文：{before} 条消息 → {len(messages)} 条。完整记录已保存。')
 
+    elif command == '/find':
+        if not argument:
+            print('  用法：/find <关键词>（跨会话搜索历史内容）')
+            return
+        rows = SessionEventStore.search_all(SESSIONS_DIR, argument, limit=8)
+        if not rows:
+            print(f'  没有包含「{argument}」的会话。')
+            return
+        from turn_progress import relative_time
+        for row in rows:
+            print(f"  {row['id'][:12]}  {relative_time(row.get('updated'))}  {row['title']}")
+            print(f"    {row.get('matched', '')}")
+
+    elif command == '/rename':
+        if session_store is None:
+            print('  [rename] 当前没有会话上下文。')
+            return
+        title = session_store.append_session_title(argument.strip()[:80])
+        print(f"  会话主题已设置为：{title['title']}")
+
     elif command == '/sessions':
         print(format_session_list())
 
@@ -1307,7 +1327,9 @@ def run_repl(initial_messages:list, session_store=None):
 
     def session_choices():
         for row in session_rows(limit=None):
-            yield row['id'], f"{row['title']} · {row['workspace'] or '工作目录未记录'} · {row['preview']}"
+            from turn_progress import relative_time
+            yield row['id'], (f"{row['title']} · {relative_time(row.get('updated'))}"
+                              f" · {row['workspace'] or '工作目录未记录'} · {row['preview']}")
 
     read_line = create_reader(lambda: WORKDIR, session_choices)
 
@@ -1332,25 +1354,32 @@ def run_repl(initial_messages:list, session_store=None):
                 break
             if command in ('/r', '/resume', '/sessions'):
                 parts = line.split(maxsplit=1)
-                if len(parts) != 2:
-                    identifier = choose_session(session_rows(limit=None, include_empty=True),
-                                                session_store.session_id, WORKDIR)
-                    if identifier is None:
-                        continue
-                else:
-                    identifier = parts[1]
+                argument = parts[1].strip() if len(parts) > 1 else ''
                 try:
-                    rows = session_rows(include_empty=False, query=identifier)
-                    matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
-                    if len(matches) == 1:
-                        path = matches[0]
-                    elif len(matches) > 1:
-                        selected = choose_session(rows, session_store.session_id)
-                        if selected is None:
+                    if argument == 'last':
+                        rows = session_rows(limit=1, include_empty=False)
+                        if not rows:
+                            print('  [session] 没有可恢复的会话。')
                             continue
-                        path = resolve_session_path(selected)
-                    else:
+                        path = resolve_session_path(rows[0]['id'])
+                    elif not argument:
+                        identifier = choose_session(session_rows(limit=None, include_empty=True),
+                                                    session_store.session_id, WORKDIR)
+                        if identifier is None:
+                            continue
                         path = resolve_session_path(identifier)
+                    else:
+                        rows = session_rows(include_empty=False, query=argument)
+                        matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
+                        if len(matches) == 1:
+                            path = matches[0]
+                        elif len(matches) > 1:
+                            selected = choose_session(rows, session_store.session_id)
+                            if selected is None:
+                                continue
+                            path = resolve_session_path(selected)
+                        else:
+                            path = resolve_session_path(argument)
                     candidate = SessionEventStore.open(path)
                     history = candidate.rebuild_openai_history(recover_pending=True)
                     summary = candidate.session_summary()
@@ -1378,6 +1407,23 @@ def run_repl(initial_messages:list, session_store=None):
                 session_store.record_workspace(WORKDIR)
                 messages = []
                 print('  已开始新会话，工作区保持不变。')
+                continue
+            if command == '/fork':
+                parts = line.split(maxsplit=1)
+                upto = None
+                if len(parts) > 1:
+                    if not parts[1].strip().isdigit():
+                        print('  [fork] 用法：/fork [事件序号]，缺省复制全部历史。')
+                        continue
+                    upto = int(parts[1].strip())
+                try:
+                    forked = SessionEventStore.fork(session_store, upto_seq=upto)
+                except (FileExistsError, OSError, SessionReplayError) as exc:
+                    print(f'  [fork] 分叉失败：{exc}')
+                    continue
+                session_store = forked
+                messages = session_store.rebuild_openai_history()
+                print(f'  已分叉出新会话 {forked.session_id}（原会话保留），后续对话在新会话进行。')
                 continue
             handle_command(line,messages,session_store)
             continue

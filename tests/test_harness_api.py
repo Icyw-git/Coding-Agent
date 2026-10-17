@@ -314,7 +314,8 @@ def test_task_storage_root_does_not_change_workspace(tmp_path, monkeypatch, api_
     monkeypatch.setenv('HARNESS_TASK_ROOT', str(tmp_path / 'records'))
     workspace = tmp_path / 'project'
     workspace.mkdir()
-    client = api_client(create_app(FakeRuntime(), api_token='t', workspace=workspace))
+    client = api_client(create_app(FakeRuntime(), api_token='t', workspace=workspace,
+                                   rate_limit=10000))
     headers = {'Authorization': 'Bearer t'}
     response = client.post('/v1/tasks', json={'command': 'echo workspace'}, headers=headers)
     assert response.status_code == 201

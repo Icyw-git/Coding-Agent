@@ -30,6 +30,9 @@ COMMANDS = (
     Command('/undo', (), '', '撤销最近一次已完成回合的文件和会话改动', '常用'),
     Command('/model', (), '', '查看当前模型配置', '常用'),
     Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '常用'),
+    Command('/fork', (), '[事件序号]', '从当前会话分叉出新会话（原会话保留）', '会话'),
+    Command('/find', ('/search',), '<关键词>', '跨会话搜索历史内容', '会话'),
+    Command('/rename', (), '<新主题>', '设置当前会话主题', '会话'),
     Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
     Command('/cd', (), '[路径]', '切换工作区；不带参数时查看路径', '工作区'),
     Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
@@ -76,6 +79,12 @@ def command_error(name: str, argument: str) -> str | None:
         if (len(tokens) != 2 or not tokens[0].isdigit()
                 or tokens[1] not in ('y', 'n')):
             return '用法：/approvals [序号] y|n，序号见 /approvals 列表。'
+    if name == '/fork' and argument and not argument.strip().isdigit():
+        return '用法：/fork [事件序号]，缺省复制全部历史。'
+    if name == '/find' and not argument.strip():
+        return '用法：/find <关键词>。'
+    if name == '/rename' and not argument.strip():
+        return '用法：/rename <新主题>。'
     return None
 
 

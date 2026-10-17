@@ -11,6 +11,23 @@ def format_duration(seconds: float) -> str:
     return f'{hours:02d}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
 
 
+def relative_time(ts: float | None, now: float | None = None) -> str:
+    """时间戳 → '刚刚 / N 分钟前 / N 小时前 / N 天前'，一周外显示日期。"""
+    if not ts:
+        return '时间未知'
+    now = time.time() if now is None else now
+    delta = max(0, int(now - ts))
+    if delta < 60:
+        return '刚刚'
+    if delta < 3600:
+        return f'{delta // 60} 分钟前'
+    if delta < 86400:
+        return f'{delta // 3600} 小时前'
+    if delta < 86400 * 7:
+        return f'{delta // 86400} 天前'
+    return time.strftime('%m-%d %H:%M', time.localtime(ts))
+
+
 class TurnProgress:
     def __init__(self):
         self.started = time.monotonic()

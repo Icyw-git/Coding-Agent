@@ -8,7 +8,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
 from cli_commands import COMMANDS, parse_command
-from session_views import (absolute_time, display_text, group_sessions, relative_time,
+from session_views import (display_text, group_sessions, relative_time,
                            session_details, session_status)
 
 
@@ -20,7 +20,7 @@ def session_label(row):
     lines = [f'  {title}', f'    工作区：{workspace}']
     if recent:
         lines.append(f'    最近：{recent}')
-    lines.append(f"    最近活跃：{absolute_time(row.get('updated', 0))}")
+    lines.append(f"    最近活跃：{relative_time(row.get('updated'))}")
     return '\n'.join(lines)
 
 
@@ -187,7 +187,7 @@ class SessionPicker:
                 previous_group = group
             marker = '› ' if index == self.index else '  '
             status = session_status(row, self.current_id)
-            suffix = f' {fit_cells(status, 6, pad=True)} {fit_cells(absolute_time(row.get("updated", 0)), 16, pad=True)}'
+            suffix = f' {fit_cells(status, 6, pad=True)} {fit_cells(relative_time(row.get("updated")), 16, pad=True)}'
             title_width = max(1, width - text_width(suffix) - 2)
             title = fit_cells(row.get('title') or '新会话', title_width, pad=True)
             output.append(('class:selected' if index == self.index else '', marker + title + suffix + '\n'))
