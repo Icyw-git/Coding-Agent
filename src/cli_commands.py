@@ -20,7 +20,7 @@ class Command:
 COMMANDS = (
     Command('/help', ('/?',), '[命令]', '显示帮助；如 /help rewind', '常用'),
     Command('/new', ('/n',), '[会话ID]', '开始新会话，保留当前工作区', '会话'),
-    Command('/resume', ('/r',), '[会话ID或前缀]', '选择并恢复会话及其工作目录', '会话'),
+    Command('/resume', ('/r',), '[last|会话ID或前缀]', '选择并恢复会话及其工作目录；last 直达最近会话', '会话'),
     Command('/sessions', ('/s',), '', '打开会话管理；按工作区分组、预览和切换', '会话'),
     Command('/archive', (), '[天数|all|empty|restore]', '归档旧会话；默认 30 天，可查看全部或恢复归档', '会话'),
     Command('/delete', (), '', '永久删除已归档会话及关联快照（不可恢复）', '会话'),

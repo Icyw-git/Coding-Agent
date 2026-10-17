@@ -25,7 +25,10 @@ def relative_time(ts: float | None, now: float | None = None) -> str:
         return f'{delta // 3600} 小时前'
     if delta < 86400 * 7:
         return f'{delta // 86400} 天前'
-    return time.strftime('%m-%d %H:%M', time.localtime(ts))
+    stamp = time.localtime(ts)
+    if stamp.tm_year != time.localtime(now).tm_year:
+        return time.strftime('%Y-%m-%d %H:%M', stamp)   # 跨年补年份，避免误读
+    return time.strftime('%m-%d %H:%M', stamp)
 
 
 class TurnProgress:

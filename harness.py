@@ -246,6 +246,7 @@ def _has_session_title_source(messages: list[dict]) -> bool:
 
 def format_status(session_store) -> str:
     """Summarize local runtime state for the interactive REPL."""
+    from turn_progress import relative_time
     manager = get_checkpoint_manager(session_store)
     with cron_lock:
         cron_count = len(scheduled_jobs)
@@ -254,8 +255,10 @@ def format_status(session_store) -> str:
     activity = [f'{count} 个{label}' for label, count in (
         ('任务', len(list_tasks())), ('定时任务', cron_count),
         ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
+    summary = session_store.session_summary()
     return (
-        f"  会话：{session_store.session_summary()['title']}\n"
+        f"  会话：{summary['title']}\n"
+        f"  最近活跃：{relative_time(summary['updated'])}\n"
         f'  工作区：{WORKDIR}\n'
         f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
@@ -289,7 +292,10 @@ def format_workspace_diff(workspace=None, path='', *, max_chars=12000) -> str:
         lines.extend(f'    {line}' for line in result.stdout.splitlines())
     if not lines:
         return '  工作区干净，没有未提交改动。'
-    return ('\n'.join(lines))[:max_chars]
+    text = '\n'.join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + '\n  （diff 过长，已截断…）'
+    return text
 
 
 def format_pending_approvals() -> str:
@@ -678,13 +684,16 @@ def format_checkpoint_list(manager)->str:
     if not rows:
         return '  暂无快照。用 /checkpoint 创建，或在执行任务时自动生成。'
     head=manager.head()
+    from turn_progress import relative_time
     lines=[]
     for row in rows:
         mark='*' if row['cp_id']==head else ' '
         label = row.get('label') or ('手动快照' if row['trigger'] == 'manual' else '任务快照')
         status = ' · 尚未完成' if row['status'] == 'open' else ''
         current = ' · 当前' if mark == '*' else ''
-        lines.append(f"  {label}{current}{status} · {len(row['files'])} 个文件\n"
+        # 时间锚点：没有它无法分辨快照是「刚才」还是「两小时前」的
+        when = f" · {relative_time(row.get('created_at'))}" if row.get('created_at') else ''
+        lines.append(f"  {label}{current}{status} · {len(row['files'])} 个文件{when}\n"
                      f"    /rewind {row['cp_id']}")
     return '\n'.join(lines)
 
@@ -1360,6 +1369,9 @@ def run_repl(initial_messages:list, session_store=None):
                         rows = session_rows(limit=1, include_empty=False)
                         if not rows:
                             print('  [session] 没有可恢复的会话。')
+                            continue
+                        if rows[0]['id'] == session_store.session_id:
+                            print(f"  [session] 最近会话就是当前会话：{rows[0]['title']}")
                             continue
                         path = resolve_session_path(rows[0]['id'])
                     elif not argument:

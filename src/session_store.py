@@ -146,7 +146,8 @@ class SessionEventStore:
             'id': self.session_id,
             'title': chosen,
             'workspace': workspace,
-            'preview': prompts[-1][:160] if prompts else '尚无任务',
+            'preview': ((' '.join((last_useful_user or last_user).split()))[:160]
+                        if (last_useful_user or last_user) else '尚无任务'),
             'last_user': last_useful_user or last_user,
             'last_assistant': last_assistant,
             'events': len(events),
@@ -459,8 +460,8 @@ class SessionEventStore:
         """从源会话分叉出新会话：复制 ≤upto_seq 的可重放事件，原会话不动。
 
         checkpoint/rewind/tool_started 等与旧会话绑定的管理事件不复制；
-        截断处的孤儿工具消息由 rebuild 的 repair 逻辑闭合。标题原样保留
-        （追加后缀会被 _useful_title_line 的最短长度规则打回）。
+        截断处的孤儿工具消息由 rebuild 的 repair 逻辑闭合。标题原样保留，
+        需要区分时用户可用 /rename 修改。
         """
         new = cls(source.directory, session_id=session_id)
         if new.path.exists():
@@ -496,6 +497,7 @@ class SessionEventStore:
                 store = cls.open(path)
             except (OSError, ValueError):
                 continue
+            summary = store.session_summary()
             snippet = None
             for event in store.read_events():
                 if event.get('type') != 'message':
@@ -503,15 +505,18 @@ class SessionEventStore:
                 message = event.get('message') or {}
                 content = message.get('content')
                 if isinstance(content, str):
-                    folded = content.casefold()
-                    pos = folded.find(needle)
+                    pos = content.casefold().find(needle)
                     if pos >= 0:
-                        role = message.get('role', '?')
+                        role = {'user': '用户', 'assistant': '助手'}.get(
+                            message.get('role'), message.get('role') or '?')
                         snippet = f"{role}: {content[max(0, pos - 40):pos + 80]}".strip()
                         break
+            if snippet is None and needle in summary['title'].casefold():
+                # 粗筛按全文命中（含标题事件）：正文找不到时标题命中也算命中，
+                # 否则只改过标题的会话会从搜索里消失
+                snippet = f"主题: {summary['title']}"
             if snippet is None:
                 continue
-            summary = store.session_summary()
             summary['matched'] = ' '.join(snippet.split())[:160]
             hits.append(summary)
             if len(hits) >= limit:

@@ -16,13 +16,17 @@ def test_status_is_readable_without_internal_ids(tmp_path, monkeypatch):
 
 
 def test_checkpoint_listing_keeps_actionable_reference():
+    import time
+
     import harness
 
     manager = SimpleNamespace(
         list=lambda: [dict(cp_id='cp_test', label='修改前', trigger='manual',
-                           status='open', files={})], head=lambda: 'cp_test')
+                           status='open', files={}, created_at=time.time() - 300)],
+        head=lambda: 'cp_test')
     output = harness.format_checkpoint_list(manager)
     assert '修改前 · 当前 · 尚未完成' in output
+    assert '5 分钟前' in output   # 快照时间锚点：能分辨「刚才」与「两小时前」
     assert '/rewind cp_test' in output
     assert 'files=' not in output
 

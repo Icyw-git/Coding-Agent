@@ -9,6 +9,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pytest
 
+import cli_input
 import gateway_sim
 import harness
 import feishu_gateway
@@ -65,7 +66,9 @@ def test_last_user_skips_noise_input(tmp_path):
     store.append_message({'role': 'user', 'content': 'x'})
     store.append_message({'role': 'assistant', 'content': 'ok'})
     store.append_message({'role': 'user', 'content': '检查会话标题过滤'})
-    assert store.session_summary()['last_user'] == '检查会话标题过滤'
+    summary = store.session_summary()
+    assert summary['last_user'] == '检查会话标题过滤'
+    assert summary['preview'] == '检查会话标题过滤'   # preview 与 last_user 同口径
     # 全部是噪声时退回原文，不凭空消失
     only = SessionEventStore(tmp_path, session_id='onlynoise')
     only.append_message({'role': 'user', 'content': 'x'})
@@ -89,6 +92,15 @@ def test_search_all_empty_query_returns_empty(tmp_path):
     assert SessionEventStore.search_all(tmp_path, '   ') == []
 
 
+def test_search_matches_title_only_sessions(tmp_path):
+    a = SessionEventStore(tmp_path, session_id='titled')
+    a.append_message({'role': 'user', 'content': '聊聊别的话题'})
+    a.append_session_title('猫爪杯专题研究')
+    hits = SessionEventStore.search_all(tmp_path, '猫爪杯')
+    assert [row['id'] for row in hits] == ['titled']
+    assert hits[0]['matched'].startswith('主题:')
+
+
 def test_relative_time():
     now = time.time()
     assert relative_time(None) == '时间未知'
@@ -96,6 +108,9 @@ def test_relative_time():
     assert relative_time(now - 300, now) == '5 分钟前'
     assert relative_time(now - 7200, now) == '2 小时前'
     assert relative_time(now - 3 * 86400, now) == '3 天前'
+    # 跨年：7 天外补年份，避免去年会话被误读成今年
+    cross = time.mktime((2025, 12, 1, 10, 0, 0, 0, 0, 0))
+    assert relative_time(cross, cross + 45 * 86400).startswith('2025-12-01')
 
 
 # ---------- CLI ----------
@@ -125,6 +140,18 @@ def test_rename_command_sets_title(tmp_path, capsys):
 def test_rename_without_title_prints_usage(capsys):
     harness.handle_command('/rename', [], None)
     assert '用法' in capsys.readouterr().out
+
+
+def test_resume_last_on_current_session(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    monkeypatch.setattr(harness, 'WORKDIR', tmp_path)
+    monkeypatch.setattr(harness, 'SKILLS_DIR', tmp_path / 'skills')
+    current = SessionEventStore(tmp_path, session_id='current')
+    current.append_message({'role': 'user', 'content': '当前会话的有效消息内容'})
+    commands = iter(['/resume last', '/quit'])
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: next(commands))
+    harness.run_repl([], current)
+    assert '最近会话就是当前会话' in capsys.readouterr().out
 
 
 def test_fork_command_validation():
@@ -207,8 +234,11 @@ def test_feishu_resume_last_fork_and_find(api_app, tmp_path):
         gw.bindings['c1'] = sid
         gw.on_message('c1', '关于猫爪杯的历史')   # 内容落盘到会话
 
-        # /resume 无参 → 直达最近会话
+        # /resume 无参：最近会话就是当前绑定 → 如实提示；解绑后再直达 → 真切换
         fake.sent.clear()
+        gw.on_message('c1', '/resume')
+        assert any('已绑定该会话' in text for _, text in fake.sent)
+        gw.on_message('c1', '/quit')
         gw.on_message('c1', '/resume')
         assert any('已切换到会话' in text for _, text in fake.sent)
 

@@ -34,6 +34,8 @@ import time
 
 import httpx
 
+from turn_progress import relative_time
+
 
 def format_event(event: dict) -> str:
     """Render one session event for the console stream."""
@@ -332,8 +334,9 @@ def repl(client: GatewayClient) -> int:
                     print(f'  session {client.create_session(argument or None)}')
                 elif command == '/sessions':
                     for row in client.list_sessions():
-                        print(f"  {row['id']}  events={row['events']}  "
-                              f"{row['title']}")
+                        # 与 CLI 口径一致：主题优先 + 相对时间；id 只留 12 位前缀供 /use
+                        print(f"  {row['id'][:12]}  {row['title']}"
+                              f"  ·  {relative_time(row.get('updated'))}")
                 elif command == '/use':
                     client.session_id = argument
                     print(f'  active session: {argument}')

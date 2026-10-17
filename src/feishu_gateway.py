@@ -536,10 +536,10 @@ class FeishuGateway:
 
     @staticmethod
     def _session_rows_text(rows, start=0):
-        from datetime import datetime
+        from turn_progress import relative_time
         lines = []
         for index, row in enumerate(rows, start + 1):
-            timestamp = datetime.fromtimestamp(row.get('updated', 0)).strftime('%m-%d %H:%M')
+            timestamp = relative_time(row.get('updated'))
             lines.append(f"{index}. {row['title']}\n工作区: {row.get('workspace') or '未记录'} · {timestamp}")
             if row.get('preview') and row['preview'] != row['title']:
                 lines.append(f"最近: {row['preview']}")
@@ -572,6 +572,10 @@ class FeishuGateway:
         self._reply(chat_id, fallback)
 
     def _switch_session(self, chat_id, row):
+        if row['id'] == self.bindings.get(chat_id):
+            # /resume 直达最近会话时，最近会话往往就是当前绑定：如实提示而非假装切换
+            self._reply(chat_id, f"已绑定该会话\n主题: {row['title']}")
+            return
         workspace = self.api.get_workspace(row['id'])
         with self._bindings_lock:
             self.bindings[chat_id] = row['id']
