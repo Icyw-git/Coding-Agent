@@ -4,10 +4,34 @@ import os
 
 import pytest
 
+import harness
 from hooks import GATE as permission_gate
 
 _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
              'HARNESS_APPROVAL_TIMEOUT')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_storage_dirs(tmp_path):
+    """把会话/快照/转录目录指向临时目录。
+
+    agent_loop 类测试（test_memory、test_context_manage 等）不传
+    session_store 时，harness 会按模块全局 SESSIONS_DIR / CHECKPOINT_DIR /
+    TRANSCRIPT_DIR 写进真实的 .cache —— 回归一次就往真实会话列表灌几十个
+    「1 分钟前」的测试会话。这里每个测试都重定向，结束后还原。
+
+    手动 try/finally 管理（不依赖 monkeypatch），理由见下方
+    _restore_permission_backend 的注释：teardown 顺序必须保证最后还原。
+    """
+    saved = (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR, harness.TRANSCRIPT_DIR)
+    harness.SESSIONS_DIR = tmp_path / 'sessions'
+    harness.CHECKPOINT_DIR = tmp_path / 'checkpoints'
+    harness.TRANSCRIPT_DIR = tmp_path / 'transcripts'
+    try:
+        yield
+    finally:
+        (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR,
+         harness.TRANSCRIPT_DIR) = saved
 
 
 @pytest.fixture(autouse=True)
