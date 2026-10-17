@@ -362,14 +362,17 @@ def consolidate_memories():
         "2. Remove outdated/contradicted memories\n"
         "3. Keep the total under 30 memories\n"
         "4. Preserve important user preferences above all\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
+        "Output ONLY the JSON array - no explanations, no markdown fences, no commentary. "
+        "The first character of your reply must be '[' and the last must be ']'. "
+        "Each item: {name, type, description, body}.\n\n"
         f"{catalog[:16000]}"
     )
 
-    try:
+    def _call(reminder=''):
         response = h.client.chat.completions.create(
             model=os.getenv('LLM_MODEL_ID'),
-            messages=[{'role': 'user', 'content': prompt}], max_tokens=4000
+            messages=[{'role': 'user', 'content': prompt + reminder}],
+            max_tokens=4000, temperature=0.2,   # 结构化输出：低温提高 JSON 合规率
         )
         msg = response.choices[0].message
         text = _extract_text(msg.content or '').strip()
@@ -377,10 +380,22 @@ def consolidate_memories():
             # 推理模型可能把 max_tokens 预算全花在 reasoning_content 上导致 content 为空，
             # 退而从 reasoning_content 里找 JSON 数组（与 extract_memories 一致）
             text = _extract_text(getattr(msg, 'reasoning_content', '') or '').strip()
+        return text
+
+    match = None
+    last_text = ''
+    for attempt in range(2):   # 首次失败（跑题/截断）：点名要求纯 JSON 重试一次
+        text = _call('\n\nREMINDER: Reply with ONLY the JSON array, nothing else.'
+                     if attempt else '')
+        last_text = text
         match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            print(f"[Memory: consolidate failed - no JSON array in LLM reply: {text[:200]!r}]")
-            return
+        if match:
+            break
+        print(f"[Memory: consolidate reply had no JSON array (attempt {attempt + 1}/2), retrying]")
+    if not match:
+        print(f"[Memory: consolidate failed - no JSON array in LLM reply: {last_text[:200]!r}]")
+        return
+    try:
         items = json.loads(match.group())
         if not items:
             # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
@@ -480,19 +495,32 @@ def collect_tool_results(messages):  # 收集所有工具结果
     return [msg for msg in messages if msg.get('role') == 'tool']
 
 
-def micro_compact(messages, size=None):  # 旧工具结果占位，只保留最近 KEEP_RECENT 条工具结果
+def micro_compact(messages, size=None, session_store=None):
+    """旧工具结果占位：只保留最近 KEEP_RECENT 条，**决策持久化为事件**。
+
+    前缀缓存保护（两条，缺一不可）：
+    1. 上下文不过半（estimate < 0.5×CONTEXT_LIMIT）不改写 —— 否则命中率 84%→6% 断崖；
+    2. 改写决策写入 tool_compacted 事件（rebuild 时确定性应用）—— 若只在内存改写，
+       每轮 rebuild 会还原原文再重新改写，滑动边界每轮断一次前缀（实测命中 ~50%）。
+       迟滞：新越界的工具结果攒够 4 条才成批改写，批间前缀逐字稳定。
+
+    占位符可恢复：带工具身份（名称+参数）与完整输出落盘路径。"""
     h = _h()
-    # 前缀缓存保护：原地改写历史会让供应商 KV 前缀缓存从改写处全部失效
-    # （实测命中率 84%→6% 断崖）。上下文不过半时保持历史逐字稳定，
-    # 用一点 token 占用换稳定命中 —— 净收益为正。超半后 token 占用优先。
-    # size：调用方（pre_compact_messages）已算好的 estimate，避免重复遍历/重复消费。
     if (size if size is not None else h.estimate_size(messages)) < h.CONTEXT_LIMIT * 0.5:
         return messages
+    if session_store is None:
+        return messages   # 无 store 无法持久化决策：跳过（auto 压缩仍兜底）
     tool_results = collect_tool_results(messages)
-    if len(tool_results) < h.KEEP_RECENT:
+    eligible = len(tool_results) - h.KEEP_RECENT
+    if eligible <= 0:
         return messages
-    # 占位符必须可恢复：带上工具身份（名称+参数）让模型知道丢的是什么、
-    # 完整输出落盘路径让信息零丢失（需要时 read 即回）。
+    compacted = session_store.compacted_placeholders()
+    prefix_ids = [m.get('tool_call_id') for m in tool_results[:eligible]]
+    new_ids = [cid for cid in prefix_ids if cid and cid not in compacted]
+    if len(new_ids) < 4:
+        return messages   # 新越界不足一批：本轮不改写，保住前缀缓存
+    content_by_id = {m.get('tool_call_id'): str(m.get('content', ''))
+                     for m in tool_results}
     identity = {}
     for m in messages:
         if m.get('role') != 'assistant':
@@ -501,14 +529,18 @@ def micro_compact(messages, size=None):  # 旧工具结果占位，只保留最�
             fn = call.get('function') or {}
             identity[call.get('id')] = (f"{fn.get('name', '?')}"
                                         f"({str(fn.get('arguments', ''))[:80]})")
-    for msg in tool_results[:-h.KEEP_RECENT]:
-        content = str(msg.get('content', ''))
-        if len(content) > 120:
-            path = _persist_to_file(msg.get('tool_call_id', 'unknown'), content)
-            saved = f' Full output saved: {path}.' if path else ''
-            ident = identity.get(msg.get('tool_call_id'), msg.get('tool_call_id', '?'))
-            msg['content'] = (f"[Earlier tool result compacted: {ident}."
-                              f"{saved} Re-run the tool if needed.]")
+    for call_id in new_ids:
+        path = _persist_to_file(call_id, content_by_id.get(call_id, ''))
+        saved = f' Full output saved: {path}.' if path else ''
+        ident = identity.get(call_id, call_id)
+        placeholder = (f"[Earlier tool result compacted: {ident}."
+                       f"{saved} Re-run the tool if needed.]")
+        session_store.append_tool_compacted(call_id, placeholder)
+        compacted[call_id] = placeholder
+    # 当前轮立即应用（历史里的占位由 rebuild 提供，这里补新决策的）
+    for m in messages:
+        if m.get('role') == 'tool' and m.get('tool_call_id') in compacted:
+            m['content'] = compacted[m['tool_call_id']]
     return messages
 
 

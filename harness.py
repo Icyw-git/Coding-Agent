@@ -589,7 +589,7 @@ tool_registry['load_skill']=load_skill
 # 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
 # ============================================================
 
-def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
+def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session_store=None): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
     """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
     返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
     messages = tool_result_budget(messages)
@@ -598,7 +598,7 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None): #压�
     if skip_micro_rounds > 0:
         skip_micro_rounds -= 1   # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
     else:
-        messages = micro_compact(messages, size)
+        messages = micro_compact(messages, size, session_store=session_store)
     if size > CONTEXT_LIMIT:
         print("  [compact] 上下文接近上限，已自动压缩历史（完整记录已保存）")
         messages = compact_history(messages)
@@ -1209,6 +1209,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         messages, skip_micro_rounds = pre_compact_messages(
             messages, skip_micro_rounds,
             on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
+            session_store=session_store,
         ) #压缩预处理流程
 
         if rounds_since_todo >=8 and messages:

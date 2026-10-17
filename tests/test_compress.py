@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
+from session_store import SessionEventStore
 
 KEEP_RECENT = harness.KEEP_RECENT
 PERSIST = harness.PERSIST_THERSHOLD
@@ -152,9 +153,11 @@ def test_collect_tool_results():
 def test_micro_compact(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 400)   # 降低门槛：只验证改写路径本身
     monkeypatch.setattr(harness, 'TOOL_RESULTS_DIR', tmp_path / 'tool_results')
-    # 轮数必须 > KEEP_RECENT，否则 [:-KEEP_RECENT] 为空、改写断言空转通过
-    msgs = build_conversation(6 + KEEP_RECENT, content_len=200)
-    out = harness.micro_compact(msgs)
+    # 轮数必须 > KEEP_RECENT，否则 eligible<=0、改写断言空转通过
+    store = SessionEventStore(tmp_path, session_id='mc')
+    for m in build_conversation(6 + KEEP_RECENT, content_len=200):
+        store.append_message(m)
+    out = harness.micro_compact(store.rebuild_openai_history(), session_store=store)
     tool_msgs = [m for m in out if m["role"] == "tool"]
     assert len(tool_msgs) == 6 + KEEP_RECENT
     for m in tool_msgs[:-KEEP_RECENT]:
@@ -163,6 +166,9 @@ def test_micro_compact(tmp_path, monkeypatch):
         assert "Full output saved" in m["content"], "完整输出必须落盘（零丢失）"
     for m in tool_msgs[-KEEP_RECENT:]:
         assert str(m["content"]).startswith("output-"), "最近的结果不应被压缩"
+    # 决策已持久化为事件：再次 rebuild 得到逐字相同的占位（跨轮/跨重启稳定）
+    again = [m["content"] for m in store.rebuild_openai_history() if m["role"] == "tool"]
+    assert again == [m["content"] for m in tool_msgs]
     # 落盘文件真实存在且内容完整
     import re
     saved = re.search(r"Full output saved: (.+?)\. Re-run", tool_msgs[0]["content"])
@@ -178,6 +184,39 @@ def test_micro_compact_gated_below_half_context():
     tool_msgs = [m for m in out if m["role"] == "tool"]
     assert all(str(m["content"]).startswith("output-") for m in tool_msgs), \
         "低水位下历史必须保持逐字稳定"
+
+
+def test_micro_compact_hysteresis_keeps_prefix_stable(tmp_path, monkeypatch):
+    """滑动窗口每轮越界 1 条：攒批改写（≥4），批间占位逐字稳定（缓存命中关键）。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 400)
+    monkeypatch.setattr(harness, 'TOOL_RESULTS_DIR', tmp_path / 'tr')
+    store = SessionEventStore(tmp_path, session_id='hys')
+    for m in build_conversation(14, content_len=200):
+        store.append_message(m)
+
+    def step(n_tools):
+        # 取前 n_tools 个工具结果对应的历史前缀（模拟会话增长到该轮）
+        seen, msgs = 0, []
+        for m in store.rebuild_openai_history():
+            if m.get('role') == 'tool':
+                seen += 1
+            msgs.append(m)
+            if seen >= n_tools:
+                break
+        out = harness.micro_compact(msgs, size=99999, session_store=store)
+        return [m['content'] for m in out if m.get('role') == 'tool']
+
+    t10 = step(10)   # eligible=4 → 首批改写 4 条
+    assert sum(c.startswith('[Earlier tool result compacted') for c in t10) == 4
+    t12 = step(12)   # eligible=6，新越界 2 < 4 → 本轮不改写
+    assert t12[:4] == t10[:4]                                   # 批间占位逐字稳定
+    assert all(c.startswith('output-') for c in t12[4:])        # 新越界保持原文
+    t14 = step(14)   # eligible=8，新越界 4 → 第二批
+    assert sum(c.startswith('[Earlier tool result compacted') for c in t14) == 8
+    assert t14[4:6] != t12[4:6]                                 # 第二批覆盖新越界条目
+    # 决策持久化：rebuild 仍得到相同占位（跨重启稳定）
+    again = [m['content'] for m in store.rebuild_openai_history() if m.get('role') == 'tool']
+    assert again == t14
 
 
 def test_persist_large_output():

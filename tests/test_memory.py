@@ -130,6 +130,39 @@ def test_agent_loop_memory_injection():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_consolidate_retries_on_non_json_reply(tmp_path, monkeypatch):
+    """consolidate 首次回复跑题（无 JSON 数组）时：点名要求纯 JSON 重试一次。"""
+    import agent_core
+
+    mem = tmp_path / 'mem'
+    monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
+    monkeypatch.setattr(harness, 'CONSOLIDATE_THRESHOLD', 2)
+    for i in range(3):
+        harness.write_memory_file(f'm{i}', 'user', f'话题{i}', f'内容{i}')
+
+    calls = []
+
+    class Reply:
+        def __init__(self, text):
+            self.choices = [SimpleNamespace(message=SimpleNamespace(
+                content=text, reasoning_content=None))]
+
+    def fake_create(**kwargs):
+        calls.append(kwargs['messages'][-1]['content'])
+        if len(calls) == 1:
+            return Reply('We need answer to user request: consolidate memory files. '
+                         'Need merge duplicates, keep under 30 memories, ')
+        return Reply('[{"name": "merged", "type": "project", '
+                     '"description": "合并后的记忆", "body": "正文内容"}]')
+
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fake_create)
+    agent_core.consolidate_memories()
+    assert len(calls) == 2, f'应重试一次，实际 {len(calls)} 次调用'
+    assert 'REMINDER: Reply with ONLY the JSON array' in calls[1]
+    assert (mem / 'merged.md').exists(), '重试成功后应落盘合并记忆'
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith('test_') and callable(v)]

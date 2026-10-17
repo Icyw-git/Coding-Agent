@@ -252,6 +252,20 @@ class SessionEventStore:
             replaces_through_seq=self._next_seq - 1,
         )
 
+    def append_tool_compacted(self, tool_call_id: str, placeholder: str) -> dict:
+        """micro_compact 的改写决策持久化：rebuild 时该工具结果以 placeholder 呈现。
+
+        事件使占位符跨轮/跨重启逐字稳定（前缀缓存依赖这一点）；
+        原始 tool 结果事件保留在流中，undo/rewind 仍可回溯。"""
+        return self.append('tool_compacted', tool_call_id=tool_call_id, placeholder=placeholder)
+
+    def compacted_placeholders(self) -> dict:
+        """已改写占位：tool_call_id → 占位文本（事件缓存命中时零解析开销）。"""
+        return {e['tool_call_id']: e['placeholder']
+                for e in self.read_events()
+                if e.get('type') == 'tool_compacted'
+                and e.get('tool_call_id') and e.get('placeholder')}
+
     def append_checkpoint(self, checkpoint_id: str, through_seq: int | None = None, *,
                           label: str = "", trigger: str = "turn") -> dict:
         """记录一个可回溯节点；快照本体在 .cache/checkpoints/<id>/ 下，不进事件流。"""
@@ -350,8 +364,15 @@ class SessionEventStore:
     def rebuild_openai_history(self, *, recover_pending: bool = False,
                                repair_gaps: bool = False) -> list[dict]:
         """Rebuild the current compacted OpenAI history from the append-only event stream."""
+        events = self.read_events()
+        # tool_compacted 占位（micro_compact 的持久化决策）：两遍扫描 ——
+        # 先收集 tool_call_id → 占位文本，再在构建时替换对应 tool 消息
+        placeholders = {e['tool_call_id']: e['placeholder']
+                        for e in events
+                        if e.get('type') == 'tool_compacted'
+                        and e.get('tool_call_id') and e.get('placeholder')}
         messages = []
-        for event in self.read_events():
+        for event in events:
             event_type = event.get("type")
             if event_type == "message":
                 message = event.get("message")
@@ -359,7 +380,11 @@ class SessionEventStore:
                     raise SessionReplayError(f"invalid message event at seq {event.get('seq')}")
                 # 事件 dict 全部源自 JSONL 解析（天然 JSON 安全）；json 往返比
                 # copy.deepcopy 快 2-3 倍，多轮长对话每回合都要整体重建历史
-                messages.append(json.loads(json.dumps(message)))
+                entry = json.loads(json.dumps(message))
+                if (entry.get('role') == 'tool'
+                        and entry.get('tool_call_id') in placeholders):
+                    entry['content'] = placeholders[entry['tool_call_id']]
+                messages.append(entry)
             elif event_type == "compaction":
                 summary = event.get("summary")
                 if not isinstance(summary, str):
@@ -371,6 +396,11 @@ class SessionEventStore:
                 if isinstance(tail, list):
                     messages.extend(m for m in tail
                                     if isinstance(m, dict) and m.get('role'))
+                    # tail 里的 tool 消息同样应用占位（保持逐字稳定）
+                    for entry in messages:
+                        if (entry.get('role') == 'tool'
+                                and entry.get('tool_call_id') in placeholders):
+                            entry['content'] = placeholders[entry['tool_call_id']]
             elif event_type == "rewind":
                 messages = self._rewound_history(event)
             elif event_type == "tool_recovery":
@@ -507,7 +537,8 @@ class SessionEventStore:
 
     # ---------- 分叉与跨会话搜索 ----------
 
-    FORK_EVENT_TYPES = ('message', 'compaction', 'session_title', 'workspace_changed')
+    FORK_EVENT_TYPES = ('message', 'compaction', 'session_title', 'workspace_changed',
+                        'tool_compacted')
 
     @classmethod
     def fork(cls, source: 'SessionEventStore', upto_seq: int | None = None,
