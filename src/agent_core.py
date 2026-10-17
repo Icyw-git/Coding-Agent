@@ -223,13 +223,14 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
 
 def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
     # 召回策略 HARNESS_MEMORY_RECALL：
-    #   llm   默认——每条消息一次 LLM 筛选往返（旧行为，兼容）
-    #   local 本地中文关键词筛选，零网络往返（省 ~2s/轮，见 perf 分段 mem.load）
-    #   off   关闭召回
+    #   local 默认——本地中文关键词筛选，零网络往返（省 ~2s/轮，见 perf 分段 mem.load）；
+    #          召回质量与 llm 模式不同（关键词匹配 vs 语义筛选）
+    #   llm    旧行为——每条消息一次 LLM 筛选往返，需要语义召回时显式开启
+    #   off    关闭召回
     # HARNESS_LOAD_MEMORIES=0 仍生效（等价 off，向后兼容）。
     if os.getenv('HARNESS_LOAD_MEMORIES', '1') == '0':
         return ''
-    mode = os.getenv('HARNESS_MEMORY_RECALL', 'llm').strip().lower()
+    mode = os.getenv('HARNESS_MEMORY_RECALL', 'local').strip().lower()
     if mode == 'off':
         return ''
     if mode == 'local':

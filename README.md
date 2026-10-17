@@ -126,7 +126,7 @@ HARNESS_MEMORY_RECALL=local
 HARNESS_PERF=1
 ```
 
-`local` 使用中英文关键词匹配，语义召回能力与 `llm` 不同；不设置时保留 `llm`。
+`local` 使用中英文关键词匹配，语义召回能力与 `llm` 不同；不设置时默认 `local`（每轮省一次 LLM 筛选往返，约 2s）。
 旧开关 `HARNESS_LOAD_MEMORIES=0` 仍会关闭召回。
 性能统计可通过 `perf.snapshot()` 读取当前执行上下文的数据；不同请求独立统计，
 飞书网关与 API 服务也分别统计，尚未自动合并为端到端报告。

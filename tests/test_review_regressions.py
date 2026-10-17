@@ -70,7 +70,7 @@ def test_catalog_reuses_and_invalidates_summaries(tmp_path, monkeypatch):
     monkeypatch.setattr(SessionEventStore, 'read_events', counted)
     assert harness.session_rows()[0]['title'] == 'task'
     initial = len(reads)
-    assert initial == 2
+    assert initial == 1   # _read_last_seq 走尾部扫描，不再触发全量 read_events
     harness.session_rows()
     harness.list_session_paths()
     assert len(reads) == initial

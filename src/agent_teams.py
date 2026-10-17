@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-import openai
 
 from team_protocols import (ProtocolState, pending_requests, new_request_id,
                             handle_inbox_message)
@@ -19,10 +18,28 @@ WORKDIR = Path(os.getcwd()).resolve()
 MAILBOX_DIR = WORKDIR / '.mailbox'
 MAILBOX_DIR.mkdir(exist_ok=True)
 
-client = openai.OpenAI(
-    api_key=os.getenv("LLM_API_KEY"),
-    base_url=os.getenv("LLM_BASE_URL"),
-)
+
+class _LazyLLMClient:
+    """延迟构造 OpenAI 客户端（同 harness._LazyLLMClient）：openai SDK 的
+    import 约 1.5s，只在真正发起团队协作调用时才加载。"""
+
+    def __init__(self):
+        self._real = None
+
+    def _instance(self):
+        if self._real is None:
+            import openai
+            self._real = openai.OpenAI(
+                api_key=os.getenv("LLM_API_KEY"),
+                base_url=os.getenv("LLM_BASE_URL"),
+            )
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._instance(), name)
+
+
+client = _LazyLLMClient()
 
 active_teammates = {}
 AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')

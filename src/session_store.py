@@ -57,8 +57,31 @@ class SessionEventStore:
             return cls._locks.setdefault(path.resolve(), threading.Lock())
 
     def _read_last_seq(self) -> int:
+        """从文件尾部定位最后一个完整事件的 seq。
+
+        只读尾部 64KB：打开会话（每回合、每次列表）都走这里，全量解析一个
+        10MB 会话要上百毫秒，而这里只需要一个数字。尾块内解析不出事件时
+        （极小文件/损坏）退回全量路径保持原语义。
+        """
         if not self.path.exists():
             return 0
+        size = self.path.stat().st_size
+        with open(self.path, 'rb') as handle:
+            handle.seek(max(0, size - 65536))
+            data = handle.read()
+        lines = data.split(b'\n')
+        if size > 65536:
+            lines = lines[1:]   # 首行是被截断的上文半行
+        for raw in reversed(lines):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue   # 写入中的半行 / 损坏行：向前找最后一条完整事件
+            if isinstance(event, dict) and isinstance(event.get('seq'), int):
+                return event['seq']
         events = self.read_events(allow_partial_tail=True)
         return max((int(event.get("seq", 0)) for event in events), default=0)
 
@@ -332,7 +355,9 @@ class SessionEventStore:
                 message = event.get("message")
                 if not isinstance(message, dict) or "role" not in message:
                     raise SessionReplayError(f"invalid message event at seq {event.get('seq')}")
-                messages.append(copy.deepcopy(message))
+                # 事件 dict 全部源自 JSONL 解析（天然 JSON 安全）；json 往返比
+                # copy.deepcopy 快 2-3 倍，多轮长对话每回合都要整体重建历史
+                messages.append(json.loads(json.dumps(message)))
             elif event_type == "compaction":
                 summary = event.get("summary")
                 if not isinstance(summary, str):

@@ -325,11 +325,12 @@ def test_task_storage_root_does_not_change_workspace(tmp_path, monkeypatch, api_
     outside = client.post('/v1/tasks', json={'command': 'echo no', 'cwd': str(tmp_path)},
                           headers=headers)
     assert outside.status_code == 400
-    for _ in range(100):
+    deadline = time.time() + 15   # 时间窗轮询：负载下 echo 子进程可能偶尔 >3s
+    while time.time() < deadline:
         state = client.get(f"/v1/tasks/{record['id']}", headers=headers).json()['task']
         if state['status'] in ('succeeded', 'failed'):
             break
-        time.sleep(0.01)
+        time.sleep(0.05)
     assert state['status'] == 'succeeded'
 
 

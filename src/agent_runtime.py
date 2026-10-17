@@ -33,15 +33,22 @@ class SessionAlreadyExistsError(ValueError):
 _summary_cache: dict[tuple, dict] = {}
 
 
+def _summary_cached(path, stat) -> dict | None:
+    """摘要缓存命中则返回浅拷贝；未命中返回 None（调用方再决定是否解析）。"""
+    hit = _summary_cache.get((str(path), stat.st_size, stat.st_mtime_ns))
+    return dict(hit) if hit is not None else None
+
+
 def _cached_summary(store) -> dict:
     stat = store.path.stat()
-    key = (str(store.path), stat.st_size, stat.st_mtime_ns)
-    hit = _summary_cache.get(key)
-    if hit is None:
-        hit = store.session_summary()
-        if len(_summary_cache) > 512:
-            _summary_cache.clear()
-        _summary_cache[key] = hit
+    hit = _summary_cached(store.path, stat)
+    if hit is not None:
+        return hit
+    hit = store.session_summary()
+    stat = store.path.stat()
+    if len(_summary_cache) > 512:
+        _summary_cache.clear()
+    _summary_cache[(str(store.path), stat.st_size, stat.st_mtime_ns)] = hit
     return dict(hit)   # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
 
 
@@ -147,11 +154,17 @@ class AgentRuntime:
         rows = []
         for path in paths:
             try:
+                hit = _summary_cached(path, path.stat())
+            except OSError:
+                continue   # unreadable log: leave it out of the listing
+            if hit is not None:
+                rows.append(hit)   # 缓存命中：连 store 都不必构造
+                continue
+            try:
                 store = self._session_store_cls.open(path)
-                summary = _cached_summary(store)
+                rows.append(_cached_summary(store))
             except (OSError, ValueError):
                 continue   # unreadable/corrupt log: leave it out of the listing
-            rows.append(summary)
         rows.sort(key=lambda row: (row['updated'], row['id']), reverse=True)
         return rows[:limit]
 

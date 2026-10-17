@@ -1,7 +1,6 @@
 import argparse
-import os 
+import os
 from dotenv import load_dotenv
-import openai
 import json
 import time
 import threading
@@ -37,7 +36,6 @@ from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
 from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
-from mcp_bridge import register_mcp_tools, shutdown_mcp
 from session_store import SessionEventStore, SessionReplayError
 from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
@@ -60,11 +58,37 @@ scan_skills()   # 扫描技能目录 → SKILL_REGISTRY（skill_system 内）
 
 
 
-client=openai.OpenAI(
-    api_key=os.getenv("LLM_API_KEY"),
-    base_url=os.getenv("LLM_BASE_URL"),
-    timeout=120,   # API 挂起时最多等 120s 抛错，避免静默阻塞 600s（SDK 默认）
-)
+class _LazyLLMClient:
+    """延迟构造 OpenAI 客户端：openai SDK 的 import 约 1.5s，CLI/测试进程
+    启动时不该为它买单。属性访问透明委托，首次真正调用 LLM 时才加载。"""
+
+    def __init__(self):
+        self._real = None
+
+    def _instance(self):
+        if self._real is None:
+            import openai   # 首次使用时加载（import 即 ~1.5s）
+            self._real = openai.OpenAI(
+                api_key=os.getenv("LLM_API_KEY"),
+                base_url=os.getenv("LLM_BASE_URL"),
+                timeout=120,   # API 挂起时最多等 120s 抛错，避免静默阻塞 600s（SDK 默认）
+            )
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._instance(), name)
+
+
+client = _LazyLLMClient()
+
+
+def __getattr__(name):
+    """模块级懒加载（PEP 562）：mcp_bridge 的 import 约 1s，只延迟到真正
+    触及 MCP 的那一刻（initialize_mcp_tools / 生命周期关闭）。"""
+    if name in ('register_mcp_tools', 'shutdown_mcp'):
+        import mcp_bridge
+        return getattr(mcp_bridge, name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 def validate_runtime_config(environ=None) -> None:
@@ -992,6 +1016,14 @@ def _stream_completion(create_kwargs, on_delta):
     _t0 = time.perf_counter()
     _ttfb_done = False
     stream = client.chat.completions.create(**create_kwargs, stream=True)
+    if not hasattr(stream, '__iter__'):
+        # 客户端不支持流式（测试假件/兼容层返回非迭代对象）：整段作为单次
+        # 增量交付并按非流式形状返回，调用方无需区分。
+        response = stream
+        content = getattr(response.choices[0].message, 'content', None)
+        if content:
+            on_delta(content)
+        return response
     text_parts = []
     tool_calls = {}
     finish_reason = None
@@ -1047,6 +1079,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     reactive_retries=0 #响应重试次数
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
+    streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1107,7 +1140,13 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             )
             if on_delta is None:
                 return client.chat.completions.create(**kwargs)
-            return _stream_completion(kwargs, on_delta)
+
+            def _delta_hook(part):
+                streamed_parts.append(part)
+                on_delta(part)
+
+            streamed_parts.clear()   # 标记只反映最近一次调用
+            return _stream_completion(kwargs, _delta_hook)
 
         try: #错误恢复逻辑
             with perf_segment('llm.main'):
@@ -1161,7 +1200,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 messages.append({'role':'user','content':force})
                 continue
             if message.content:
-                print(message.content)
+                if streamed_parts:
+                    print()   # 流式已逐段输出到终端，只补换行
+                else:
+                    print(message.content)
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
@@ -1272,7 +1314,12 @@ def initialize_mcp_tools() -> None:
     global _mcp_initialized
     with _mcp_init_lock:
         if not _mcp_initialized:
-            TOOLS.extend(register_mcp_tools(tool_registry))
+            # 优先取模块命名空间里的 register_mcp_tools（测试可打补丁）；
+            # 未注入时才懒加载 mcp_bridge（import 约 1s，见模块级 __getattr__）
+            register = globals().get('register_mcp_tools')
+            if register is None:
+                from mcp_bridge import register_mcp_tools as register
+            TOOLS.extend(register(tool_registry))
             _mcp_initialized = True
 
 
@@ -1443,7 +1490,9 @@ def run_repl(initial_messages:list, session_store=None):
         messages.append({'role':'user','content':line})
         session_store.append_message(messages[-1])
         try:
-            agent_loop(messages,session_store=session_store)
+            # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
+            agent_loop(messages, session_store=session_store,
+                       on_delta=lambda part: print(part, end='', flush=True))
         except KeyboardInterrupt:
             print('\n[会话已中断]')
         messages[:]=session_store.rebuild_openai_history(recover_pending=True)

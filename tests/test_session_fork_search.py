@@ -78,6 +78,30 @@ def test_read_events_cache_stays_coherent(tmp_path):
     assert len(third) == 3 and third[-1]['title'] == '外部写入'
 
 
+def test_agent_loop_streams_without_duplicate_print(tmp_path, monkeypatch, capsys):
+    import test_context_manage as tcm
+
+    store = SessionEventStore(tmp_path, session_id='stream')
+    mem = tmp_path / 'mem'
+    monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
+    harness.write_memory_file('e2e-mem', 'user', 'desc', 'Body text.')
+    fake = tcm.FakeCompletions([
+        tcm.make_text_response('[0]'),
+        tcm.make_text_response('task done'),
+        tcm.make_text_response('[]'),
+    ])
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fake.create)
+    seen = []
+    harness.agent_loop([{'role': 'user', 'content': 'do it'}],
+                       session_store=store,
+                       on_delta=lambda part: seen.append(part))
+    harness.wait_for_housekeeping(30)
+    assert seen == ['task done']      # 流式增量把回复交付一次（非流式客户端降级）
+    out = capsys.readouterr().out
+    assert 'task done' not in out     # 最终打印被抑制，无双份
+
+
 def test_last_user_skips_noise_input(tmp_path):
     store = SessionEventStore(tmp_path, session_id='noise')
     store.append_message({'role': 'user', 'content': 'x'})
