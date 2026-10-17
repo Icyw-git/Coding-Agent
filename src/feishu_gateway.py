@@ -617,6 +617,17 @@ class FeishuGateway:
             except Exception as exc:
                 self._reply(chat_id, '无法打开此会话，请重新 /sessions 查看有效会话。')
                 print(f'[feishu] session action failed: {exc}')
+        elif action == 'fork' and index < len(rows):
+            # 卡片上的 fork 入口：与 /fork 命令同一条 API 链路，原会话保留并切换绑定
+            try:
+                new_id = self.api.fork_session(rows[index]['id'])
+            except Exception as exc:
+                self._reply(chat_id, f'[fork] 分叉失败: {exc}')
+                return
+            with self._bindings_lock:
+                self.bindings[chat_id] = new_id
+                self._save_bindings()
+            self._reply(chat_id, f'已分叉出新会话 {new_id}（原会话保留），已切换。')
         else:
             self._reply(chat_id, '没有这一页，请重新 /sessions 查看会话列表。')
 
@@ -959,7 +970,7 @@ class FeishuGateway:
                 return '会话列表已失效，请重新 /sessions', False
             index, action = value.get('index'), value.get('action')
             limit = ((len(view[1]) + PAGE_SIZE - 1) // PAGE_SIZE if action == 'page' else len(view[1]))
-            if action not in ('page', 'details', 'switch') or type(index) is not int or not 0 <= index < limit:
+            if action not in ('page', 'details', 'switch', 'fork') or type(index) is not int or not 0 <= index < limit:
                 return '无效的会话按钮，请重新 /sessions', False
             try:
                 self._events.put_nowait((chat_id, value, open_id))

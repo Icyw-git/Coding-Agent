@@ -102,6 +102,42 @@ def test_agent_loop_streams_without_duplicate_print(tmp_path, monkeypatch, capsy
     assert 'task done' not in out     # 最终打印被抑制，无双份
 
 
+def test_stream_completion_captures_usage(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    chunks = [
+        NS(choices=[NS(delta=NS(content='你好', tool_calls=None), finish_reason=None)],
+           usage=None),
+        NS(choices=[], usage=NS(prompt_tokens=10, completion_tokens=5, total_tokens=15)),
+    ]
+    fake_client = NS(chat=NS(completions=NS(create=lambda **kw: iter(chunks))))
+    monkeypatch.setattr(harness, 'client', fake_client)
+    parts = []
+    resp = harness._stream_completion({'model': 'x'}, parts.append)
+    assert parts == ['你好']   # usage-only 收尾块被跳过，不进增量
+    assert resp.usage.total_tokens == 15
+
+
+def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace as NS
+
+    store = SessionEventStore(tmp_path, session_id='usage')
+    mem = tmp_path / 'mem'
+    monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
+    usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+
+    def fake_create(**kwargs):
+        return NS(choices=[NS(message=NS(role='assistant', content='done', tool_calls=None),
+                                finish_reason='stop')], usage=usage)
+
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fake_create)
+    harness.agent_loop([{'role': 'user', 'content': '统计 token'}], session_store=store)
+    out = capsys.readouterr().out
+    assert '[tokens] 本轮 120 · 会话累计 120' in out
+    assert 'tokens：120' in harness.format_status(store)   # /status 显示会话累计
+
+
 def test_compaction_tail_survives_replay(tmp_path):
     store = SessionEventStore(tmp_path, session_id='tail')
     store.append_message({'role': 'user', 'content': '早期问题'})

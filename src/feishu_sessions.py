@@ -57,6 +57,7 @@ def detail_card(row, token, index, current_id=None, reply_markdown=None):
     elements.append({'tag': 'action', 'actions': [
         _button('返回列表', token, 'page', index // PAGE_SIZE),
         _button('切换到此会话', token, 'switch', index, True),
+        _button('分叉新会话', token, 'fork', index),
     ]})
     return {'config': {'wide_screen_mode': True},
             'header': {'title': {'tag': 'plain_text', 'content': '会话详情'}},

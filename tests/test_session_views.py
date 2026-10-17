@@ -145,6 +145,33 @@ def test_feishu_card_pages_details_and_switch_on_dispatcher(tmp_path):
         gw.stop()
 
 
+def test_feishu_detail_card_fork_button(tmp_path):
+    api, transport = API(), CardTransport()
+
+    def fork_session(session_id, upto_seq=None):
+        api.fork_calls.append(session_id)
+        return 'forked-id'
+
+    api.fork_calls = []
+    api.fork_session = fork_session
+    gw = FeishuGateway(api, transport=transport, bindings_path=tmp_path / 'bindings.json',
+                       allowed_users=['owner'])
+    gw.start_dispatcher(workers=1)
+    try:
+        gw.on_message('chat', '/sessions', sender_id='owner')
+        details = next(a for a in buttons(transport.cards[-1][1]) if a['action'] == 'details')
+        gw.handle_card_action('owner', details, 'message', chat_id='chat')[1]
+        gw._events.join()
+        fork = next(a for a in buttons(transport.cards[-1][1]) if a['action'] == 'fork')
+        assert gw.handle_card_action('owner', fork, 'message', chat_id='chat')[1]
+        gw._events.join()
+        selected_id = gw._session_choices['chat'][fork['index']]['id']
+        assert api.fork_calls == [selected_id]   # 分叉的是详情卡对应的会话
+        assert gw.bindings['chat'] == 'forked-id'
+    finally:
+        gw.stop()
+
+
 def test_feishu_rejects_forwarded_expired_and_unauthorized_buttons(tmp_path, monkeypatch):
     transport = CardTransport()
     gw = FeishuGateway(API(), transport=transport, bindings_path=tmp_path / 'bindings.json',

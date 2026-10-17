@@ -5,6 +5,8 @@ import json
 import time
 import threading
 import subprocess
+import concurrent.futures
+import contextvars
 from contextlib import contextmanager
 from contextvars import ContextVar
 import sys
@@ -77,6 +79,11 @@ class _LazyLLMClient:
 
     def __getattr__(self, name):
         return getattr(self._instance(), name)
+
+    def warmup(self):
+        """后台预热：提前完成 openai SDK import 与客户端构造（~1.5s），
+        用户敲第一条消息时不再等待。"""
+        self._instance()
 
 
 client = _LazyLLMClient()
@@ -280,6 +287,11 @@ def format_status(session_store) -> str:
         ('任务', len(list_tasks())), ('定时任务', cron_count),
         ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
     summary = session_store.session_summary()
+    with _usage_lock:
+        usage = dict(_usage_by_session.get(session_store.session_id, {}))
+    usage_line = (f'\n  tokens：{_fmt_tokens(usage["total"])}'
+                  f'（输入 {_fmt_tokens(usage["prompt"])} · 输出 {_fmt_tokens(usage["completion"])}）'
+                  if usage.get('total') else '')
     return (
         f"  会话：{summary['title']}\n"
         f"  最近活跃：{relative_time(summary['updated'])}\n"
@@ -287,6 +299,7 @@ def format_status(session_store) -> str:
         f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
+        f'{usage_line}'
     )
 
 
@@ -630,6 +643,40 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
     return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
+
+
+# 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
+# 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为永不并行。
+PARALLEL_SAFE_TOOLS = frozenset({
+    'read', 'glob', 'list_tasks', 'get_task', 'list_crons', 'check_inbox', 'load_skill',
+})
+PARALLEL_MAX_WORKERS = 4
+
+
+def _run_tool_batch(tool_calls, session_store, tool_messages):
+    """执行一批 tool_call：全部只读时并行，任一可变则整批串行兜底。
+
+    started 事件与结果**始终按模型给定的原序**写回 store —— append-only
+    回放要求 tool 结果顺序与 assistant.tool_calls 对齐，乱序会产生孤儿。
+    线程内用 copy_context 传播 checkpoint/perf 的 ContextVar。"""
+    parallel = (len(tool_calls) > 1
+                and all(tc.function.name in PARALLEL_SAFE_TOOLS for tc in tool_calls))
+    if parallel:
+        for tool_call in tool_calls:
+            session_store.append_tool_started(tool_call)   # 原序登记全部 started
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
+            executed = list(pool.map(
+                lambda tc: contextvars.copy_context().run(exec_tool_call, tc),
+                tool_calls))
+    else:
+        executed = []
+        for tool_call in tool_calls:
+            session_store.append_tool_started(tool_call)
+            executed.append(exec_tool_call(tool_call))
+    for _, _, tool_message in executed:   # 原序写回结果
+        tool_messages.append(tool_message)
+        session_store.append_message(tool_message)
 
 def _record_compaction(session_store, compacted_messages, strategy):
     summary = next(
@@ -1014,11 +1061,43 @@ def wait_for_housekeeping(timeout: float = 30.0) -> None:
         thread.join(timeout=max(0.0, deadline - time.time()))
 
 
+_usage_lock = threading.Lock()
+_usage_by_session: dict[str, dict] = {}   # session_id -> {'prompt','completion','total'} 进程内累计
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.2f}M'
+    if n >= 1000:
+        return f'{n / 1000:.1f}k'
+    return str(n)
+
+
+def _record_usage(session_id: str, usage) -> int:
+    """把一次 LLM 调用的 usage 累计进会话账本，返回本次 total（缺失时静默跳过）。"""
+    if not usage:
+        return 0
+    prompt = int(getattr(usage, 'prompt_tokens', 0) or 0)
+    completion = int(getattr(usage, 'completion_tokens', 0) or 0)
+    total = int(getattr(usage, 'total_tokens', 0) or prompt + completion)
+    if total <= 0:
+        return 0
+    with _usage_lock:
+        bucket = _usage_by_session.setdefault(
+            session_id, {'prompt': 0, 'completion': 0, 'total': 0})
+        bucket['prompt'] += prompt
+        bucket['completion'] += completion
+        bucket['total'] += total
+    return total
+
+
 def _stream_completion(create_kwargs, on_delta):
     """Collect a streamed completion while preserving the existing response shape."""
     _t0 = time.perf_counter()
     _ttfb_done = False
-    stream = client.chat.completions.create(**create_kwargs, stream=True)
+    # include_usage：流式默认不带 usage，显式索取后随收尾块返回（Deepseek/OpenAI 兼容）
+    stream = client.chat.completions.create(**create_kwargs, stream=True,
+                                            stream_options={'include_usage': True})
     if not hasattr(stream, '__iter__'):
         # 客户端不支持流式（测试假件/兼容层返回非迭代对象）：整段作为单次
         # 增量交付并按非流式形状返回，调用方无需区分。
@@ -1030,7 +1109,11 @@ def _stream_completion(create_kwargs, on_delta):
     text_parts = []
     tool_calls = {}
     finish_reason = None
+    usage = None
     for chunk in stream:
+        usage = getattr(chunk, 'usage', None) or usage
+        if not getattr(chunk, 'choices', None):
+            continue   # include_usage 的收尾块只带 usage、choices 为空
         choice = chunk.choices[0]
         finish_reason = choice.finish_reason or finish_reason
         delta = choice.delta
@@ -1061,7 +1144,9 @@ def _stream_completion(create_kwargs, on_delta):
         tool_calls=calls or None,
     )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=usage,
+    )
 
 
 @_isolated_checkpoint_context()
@@ -1083,6 +1168,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
+    turn_tokens=0 #本回合累计 tokens（含工具轮次）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1155,6 +1241,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             with perf_segment('llm.main'):
                 response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
+            turn_tokens += _record_usage(session_store.session_id,
+                                         getattr(response, 'usage', None))
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 reactive_retries+=1
@@ -1207,6 +1295,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                     print()   # 流式已逐段输出到终端，只补换行
                 else:
                     print(message.content)
+            if turn_tokens:
+                with _usage_lock:
+                    cum = _usage_by_session.get(session_store.session_id, {}).get('total', 0)
+                print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · 会话累计 {_fmt_tokens(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
@@ -1229,9 +1321,17 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
 
         # compact 工具：在 for 循环内按顺序处理——compact 之前的 tool_call 先正常执行，
         # 遇到 compact 时压缩历史并重开一轮。
+        # 连续的普通 tool_call 攒成 batch（全只读并行 / 含可变串行，见 _run_tool_batch），
+        # 遇 checkpoint/compact 特殊工具先 flush 再处理。
         tool_messages = []
         compacted = False
         used_todo = False
+        batch = []
+
+        def _flush_batch():
+            _run_tool_batch(batch, session_store, tool_messages)
+            batch.clear()
+
         for tool_call in message.tool_calls:
             if tool_call.function.name == 'todo_write':
                 used_todo = True
@@ -1239,6 +1339,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 # 当前节点在本轮请求前已创建，快照是完整 OpenAI 历史。只给它加标签，不能
                 # 在 assistant tool_calls 与对应 tool 结果之间新建快照，否则 rewind 后历史无法重放。
                 # 与 compact 一样不进 tool_registry —— 它是 loop 行为，不是普通工具。
+                _flush_batch()
                 try:
                     label=str(json.loads(tool_call.function.arguments or '{}').get('label',''))
                 except json.JSONDecodeError:
@@ -1256,6 +1357,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
                 # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
                 # 改为文本附到新上下文里，避免执行结果丢失。
+                _flush_batch()
                 messages[:] = compact_history(messages)
                 _record_compaction(session_store, messages, 'tool')
                 skip_micro_rounds=3
@@ -1268,10 +1370,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 compacted = True
                 break
 
-            session_store.append_tool_started(tool_call)
-            _, _, tool_message = exec_tool_call(tool_call)   # hook 权限 → 后台/直接执行 → 兜底
-            tool_messages.append(tool_message)
-            session_store.append_message(tool_message)
+            batch.append(tool_call)
+        _flush_batch()
 
         if compacted: #压缩后工具丢失，需要重新执行
             continue
