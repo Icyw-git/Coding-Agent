@@ -2,7 +2,7 @@
 
 覆盖：
 - 正常多工具流 + 最终文本回复（工具结果以 role=tool 回填）
-- 循环开头三道预处理（budget → snip → micro）的执行顺序
+- 循环开头三道预处理（micro → snip → budget）的执行顺序
 - 超过 CONTEXT_LIMIT 时自动 compact_history
 - API 报 prompt_too_long 时 reactive compact + 重试 / 重试上限后抛错
 - 模型调用 compact 工具：先执行 compact 之前的工具，再压缩重开
@@ -167,8 +167,9 @@ def test_normal_tool_flow():
 
 
 def test_preprocessors_order():
-    """每轮循环开头必须按 budget → snip → micro 顺序执行预处理。"""
-    names = ('tool_result_budget', 'snip_compact', 'micro_compact')
+    """每轮循环开头必须按 micro → snip → budget 顺序执行预处理
+    （先便宜可恢复的占位，再破坏性截断；budget 因入口截断降级为净兜底）。"""
+    names = ('micro_compact', 'snip_compact', 'tool_result_budget')
     originals = {n: getattr(harness, n) for n in names}
     order = []
     try:
@@ -219,8 +220,10 @@ def test_reactive_compact_retry_then_success():
     """API 报 prompt_too_long → reactive_compact 后重试成功。"""
     orig_reactive = harness.reactive_compact
     reactive_calls = []
-    harness.reactive_compact = lambda msgs: (reactive_calls.append(len(msgs))
-                                             or [{'role': 'user', 'content': '[Reactive compact] summary'}])
+    harness.reactive_compact = lambda msgs, keep=5, budget_tokens=None: (
+        reactive_calls.append(len(msgs))
+        or logger.info("[scenario] reactive_compact called on %d msgs", len(msgs))
+        or [{'role': 'user', 'content': '[Reactive compact] summary'}])
     orig_create = harness.client.chat.completions.create
     try:
         fake = FakeCompletions([
@@ -241,11 +244,14 @@ def test_reactive_compact_retry_then_success():
 def test_reactive_compact_exhausts_retries():
     """连续报错达到重试上限后应抛出原始异常（不再无限重试）。"""
     orig_reactive = harness.reactive_compact
-    harness.reactive_compact = lambda msgs: [{'role': 'user', 'content': '[Reactive compact]'}]
+    harness.reactive_compact = lambda msgs, keep=5, budget_tokens=None: [
+        {'role': 'user', 'content': '[Reactive compact]'}]
     orig_create = harness.client.chat.completions.create
     try:
-        # MAX_REACTIVE_RETRIES=1：第 1 次错误重试，第 2 次错误直接抛
+        # MAX_REACTIVE_RETRIES=3：前 3 次错误逐次缩尾重试，第 4 次错误直接抛
         fake = FakeCompletions([
+            RuntimeError('prompt_too_long: reduce input'),
+            RuntimeError('prompt_too_long: reduce input'),
             RuntimeError('prompt_too_long: reduce input'),
             RuntimeError('prompt_too_long: reduce input'),
         ])
@@ -385,9 +391,10 @@ def test_full_session_scenario():
     harness.compact_history = lambda msgs: (compact_calls.append(len(msgs))
                                             or logger.info("[scenario] compact_history called (auto/compact tool) on %d msgs", len(msgs))
                                             or [{'role': 'user', 'content': '[Compacted] summary'}])
-    harness.reactive_compact = lambda msgs: (reactive_calls.append(len(msgs))
-                                             or logger.info("[scenario] reactive_compact called on %d msgs", len(msgs))
-                                             or [{'role': 'user', 'content': '[Reactive compact] summary'}])
+    harness.reactive_compact = lambda msgs, keep=5, budget_tokens=None: (
+        reactive_calls.append(len(msgs))
+        or logger.info("[scenario] reactive_compact called on %d msgs", len(msgs))
+        or [{'role': 'user', 'content': '[Reactive compact] summary'}])
     try:
         fake = FakeCompletions([
             make_tool_response([('c1', 'bash', '{"command": "echo 1"}')]),

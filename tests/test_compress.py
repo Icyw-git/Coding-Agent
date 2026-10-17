@@ -291,25 +291,164 @@ def test_snip_threshold_scales_with_window(monkeypatch):
 
 
 def test_snip_persisted_and_replayed(tmp_path, monkeypatch):
-    """snip 触发即写 history_snipped 事件：rebuild 与内存形态逐字一致，
-    marker 冻结（不再每轮变文本），跨重启（新 store 实例）还原相同历史。"""
+    """snip 触发即写 history_snipped 索引事件（head_end/tail_start/snipped 三个整数）：
+    rebuild 用同一切片表达式还原，与内存形态逐字一致；跨重启（新 store 实例）相同；
+    旧版 head/tail 副本事件走兼容分支。"""
     monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 阈值 50
     store = SessionEventStore(tmp_path, session_id='snip')
-    out, _ = harness.pre_compact_messages(build_conversation(30), session_store=store)
+    msgs = build_conversation(30)
+    for m in msgs:   # 真实时序：消息先落盘，pre_compact 作用于已落盘历史
+        store.append_message(m)
+    out, _ = harness.pre_compact_messages(store.rebuild_openai_history(),
+                                          session_store=store)
     assert any(str(m.get('content', '')).startswith('[snipped ') for m in out)
     events = [e for e in store.read_events() if e['type'] == 'history_snipped']
     assert len(events) == 1
-    rebuilt = store.rebuild_openai_history()
-    assert [m['content'] for m in rebuilt] == [m['content'] for m in out]
+    ev = events[0]
+    assert isinstance(ev['head_end'], int) and isinstance(ev['tail_start'], int)
+    assert ev['snipped'] == ev['tail_start'] - ev['head_end']
+    assert 'head' not in ev and 'tail' not in ev, "索引事件不应再携带 head/tail 副本"
+    # rebuild 与内存形态逐字一致（结构保证：同一表达式）
+    assert [m['content'] for m in store.rebuild_openai_history()] == [m['content'] for m in out]
     # 跨重启
     reopened = SessionEventStore.open(store.path)
     assert [m['content'] for m in reopened.rebuild_openai_history()] == [m['content'] for m in out]
-    # 再次触发：新事件替换，rebuild 跟随最后一次决策
-    out2, _ = harness.pre_compact_messages(
-        out + [{'role': 'user', 'content': 'x' * 200}] * 8, session_store=store)
+    # 再次触发：新消息先落盘（索引引用的是回放态位置），rebuild 跟随最后一次决策
+    for m in [{'role': 'user', 'content': 'x' * 200}] * 8:
+        store.append_message(m)
+    out2, _ = harness.pre_compact_messages(store.rebuild_openai_history(),
+                                           session_store=store)
     events2 = [e for e in store.read_events() if e['type'] == 'history_snipped']
     assert len(events2) == 2
     assert [m['content'] for m in store.rebuild_openai_history()] == [m['content'] for m in out2]
+
+
+def test_snip_legacy_copy_event_compat(tmp_path):
+    """旧版 head/tail 全量副本事件（索引化之前产生）仍可回放。"""
+    store = SessionEventStore(tmp_path, session_id='legacy')
+    head = [{'role': 'user', 'content': '开头'},
+            {'role': 'assistant', 'content': '回复'}]
+    tail = [{'role': 'user', 'content': '最近的问题'},
+            {'role': 'assistant', 'content': '最近的回答'}]
+    store.append('history_snipped', head=head, tail=tail, snipped=5)
+    history = store.rebuild_openai_history()
+    assert [m['content'] for m in history] == ['开头', '回复',
+                                               '[snipped 5 messages]',
+                                               '最近的问题', '最近的回答']
+
+
+def test_snip_hysteresis_between_fires(tmp_path, monkeypatch):
+    """snip 触发迟滞（对齐 Codex「越线一次性替换」）：无迟滞时越线后每回合滑动，
+    marker 每次变文本 + 尾段位移 → 前缀每回合断裂（实测命中率 6-19%）。
+    迟滞：触发后下次触发线 = 压缩后条数 + 阈值/4，两次触发之间逐字稳定。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 阈值 50
+    store = SessionEventStore(tmp_path, session_id='hys')
+    for m in build_conversation(30):                        # 63 条 > 50 → 首次触发
+        store.append_message(m)
+    state = {}
+    msgs = store.rebuild_openai_history()
+    out1, _ = harness.pre_compact_messages(msgs, session_store=store, snip_state=state)
+    assert state['fire_at'] == len(out1) + max(8, len(out1) // 4), "触发后武装迟滞线"
+    # 基线附近增长（+6 < 迟滞量 12）：不触发，历史逐字稳定（前缀缓存可命中）
+    for m in [{'role': 'user', 'content': 'g'}] * 6:
+        store.append_message(m)
+    msgs = store.rebuild_openai_history()
+    out2, _ = harness.pre_compact_messages(msgs, session_store=store, snip_state=state)
+    events = [e for e in store.read_events() if e['type'] == 'history_snipped']
+    assert len(events) == 1, "迟滞线内不得再次触发"
+    assert [m['content'] for m in out2] == [m['content'] for m in msgs], "两次触发之间逐字稳定"
+    # 越过迟滞线（+15 > 12）：再次触发
+    for m in [{'role': 'user', 'content': 'h'}] * 15:
+        store.append_message(m)
+    out3, _ = harness.pre_compact_messages(store.rebuild_openai_history(),
+                                           session_store=store, snip_state=state)
+    events = [e for e in store.read_events() if e['type'] == 'history_snipped']
+    assert len(events) == 2, "越过迟滞线后再次触发"
+    assert state['fire_at'] == len(out3) + max(8, len(out3) // 4)
+
+
+def test_bound_tool_output_middle_out(tmp_path, monkeypatch):
+    """入口 middle-out 截断：保头 + 保尾 + 截断标注；全量落盘可恢复；
+    阈值内原样返回（不产生落盘）。"""
+    monkeypatch.setattr(harness, 'TOOL_RESULTS_DIR', tmp_path / 'tr')
+    monkeypatch.setattr(harness, 'TOOL_RESULT_CHAR_LIMIT', 24_000)
+    small = 'x' * 1000
+    assert harness._bound_tool_output('c_small', small) == small   # 阈值内原样
+    # 头部是声明、尾部是错误摘要（最有用的部分在尾）
+    big = ('HEADER line\n' + 'm' * 30_000 + '\nERROR: tests failed at the very end')
+    out = harness._bound_tool_output('c_big', big)
+    assert out.startswith('HEADER line'), "保头"
+    assert out.endswith('ERROR: tests failed at the very end'), "保尾（旧 persist 预览只留头）"
+    assert 'chars truncated' in out and 'Full output:' in out
+    assert len(out) < len(big) // 2, "截断后显著变小"
+    # 全量落盘可恢复
+    path = tmp_path / 'tr' / 'c_big.txt'
+    assert path.exists() and path.read_text(encoding='utf-8') == big
+
+
+def test_per_call_usage_events(tmp_path, monkeypatch):
+    """usage 事件逐调用落盘：一次工具回合（2 次 LLM 调用）→ 2 条事件，
+    每条携带该次请求的 prompt；聚合口径与回合累计一致。"""
+    from types import SimpleNamespace as NS
+    store = SessionEventStore(tmp_path, session_id='ucall')
+    mem = tmp_path / 'mem'
+    monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
+    u1 = NS(prompt_tokens=100, completion_tokens=10, total_tokens=110,
+            prompt_tokens_details=NS(cached_tokens=80))
+    u2 = NS(prompt_tokens=200, completion_tokens=5, total_tokens=205,
+            prompt_tokens_details=NS(cached_tokens=180))
+
+    def fake_create(**kwargs):
+        return fake_create.queue.pop(0)
+    fake_create.queue = [
+        NS(choices=[NS(message=NS(role='assistant', content=None,
+                                  tool_calls=[NS(id='c1', type='function',
+                                                 function=NS(name='noop', arguments='{}'))]),
+                          finish_reason='tool_calls')], usage=u1),
+        NS(choices=[NS(message=NS(role='assistant', content='done', tool_calls=None),
+                          finish_reason='stop')], usage=u2),
+    ]
+    monkeypatch.setattr(harness, 'tool_registry', {'noop': lambda **kw: 'ok'})
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fake_create)
+    harness.agent_loop([{'role': 'user', 'content': '两次调用'}], session_store=store)
+    harness.wait_for_housekeeping(30)
+    events = [e for e in store.read_events() if e.get('type') == 'usage']
+    assert [e['prompt'] for e in events] == [100, 200], "每次调用一条 usage 事件"
+    assert [e['cached'] for e in events] == [80, 180]
+    totals = store.usage_totals()
+    assert totals['prompt'] == 300 and totals['total'] == 315 and totals['calls'] == 2
+
+
+def test_tail_within_budget(tmp_path, monkeypatch):
+    """尾部保留：条数上限 + token 预算双约束（500KB 尾部不再原样保留）。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 800_000)
+    big = {'role': 'tool', 'tool_call_id': 't', 'content': 'z' * 60_000}
+    small = [{'role': 'user', 'content': 'q'}]
+    msgs = small + [dict(big, tool_call_id=f't{i}') for i in range(10)]
+    # 条数约束：keep=3 → 最多 3 条
+    start = harness._tail_within_budget(msgs, keep=3, budget_tokens=None)
+    assert len(msgs) - start <= 3
+    # 预算约束：每条 ≈17k tokens，预算 20k → 只留最后 1 条（至少保留一条）
+    start = harness._tail_within_budget(msgs, keep=10, budget_tokens=20_000)
+    assert len(msgs) - start <= 2, "预算收紧尾部（17k+17k > 20k）"
+    # 至少保留最后一条（即使单条超预算）
+    huge = [{'role': 'user', 'content': 'w' * 90_000}]
+    start = harness._tail_within_budget(huge, keep=5, budget_tokens=100)
+    assert start == 0
+
+
+def test_summary_input_keeps_goal_and_budget():
+    """summarize 输入：第一条 user（原始目标）始终保留；尾部按预算整条取，
+    不再切在 JSON 中间。"""
+    goal = {'role': 'user', 'content': '重构缓存模块，禁止改公共接口'}
+    huge_mid = [{'role': 'assistant', 'content': 'a' * 50_000} for _ in range(5)]
+    tail_note = {'role': 'user', 'content': '最新发现：预算计算有误'}
+    msgs = [goal] + huge_mid + [tail_note]
+    text = harness._summary_input(msgs, budget=30_000)
+    assert text.startswith('[原始目标] 重构缓存模块'), "原始目标始终保留"
+    assert '最新发现：预算计算有误' in text, "最新尾部保留"
+    assert len(text) < 60_000, "受预算约束"
 
 
 def test_tool_result_budget_persists_placeholders(tmp_path, monkeypatch):

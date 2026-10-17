@@ -33,8 +33,9 @@ from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
                         consolidate_memories, estimate_size, _message_has_tool_use,
                         _is_tool_result_message, collect_tool_results, snip_compact,
                         micro_compact, persist_large_output, tool_result_budget,
-                        write_transcript, summarize_history, compact_history,
-                        reactive_compact, inject_memories)
+                        _bound_tool_output, write_transcript, summarize_history,
+                        _summary_input, _tail_within_budget,
+                        compact_history, reactive_compact, inject_memories)
 from tools import TOOLS, tool_registry, run_bash
 from skill_system import scan_skills, list_skills, load_skill
 from subagent import spawn_subagent
@@ -449,13 +450,20 @@ OUTPUT_RESERVE=8192        # 给 max_tokens=8000 输出预留
 CTX_SAFETY=0.8             # 留余量，防 prompt_too_long
 
 def _default_context_limit()->int:
-    window=int(os.getenv('LLM_CONTEXT_WINDOW') or
-               MODEL_WINDOWS.get(os.getenv('LLM_MODEL_ID',''),65536))
-    return max(4000,int((window-OUTPUT_RESERVE)*CTX_SAFETY))
+    model=os.getenv('LLM_MODEL_ID','')
+    window=os.getenv('LLM_CONTEXT_WINDOW') or MODEL_WINDOWS.get(model)
+    if window is None:
+        # Codex 行为：模型信息表 + 告警，绝不静默降级（此前 deepseek-flash 缺注册
+        # 曾静默回落 64K，压缩阈值被低估 16 倍）
+        print(f'[ctx] 未知模型 {model!r}：按 64K 窗口保守处理，'
+              f'可用 LLM_CONTEXT_WINDOW 显式配置', file=sys.stderr)
+        window=65536
+    return max(4000,int((int(window)-OUTPUT_RESERVE)*CTX_SAFETY))
 
 CONTEXT_LIMIT=_default_context_limit()
 KEEP_RECENT=6
 PERSIST_THERSHOLD=10000
+TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）
 
 # ---------- 缓存目录 ----------
 TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
@@ -472,7 +480,7 @@ CHECKPOINT_SECRETS=['.env','*.pem','*_rsa']
 _checkpoint_manager = ContextVar('checkpoint_manager', default=None)
 
 # ---------- 重试配置 ----------
-MAX_REACTIVE_RETRIES=1
+MAX_REACTIVE_RETRIES=3   # 逐次缩尾重试（keep/budget 见 agent_loop 的 attempts），仍超限才 raise
 
 
 def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没有改变，直接返回缓存的系统提示，否则重新组装系统提示
@@ -593,21 +601,46 @@ tool_registry['load_skill']=load_skill
 # 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
 # ============================================================
 
-def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session_store=None): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
-    """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
-    返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
-    messages = tool_result_budget(messages, session_store=session_store)
-    compacted = snip_compact(messages)
-    if compacted is not messages and session_store is not None:
-        # snip 触发：截断决策持久化为事件（marker 冻结、rebuild 逐字还原）——
-        # 否则滑动窗口每轮重写 marker + 位移保留段，前缀缓存每轮断裂
-        session_store.append_history_snipped(compacted)
-    messages = compacted
-    size = estimate_size(messages)   # 每轮只算一次：micro 门槛与 auto 压缩共用
+def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session_store=None,
+                         size=None, snip_state=None): #压缩逻辑，每轮开头的压缩预处理：micro → snip → budget →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
+    """每轮开头的压缩预处理，判据优先用真实用量（P0）：
+
+    - size：上一次请求的 prompt_tokens（供应商权威值）+ 本回合新增消息的估算
+      增量，由 agent_loop 逐调用维护；None 时回落 estimate_size（teammate /
+      直调 / 会话首轮）。旧实现每轮对全量历史逐字符估算（4M 字符 ≈ 279ms）
+      且 CJK 高估 1.69 倍——判据是猜的，现在只有增量是估的。
+    - 顺序 micro → snip → budget：先便宜可恢复的（占位符），再破坏性的
+      （整段截断），budget 因入口截断降级为净兜底。
+    - 任一层发生改写即重算 size（改写会缩小上下文，旧值会让 auto 门槛误触发）。
+    - snip_state（agent_loop 持有的 dict）：snip 触发迟滞——触发后下次触发线 =
+      压缩后条数 + 阈值/4。实测无迟滞时越线后每回合滑动（marker 每次变文本 +
+      尾段位移），22 次调用回合命中率仅 56%、实测会话低至 6%；迟滞让两次触发
+      之间前缀逐字稳定，每次触发只断一次（对齐 Codex「越线一次性替换」手感）。"""
+    if size is None:
+        size = estimate_size(messages)
+    micro_info = {}
     if skip_micro_rounds > 0:
         skip_micro_rounds -= 1   # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
     else:
-        messages = micro_compact(messages, size, session_store=session_store)
+        messages = micro_compact(messages, size, session_store=session_store, info=micro_info)
+        if micro_info.get('rewrote'):
+            size = estimate_size(messages)
+    snip_info = {}
+    compacted = snip_compact(messages, max_messages=(snip_state or {}).get('fire_at'),
+                             info=snip_info)
+    if snip_info:
+        # snip 触发：截断决策持久化为索引事件（head_end/tail_start/snipped，
+        # rebuild 用同一切片表达式逐字还原，marker 冻结到下次触发）
+        if session_store is not None:
+            session_store.append_history_snip(**snip_info)
+        messages = compacted
+        size = estimate_size(messages)
+        if snip_state is not None:
+            snip_state['fire_at'] = len(messages) + max(8, len(messages) // 4)
+    budget_info = {}
+    messages = tool_result_budget(messages, session_store=session_store, info=budget_info)
+    if budget_info.get('rewrote'):
+        size = estimate_size(messages)
     if size > CONTEXT_LIMIT:
         print("  [compact] 上下文接近上限，已自动压缩历史（完整记录已保存）")
         messages = compact_history(messages)
@@ -653,7 +686,10 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
             output = f"Error: {e}"
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
-    return name, args, {"role": "tool", "tool_call_id": tool_call.id, "content": output}
+    # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
+    # 形态，前缀天然稳定；全量已落盘可恢复）。hooks 拿到的仍是全量输出。
+    return name, args, {"role": "tool", "tool_call_id": tool_call.id,
+                        "content": _bound_tool_output(tool_call.id, output)}
 
 
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
@@ -1186,7 +1222,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
     turn_tokens=0 #本回合累计 tokens（含工具轮次）
-    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末写 usage 事件）
+    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末打印）
+    ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
+    snip_state={} #snip 触发迟滞：触发后基线+阈值/4 才允许再次触发（无迟滞则越线后每回合滑动断前缀）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1206,7 +1244,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             messages, skip_micro_rounds,
             on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
             session_store=session_store,
-        ) #压缩预处理流程
+            size=ctx_tokens,
+            snip_state=snip_state,
+        ) #压缩预处理流程（判据优先用真实用量，见 pre_compact_messages）
 
         if rounds_since_todo >=8 and messages:
             reminder = {
@@ -1266,13 +1306,23 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 for _k in ('prompt','completion','cached','total'):
                     turn_usage[_k] += detail[_k]
                 turn_usage['cached_seen'] = turn_usage['cached_seen'] or detail['cached_seen']
+                # 埋点：逐调用 usage 事件（供应商权威值；命中率可逐调用分析，
+                # 聚合口径由 usage_totals() 求和保持不变）
+                session_store.append('usage', **detail)
+                ctx_tokens = detail['prompt']   # 压缩判据锚点：本请求真实大小
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
+                # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
+                attempts=((6,None),(3,12_000),(1,4_000))
+                keep,budget=attempts[min(reactive_retries,len(attempts)-1)]
                 reactive_retries+=1
-                print('  [compact] 请求超限，已自动压缩历史并重试（完整记录已保存）')
-                messages[:]=reactive_compact(messages) #保存完整对话记录，保留最近五条消息，返回压缩后的消息
+                print(f'  [compact] 请求超限，已自动压缩历史并重试'
+                      f'（第 {reactive_retries}/{MAX_REACTIVE_RETRIES} 次，保留 {keep} 条）')
+                messages[:]=reactive_compact(messages, keep=keep, budget_tokens=budget)
                 _record_compaction(session_store, messages, 'reactive')
                 skip_micro_rounds=3
+                if ctx_tokens is not None:
+                    ctx_tokens = estimate_size(messages)   # 历史被整体替换，重估避免 auto 误触发
                 continue
             raise
 
@@ -1293,6 +1343,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             }
         messages.append(assistant_message) #添加模型回复到上下文
         session_store.append_message(assistant_message)
+        if ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
+            ctx_tokens += estimate_size([assistant_message])
 
         # 输出被截断：升级到加大 max_tokens 并提示续写
         if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
@@ -1305,6 +1357,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             continuation = {'role':'user','content':recovery.CONTINUATION_PROMPT}
             messages.append(continuation)
             session_store.append_message(continuation)
+            if ctx_tokens is not None:
+                ctx_tokens += estimate_size([continuation])
             continue
 
 
@@ -1312,6 +1366,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             force=trigger_hooks('Stop',messages)
             if force:
                 messages.append({'role':'user','content':force})
+                if ctx_tokens is not None:
+                    ctx_tokens += estimate_size([messages[-1]])
                 continue
             if message.content:
                 if streamed_parts:
@@ -1319,9 +1375,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 else:
                     print(message.content)
             if turn_tokens:
-                # 埋点：本回合 usage 持久化为事件（跨重启可聚合，命中率可事后分析）
-                session_store.append('usage', **turn_usage)
-                cum = session_store.usage_totals()
+                cum = session_store.usage_totals()   # 逐调用 usage 事件聚合
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
                       f'会话累计 {_fmt_tokens(cum["total"])}'
                       f'{_cache_hit_rate_line(cum)}')
@@ -1394,6 +1448,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 messages.append({'role': 'user', 'content': note})
                 session_store.append_message(messages[-1])
                 compacted = True
+                if ctx_tokens is not None:
+                    ctx_tokens = estimate_size(messages)   # 历史被整体替换，重估避免 auto 误触发
                 break
 
             batch.append(tool_call)
@@ -1418,6 +1474,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                   f"notification(s)\033[0m")
 
         messages.extend(tool_messages)
+        if ctx_tokens is not None and tool_messages:   # 增量：新增工具结果（已入口截断，单条有界）
+            ctx_tokens += estimate_size(tool_messages)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
         system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等

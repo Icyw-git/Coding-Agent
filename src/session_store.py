@@ -260,26 +260,17 @@ class SessionEventStore:
         原始 tool 结果事件保留在流中，undo/rewind 仍可回溯。"""
         return self.append('tool_compacted', tool_call_id=tool_call_id, placeholder=placeholder)
 
-    def append_history_snipped(self, compacted: list[dict]) -> dict:
-        """snip_compact 的截断决策持久化：rebuild 时逐字还原 head + marker + 保留段。
+    def append_history_snip(self, head_end: int, tail_start: int, snipped: int) -> dict:
+        """snip_compact 的截断决策持久化：只存切片索引（3 个整数，~100B）。
 
+        rebuild 用与触发时相同的切片表达式还原（内存形态 == 重建形态是结构性
+        保证）：messages = messages[:head_end] + [marker] + messages[tail_start:]。
         不持久化的话 marker 活在请求内存里：滑动窗口每轮重写 marker 文本（N 递增）
         并位移保留段，前缀缓存每轮断裂——实测一次 22 次调用的回合命中率仅 56%
-        （每次只命中稳定头部 ~7k）。事件里的 head/tail 源自已落盘消息的裁剪视图，
-        原始 message 事件保留在流中，undo/rewind 仍可回溯。"""
-        marker_idx = next((i for i, m in enumerate(compacted)
-                           if isinstance(m, dict)
-                           and str(m.get('content', '')).startswith('[snipped ')), None)
-        if marker_idx is None:
-            head, tail, snipped = compacted, [], 0
-        else:
-            head = compacted[:marker_idx]
-            tail = compacted[marker_idx + 1:]
-            snipped = int(str(compacted[marker_idx]['content']).split()[1])
-        return self.append('history_snipped',
-                           head=copy.deepcopy(head),
-                           tail=copy.deepcopy(tail),
-                           snipped=snipped)
+        （每次只命中稳定头部 ~7k）。head/tail 全量副本的旧事件（head/tail 字段）
+        由 rebuild 兼容分支还原；原始 message 事件保留在流中，undo/rewind 仍可回溯。"""
+        return self.append('history_snipped', head_end=int(head_end),
+                           tail_start=int(tail_start), snipped=int(snipped))
 
     def compacted_placeholders(self) -> dict:
         """已改写占位：tool_call_id → 占位文本（事件缓存命中时零解析开销）。"""
@@ -440,16 +431,24 @@ class SessionEventStore:
                                 and entry.get('tool_call_id') in placeholders):
                             entry['content'] = placeholders[entry['tool_call_id']]
             elif event_type == "history_snipped":
-                # snip_compact 的持久化决策：逐字还原 head + marker + 保留段，
-                # 与触发当时的请求内形态一致（跨轮/跨重启前缀稳定）
-                head = event.get("head") or []
-                tail = event.get("tail") or []
-                messages = [json.loads(json.dumps(m)) for m in head
-                            if isinstance(m, dict) and m.get('role')]
-                messages.append({"role": "user",
-                                 "content": f"[snipped {int(event.get('snipped') or 0)} messages]"})
-                messages.extend(json.loads(json.dumps(m)) for m in tail
-                                if isinstance(m, dict) and m.get('role'))
+                # snip_compact 的持久化决策。索引版（head_end/tail_start/snipped）：
+                # 与触发时相同的切片表达式，内存形态 == 重建形态是结构性保证。
+                if 'head_end' in event:
+                    he, ts = int(event['head_end']), int(event['tail_start'])
+                    messages = (messages[:he]
+                                + [{"role": "user",
+                                    "content": f"[snipped {int(event.get('snipped') or 0)} messages]"}]
+                                + messages[ts:])
+                else:
+                    # 旧版 head/tail 全量副本事件：逐字还原 head + marker + 保留段
+                    head = event.get("head") or []
+                    tail = event.get("tail") or []
+                    messages = [json.loads(json.dumps(m)) for m in head
+                                if isinstance(m, dict) and m.get('role')]
+                    messages.append({"role": "user",
+                                     "content": f"[snipped {int(event.get('snipped') or 0)} messages]"})
+                    messages.extend(json.loads(json.dumps(m)) for m in tail
+                                    if isinstance(m, dict) and m.get('role'))
                 for entry in messages:
                     if (entry.get('role') == 'tool'
                             and entry.get('tool_call_id') in placeholders):
