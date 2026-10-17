@@ -445,7 +445,7 @@ def estimate_size(msgs):
     text = str(msgs)
     ascii_chars = sum(1 for ch in text if ord(ch) < 128)
     cjk = len(text) - ascii_chars
-    return max(1, int(ascii_chars / 3.5 + cjk * 1.3))
+    return max(1, int(ascii_chars / 3.5 + cjk / 1.3))
 
 
 def _message_has_tool_use(msg):  # 判断是否工具调用
@@ -456,7 +456,15 @@ def _is_tool_result_message(msg):  # 判断是否工具结果
     return msg.get('role') == 'tool'
 
 
-def snip_compact(messages, max_messages=50):  # 保留头 3 条，尾部 47 条，中间按 tool_calls 分组
+def snip_compact(messages, max_messages=None):
+    """保留头 3 条 + marker + 尾部，中间按 tool_calls 分组裁剪。
+
+    消息数安全阀随窗口缩放（默认 max(50, CONTEXT_LIMIT//4000)，1M 上下文 ≈ 208 条）：
+    它只做「消息数失控」的兜底，日常大小压缩由 micro_compact 按水位触发——
+    触发越频繁，[snipped N] marker 每轮变文本 + 窗口滑动，前缀缓存断得越狠。"""
+    h = _h()
+    if max_messages is None:
+        max_messages = max(50, h.CONTEXT_LIMIT // 4000)
     if len(messages) <= max_messages:
         return messages
     # 头部：保留前 3 条；不能切断"assistant 带多个工具"的分组（否则 dangling）
@@ -567,11 +575,16 @@ def persist_large_output(tool_use_id, output):  # 持久化大输出
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
 
-def tool_result_budget(messages, max_bytes=None):  # 将工具结果压缩到 max_bytes 内存
+def tool_result_budget(messages, max_bytes=None, session_store=None):
+    """工具结果总量预算：超大单条输出（>PERSIST_THERSHOLD 字符）落盘换预览。
+
+    预算与 estimate_size 同源换算（CONTEXT_LIMIT 是 token，工具结果以英文为主
+    ≈3 字符/token），职责仅剩「单条超大输出」安全阀——日常大小压缩由
+    micro_compact 按水位触发。改写决策持久化为 tool_compacted 事件（与 micro
+    同机制）：只改内存的话重启 rebuild 会还原原文，前缀缓存跨重启断裂。"""
     h = _h()
     if max_bytes is None:
-        # 默认预算取 CONTEXT_LIMIT 的 80%，保证 budget 先于自动压缩(LLM)触发
-        max_bytes = int(h.CONTEXT_LIMIT * 0.8)
+        max_bytes = int(h.CONTEXT_LIMIT * 0.8 * 3)
     tool_msgs = [m for m in messages if m.get('role') == 'tool']
     total = sum(len(str(m.get('content', ''))) for m in tool_msgs)
     if total <= max_bytes:
@@ -585,6 +598,8 @@ def tool_result_budget(messages, max_bytes=None):  # 将工具结果压缩到 ma
             continue
         tid = m.get('tool_call_id', 'unknown')
         m['content'] = persist_large_output(tid, content)  # 持久化大输出，返回引用路径和预览内容
+        if session_store is not None:
+            session_store.append_tool_compacted(tid, m['content'])
         total = sum(len(str(x.get('content', ''))) for x in tool_msgs)
     return messages
 

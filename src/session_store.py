@@ -253,11 +253,33 @@ class SessionEventStore:
         )
 
     def append_tool_compacted(self, tool_call_id: str, placeholder: str) -> dict:
-        """micro_compact 的改写决策持久化：rebuild 时该工具结果以 placeholder 呈现。
+        """micro_compact / tool_result_budget 的改写决策持久化：rebuild 时该工具
+        结果以 placeholder 呈现。
 
         事件使占位符跨轮/跨重启逐字稳定（前缀缓存依赖这一点）；
         原始 tool 结果事件保留在流中，undo/rewind 仍可回溯。"""
         return self.append('tool_compacted', tool_call_id=tool_call_id, placeholder=placeholder)
+
+    def append_history_snipped(self, compacted: list[dict]) -> dict:
+        """snip_compact 的截断决策持久化：rebuild 时逐字还原 head + marker + 保留段。
+
+        不持久化的话 marker 活在请求内存里：滑动窗口每轮重写 marker 文本（N 递增）
+        并位移保留段，前缀缓存每轮断裂——实测一次 22 次调用的回合命中率仅 56%
+        （每次只命中稳定头部 ~7k）。事件里的 head/tail 源自已落盘消息的裁剪视图，
+        原始 message 事件保留在流中，undo/rewind 仍可回溯。"""
+        marker_idx = next((i for i, m in enumerate(compacted)
+                           if isinstance(m, dict)
+                           and str(m.get('content', '')).startswith('[snipped ')), None)
+        if marker_idx is None:
+            head, tail, snipped = compacted, [], 0
+        else:
+            head = compacted[:marker_idx]
+            tail = compacted[marker_idx + 1:]
+            snipped = int(str(compacted[marker_idx]['content']).split()[1])
+        return self.append('history_snipped',
+                           head=copy.deepcopy(head),
+                           tail=copy.deepcopy(tail),
+                           snipped=snipped)
 
     def compacted_placeholders(self) -> dict:
         """已改写占位：tool_call_id → 占位文本（事件缓存命中时零解析开销）。"""
@@ -417,6 +439,21 @@ class SessionEventStore:
                         if (entry.get('role') == 'tool'
                                 and entry.get('tool_call_id') in placeholders):
                             entry['content'] = placeholders[entry['tool_call_id']]
+            elif event_type == "history_snipped":
+                # snip_compact 的持久化决策：逐字还原 head + marker + 保留段，
+                # 与触发当时的请求内形态一致（跨轮/跨重启前缀稳定）
+                head = event.get("head") or []
+                tail = event.get("tail") or []
+                messages = [json.loads(json.dumps(m)) for m in head
+                            if isinstance(m, dict) and m.get('role')]
+                messages.append({"role": "user",
+                                 "content": f"[snipped {int(event.get('snipped') or 0)} messages]"})
+                messages.extend(json.loads(json.dumps(m)) for m in tail
+                                if isinstance(m, dict) and m.get('role'))
+                for entry in messages:
+                    if (entry.get('role') == 'tool'
+                            and entry.get('tool_call_id') in placeholders):
+                        entry['content'] = placeholders[entry['tool_call_id']]
             elif event_type == "rewind":
                 messages = self._rewound_history(event)
             elif event_type == "tool_recovery":
@@ -554,7 +591,7 @@ class SessionEventStore:
     # ---------- 分叉与跨会话搜索 ----------
 
     FORK_EVENT_TYPES = ('message', 'compaction', 'session_title', 'workspace_changed',
-                        'tool_compacted')
+                        'tool_compacted', 'history_snipped')
 
     @classmethod
     def fork(cls, source: 'SessionEventStore', upto_seq: int | None = None,

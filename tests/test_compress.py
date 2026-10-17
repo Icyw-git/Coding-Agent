@@ -70,7 +70,8 @@ def validate_pairs(msgs, label):
 
 # ---------- 用例 ----------
 
-def test_snip_compact():
+def test_snip_compact(monkeypatch):
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 固定阈值 50，与窗口配置解耦
     msgs = build_conversation(30)          # 2 + 60 + 1 = 63 条，超过 50
     assert len(msgs) > 50
     out = harness.snip_compact(msgs)
@@ -87,8 +88,9 @@ def test_snip_noop_when_short():
     assert len(out) == 23
 
 
-def test_snip_compact_tool_groups():
+def test_snip_compact_tool_groups(monkeypatch):
     """真实会话常见"一个 assistant 带多个工具"分组：裁剪后不得出现孤儿 tool 消息。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 固定阈值 50
     msgs = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "u"},
@@ -107,8 +109,9 @@ def test_snip_compact_tool_groups():
     validate_pairs(out, "snip-groups")
 
 
-def test_snip_compact_head_no_dangling():
+def test_snip_compact_head_no_dangling(monkeypatch):
     """头部边界（head_end=3）落在多工具分组中间：裁剪后不得出现 dangling assistant。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 固定阈值 50
     msgs = [
         {"role": "user", "content": "u0"},
         {"role": "assistant", "content": None,
@@ -245,6 +248,101 @@ def test_tool_result_budget():
     for p in created:
         if p.exists():
             p.unlink()
+
+
+# ---------- 窗口参数与单位（前缀缓存诊断后修正） ----------
+
+def test_model_window_deepseek_1m(monkeypatch):
+    """DeepSeek 现行名与退役旧名都注册 1M（官方：V4.1-Flash/V4-Pro 上下文 1M，
+    旧名路由到同模型）——.env 的 deepseek-flash 不得再回落 64K。"""
+    for name in ('deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-pro',
+                 'deepseek-chat', 'deepseek-reasoner'):
+        assert harness.MODEL_WINDOWS.get(name) == 1_048_576, name
+    monkeypatch.setenv('LLM_MODEL_ID', 'deepseek-flash')
+    monkeypatch.setenv('LLM_CONTEXT_WINDOW', '')
+    assert harness._default_context_limit() == int((1_048_576 - harness.OUTPUT_RESERVE) * harness.CTX_SAFETY)
+    monkeypatch.setenv('LLM_MODEL_ID', 'unknown-model')   # 未知模型保守回落
+    assert harness._default_context_limit() == int((65536 - harness.OUTPUT_RESERVE) * harness.CTX_SAFETY)
+    monkeypatch.setenv('LLM_CONTEXT_WINDOW', '100000')    # env 显式配置优先
+    assert harness._default_context_limit() == int((100000 - harness.OUTPUT_RESERVE) * harness.CTX_SAFETY)
+
+
+def test_estimate_size_units():
+    """CJK 单位修正：1.3 字符/token（除法）。旧算法 cjk*1.3 高估 1.69 倍，
+    会让全部压缩阈值提前触发。"""
+    ascii_est = harness.estimate_size([{'role': 'user', 'content': 'a' * 3500}])
+    assert abs(ascii_est - 1000) < 30          # 3500/3.5 = 1000
+    cjk_est = harness.estimate_size([{'role': 'user', 'content': '中' * 1300}])
+    assert abs(cjk_est - 1000) < 30            # 1300/1.3 = 1000（旧算法 ≈1690）
+
+
+def test_snip_threshold_scales_with_window(monkeypatch):
+    """消息数安全阀随窗口缩放：默认窗口阈值 50，1M 窗口 262——
+    大窗口下 snip 不应再中途触发（滑动窗口是前缀缓存杀手）。"""
+    msgs = build_conversation(30)              # 63 条
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)
+    given = list(msgs)
+    out = harness.snip_compact(given)
+    assert out is not given and len(out) <= 50 # 默认窗口：照常触发
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 1_048_576)
+    given2 = list(msgs)
+    assert harness.snip_compact(given2) is given2     # 1M 窗口：63 条远未到 262，不触发
+    assert harness.snip_compact(given2, max_messages=10) is not given2  # 显式参数仍生效
+
+
+def test_snip_persisted_and_replayed(tmp_path, monkeypatch):
+    """snip 触发即写 history_snipped 事件：rebuild 与内存形态逐字一致，
+    marker 冻结（不再每轮变文本），跨重启（新 store 实例）还原相同历史。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 45_888)   # 阈值 50
+    store = SessionEventStore(tmp_path, session_id='snip')
+    out, _ = harness.pre_compact_messages(build_conversation(30), session_store=store)
+    assert any(str(m.get('content', '')).startswith('[snipped ') for m in out)
+    events = [e for e in store.read_events() if e['type'] == 'history_snipped']
+    assert len(events) == 1
+    rebuilt = store.rebuild_openai_history()
+    assert [m['content'] for m in rebuilt] == [m['content'] for m in out]
+    # 跨重启
+    reopened = SessionEventStore.open(store.path)
+    assert [m['content'] for m in reopened.rebuild_openai_history()] == [m['content'] for m in out]
+    # 再次触发：新事件替换，rebuild 跟随最后一次决策
+    out2, _ = harness.pre_compact_messages(
+        out + [{'role': 'user', 'content': 'x' * 200}] * 8, session_store=store)
+    events2 = [e for e in store.read_events() if e['type'] == 'history_snipped']
+    assert len(events2) == 2
+    assert [m['content'] for m in store.rebuild_openai_history()] == [m['content'] for m in out2]
+
+
+def test_tool_result_budget_persists_placeholders(tmp_path, monkeypatch):
+    """budget 改写走 tool_compacted 事件：跨轮 + 跨重启占位稳定（原实现只改内存，
+    重启 rebuild 还原原文导致前缀断裂）。"""
+    monkeypatch.setattr(harness, 'TOOL_RESULTS_DIR', tmp_path / 'tr')
+    store = SessionEventStore(tmp_path, session_id='budget')
+    msgs = [
+        {'role': 'user', 'content': 'u'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'c1', 'type': 'function', 'function': {'name': 'bash', 'arguments': '{}'}},
+            {'id': 'c2', 'type': 'function', 'function': {'name': 'bash', 'arguments': '{}'}},
+        ]},
+        {'role': 'tool', 'tool_call_id': 'c1', 'content': 'a' * (PERSIST + 1000)},
+        {'role': 'tool', 'tool_call_id': 'c2', 'content': 'b' * (PERSIST + 2000)},
+    ]
+    for m in msgs:   # 真实时序：原始消息先落盘，budget 作用于 rebuild 出的历史
+        store.append_message(m)
+    out = harness.tool_result_budget(store.rebuild_openai_history(),
+                                     max_bytes=4000, session_store=store)
+    out_tools = [m for m in out if m['role'] == 'tool']
+    assert all(str(m['content']).startswith('<persisted-output>') for m in out_tools)
+    # rebuild 与内存一致（事件已应用占位）
+    rebuilt_tools = [m for m in store.rebuild_openai_history() if m['role'] == 'tool']
+    assert [m['content'] for m in rebuilt_tools] == [m['content'] for m in out_tools]
+    # 跨重启
+    reopened = SessionEventStore.open(store.path)
+    rebuilt2 = [m for m in reopened.rebuild_openai_history() if m['role'] == 'tool']
+    assert [m['content'] for m in rebuilt2] == [m['content'] for m in out_tools]
+    # 原始大输出事件保留在流中（append-only，undo/rewind 可回溯）
+    raw = [e for e in store.read_events()
+           if e.get('type') == 'message' and (e.get('message') or {}).get('role') == 'tool']
+    assert len(raw) == 2 and len(raw[0]['message']['content']) == PERSIST + 1000
 
 
 # ---------- 运行 ----------

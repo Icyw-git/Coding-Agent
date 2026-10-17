@@ -435,10 +435,15 @@ DESTRUCTIVE=["rm ","del ","rmdir ","rd ","remove-item ","erase ",
              "clear-content ","> /etc/","chmod 777"]
 
 # ---------- 模型上下文配置 ----------
+# DeepSeek 官方（api-docs.deepseek.com/models）：V4.1-Flash / V4-Pro 上下文均为 1M；
+# deepseek-chat / deepseek-reasoner / deepseek-v4-flash 为已退役旧名（仍被接受，
+# 路由到 V4.1-Flash）——窗口同为 1M，勿按旧文档写 64K/128K。
 MODEL_WINDOWS={
-    'deepseek-v4-flash':131072,
-    'deepseek-chat':65536,
-    'deepseek-reasoner':65536,
+    'deepseek-flash':1_048_576,
+    'deepseek-v4-flash':1_048_576,
+    'deepseek-v4-pro':1_048_576,
+    'deepseek-chat':1_048_576,
+    'deepseek-reasoner':1_048_576,
 }
 OUTPUT_RESERVE=8192        # 给 max_tokens=8000 输出预留
 CTX_SAFETY=0.8             # 留余量，防 prompt_too_long
@@ -591,8 +596,13 @@ tool_registry['load_skill']=load_skill
 def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session_store=None): #压缩逻辑，每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
     """每轮开头的压缩预处理：budget → snip → micro →（仍超限）LLM 摘要。
     返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
-    messages = tool_result_budget(messages)
-    messages = snip_compact(messages)
+    messages = tool_result_budget(messages, session_store=session_store)
+    compacted = snip_compact(messages)
+    if compacted is not messages and session_store is not None:
+        # snip 触发：截断决策持久化为事件（marker 冻结、rebuild 逐字还原）——
+        # 否则滑动窗口每轮重写 marker + 位移保留段，前缀缓存每轮断裂
+        session_store.append_history_snipped(compacted)
+    messages = compacted
     size = estimate_size(messages)   # 每轮只算一次：micro 门槛与 auto 压缩共用
     if skip_micro_rounds > 0:
         skip_micro_rounds -= 1   # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
