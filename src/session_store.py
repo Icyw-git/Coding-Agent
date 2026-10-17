@@ -16,6 +16,20 @@ class SessionReplayError(ValueError):
 _GENERIC_ACKS = {'go', 'ok', 'okay', 'yes', 'y', '嗯', '行', '好的',
                  '继续', 'continue', 'do it', 'start'}
 
+# agent_loop 以 user 角色注入的系统消息前缀： todo 提醒 / 后台任务通知 / cron /
+# compact 工具备注 / 续写提示 / 落盘引用 / 恢复注入 —— 它们不是用户的「最近动态」，
+# 混进 last_user/preview/标题取材会把会话列表变成垃圾场（实测 preview 全是
+# '<reminder>Update your todos.</reminder>'）。
+_INJECTED_USER_PREFIXES = ('<reminder', '<task_notification', '<persisted-output',
+                           '<recovery', '[scheduled]', '[compacted', '[reactive compact',
+                           '[snipped', '[background task', 'output token limit hit')
+
+
+def is_injected_user_content(text: str) -> bool:
+    """判断 user 消息是否为系统注入（前缀大小写不敏感）。"""
+    stripped = ' '.join(str(text or '').split()).casefold()
+    return stripped.startswith(_INJECTED_USER_PREFIXES)
+
 
 class SessionEventStore:
     """The recovery source of truth; transcript snapshots remain separate exports."""
@@ -123,9 +137,11 @@ class SessionEventStore:
     def append_message(self, message: dict) -> dict:
         return self.append("message", message=copy.deepcopy(message))
 
-    def append_session_title(self, title: str) -> dict:
-        """Persist a short human-readable topic for session listings."""
-        return self.append("session_title", title=title)
+    def append_session_title(self, title: str, source: str = 'auto') -> dict:
+        """Persist a short human-readable topic for session listings.
+
+        source='user'（/rename）的标题受保护：异步重生成会跳过这些会话。"""
+        return self.append("session_title", title=title, source=source)
 
     def record_workspace(self, workspace: Path) -> None:
         """Record changes only; browsing a legacy session must not invent its cwd."""
@@ -155,6 +171,9 @@ class SessionEventStore:
                 if isinstance(content, str) and content.strip():
                     if message['role'] == 'user':
                         stripped = content.strip()
+                        # 系统注入（todo 提醒/后台通知/cron/压缩备注）不是「最近动态」
+                        if is_injected_user_content(stripped):
+                            continue
                         last_user = stripped[:1000]
                         # 「最近任务」跳过纯确认语/单字符噪声，露出最后一条有效输入
                         if stripped.casefold() not in _GENERIC_ACKS and len(stripped) > 1:
@@ -162,7 +181,8 @@ class SessionEventStore:
                     else:
                         last_assistant = content.strip()[:2000]
             if (event.get('type') == 'message' and message.get('role') == 'user'
-                    and isinstance(content, str) and content.strip()):
+                    and isinstance(content, str) and content.strip()
+                    and not is_injected_user_content(content)):
                 prompts.append(' '.join(content.split()))
         # session_title 事件是正式生成的标题（LLM/用户设置）：非系统注入、
         # 非纯确认语（'go'/'好的'/…——显式宣告本会话无好标题）时直接采用。
@@ -179,12 +199,15 @@ class SessionEventStore:
         else:
             chosen = next((p[:80] for p in meaningful if _useful_title_line(p)),
                           meaningful[0][:80] if meaningful else '新会话')
+        # preview 兜底：最后一段没有有效用户输入（整段都是工具活动）时，展示
+        # 最后一条 assistant 文本——比 reminder/通知垃圾或空白都有信息量
+        preview_src = last_useful_user or last_user or last_assistant
         return {
             'id': self.session_id,
             'title': chosen,
             'workspace': workspace,
-            'preview': ((' '.join((last_useful_user or last_user).split()))[:160]
-                        if (last_useful_user or last_user) else '尚无任务'),
+            'preview': ((' '.join(preview_src.split()))[:160]
+                        if preview_src else '尚无任务'),
             'last_user': last_useful_user or last_user,
             'last_assistant': last_assistant,
             'events': len(events),
@@ -232,6 +255,13 @@ class SessionEventStore:
             if event.get("type") == "session_title" and event.get("title"):
                 return str(event["title"])
         return None
+
+    def saved_session_title_source(self) -> str:
+        """最新标题的来源：'user'（/rename，受保护）或 'auto'（旧事件无 source 视为 auto）。"""
+        for event in reversed(self.read_events()):
+            if event.get("type") == "session_title" and event.get("title"):
+                return str(event.get('source') or 'auto')
+        return 'auto'
 
 
     def append_tool_started(self, tool_call) -> dict:

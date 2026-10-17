@@ -279,3 +279,83 @@ def test_generate_session_title_ignores_acknowledgment(monkeypatch):
         {'role': 'assistant', 'content': 'We should fix the checkpoint rewind history and preserve tool pairing.'},
     ])
     assert title == '修复 checkpoint 回滚后的工具调用历史'
+
+
+def test_generate_session_title_material_includes_goal_and_instruments(monkeypatch):
+    """取材改造：输入必须包含首条有效 user（目标）与工具名，且指令明确
+    「概括整个会话而非复述最后一条消息」（旧实现 exchanges[-8:] 取尾部，
+    长会话标题退化成最后一条助手回复的复述）。"""
+    captured = {}
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='缓存命中率诊断'))])
+
+    monkeypatch.setattr(harness, 'client', SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    filler = [{'role': 'assistant', 'content': f'中间步骤 {i}'} for i in range(20)]
+    title = harness.generate_session_title([
+        {'role': 'user', 'content': '诊断缓存命中率为什么只有 58%'},
+        *filler,
+        {'role': 'assistant', 'content': None,
+         'tool_calls': [{'id': 'c1', 'type': 'function',
+                         'function': {'name': 'bash', 'arguments': '{"command":"pytest"}'}}]},
+    ])
+    assert title == '缓存命中率诊断'
+    user_prompt = captured['messages'][-1]['content']
+    assert '诊断缓存命中率为什么只有 58%' in user_prompt, "目标（会话开头）必须进输入"
+    assert 'bash' in user_prompt, "最近工具名进输入"
+    system_prompt = captured['messages'][0]['content']
+    assert '不是复述最后一条消息' in system_prompt
+
+
+def test_generate_session_title_skips_injected_user_messages(monkeypatch):
+    """reminder/通知等系统注入不得成为标题取材的第一条 user。"""
+    captured = {}
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='重构压缩机制'))])
+
+    monkeypatch.setattr(harness, 'client', SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    harness.generate_session_title([
+        {'role': 'user', 'content': '<reminder>Update your todos.</reminder>'},
+        {'role': 'user', 'content': '重构压缩机制，保持前缀稳定'},
+    ])
+    user_prompt = captured['messages'][-1]['content']
+    assert '重构压缩机制，保持前缀稳定' in user_prompt
+    assert '<reminder>' not in user_prompt
+
+
+def test_housekeeping_title_regenerates_every_8_turns_and_respects_rename(tmp_path, monkeypatch):
+    """首次生成；8 的倍数回合异步重生成；用户 /rename（source='user'）后永不覆盖。"""
+    monkeypatch.setattr(harness, 'extract_memories', lambda pre_compress: None)
+    monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
+    store = harness.SessionEventStore(tmp_path, session_id='ttl')
+    titles = iter(['主题一', '主题二', '主题三'])
+    monkeypatch.setattr(harness, 'generate_session_title', lambda messages: next(titles))
+
+    harness._post_turn_housekeeping([], [], store, turn_no=1)
+    assert store.saved_session_title() == '主题一'
+    harness._post_turn_housekeeping([], [], store, turn_no=5)
+    assert store.saved_session_title() == '主题一', "非 8 倍数回合不重生成"
+    harness._post_turn_housekeeping([], [], store, turn_no=8)
+    assert store.saved_session_title() == '主题二', "第 8 回合重生成"
+    # /rename 保护
+    store.append_session_title('用户命名', source='user')
+    harness._post_turn_housekeeping([], [], store, turn_no=16)
+    assert store.saved_session_title() == '用户命名', "用户命名不受重生成覆盖"
+
+
+def test_saved_session_title_source_defaults_for_legacy_events(tmp_path):
+    store = harness.SessionEventStore(tmp_path, session_id='src')
+    store.append_session_title('旧式标题')   # 旧事件无 source 字段
+    assert store.saved_session_title_source() == 'auto'
+    store.append_session_title('手动命名', source='user')
+    assert store.saved_session_title_source() == 'user'
+    assert store.saved_session_title() == '手动命名'

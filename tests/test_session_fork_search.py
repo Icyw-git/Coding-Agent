@@ -244,6 +244,27 @@ def test_last_user_skips_noise_input(tmp_path):
     assert only.session_summary()['last_user'] == 'x'
 
 
+def test_preview_skips_injected_and_falls_back_to_assistant(tmp_path):
+    """todo 提醒/后台通知/压缩备注等系统注入不是「最近动态」；整段都是工具
+    活动时 preview 兜底为最后一条 assistant 文本（实测旧版 preview 全是
+    '<reminder>Update your todos.</reminder>'）。"""
+    store = SessionEventStore(tmp_path, session_id='inj')
+    store.append_message({'role': 'user', 'content': '继续任务'})
+    store.append_message({'role': 'user', 'content': '<reminder>Update your todos.</reminder>'})
+    store.append_message({'role': 'user', 'content': '<task_notification>\n <task_id>bg_1</task_id></task_notification>'})
+    store.append_message({'role': 'user', 'content': '[Compacted] Conversation history has been summarized.'})
+    summary = store.session_summary()
+    assert summary['last_user'] == '继续任务'
+    assert summary['preview'] == '继续任务'
+    # 整段无有效用户输入 → 兜底 assistant 文本
+    only_tool = SessionEventStore(tmp_path, session_id='tooly')
+    only_tool.append_message({'role': 'user', 'content': '<reminder>Update your todos.</reminder>'})
+    only_tool.append_message({'role': 'assistant', 'content': '结论：缓存命中率已修复至 92%。'})
+    s2 = only_tool.session_summary()
+    assert s2['last_user'] == ''
+    assert s2['preview'] == '结论：缓存命中率已修复至 92%。'
+
+
 # ---------- 跨会话搜索 ----------
 
 def test_search_all_matches_and_snippets(tmp_path):

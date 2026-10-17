@@ -187,26 +187,39 @@ def format_session_list(limit: int = 20) -> str:
 
 
 def generate_session_title(messages: list[dict]) -> str:
-    """Ask the configured model for a compact session topic, with a local fallback."""
+    """Ask the configured model for a compact session topic, with a local fallback.
+
+    取材是「会话在做什么」而非「最后说了什么」：首条有效 user（原始目标）+
+    最近一条 assistant 结论 + 最近用过的工具名。旧实现 exchanges[-8:] 取尾部，
+    长会话标题会变成最后一条助手回复的复述（实测 '工作区当前是干净的…'）。"""
+    from session_store import is_injected_user_content
+    first_user = next((m for m in messages
+                       if m.get('role') == 'user' and isinstance(m.get('content'), str)
+                       and m['content'].strip()
+                       and not is_injected_user_content(m['content'])), None)
+    last_assistant_text = next((m['content'].strip() for m in reversed(messages)
+                                if m.get('role') == 'assistant'
+                                and isinstance(m.get('content'), str)
+                                and m['content'].strip()), '')
+    tool_names = []
+    for m in reversed(messages):
+        for call in m.get('tool_calls') or []:
+            name = (call.get('function') or {}).get('name', '')
+            if name and name not in tool_names:
+                tool_names.append(name)
+    has_tool_context = bool(tool_names)
     exchanges = []
-    has_tool_context = False
-    for message in messages:
-        role = message.get('role')
-        content = message.get('content')
-        if role in ('user', 'assistant') and isinstance(content, str) and content.strip():
-            exchanges.append(f"{role}: {content.strip()[:600]}")
-        if role == 'assistant':
-            for call in message.get('tool_calls') or []:
-                function = call.get('function') or {}
-                name = function.get('name', '')
-                arguments = function.get('arguments', '')
-                if name:
-                    exchanges.append(f"tool call: {name} {str(arguments)[:300]}")
-                    has_tool_context = True
+    if first_user is not None:
+        exchanges.append(f"user（目标）: {first_user['content'].strip()[:600]}")
+    if last_assistant_text:
+        exchanges.append(f"assistant（最近结论）: {last_assistant_text[:400]}")
+    if tool_names:
+        exchanges.append("最近使用的工具: " + ', '.join(tool_names[:8]))
     fallback = next((
         ' '.join(line.split()).strip()[:60]
         for message in messages
         if message.get('role') == 'user' and isinstance(message.get('content'), str)
+        and not is_injected_user_content(message['content'])
         for line in message['content'].splitlines()
         if _is_session_title_candidate(line)
     ), None)
@@ -215,6 +228,7 @@ def generate_session_title(messages: list[dict]) -> str:
             ' '.join(line.split()).strip()[:60]
             for message in messages
             if message.get('role') == 'assistant' and isinstance(message.get('content'), str)
+            and not is_injected_user_content(message['content'])
             for line in message['content'].splitlines()
             if _is_session_title_candidate(line)
         ), '(untitled session)')
@@ -227,11 +241,13 @@ def generate_session_title(messages: list[dict]) -> str:
             model=os.getenv('LLM_MODEL_ID'),
             messages=[
                 {'role': 'system', 'content': (
-                    '为这段 coding agent 会话概括一个简短主题。只输出标题，使用用户原语言，'
-                    '控制在 20 个汉字或 8 个英文词以内。忽略“继续、好的、go、do it”等确认语，'
-                    '根据实际任务概括；如果记录没有提供足够信息，只输出 (untitled session)，不要猜测。'
+                    '为这段 coding agent 会话概括一个主题标题。只输出标题本体（名词短语，'
+                    '不加句号、前缀或引号），使用用户原语言，不超过 20 个汉字或 8 个英文词。'
+                    '概括的是整个会话在做什么，不是复述最后一条消息或结论。'
+                    '忽略 <reminder>、<task_notification> 等系统注入和“继续、好的、go”等确认语；'
+                    '如果记录没有提供足够信息，只输出 (untitled session)，不要猜测。'
                 )},
-                {'role': 'user', 'content': '\n'.join(exchanges[-8:])},
+                {'role': 'user', 'content': '\n'.join(exchanges)},
             ],
             temperature=0,
             max_tokens=40,
@@ -955,7 +971,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         if session_store is None:
             print('  [rename] 当前没有会话上下文。')
             return
-        title = session_store.append_session_title(argument.strip()[:80])
+        title = session_store.append_session_title(argument.strip()[:80], source='user')
         print(f"  会话主题已设置为：{title['title']}")
 
     elif command == '/sessions':
@@ -1077,17 +1093,21 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(f"  unknown command: {command}")
 
 
-def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store):
-    """回合结束后的副通道作业：会话标题生成 + 记忆提炼/合并。
+def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn_no=1):
+    """回合结束后的副通道作业：会话标题生成/重生成 + 记忆提炼/合并。
 
     每项各自要走一次 LLM——放后台线程执行，回复立即返回给调用方，
     不让飞书/SDK 用户多等几秒到几十秒。异常只告警，绝不影响主流程。
+    标题：首次生成 + 每 8 回合异步重生成（主题演化后旧标题会过时）；
+    用户 /rename 设过（source='user'）的会话永不重生成。
     """
     try:
-        if not session_store.saved_session_title():
+        saved = session_store.saved_session_title()
+        source = session_store.saved_session_title_source()
+        if source != 'user' and (not saved or (turn_no > 1 and turn_no % 8 == 0)):
             title = generate_session_title(messages_snapshot)
-            if title != '(untitled session)' and not session_store.saved_session_title():
-                session_store.append_session_title(title)
+            if title != '(untitled session)' and title != saved:
+                session_store.append_session_title(title, source='auto')
     except Exception as exc:
         print(f'  \033[33m[title] skipped: {exc}\033[0m')
     try:
@@ -1225,6 +1245,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
     turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末打印）
     ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
     snip_state={} #snip 触发迟滞：触发后基线+阈值/4 才允许再次触发（无迟滞则越线后每回合滑动断前缀）
+    turn_no=0 #已完成回合数（每 8 回合异步重生成一次会话标题）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
@@ -1384,9 +1405,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
             # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
             # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
+            turn_no += 1
             housekeeping = threading.Thread(
                 target=_post_turn_housekeeping,
-                args=(pre_compress, list(messages), session_store),
+                args=(pre_compress, list(messages), session_store, turn_no),
                 daemon=True,
             )
             with _housekeeping_lock:

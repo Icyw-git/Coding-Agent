@@ -184,7 +184,7 @@ class AgentRuntime:
         if not title:
             raise ValueError('标题不能为空')
         store = self._open_session(session_id)
-        store.append_session_title(title[:80])
+        store.append_session_title(title[:80], source='user')   # 用户命名：异步重生成永不覆盖
         return store.session_summary()['title']
 
     def manage_session(self, action: str, row: dict):
