@@ -27,6 +27,24 @@ class SessionAlreadyExistsError(ValueError):
     """Raised when a caller tries to create an existing session ID."""
 
 
+# 会话摘要缓存 (path, size, mtime_ns) → summary：飞书 /sessions 每次列表都要
+# 概括全部会话文件，store 的实例级缓存跨列表失效；key 含 size/mtime，
+# 追加自动过期。上限兜底防爆炸（陈旧 key 只占少量内存）。
+_summary_cache: dict[tuple, dict] = {}
+
+
+def _cached_summary(store) -> dict:
+    stat = store.path.stat()
+    key = (str(store.path), stat.st_size, stat.st_mtime_ns)
+    hit = _summary_cache.get(key)
+    if hit is None:
+        hit = store.session_summary()
+        if len(_summary_cache) > 512:
+            _summary_cache.clear()
+        _summary_cache[key] = hit
+    return dict(hit)   # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
+
+
 class AgentRuntime:
     """Coordinate persisted sessions and invoke a supplied agent turn runner."""
 
@@ -130,7 +148,7 @@ class AgentRuntime:
         for path in paths:
             try:
                 store = self._session_store_cls.open(path)
-                summary = store.session_summary()
+                summary = _cached_summary(store)
             except (OSError, ValueError):
                 continue   # unreadable/corrupt log: leave it out of the listing
             rows.append(summary)

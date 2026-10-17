@@ -2,6 +2,7 @@
 
 运行: python test_session_fork_search.py
 """
+import json
 import os
 import sys
 import time
@@ -59,6 +60,22 @@ def test_fork_rejects_existing_target(tmp_path):
     src.append_message({'role': 'user', 'content': 'hello'})   # 让目标文件存在
     with pytest.raises(FileExistsError):
         SessionEventStore.fork(src, session_id='src')
+
+
+def test_read_events_cache_stays_coherent(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='cache')
+    store.append_message({'role': 'user', 'content': 'one'})
+    assert len(store.read_events()) == 1   # 首读并缓存
+    store.append_message({'role': 'assistant', 'content': 'two'})
+    second = store.read_events()
+    assert [e['seq'] for e in second] == [1, 2]   # append 扩展缓存，不丢事件
+    second.append({'seq': 99})   # 返回列表是快照：调用方改动不得污染缓存
+    assert len(store.read_events()) == 2
+    with open(store.path, 'a', encoding='utf-8') as fh:   # 外部写入 → size 失效重读
+        fh.write(json.dumps({'v': 1, 'seq': 3, 'session_id': 'cache', 'type': 'session_title',
+                             'ts': time.time(), 'title': '外部写入'}, ensure_ascii=False) + '\n')
+    third = store.read_events()
+    assert len(third) == 3 and third[-1]['title'] == '外部写入'
 
 
 def test_last_user_skips_noise_input(tmp_path):

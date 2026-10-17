@@ -31,6 +31,11 @@ class SessionEventStore:
         else:
             self.session_id = session_id or uuid.uuid4().hex
             self.path = self.directory / f"session_{self.session_id}.jsonl"
+        # 完整解析成功后的只读缓存 (size, mtime_ns, events)：saved_session_title/
+        # session_summary 每回合被调多次，长会话全量 JSON 重解析是 housekeeping
+        # 首步卡顿的来源。命中时浅拷贝列表返回（事件 dict 只读共享）。
+        # 必须在 _read_last_seq() 之前就位——它会触发第一次 read_events。
+        self._events_cache = None
         self._next_seq = self._read_last_seq() + 1
         # 锁在初始化时解析一次（每次 append 都 resolve 约 10ms 开销）；
         # 同路径的多实例仍从类级 _locks 取到同一把锁
@@ -81,6 +86,15 @@ class SessionEventStore:
                 os.fsync(handle.fileno())
             self._next_seq = next_seq + 1
             self._known_size = current_size + len(encoded.encode('utf-8'))
+            # 追加后把新事件扩进缓存（deepcopy 隔离，调用方改动不污染缓存），
+            # 免掉每回合 2-3 次的全量重解析；缓存口径不符时简单失效。
+            cache = self._events_cache
+            if cache is not None and cache[0] == current_size:
+                stat = self.path.stat()
+                self._events_cache = (stat.st_size, stat.st_mtime_ns,
+                                      cache[2] + [copy.deepcopy(event)])
+            else:
+                self._events_cache = None
         return event
 
     def append_message(self, message: dict) -> dict:
@@ -238,9 +252,14 @@ class SessionEventStore:
     def read_events(self, *, allow_partial_tail: bool = True) -> list[dict]:
         if not self.path.exists():
             return []
+        stat = self.path.stat()
+        cached = self._events_cache
+        if cached is not None and cached[0] == stat.st_size and cached[1] == stat.st_mtime_ns:
+            return list(cached[2])
         lines = self.path.read_text(encoding="utf-8").splitlines()
         events = []
         expected_seq = 1
+        partial_tail = False
         for index, line in enumerate(lines):
             if not line.strip():
                 continue
@@ -248,6 +267,7 @@ class SessionEventStore:
                 event = json.loads(line)
             except json.JSONDecodeError as exc:
                 if allow_partial_tail and index == len(lines) - 1:
+                    partial_tail = True   # 文件写入中：不缓存，下次重读
                     break
                 raise SessionReplayError(f"invalid JSONL event at line {index + 1}") from exc
             if not isinstance(event, dict):
@@ -259,6 +279,8 @@ class SessionEventStore:
                 )
             expected_seq += 1
             events.append(event)
+        if not partial_tail:
+            self._events_cache = (stat.st_size, stat.st_mtime_ns, events)
         return events
 
     def tail_events(self, offset: int = 0, *, strict: bool = False) -> tuple[list[dict], int]:
