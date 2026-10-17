@@ -174,9 +174,9 @@ def test_preprocessors_order():
     try:
         for n in names:
             orig = originals[n]
-            setattr(harness, n, (lambda o, name: lambda m: (order.append(name),
+            setattr(harness, n, (lambda o, name: lambda m, *a, **kw: (order.append(name),
                                                             logger.debug("[preprocess] %s called on %d msgs", name, len(m)),
-                                                            o(m))[2])(orig, n))
+                                                            o(m, *a, **kw))[2])(orig, n))
         fake = FakeCompletions([make_text_response('ok')])
         orig_create = harness.client.chat.completions.create
         harness.client.chat.completions.create = fake.create

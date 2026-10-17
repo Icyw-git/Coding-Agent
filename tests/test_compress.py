@@ -2,8 +2,10 @@
 
 运行: python test_compress.py
 """
+import json
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
@@ -147,17 +149,35 @@ def test_collect_tool_results():
     assert all("tool_call_id" in m for m in results)
 
 
-def test_micro_compact():
-    msgs = build_conversation(6, content_len=200)   # 每个工具结果 200+ 字符
+def test_micro_compact(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 400)   # 降低门槛：只验证改写路径本身
+    monkeypatch.setattr(harness, 'TOOL_RESULTS_DIR', tmp_path / 'tool_results')
+    # 轮数必须 > KEEP_RECENT，否则 [:-KEEP_RECENT] 为空、改写断言空转通过
+    msgs = build_conversation(6 + KEEP_RECENT, content_len=200)
     out = harness.micro_compact(msgs)
     tool_msgs = [m for m in out if m["role"] == "tool"]
-    assert len(tool_msgs) == 6
+    assert len(tool_msgs) == 6 + KEEP_RECENT
     for m in tool_msgs[:-KEEP_RECENT]:
         assert str(m["content"]).startswith("[Earlier tool result compacted"), m
+        assert "bash(" in m["content"], "占位符必须带工具身份（名称+参数）"
+        assert "Full output saved" in m["content"], "完整输出必须落盘（零丢失）"
     for m in tool_msgs[-KEEP_RECENT:]:
         assert str(m["content"]).startswith("output-"), "最近的结果不应被压缩"
+    # 落盘文件真实存在且内容完整
+    import re
+    saved = re.search(r"Full output saved: (.+?)\. Re-run", tool_msgs[0]["content"])
+    assert saved and Path(saved.group(1)).read_text(encoding="utf-8").startswith("output-0:")
     # 结构仍有效
     assert all("tool_call_id" in m for m in tool_msgs)
+
+
+def test_micro_compact_gated_below_half_context():
+    # 前缀缓存保护：上下文不过半时不得改写历史（否则 KV 缓存 84%→6% 断崖）
+    msgs = build_conversation(12, content_len=200)
+    out = harness.micro_compact(msgs)
+    tool_msgs = [m for m in out if m["role"] == "tool"]
+    assert all(str(m["content"]).startswith("output-") for m in tool_msgs), \
+        "低水位下历史必须保持逐字稳定"
 
 
 def test_persist_large_output():

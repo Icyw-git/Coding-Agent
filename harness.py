@@ -291,6 +291,7 @@ def format_status(session_store) -> str:
         usage = dict(_usage_by_session.get(session_store.session_id, {}))
     usage_line = (f'\n  tokens：{_fmt_tokens(usage["total"])}'
                   f'（输入 {_fmt_tokens(usage["prompt"])} · 输出 {_fmt_tokens(usage["completion"])}）'
+                  f'{_cache_hit_rate_line(usage)}'
                   if usage.get('total') else '')
     return (
         f"  会话：{summary['title']}\n"
@@ -474,17 +475,17 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
     key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
     cached = _prompt_cache.get()
     if cached is not None and cached[0] == key:
-        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        if os.getenv('HARNESS_DEBUG') == '1':
+            print("  \033[90m[cache hit] system prompt unchanged\033[0m")
         return cached[1]
     prompt = assemble_system_prompt(context)
     _prompt_cache.set((key, prompt))
 
     loaded=['identity','tools','workspace','rules']
-    if context.get('memories'):
-        loaded.append('memory')
     if context.get('skills'):
         loaded.append('skills')
-    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    if os.getenv('HARNESS_DEBUG') == '1':
+        print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return prompt
 
 def update_context(context:dict,messages:list)->dict: # 更新上下文：工具、工作目录、技能
@@ -593,11 +594,12 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None): #压�
     返回 (压缩后的 messages, 新的 skip_micro_rounds)。"""
     messages = tool_result_budget(messages)
     messages = snip_compact(messages)
+    size = estimate_size(messages)   # 每轮只算一次：micro 门槛与 auto 压缩共用
     if skip_micro_rounds > 0:
         skip_micro_rounds -= 1   # 压缩后前几轮跳过 micro_compact，保留刚拿到的工具结果
     else:
-        messages = micro_compact(messages)
-    if estimate_size(messages) > CONTEXT_LIMIT:
+        messages = micro_compact(messages, size)
+    if size > CONTEXT_LIMIT:
         print("  [compact] 上下文接近上限，已自动压缩历史（完整记录已保存）")
         messages = compact_history(messages)
         if on_compact:
@@ -1074,7 +1076,10 @@ def _fmt_tokens(n: int) -> str:
 
 
 def _record_usage(session_id: str, usage) -> int:
-    """把一次 LLM 调用的 usage 累计进会话账本，返回本次 total（缺失时静默跳过）。"""
+    """把一次 LLM 调用的 usage 累计进会话账本，返回本次 total（缺失时静默跳过）。
+
+    同时采集缓存命中 token：OpenAI 为 prompt_tokens_details.cached_tokens，
+    DeepSeek 为扁平字段 prompt_cache_hit_tokens —— 没有它命中率不可观测。"""
     if not usage:
         return 0
     prompt = int(getattr(usage, 'prompt_tokens', 0) or 0)
@@ -1082,13 +1087,30 @@ def _record_usage(session_id: str, usage) -> int:
     total = int(getattr(usage, 'total_tokens', 0) or prompt + completion)
     if total <= 0:
         return 0
+    details = getattr(usage, 'prompt_tokens_details', None)
+    cached = getattr(details, 'cached_tokens', None) if details is not None else None
+    if cached is None:
+        cached = getattr(usage, 'prompt_cache_hit_tokens', None)
+    cached_seen = cached is not None
+    cached = int(cached or 0)
     with _usage_lock:
         bucket = _usage_by_session.setdefault(
-            session_id, {'prompt': 0, 'completion': 0, 'total': 0})
+            session_id, {'prompt': 0, 'completion': 0, 'total': 0,
+                         'cached': 0, 'cached_seen': False})
         bucket['prompt'] += prompt
         bucket['completion'] += completion
         bucket['total'] += total
+        bucket['cached'] += cached
+        bucket['cached_seen'] = bucket['cached_seen'] or cached_seen
     return total
+
+
+def _cache_hit_rate_line(bucket: dict) -> str:
+    """命中率后缀：供应商未回传 cached 字段时不显示（避免把「未知」当 0）。"""
+    if not bucket.get('cached_seen') or not bucket.get('prompt'):
+        return ''
+    rate = bucket['cached'] / bucket['prompt']
+    return f' · 缓存命中 {rate:.0%}'
 
 
 def _stream_completion(create_kwargs, on_delta):
@@ -1297,8 +1319,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                     print(message.content)
             if turn_tokens:
                 with _usage_lock:
-                    cum = _usage_by_session.get(session_store.session_id, {}).get('total', 0)
-                print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · 会话累计 {_fmt_tokens(cum)}')
+                    cum = dict(_usage_by_session.get(session_store.session_id, {}))
+                print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
+                      f'会话累计 {_fmt_tokens(cum.get("total", 0))}'
+                      f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             session_store.append('turn_completed')
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash

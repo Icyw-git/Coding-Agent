@@ -224,13 +224,15 @@ def large_output_hook(tool:str,args:dict,output:str):
 
 
 def context_injection_hook(query:str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {_h().get_workdir()}\033[0m")
+    if os.getenv('HARNESS_DEBUG') == '1':
+        print(f"\033[90m[HOOK] UserPromptSubmit: working in {_h().get_workdir()}\033[0m")
     return None
 
 
 def summary_hook(messages:list):
-    tool_count=sum(1 for m in messages if m.get('role')=='tool')
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    if os.getenv('HARNESS_DEBUG') == '1':
+        tool_count=sum(1 for m in messages if m.get('role')=='tool')
+        print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
 

@@ -480,25 +480,58 @@ def collect_tool_results(messages):  # 收集所有工具结果
     return [msg for msg in messages if msg.get('role') == 'tool']
 
 
-def micro_compact(messages):  # 旧工具结果占位，只保留最近 KEEP_RECENT 条工具结果
+def micro_compact(messages, size=None):  # 旧工具结果占位，只保留最近 KEEP_RECENT 条工具结果
     h = _h()
+    # 前缀缓存保护：原地改写历史会让供应商 KV 前缀缓存从改写处全部失效
+    # （实测命中率 84%→6% 断崖）。上下文不过半时保持历史逐字稳定，
+    # 用一点 token 占用换稳定命中 —— 净收益为正。超半后 token 占用优先。
+    # size：调用方（pre_compact_messages）已算好的 estimate，避免重复遍历/重复消费。
+    if (size if size is not None else h.estimate_size(messages)) < h.CONTEXT_LIMIT * 0.5:
+        return messages
     tool_results = collect_tool_results(messages)
     if len(tool_results) < h.KEEP_RECENT:
         return messages
+    # 占位符必须可恢复：带上工具身份（名称+参数）让模型知道丢的是什么、
+    # 完整输出落盘路径让信息零丢失（需要时 read 即回）。
+    identity = {}
+    for m in messages:
+        if m.get('role') != 'assistant':
+            continue
+        for call in m.get('tool_calls') or []:
+            fn = call.get('function') or {}
+            identity[call.get('id')] = (f"{fn.get('name', '?')}"
+                                        f"({str(fn.get('arguments', ''))[:80]})")
     for msg in tool_results[:-h.KEEP_RECENT]:
-        if len(str(msg.get('content', ''))) > 120:
-            msg['content'] = "[Earlier tool result compacted. Re-run if needed.]"
+        content = str(msg.get('content', ''))
+        if len(content) > 120:
+            path = _persist_to_file(msg.get('tool_call_id', 'unknown'), content)
+            saved = f' Full output saved: {path}.' if path else ''
+            ident = identity.get(msg.get('tool_call_id'), msg.get('tool_call_id', '?'))
+            msg['content'] = (f"[Earlier tool result compacted: {ident}."
+                              f"{saved} Re-run the tool if needed.]")
     return messages
+
+
+def _persist_to_file(tool_use_id, output) -> str | None:
+    """把输出写入 TOOL_RESULTS_DIR，返回文件路径；写失败返回 None。"""
+    h = _h()
+    try:
+        h.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = h.TOOL_RESULTS_DIR / f'{tool_use_id}.txt'
+        if not path.exists():
+            path.write_text(output, encoding='utf-8')
+        return str(path)
+    except OSError:
+        return None
 
 
 def persist_large_output(tool_use_id, output):  # 持久化大输出
     h = _h()
     if len(output) <= h.PERSIST_THERSHOLD:
         return output
-    h.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = h.TOOL_RESULTS_DIR / f'{tool_use_id}.txt'
-    if not path.exists():
-        path.write_text(output, encoding='utf-8')
+    path = _persist_to_file(tool_use_id, output)
+    if path is None:
+        return output
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
 

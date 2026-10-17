@@ -125,7 +125,8 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     mem = tmp_path / 'mem'
     monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
     monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
-    usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+               prompt_tokens_details=NS(cached_tokens=96))
 
     def fake_create(**kwargs):
         return NS(choices=[NS(message=NS(role='assistant', content='done', tool_calls=None),
@@ -134,8 +135,33 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(harness.client.chat.completions, 'create', fake_create)
     harness.agent_loop([{'role': 'user', 'content': '统计 token'}], session_store=store)
     out = capsys.readouterr().out
-    assert '[tokens] 本轮 120 · 会话累计 120' in out
+    assert '[tokens] 本轮 120 · 会话累计 120 · 缓存命中 96%' in out
     assert 'tokens：120' in harness.format_status(store)   # /status 显示会话累计
+    assert '缓存命中 96%' in harness.format_status(store)
+
+
+def test_record_usage_collects_cached_tokens():
+    from types import SimpleNamespace as NS
+
+    harness._usage_by_session.clear()
+    try:
+        # OpenAI 嵌套字段
+        openai_usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                          prompt_tokens_details=NS(cached_tokens=80))
+        assert harness._record_usage('sess-cache', openai_usage) == 120
+        # DeepSeek 扁平字段
+        ds_usage = NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
+                      prompt_cache_hit_tokens=60)
+        harness._record_usage('sess-cache', ds_usage)
+        bucket = harness._usage_by_session['sess-cache']
+        assert bucket['cached'] == 140 and bucket['cached_seen']
+        assert '70%' in harness._cache_hit_rate_line(bucket)   # 140 / 200（cached ⊆ prompt）
+        # 供应商未回传 cached 字段 → 不显示（未知 ≠ 0）
+        harness._record_usage('sess-plain', NS(prompt_tokens=50, completion_tokens=10,
+                                               total_tokens=60))
+        assert harness._cache_hit_rate_line(harness._usage_by_session['sess-plain']) == ''
+    finally:
+        harness._usage_by_session.clear()
 
 
 def test_compaction_tail_survives_replay(tmp_path):
