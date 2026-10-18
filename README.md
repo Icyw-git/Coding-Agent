@@ -113,12 +113,14 @@ HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一
 - `read-only` 只放公认不改动的命令（`dir`、`ls`、`git status` 等）；解释器、命令替换（`$()` / 反引号）
   和带重定向的命令仍要审批。
 - `danger-full-access` 取消提示级限制和工作区路径约束，只保留黑名单硬拒。
-- `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位没有 OS 沙箱兜底，
-  需要审批的操作直接失败（fail-closed），而不是静默执行。
+- `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位下需要审批的
+  操作直接失败（fail-closed），而不是静默执行。开启 OS 沙箱也不改变这一点——沙箱只约束写入，
+  不替代审批。
 - 黑名单、根删（`rm -rf --no-preserve-root /`）、`cmd /c` 包装、`su""do` 拆引号等变体在硬拒层，
   档位和白名单都越不过去。
 - 默认档下，`read`/`write`/`edit` 文件工具的工作区外访问直接硬拒；`danger-full-access` 会放开这条路径检查。
-  **这不约束 shell 命令的写入路径**：例如重定向、`mkdir` 或解释器代码可能访问工作区外；Stage 1 不能视为文件系统隔离。
+  **策略档位本身不约束 shell 命令的写入路径**：例如重定向、`mkdir` 或解释器代码可能访问工作区外；
+  需要内核级写入约束时开启下文的 OS 沙箱。
 - 第三方 MCP 工具当前不经过这一层判定（P0.2 计划覆盖）；启用 MCP 时不要把 `read-only` 当成隔离。
 
 配置入口：`/sandbox` 查看和切换（CLI、飞书、`gateway_sim`、`GET/POST /v1/policy` 都走服务端同一份
@@ -133,8 +135,38 @@ HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一
 一次批准会以一次性凭据传到工具边界，同一次调用不会被问第二遍；「本次会话允许同类」的白名单按键
 按会话分区，不会让某个会话批过的 `rm` 在别的会话也免审。
 
-⚠ 这一层是策略级判定，不是操作系统沙箱：它不隔离文件读取和网络，也不保证进程无法绕开。
-内核级隔离（Windows Job Object / AppContainer、Linux seccomp）属于后续阶段。
+⚠ 没有开启 OS 沙箱时，这一层只是策略级判定：它不隔离文件读取和网络，也不保证进程无法绕开。
+
+### OS 沙箱（可选，Windows）
+
+`HARNESS_OS_SANDBOX` 控制是否用 Windows 强制完整性控制（MIC）把 shell 子进程降到
+**低完整性级别（Low IL）**。它独立于执行/审批档位，默认 `off`：
+
+| 取值 | 行为 |
+| --- | --- |
+| `off`（默认） | 不启用，shell 以普通权限运行 |
+| `auto` | 尝试启用；本机不支持或初始化失败时退回普通执行，并在 stderr 提示一次 |
+| `require` | 必须启用；失败时命令直接返回 `Error: OS 沙箱不可用：…`，不会降级执行 |
+
+启用后：
+
+- 工作区目录树被标记为 Low IL，临时目录重定向到 `<工作区>/.cache/sandbox-tmp`；
+  子进程对 Medium IL 的工作区外文件写入、注册表写入会被内核拒绝（no-write-up）。
+- **读取和网络不隔离**，命令仍能读取任意可读文件、访问网络；这是写入方向的最低成本兜底，
+  不是 AppContainer 级别的完整沙箱。
+- 覆盖范围是本项目启动的 shell 子进程：工具 `bash`（含 Teammate、后台 worker）和
+  任务管理器的长命令；不覆盖第三方 MCP 工具及 Agent 进程自身的 Python 调用。
+- 首次启用会对工作区执行一次 `icacls /setintegritylevel … L`。如果继承的 ACL 缺少
+  `WRITE_OWNER`（在部分非系统盘上常见），会先为当前用户补一条 `(OI)(CI)(WO)` 授权；
+  该操作只需要一次，结果按工作区缓存并提示一次。目录树较大时首次启用会明显变慢。
+- **Git Bash / MSYS 工具（`ls`、`grep`、`cat`、`bash`、`sed` 等）在 Low IL 下会崩溃**
+  （无法访问 `\BaseNamedObjects`，退出码 `3221225794`）。沙箱内请使用原生命令
+  （`dir`、`findstr`、PowerShell、Python、Node、git、npm、curl 等），或保持沙箱关闭。
+- 关闭沙箱不会撤销已经打上的 Low 标签；需要恢复时执行
+  `icacls "<工作区>" /setintegritylevel M /T /C /Q`。
+
+沙箱不可用（非 Windows、无法打标签、无法创建受限令牌等）时，`auto` 退回普通执行并提示，
+`require` 拒绝执行——与 `never` 审批档的 fail-closed 语义一致，不会静默降级。
 
 ## 快速开始
 
@@ -168,6 +200,9 @@ HARNESS_SANDBOX_MODE=workspace-write
 
 # 可选：审批档位 untrusted / on-request（默认）/ never；也可运行中用 /sandbox 切换
 HARNESS_APPROVAL_POLICY=on-request
+
+# 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
+HARNESS_OS_SANDBOX=off
 
 # 可选：启用分段计时，启动前设置
 HARNESS_PERF=1
@@ -287,7 +322,9 @@ python -m pytest
 ```
 
 测试文件位于 `tests/`，覆盖会话存储、上下文压缩、记忆、任务系统、Worktree、执行策略
-（`test_exec_policy.py` 测判定矩阵，`test_execution_paths.py` 测四条执行入口的接线）等模块。
+（`test_exec_policy.py` 测判定矩阵，`test_execution_paths.py` 测四条执行入口的接线，
+`test_sandbox.py` 测 OS 沙箱的启动、拒绝写与失败降级；Windows 集成用例在无法打标签时跳过）等模块。
+测试默认将 `HARNESS_OS_SANDBOX` 固定为 `off`，避免把 `tmp_path` 目录标记为 Low。
 在受限环境中，可为 pytest 指定一个可写的临时目录：
 
 ```bash
@@ -305,6 +342,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
 | `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
+| `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
 | `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |
 | `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
 | `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
