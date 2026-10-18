@@ -178,3 +178,56 @@ def test_failed_termination_does_not_claim_cancellation(tmp_path, monkeypatch, m
     # Synthetic record, no OS process was spawned.
     manager._tasks.clear()
     manager._procs.clear()
+
+
+# ---------- 执行策略接线（第四条路径：HTTP 建的任务不经过 PreToolUse hook） ----------
+
+def _wait_terminal(manager, record, timeout=5.0):
+    for _ in range(int(timeout / 0.05)):
+        record = manager.get(record.id)
+        if record.status not in ('queued', 'running'):
+            return record
+        time.sleep(0.05)
+    pytest.fail(f'task {record.id} never reached a terminal state')
+
+
+def test_enforce_blocks_the_command_before_spawning(tmp_path, monkeypatch, manager_factory):
+    from unittest.mock import Mock
+
+    spawn = Mock(side_effect=AssertionError('blocked command must not start'))
+    monkeypatch.setattr('task_manager.subprocess.Popen', spawn)
+    manager = manager_factory(tmp_path, enforce=lambda command: 'Error: needs approval')
+    record = _wait_terminal(manager, manager.create('echo nope'))
+
+    assert record.status == 'cancelled'
+    assert 'approval' in record.detail      # 拒绝原因留在记录里，/status 能看到
+    assert record.ended_at is not None
+    assert not Path(record.log_path).exists(), '被拦下的任务不该留下日志'
+    spawn.assert_not_called()
+    saved = json.loads((tmp_path / f'{record.id}.json').read_text(encoding='utf-8'))
+    assert saved['status'] == 'cancelled'
+
+
+def test_enforce_allows_the_command_when_the_policy_allows(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path, enforce=lambda command: None)
+    record = _wait_terminal(manager, manager.create('echo gated-ok'))
+    assert record.status == 'succeeded', record.detail
+    assert 'gated-ok' in manager.tail_logs(record.id)
+
+
+def test_enforce_runs_in_the_worker_not_the_request_thread(tmp_path, manager_factory):
+    """POST 立即返回 queued：审批阻塞的是 runner 线程，不是 HTTP 请求线程。"""
+    seen = {}
+
+    def slow_enforce(command):
+        seen['thread'] = threading.current_thread().name
+        time.sleep(0.3)
+        return None
+
+    manager = manager_factory(tmp_path, enforce=slow_enforce)
+    started = time.time()
+    record = manager.create('echo hi')
+    assert time.time() - started < 0.2, 'create() 不应等待审批'
+    assert record.status == 'queued'
+    assert seen.get('thread') not in (None, 'MainThread'), '判定发生在 runner 线程'
+    assert _wait_terminal(manager, record).status == 'succeeded'

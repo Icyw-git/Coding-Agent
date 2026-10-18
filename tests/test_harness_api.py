@@ -357,3 +357,56 @@ def test_api_shutdown_stops_tasks_and_releases_log(tmp_path):
     assert saved['exit_code'] is not None
     # Windows refuses this rename if a FileHandler still owns the file.
     log.rename(tmp_path / 'released.log')
+
+
+# ---------- 执行档位端点（/sandbox 的服务端一侧） ----------
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_policy_endpoint_reads_switches_and_rejects_bad_tiers(tmp_path, api_client):
+    from exec_policy import load_policy
+
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks', workspace=tmp_path,
+                                   rate_limit=10000))
+    headers = {'Authorization': 'Bearer t'}
+    default = {'sandbox_mode': 'workspace-write', 'approval_policy': 'on-request'}
+    assert client.get('/v1/policy', headers=headers).json() == {'policy': default}
+
+    switched = client.post('/v1/policy', json={'sandbox_mode': 'read-only'},
+                           headers=headers)
+    assert switched.status_code == 200
+    assert switched.json()['policy'] == {'sandbox_mode': 'read-only',
+                                         'approval_policy': 'on-request'}
+    assert load_policy().sandbox_mode == 'read-only', '服务端进程需立即生效'
+
+    bad = client.post('/v1/policy', json={'approval_policy': 'ask-me'}, headers=headers)
+    assert bad.status_code == 400
+    assert 'on-request' in bad.json()['detail']      # 400 里带可选值清单
+    assert load_policy().approval_policy == 'on-request'
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_http_task_is_gated_by_the_policy_tier(tmp_path, api_client, monkeypatch):
+    """POST /v1/tasks 不经过 PreToolUse hook：runner 在 Popen 前自己判（第四条路径）。"""
+    monkeypatch.setattr('hooks.GATE.timeout', 0.2)   # 无人决议 → 超时拒绝
+
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks', workspace=tmp_path,
+                                   rate_limit=10000))
+    headers = {'Authorization': 'Bearer t'}
+    client.post('/v1/policy', json={'sandbox_mode': 'read-only'}, headers=headers)
+
+    created = client.post('/v1/tasks',
+                          json={'command': 'python -c "print(1)"'}, headers=headers)
+    assert created.status_code == 201
+    record = created.json()['task']
+    assert record['status'] == 'queued', '创建请求不应等待审批'
+
+    for _ in range(100):
+        record = client.get(f"/v1/tasks/{record['id']}", headers=headers).json()['task']
+        if record['status'] not in ('queued', 'running'):
+            break
+        time.sleep(0.05)
+    assert record['status'] == 'cancelled'
+    assert record['detail'] == 'Permission denied by user'
+    assert client.get(f"/v1/tasks/{record['id']}/logs", headers=headers).text == ''

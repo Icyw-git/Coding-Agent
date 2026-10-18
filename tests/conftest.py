@@ -8,7 +8,13 @@ import harness
 from hooks import GATE as permission_gate
 
 _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
-             'HARNESS_APPROVAL_TIMEOUT')
+             'HARNESS_APPROVAL_TIMEOUT',
+             # 执行档位：本机 .env 配了 read-only/never 时，不能把「默认档即重构前
+             # 行为」的测试前提一起改掉。需要特定档位的用例自己 setenv。
+             'HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
+             'HARNESS_APPROVAL_ALL')
+_TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
+              'HARNESS_APPROVAL_ALL')
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +55,8 @@ def _restore_permission_backend():
 
     同时钉住：记忆召回策略（本机 .env 可能配了 local/off，测试默认预期是
     llm 旧行为，test_memory_recall 自己显式切换）、审批超时压到 3s（泄漏
-    时 3 秒显形为失败，而不是按 .env 的 600s 挂死）。
+    时 3 秒显形为失败，而不是按 .env 的 600s 挂死）、执行档位（清掉环境里的
+    档位配置，让所有用例从默认档起步；要试别的档位自己 setenv）。
 
     ⚠ 刻意不依赖 monkeypatch fixture：依赖它会让 monkeypatch 成为 autouse
     的前置、从而在 autouse 之后才 teardown——其 undo() 会把 backend 覆盖
@@ -60,6 +67,8 @@ def _restore_permission_backend():
     os.environ['HARNESS_MEMORY_RECALL'] = 'llm'
     os.environ.pop('HARNESS_LOAD_MEMORIES', None)
     os.environ['HARNESS_APPROVAL_TIMEOUT'] = '3'
+    for key in _TIER_KEYS:
+        os.environ.pop(key, None)   # 用例默认跑默认档，需要别的档位自己 setenv
     previous = permission_gate.backend
     previous_timeout = permission_gate.timeout
     permission_gate.timeout = 3   # GATE 在导入时已读走 timeout，setenv 来不及

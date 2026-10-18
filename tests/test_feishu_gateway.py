@@ -716,3 +716,63 @@ def test_api_permission_endpoints_flow(api_app):
                            json={'allow': True}, headers=headers).status_code == 404
     finally:
         permission_gate.backend = monkey_backend
+
+
+# ---------- /sandbox：档位读写（转发到服务端 /v1/policy） ----------
+
+def test_gateway_client_policy_round_trip(api_app):
+    """网关客户端 ↔ HTTP 端点的真实链路（飞书 /sandbox 走的就是这两个方法）。"""
+    api = gateway_sim.GatewayClient('http://test', 't',
+                                    transport=_sync_asgi_transport(api_app))
+    try:
+        assert api.get_policy() == {'sandbox_mode': 'workspace-write',
+                                    'approval_policy': 'on-request'}
+        assert api.set_policy(sandbox_mode='read-only')['sandbox_mode'] == 'read-only'
+        assert api.get_policy()['sandbox_mode'] == 'read-only'
+    finally:
+        api.close()
+
+
+def test_sandbox_command_reports_tiers_and_errors(gateway, monkeypatch):
+    gw, fake = gateway
+
+    class PolicyAPI:
+        def __init__(self):
+            self.policy = {'sandbox_mode': 'workspace-write',
+                           'approval_policy': 'on-request'}
+            self.calls = []
+
+        def get_policy(self):
+            self.calls.append(('get',))
+            return dict(self.policy)
+
+        def set_policy(self, **kwargs):
+            self.calls.append(('set', kwargs))
+            self.policy.update(kwargs)
+            return dict(self.policy)
+
+    api = PolicyAPI()
+    monkeypatch.setattr(gw, 'api', api)
+
+    gw.on_message('c1', '/sandbox')
+    assert 'workspace-write' in fake.last() and 'OS 级沙箱' in fake.last()
+    gw.on_message('c1', '/sandbox read-only')
+    assert 'read-only' in fake.last()
+    gw.on_message('c1', '/sandbox approvals never')
+    assert 'never' in fake.last()
+    assert api.calls == [('get',), ('set', {'sandbox_mode': 'read-only'}),
+                         ('set', {'approval_policy': 'never'})]
+
+    # 形状不对：本地拦下，不发请求
+    gw.on_message('c1', '/sandbox approvals')
+    assert '用法' in fake.last()
+    assert len(api.calls) == 3
+
+    class BrokenAPI(PolicyAPI):
+        def set_policy(self, **kwargs):
+            raise RuntimeError("unknown HARNESS_SANDBOX_MODE 'nope'; "
+                               'choose one of read-only, workspace-write, danger-full-access')
+
+    monkeypatch.setattr(gw, 'api', BrokenAPI())
+    gw.on_message('c1', '/sandbox nope')
+    assert '[sandbox] unknown' in fake.last(), '服务端的 400 说明要转给用户'
