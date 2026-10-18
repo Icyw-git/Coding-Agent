@@ -31,7 +31,8 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from process_utils import kill_process_tree
+from process_utils import close_process, kill_process_tree
+from sandbox import SandboxProcess, spawn_shell
 
 TERMINAL_STATUSES = {'succeeded', 'failed', 'cancelled', 'interrupted'}
 ACTIVE_STATUSES = {'queued', 'running'}
@@ -72,7 +73,7 @@ class TaskManager:
         self._enforce = enforce
         self._lock = threading.RLock()
         self._tasks: dict[str, TaskRecord] = {}
-        self._procs: dict[str, subprocess.Popen] = {}
+        self._procs: dict[str, subprocess.Popen | SandboxProcess] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._closed = False
         self._load_all()
@@ -204,10 +205,10 @@ class TaskManager:
                 try:
                     handle.write(f'$ {record.command}\n[cwd] {record.cwd}\n')
                     handle.flush()
-                    proc = subprocess.Popen(
-                        record.command, cwd=record.cwd, shell=True,
-                        stdout=handle, stderr=subprocess.STDOUT,
-                        start_new_session=os.name != 'nt',
+                    proc = spawn_shell(
+                        record.command, cwd=record.cwd, stdout=handle,
+                        workspace=str(self.allowed_root)
+                        if self.allowed_root is not None else None,
                     )
                     record.pid = proc.pid
                     self._procs[record.id] = proc
@@ -240,11 +241,12 @@ class TaskManager:
                     record.detail = f'{type(exc).__name__}: {exc}'
                 self._save(record)
         finally:
+            close_process(proc)
             with self._lock:
                 self._threads.pop(record.id, None)
 
     @staticmethod
-    def _kill_tree(proc: subprocess.Popen) -> None:
+    def _kill_tree(proc: subprocess.Popen | SandboxProcess) -> None:
         """Kill the process and its children (cmd.exe spawns intermediaries)."""
         kill_process_tree(proc)
 

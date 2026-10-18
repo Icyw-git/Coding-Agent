@@ -5,8 +5,12 @@ import signal
 import subprocess
 
 
-def kill_process_tree(proc: subprocess.Popen) -> None:
+def kill_process_tree(proc) -> None:
     if proc.poll() is not None:
+        return
+    from sandbox import SandboxProcess   # 局部导入：避免与 task_manager 的导入顺序耦合
+    if isinstance(proc, SandboxProcess):
+        proc.kill_tree()
         return
     if os.name == 'nt':
         result = subprocess.run(
@@ -21,3 +25,10 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass
     proc.wait(timeout=10)
+
+
+def close_process(proc) -> None:
+    """Release sandbox handles (kills any remaining descendants); Popen needs none."""
+    from sandbox import SandboxProcess
+    if isinstance(proc, SandboxProcess):
+        proc.close()

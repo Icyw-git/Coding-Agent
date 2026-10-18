@@ -8,7 +8,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional, List
-from process_utils import kill_process_tree
+
+import sandbox
+from process_utils import close_process, kill_process_tree
 
 from exec_policy import load_policy
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
@@ -428,14 +430,16 @@ def run_bash(command:str, cwd: str = None)->str:
     denied = _gate().enforce_headless('bash', {'command': command})
     if denied:
         return denied
+    proc = None
     try:
         base = cwd or str(_h().get_workdir())
         # A descendant can keep a PIPE open after cmd.exe exits. A temporary
         # output file lets the timeout bound execution without waiting for EOF.
         with tempfile.TemporaryFile() as output:
-            proc = subprocess.Popen(command, shell=True, cwd=base,
-                                    stdout=output, stderr=subprocess.STDOUT,
-                                    start_new_session=os.name != 'nt')
+            # cwd 同时是 OS 沙箱的可写根：teammate 在 worktree 里执行时，
+            # 可写范围就是那个 worktree，而不是主工作区。
+            proc = sandbox.spawn_shell(command, cwd=base, stdout=output,
+                                       workspace=base)
             try:
                 proc.wait(timeout=BASH_TIMEOUT)
             except subprocess.TimeoutExpired:
@@ -453,10 +457,14 @@ def run_bash(command:str, cwd: str = None)->str:
         out=out.strip()
         out=out.replace('\ufffd','?')  # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
         return out[:50000] if out else "No output"
+    except sandbox.SandboxUnavailable as e:
+        return f'Error: {e}'
     except subprocess.TimeoutExpired:
         return 'Error: Timed out while terminating command; process state unknown.'
     except (FileNotFoundError,OSError) as e:
         return f'Error:{e}'
+    finally:
+        close_process(proc)
 
 def safe_path(p: str, cwd: str = None) -> Path:
     workspace = _h().get_workdir()
