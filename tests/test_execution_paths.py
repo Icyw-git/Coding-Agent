@@ -308,7 +308,9 @@ def test_sandbox_command_lists_tiers_and_the_limitation(capsys):
                  'untrusted', 'on-request', 'never'):
         assert tier in out
     assert '*workspace-write' in out          # 默认档被标出
-    assert '不是 OS 级沙箱' in out             # 边界说明必须出现在菜单里
+    assert '策略级判定' in out                 # 边界说明必须出现在菜单里
+    assert 'HARNESS_OS_SANDBOX' in out        # OS 沙箱是独立开关，菜单里要看得到
+    assert 'off' in out                       # conftest 把测试环境固定在 off 档
 
 
 @pytest.mark.parametrize(('line', 'sandbox', 'approval'), [

@@ -5,10 +5,11 @@ import os
 import pytest
 
 import harness
+import sandbox
 from hooks import GATE as permission_gate
 
 _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
-             'HARNESS_APPROVAL_TIMEOUT',
+             'HARNESS_APPROVAL_TIMEOUT', 'HARNESS_OS_SANDBOX',
              # 执行档位：本机 .env 配了 read-only/never 时，不能把「默认档即重构前
              # 行为」的测试前提一起改掉。需要特定档位的用例自己 setenv。
              'HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
@@ -67,6 +68,10 @@ def _restore_permission_backend():
     os.environ['HARNESS_MEMORY_RECALL'] = 'llm'
     os.environ.pop('HARNESS_LOAD_MEMORIES', None)
     os.environ['HARNESS_APPROVAL_TIMEOUT'] = '3'
+    # OS 沙箱默认关闭：本机 .env 开 auto 时，用它跑 tmp_path 里的真实命令会
+    # 给测试目录打 Low 标签、拖慢甚至改变行为。需要沙箱的用例自己打开。
+    os.environ['HARNESS_OS_SANDBOX'] = 'off'
+    sandbox.reset_cache()
     for key in _TIER_KEYS:
         os.environ.pop(key, None)   # 用例默认跑默认档，需要别的档位自己 setenv
     previous = permission_gate.backend
