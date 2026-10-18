@@ -212,18 +212,18 @@ class Policy:
     def _apply_approval_policy(self, decision: Decision) -> Decision:
         """approval_policy 只调节「询问」的去向，永不放松「硬拒」。
 
-        never 的语义是「别问我要不要」，于是普通询问直接放行；但 read-only 档的
-        询问代表「这个档位不允许」，没有交互可确认时只能硬拒 —— 与 Codex 的
-        sandbox_mode=read-only + approval_policy=never 行为一致（写操作直接失败）。
+        never 的语义是「别问我要不要」。Codex 敢让询问直接通过，是因为 workspace-write
+        有 OS 沙箱兜底；本项目 Stage 1 没有，放行等于静默执行 rm -rf / curl | sh。
+        所以除 danger-full-access（用户显式选择完全自主）外，需要审批的操作一律失败，
+        与 read-only + never 的既有行为保持一致。
         """
         if decision.action != ASK:
             return decision
         if self.approval_policy != 'never':
             return decision
-        if decision.code == 'sandbox_read_only' or self.sandbox_mode == 'read-only':
-            return Decision(DENY, decision.code or 'sandbox_read_only',
-                            decision.reason, decision.pattern)
-        return Decision(ALLOW, decision.code, decision.reason, decision.pattern)
+        if self.sandbox_mode == 'danger-full-access':
+            return Decision(ALLOW, decision.code, decision.reason, decision.pattern)
+        return Decision(DENY, decision.code, decision.reason, decision.pattern)
 
 
 # ============================================================

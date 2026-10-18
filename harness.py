@@ -303,7 +303,7 @@ SANDBOX_MODE_HELP = (
 APPROVAL_POLICY_HELP = (
     ('untrusted', '每条 bash 都要审批'),
     ('on-request', '默认档：只在策略层判定有风险时询问'),
-    ('never', '不打断；read-only 档下无法放行的写改直接失败'),
+    ('never', '不打断；除 danger-full-access 外，需要审批的操作直接失败'),
 )
 
 
