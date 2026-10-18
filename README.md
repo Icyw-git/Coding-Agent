@@ -32,6 +32,7 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 - `/sessions`（`/s`）：打开会话管理，与不带参数的 `/resume` 使用同一界面。
 - `/cd "D:\My Project"`：切换工作区，支持带空格的路径；`/pwd` 查看路径。
 - `/checkpoint [标签]`、`/checkpoints`、`/rewind`：创建、查看和回溯快照。
+- `/sandbox`：查看并切换执行档位与审批档位，见「执行安全与审批」。
 - `/status` 查看状态，`/quit`（`/exit`）退出。
 
 新建会话保留当前工作区；恢复会话会同时恢复已记录的工作目录。旧会话未记录目录时，明确提示并保留当前目录；目录不存在时不会切换。`/sessions` 只读取本地摘要，不调用模型。工作区切换不会自动新建会话。
@@ -67,6 +68,7 @@ Enter 切换、Esc 返回，Ctrl+A 切换当前/全部工作区。Tab/Shift+Tab 
 - `/archive [天数|all|empty|restore]`：列出可归档或恢复的会话，默认 30 天未活跃。
 - `/archive select 1 3`：选择列表中的会话，预览后用 `/confirm` 执行，或 `/cancel` 取消。
 - `/delete`、`/delete select 1 3`：选择已归档会话；必须用 `/confirm 删除` 才永久删除。
+- `/sandbox [档位|approvals <档位>]`：查看或切换服务端的执行/审批档位，对所有会话立即生效。
 
 会话列表最多读取 1000 条，每次重新展示列表会让旧列表按钮失效，10 分钟后也需重新 `/sessions`。
 按钮受用户白名单及聊天来源校验，会话已删除或目录失效时不切换。
@@ -95,6 +97,42 @@ SDK 对应 `client.sessions.workspace(id)`、`client.sessions.change_workspace(i
 设置 `HARNESS_API_LOG` 后使用对应日志路径。这里的进度心跳不代表任务已完成。
 同步 shell 工具执行超过 120 秒会请求终止进程树，并向 Agent 返回超时结果。
 
+## 执行安全与审批
+
+所有会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
+PreToolUse 钩子、工具边界（`run_bash` / `run_write` / `run_edit`）、Teammate 线程、后台与
+HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一份黑名单。
+
+两档配置，命名与 Codex 对齐，默认值就是本项目重构前的实际行为：
+
+| 档位 | 取值 | 默认 |
+| --- | --- | --- |
+| `sandbox_mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write`：工作区内写改放行，破坏性命令询问 |
+| `approval_policy` | `untrusted`、`on-request`、`never` | `on-request`：只在策略层判定有风险时询问 |
+
+- `read-only` 只放公认不改动的命令（`dir`、`ls`、`git status` 等）；解释器和带重定向的命令仍要审批。
+- `danger-full-access` 取消提示级限制和工作区路径约束，只保留黑名单硬拒。
+- `never` 的语义是「不用问我」：普通询问直接放行，但 `read-only` 档下无法放行的写改直接失败。
+- 黑名单、根删（`rm -rf --no-preserve-root /`）、`cmd /c` 包装、`su""do` 拆引号等变体在硬拒层，
+  档位和白名单都越不过去。
+- 默认档下，`read`/`write`/`edit` 文件工具的工作区外访问直接硬拒；`danger-full-access` 会放开这条路径检查。
+  **这不约束 shell 命令的写入路径**：例如重定向、`mkdir` 或解释器代码可能访问工作区外；Stage 1 不能视为文件系统隔离。
+
+配置入口：`/sandbox` 查看和切换（CLI、飞书、`gateway_sim`、`GET/POST /v1/policy` 都走服务端同一份
+判定，运行时立即生效）；也可以写进环境 `HARNESS_SANDBOX_MODE` 与 `HARNESS_APPROVAL_POLICY`
+（旧开关 `HARNESS_APPROVAL_ALL=1` 等价于 `approval_policy=untrusted`，仅在没有显式配置新档位时兜底）。
+档位名写错不会静默回落到默认档：`/sandbox` 报用法，环境变量按默认档并在 stderr 提示一次，
+`/status` 和 `--doctor` 始终显示实际生效的档位。
+
+审批有三条通道：CLI 主循环读 stdin；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
+队列，由飞书卡片或 `/approvals` 决议；Teammate、后台 worker、任务 runner 这些不能抢控制台的线程
+只排队等远程决议。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝。
+一次批准会以一次性凭据传到工具边界，同一次调用不会被问第二遍；「本次会话允许同类」的白名单按键
+按会话分区，不会让某个会话批过的 `rm` 在别的会话也免审。
+
+⚠ 这一层是策略级判定，不是操作系统沙箱：它不隔离文件读取和网络，也不保证进程无法绕开。
+内核级隔离（Windows Job Object / AppContainer、Linux seccomp）属于后续阶段。
+
 ## 快速开始
 
 ### 1. 获取代码
@@ -122,6 +160,12 @@ HARNESS_UI=ansi
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
 
+# 可选：执行档位 read-only / workspace-write（默认）/ danger-full-access
+HARNESS_SANDBOX_MODE=workspace-write
+
+# 可选：审批档位 untrusted / on-request（默认）/ never；也可运行中用 /sandbox 切换
+HARNESS_APPROVAL_POLICY=on-request
+
 # 可选：启用分段计时，启动前设置
 HARNESS_PERF=1
 ```
@@ -134,7 +178,7 @@ HARNESS_PERF=1
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动）、`/compact`（保存完整记录后压缩当前上下文）、
 `/undo`（回到最近一次快照）和 `/approvals`（查看待审批操作）。飞书网关同步支持
-`/model`、`/approvals` 和 `/perms`；文件查看与上下文压缩仍建议在 CLI 中执行。
+`/model`、`/approvals`、`/perms` 和 `/sandbox`；文件查看与上下文压缩仍建议在 CLI 中执行。
 
 请勿提交 `.env` 或任何真实 API 密钥；`.gitignore` 已默认忽略该文件。
 
@@ -208,7 +252,9 @@ python entrypoint.py --resume <session_id>
   ```
 
   API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
-  `GET /v1/sessions/{id}/events`（SSE）。所有 `/v1/` 请求都需要
+  `GET /v1/sessions/{id}/events`（SSE）；`GET/POST /v1/tasks` 系列管理长命令，
+  `GET /v1/permissions` 与 `POST /v1/permissions/{id}/resolve` 用于远程决议审批，
+  `GET/POST /v1/policy` 读写执行/审批档位。所有 `/v1/` 请求都需要
   `Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
   通过 SDK/应用工厂传入 `access_log_path`）。API 默认启用每个客户端和路径每分钟 60 次的轻量限流。
 
@@ -237,12 +283,15 @@ npm run preview
 python -m pytest
 ```
 
-测试文件位于 `tests/`，覆盖会话存储、上下文压缩、记忆、任务系统和 Worktree 等模块。
+测试文件位于 `tests/`，覆盖会话存储、上下文压缩、记忆、任务系统、Worktree、执行策略
+（`test_exec_policy.py` 测判定矩阵，`test_execution_paths.py` 测四条执行入口的接线）等模块。
 在受限环境中，可为 pytest 指定一个可写的临时目录：
 
 ```bash
-python -m pytest --basetemp .test-tmp
+python -m pytest --basetemp /tmp/harness-pytest
 ```
+
+`--basetemp` 请指向仓库外的目录：落在 Git 工作树内时，依赖「当前目录不是 Git 仓库」的用例会失真。
 
 ## 项目结构
 
@@ -252,6 +301,8 @@ python -m pytest --basetemp .test-tmp
 | `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
+| `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
+| `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |
 | `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
 | `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
 | `tests/` | 自动化测试与测试辅助程序 |

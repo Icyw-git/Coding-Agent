@@ -17,8 +17,9 @@
         → agent_loop（每轮开头先跑 4 级压缩预处理）
         → API 调用（Spinner / 后台任务并行执行）
         → 每个 tool_call：
-              [PreToolUse hook] → 可阻断（黑名单硬拒 / 危险命令询问 / 越界询问）
+              [PreToolUse hook] → enforce()：策略层判定（黑名单硬拒 / 危险命令询问 / 档位 + 会话白名单）
               → tool_registry[name](**args)   ← 分发；task=子代理 / 慢命令=后台线程
+                 teammate / 后台 worker / HTTP 任务不经过 hook，在工具边界走同一个 enforce（凭据免二次询问）
               → [PostToolUse hook]
               → 必须回一条 role=tool 消息（阻断也一样）
         → 若 finish_reason != tool_calls：后台通知收集 → [Stop hook] → 最终回答
@@ -82,6 +83,9 @@ def trigger_hooks(event, *args):
 | `DENY_LIST`   | 直接拒绝，不询问   | `rm -rf /`、`sudo`            |
 | `DESTRUCTIVE` | 询问用户，n 则拒绝 | `del`、`Remove-Item`、`rmdir` |
 | 越界访问      | 询问用户，n 则拒绝 | read/write/edit 访问工作区外  |
+
+> 这张表是当时的形态。现在判定收敛到 `src/exec_policy.py` 一处，越界访问改成硬拒
+> （批准了也照样被 `safe_path` 拦，等于不起作用的按钮），详见第 15 部分。
 
 **核心坑（必考）**：阻断 ≠ 跳过。被 `PreToolUse` 拦截时若用 `continue` 跳过，OpenAI 报
 `insufficient tool messages following tool_calls`——**每个 `tool_call_id` 必须有一条 tool 消息回应**，
@@ -555,6 +559,62 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 
 ---
 
+# 第 15 部分：执行策略收敛——一处判定，四条路径（新增）
+
+## 问题：同一句"这命令危不危险"被写了三遍，而且各判各的
+
+`hooks.permission_hook`（PreToolUse 黑名单 + `input()` 询问）、`tools.run_bash`（第二份
+`dangerous=[...]`）、`agent_teams.safe_bash`（第三份）各有一套，`approval_class` 在 hooks 和
+飞书网关也各有一份。结果是：teammate、后台 worker、`POST /v1/tasks` 三条不经过 hook 的路径
+判定强度和文案都不一样，而 CLI 里批准过的命令到工具边界又被打断一次。
+
+## 做法
+
+- 新增 `src/exec_policy.py`：纯函数策略层，只回答"该不该做"，不 import harness，
+  黑名单由调用方注入（`monkeypatch` 假配置的既有测试不用改）。
+- 两个档位与 Codex 对齐：`sandbox_mode`（read-only | workspace-write | danger-full-access）、
+  `approval_policy`（untrusted | on-request | never），默认组合 = 重构前的实际行为，零行为漂移。
+- `hooks.enforce(tool, args, interactive=)` 成为唯一入口：策略判定 → 会话白名单 → 审批 → 凭据。
+  四条路径都走它，区别只有 `interactive`——即调用线程能不能读 stdin。
+- 无头路径（teammate / 后台 worker / 任务 runner / HTTP 任务）走 `decide_queued`：登记进
+  `/v1/permissions` 队列等远程决议，超时拒绝；不再在工作线程里 `input()`，也不再"看不见就放行"。
+- 审批通过发一张一次性凭据（`ContextVar`），工具边界取走即用，同一次调用不会问第二遍；
+  跨线程要像 `use_workspace` 那样显式带走。
+
+## 踩过的坑
+
+- **审批白名单是进程级集合**：一个会话批过 `rm`，别的会话也免审。改成按
+  `session_allow_key(tool, klass, session_id)` 分区；取不到会话时退回旧的进程级键，
+  既有测试（假配置没有 `active_checkpoint_manager`）行为不变。
+- **"越界访问"是个不起作用的按钮**：策略层问一次"要不要访问工作区外"，用户批了，
+  `safe_path` 照样拒绝。改成直接硬拒，确需越界切 `danger-full-access`。
+- **档位名大小写不一致**：`command_error` 用 casefold 校验通过，`apply_sandbox_tier` 却按原样
+  比较 `parts[0] == 'approvals'`，于是 `/sandbox APPROVALS never` 会当成执行档位名去校验并抛错。
+  分支判定也要归一。
+- **新档位差点又变成一个不起作用的按钮**：`danger-full-access` 最初只改策略层判定，
+  `tools.safe_path` 仍无条件拒绝越界路径——档位写了却不生效。路径检查也要读档位
+  （默认两档锁工作区，`danger-full-access` 放开），两处不能给出相反结论。
+- **拒绝语文案是对外契约**：`'Permission denied by user'`、
+  `'Error: Dangerous command {pattern}, please do not execute'` 被提示词规则和历史测试断言，
+  重构时先固定文案再动逻辑。
+- **`read-only` 档的短路顺序**：`never` 的含义是"别问我要不要"，不代表"允许"，
+  所以 read-only 档下的询问在 `never` 时必须变成硬拒，否则配了只读档反而更松。
+
+## 测试
+
+`test_exec_policy.py`（判定矩阵：默认档等值、绕过语料、三档差异、配置解析与告警）+
+`test_execution_paths.py`（凭据只消费一次、无头排队与超时、白名单分区、四条入口边界、`/sandbox`），
+`test_task_manager.py` 补 enforce 回调，`test_harness_api.py` 补 `/v1/policy` 与任务被档位拦下，
+`test_feishu_gateway.py` 补网关档位读写。全量 474 passed。
+
+## 收获
+
+- **安全边界的价值在于"只有一处"**：判定重复三遍时，最弱的那条路径就是实际边界；
+- 新配置项必须有真实区别和显式失败：静默回落默认值等于骗用户"保护开了其实没开"；
+- 无头线程的审批要"排队 + 超时拒绝"，既不能抢控制台，也不能悄悄放行。
+
+---
+
 ## 核心教训总纲
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。
@@ -570,3 +630,4 @@ patch `harness.client` 照常生效，**19 个测试零改动全绿**。可变�
 11. **"公平分工"是协调问题不是并发问题**——轮询认领无协调必然偏斜（相位领先者通吃）；多 agent 协作要显式分配或加抖动。
 12. **改返回值语义必须同步所有调用点**——返回码从布尔改字符串后，调用方真值判断把 'awake' 当成 shutdown，teammate 收到计划批准反而退出。
 13. **隔离优于约束**——与其提示模型"别写错目录"，不如用 git worktree 在物理上隔离；会话级可变状态（当前 cwd）必须显式跟踪完整生命周期，否则泄漏到下一个任务。
+14. **判定只能有一处**——同一套黑名单写三遍，实际边界就是最弱的那条路径；策略层收敛后，档位、审批分级、凭据都只需要解释一次，四条执行入口的行为才可验证。
