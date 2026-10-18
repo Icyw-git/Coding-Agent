@@ -43,6 +43,7 @@ from session_store import SessionEventStore, SessionReplayError
 from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
 from cli_commands import parse_command, command_error, format_command_help
+from exec_policy import load_policy, set_tier
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 from perf import segment as perf_segment, record as perf_record, reset as perf_reset
 
@@ -292,6 +293,52 @@ def _has_session_title_source(messages: list[dict]) -> bool:
     )
 
 
+# ---------- 执行档位（/sandbox）----------
+# 档位只描述「策略层怎么判」，不代表内核强制：见 exec_policy 模块头的边界说明。
+SANDBOX_MODE_HELP = (
+    ('read-only', '只放公认只读的命令，写改与其余命令都要审批'),
+    ('workspace-write', '默认档：工作区内写改放行，破坏性命令询问'),
+    ('danger-full-access', '取消提示级限制与工作区路径约束，只保留黑名单硬拒'),
+)
+APPROVAL_POLICY_HELP = (
+    ('untrusted', '每条 bash 都要审批'),
+    ('on-request', '默认档：只在策略层判定有风险时询问'),
+    ('never', '不打断；read-only 档下无法放行的写改直接失败'),
+)
+
+
+def format_sandbox_tier() -> str:
+    """档位清单 + 当前选中项，/status 与 --doctor 都复用这段说明。"""
+    policy = load_policy()
+    lines = [f'  执行档位：{policy.sandbox_mode} · 审批档位：{policy.approval_policy}']
+    for title, options, current in (
+            ('执行档位（/sandbox <档位>）', SANDBOX_MODE_HELP, policy.sandbox_mode),
+            ('审批档位（/sandbox approvals <档位>）', APPROVAL_POLICY_HELP,
+             policy.approval_policy)):
+        lines.append(f'  {title}')
+        lines.extend(f'    {"*" if name == current else " "}{name:<20}{note}'
+                     for name, note in options)
+    lines.append('  说明：以上是策略级判定（四个执行入口同一套规则），不是 OS 级沙箱，'
+                 '不隔离文件读取与网络。')
+    return '\n'.join(lines)
+
+
+def apply_sandbox_tier(argument: str) -> str:
+    """/sandbox <档位> 与 /sandbox approvals <档位>。参数已由 command_error 校验。"""
+    # 档位名大小写不敏感（load_policy 也是 casefold 读的）；分支判定同样要归一，
+    # 否则 '/sandbox APPROVALS never' 校验通过却走进执行档位分支。
+    parts = [part.casefold() for part in argument.split()]
+    if parts[0] == 'approvals':
+        policy = set_tier(approval_policy=parts[1])
+        changed = f'审批档位 → {policy.approval_policy}'
+    else:
+        policy = set_tier(sandbox_mode=parts[0])
+        changed = f'执行档位 → {policy.sandbox_mode}'
+    # 档位写进环境：load_policy 即时读取，下一条工具调用就生效，子进程也继承
+    return (f'  已切换 {changed}'
+            f'（当前 {policy.sandbox_mode} · {policy.approval_policy}）')
+
+
 def format_status(session_store) -> str:
     """Summarize local runtime state for the interactive REPL."""
     from turn_progress import relative_time
@@ -305,6 +352,7 @@ def format_status(session_store) -> str:
         ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
     summary = session_store.session_summary()
     usage = session_store.usage_totals()   # 从 usage 事件聚合，跨重启准确
+    policy = load_policy()
     usage_line = (f'\n  tokens：{_fmt_tokens(usage["total"])}'
                   f'（输入 {_fmt_tokens(usage["prompt"])} · 输出 {_fmt_tokens(usage["completion"])}）'
                   f'{_cache_hit_rate_line(usage)}'
@@ -314,6 +362,7 @@ def format_status(session_store) -> str:
         f"  最近活跃：{relative_time(summary['updated'])}\n"
         f'  工作区：{WORKDIR}\n'
         f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
+        f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
         f'{usage_line}'
@@ -382,6 +431,11 @@ def run_doctor() -> int:
             checks.append((f'writable {directory}', False))
     for label, passed in checks:
         print(f'[{"ok" if passed else "missing"}] {label}')
+    # 档位属于运行时配置，诊断输出里必须看得见：否则「以为开了只读其实没开」
+    # 这类误差只能在事故发生后才发现。
+    policy = load_policy()
+    print(f'[policy] sandbox_mode={policy.sandbox_mode} '
+          f'approval_policy={policy.approval_policy}（策略级判定，非 OS 沙箱）')
     return 0 if all(passed for _, passed in checks) else 1
 
 PROMPT_SECTIONS={
@@ -924,6 +978,9 @@ def handle_command(line:str,messages:list,session_store)->None:
     elif command == '/model':
         print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
         print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
+
+    elif command == '/sandbox':
+        print(apply_sandbox_tier(argument) if argument else format_sandbox_tier())
 
     elif command == '/approvals':
         tokens = argument.split()

@@ -22,7 +22,8 @@ from agent_runtime import AgentRuntime, SessionAlreadyExistsError
 from session_store import SessionReplayError
 from task_manager import TaskManager
 from turn_progress import TurnProgress, format_duration
-from hooks import GATE as permission_gate
+from exec_policy import load_policy, set_tier
+from hooks import GATE as permission_gate, enforce_headless
 
 STREAM_PROGRESS_INTERVAL = float(os.getenv('HARNESS_PROGRESS_INTERVAL', '1'))
 STREAM_DIAGNOSTIC_INTERVAL = 60
@@ -66,6 +67,11 @@ if BaseModel is not None:
         klass: str | None = None     # 同类判定键（bash 命令首词）
 
 
+    class PolicyRequest(BaseModel):
+        sandbox_mode: str | None = None       # 缺省表示不改这一档
+        approval_policy: str | None = None
+
+
     class ForkSessionRequest(BaseModel):
         upto_seq: int | None = None  # 复制到的事件序号（缺省=全部）
 
@@ -102,6 +108,9 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     tasks = TaskManager(
         task_base,
         allowed_root=workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd(),
+        # 执行策略层接线：任务命令不经过 PreToolUse hook，由 runner 在 Popen 前判定
+        # （需要审批时进 /v1/permissions 队列，超时拒绝）。
+        enforce=lambda command: enforce_headless('bash', {'command': command}),
     )
     if isinstance(runtime, AgentRuntime):
         runtime.configure_workspace_root(tasks.allowed_root)
@@ -394,6 +403,21 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"request": record.to_dict()}
+
+    @app.get('/v1/policy')
+    def get_policy():
+        """当前执行/审批档位；消息网关的 /sandbox 读这里。"""
+        return {'policy': asdict(load_policy())}
+
+    @app.post('/v1/policy')
+    def change_policy(request: PolicyRequest):
+        """运行时切档（写进服务端环境，对所有会话与后续工具调用立即生效）。"""
+        try:
+            policy = set_tier(sandbox_mode=request.sandbox_mode,
+                              approval_policy=request.approval_policy)
+        except ValueError as exc:      # 打错档位名：400 说清可选值，绝不静默回落
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {'policy': asdict(policy)}
 
     @app.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):

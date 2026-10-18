@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, List
 from process_utils import kill_process_tree
 
+from exec_policy import load_policy
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 from cron_scheduler import schedule_job, cancel_job, cron_lock, scheduled_jobs
 from agent_teams import spawn_teammate_thread, BUS
@@ -20,6 +21,20 @@ from worktree import create_worktree, remove_worktree, keep_worktree
 def _h():
     import harness
     return harness
+
+
+def _gate():
+    """延迟导入：hooks 在模块级依赖 tools，反向只能按需取（与 _h() 同一手法）。"""
+    import hooks
+    return hooks
+
+
+def _gate_file(tool: str, path: str, cwd: str | None) -> str | None:
+    """文件工具的边界判定：参数形状与 safe_path 保持一致（cwd 只在显式传入时参与）。"""
+    args = {'path': path}
+    if cwd:
+        args['cwd'] = cwd
+    return _gate().enforce_headless(tool, args)
 
 
 TOOLS=[{
@@ -408,10 +423,11 @@ BASH_TIMEOUT = 120
 
 
 def run_bash(command:str, cwd: str = None)->str:
-
-    dangerous=["rm -rf /","sudo","shutdown","reboot","> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Error: Dangerous command, please do not execute"
+    # 判定只有一处（策略层），第三份黑名单已删：teammate / 后台 worker / 任务 runner
+    # 绕过 PreToolUse hook 直接走到这里，凭据缺失时按无头路径审批（远程队列，超时拒绝）。
+    denied = _gate().enforce_headless('bash', {'command': command})
+    if denied:
+        return denied
     try:
         base = cwd or str(_h().get_workdir())
         # A descendant can keep a PIPE open after cmd.exe exits. A temporary
@@ -446,7 +462,10 @@ def safe_path(p: str, cwd: str = None) -> Path:
     workspace = _h().get_workdir()
     base = Path(cwd) if cwd else workspace
     path = (base / p).resolve()
-    if not path.is_relative_to(workspace):
+    # danger-full-access 档必须在这里也生效：否则「全量访问」档位对文件工具是个
+    # 不起作用的按钮（bash 早就能读任意路径），策略层与路径检查也会给出相反结论。
+    if not path.is_relative_to(workspace) \
+            and load_policy().sandbox_mode != 'danger-full-access':
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
@@ -469,6 +488,11 @@ def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str, cwd: str = None) -> str:
+    # read-only 档 / 无头路径（teammate、后台）的写改同样要在边界拦一道：
+    # 判定参数与 safe_path 一致，两处不会给出相反结论。
+    denied = _gate_file('write', path, cwd)
+    if denied:
+        return denied
     try:
         file_path = safe_path(path, cwd)
         _capture_checkpoint(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
@@ -479,6 +503,9 @@ def run_write(path: str, content: str, cwd: str = None) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
+    denied = _gate_file('edit', path, cwd)
+    if denied:
+        return denied
     try:
         file_path = safe_path(path, cwd)
         text = file_path.read_text(encoding='utf-8', errors='replace')

@@ -13,9 +13,11 @@ Layout under the task root directory:
     <root>/<task_id>.json   task record (atomic writes)
     <root>/<task_id>.log    combined stdout+stderr of the process
 
-Security note: the caller constrains where tasks may run via ``allowed_root``;
-the HTTP adapter wires this to the server workspace so the gateway can never
-point ``cwd`` at arbitrary machine paths.
+Security note: the caller constrains where tasks may run via ``allowed_root``,
+and decides *whether* a command may run at all via ``enforce`` — the HTTP
+adapter wires both to the server workspace and to the execution policy layer
+(hooks.enforce_headless). Without ``enforce`` this manager spawns whatever it
+is given, exactly as it did before the policy layer existed.
 """
 
 from __future__ import annotations
@@ -60,12 +62,14 @@ class TaskRecord:
 class TaskManager:
     """Create, observe, and stop background commands with persisted state."""
 
-    def __init__(self, root, allowed_root=None) -> None:
+    def __init__(self, root, allowed_root=None, enforce=None) -> None:
+        """enforce: 可选的 command -> 拒绝语|None 判定（执行策略层接线用）。"""
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.allowed_root = (
             Path(allowed_root).resolve() if allowed_root else None
         )
+        self._enforce = enforce
         self._lock = threading.RLock()
         self._tasks: dict[str, TaskRecord] = {}
         self._procs: dict[str, subprocess.Popen] = {}
@@ -179,6 +183,19 @@ class TaskManager:
     def _run(self, record: TaskRecord) -> None:
         proc = None
         try:
+            # 第四条执行路径：HTTP 建的任务不经过 PreToolUse hook，Popen 之前必须自己判。
+            # 判在 runner 里而不是 create 里，是为了让 POST 立刻返回 queued：需要审批的
+            # 命令停在队列里等人决议，既不占用请求线程，也不让 HTTP 客户端挂到超时。
+            blocked = self._enforce(record.command) if self._enforce is not None else None
+            if blocked is not None:
+                with self._lock:
+                    if record.status == 'queued':   # 等审批期间可能已被 stop
+                        record.status = 'cancelled'
+                        record.ended_at = time.time()
+                        record.duration_ms = _duration_ms(record)
+                        record.detail = blocked
+                        self._save(record)
+                return
             # Cancellation cannot interleave between the check, spawn and registration.
             with self._lock:
                 if record.status != 'queued':

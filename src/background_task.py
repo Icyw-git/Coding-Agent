@@ -46,10 +46,14 @@ def start_background_task(tool_call,registry:dict)->str: #启动后台任务，�
         }
 
     workspace = current_workspace(Path.cwd())
+    import hooks   # 延迟导入：hooks 模块级依赖 tools，反向按需取
+    grants = hooks.take_grants()   # 凭据转移给 worker，父上下文不再保留副本
 
     def worker(): #后台任务线程函数
         try:
-            with use_workspace(workspace):
+            # 带上工作区与「本次调用已批准」的凭据：工具边界据此放行，
+            # 否则 hook 批过的命令会在 worker 里被再问一次（或超时拒绝）。
+            with use_workspace(workspace), hooks.use_grants(grants):
                 result=str(execute_tool(name,args,registry))
             status='completed'
         except Exception as exc:

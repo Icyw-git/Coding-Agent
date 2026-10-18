@@ -291,6 +291,30 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['request']
 
+    # ---------- 执行档位 ----------
+
+    def get_policy(self) -> dict:
+        response = self.http.get('/v1/policy')
+        response.raise_for_status()
+        return response.json()['policy']
+
+    def set_policy(self, sandbox_mode: str | None = None,
+                   approval_policy: str | None = None) -> dict:
+        """None 表示这一档不改；非法档名 → 400，由调用方显示可选值。"""
+        response = self.http.post('/v1/policy', json={
+            'sandbox_mode': sandbox_mode, 'approval_policy': approval_policy})
+        response.raise_for_status()
+        return response.json()['policy']
+
+
+_SANDBOX_USAGE = ('  usage: /sandbox [read-only|workspace-write|danger-full-access]'
+                  ' 或 /sandbox approvals [untrusted|on-request|never]')
+
+
+def _print_policy(policy: dict) -> None:
+    print(f"  sandbox={policy['sandbox_mode']} · approvals={policy['approval_policy']}"
+          '（策略级判定，非 OS 沙箱）')
+
 
 def _print_task(task: dict) -> None:
     from turn_progress import format_duration
@@ -314,7 +338,7 @@ def _print_task(task: dict) -> None:
 
 def repl(client: GatewayClient) -> int:
     print('gateway sim ready — /new /sessions /use /stream /run /status /logs '
-          '/stop /perms /approve /quit, or type a message')
+          '/stop /perms /approve /sandbox /quit, or type a message')
     while True:
         try:
             line = input('\n[gw] > ').strip()
@@ -365,6 +389,17 @@ def repl(client: GatewayClient) -> int:
                     print(client.task_logs(task_id, lines))
                 elif command == '/stop':
                     print('  stopped' if client.stop_task(argument) else '')
+                elif command == '/sandbox':
+                    tokens = [token.casefold() for token in argument.split()]
+                    if not tokens:
+                        _print_policy(client.get_policy())
+                    elif tokens[0] == 'approvals' and len(tokens) == 2:
+                        _print_policy(client.set_policy(approval_policy=tokens[1]))
+                    elif tokens[0] != 'approvals' and len(tokens) == 1:
+                        _print_policy(client.set_policy(sandbox_mode=tokens[0]))
+                    else:
+                        # 档名是否合法交给服务端判（400 里带可选值清单），这里只管形状
+                        print(_SANDBOX_USAGE)
                 elif command == '/perms':
                     pending = client.pending_permissions()
                     if not pending:

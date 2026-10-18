@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from difflib import get_close_matches
 
+from exec_policy import APPROVAL_POLICIES, SANDBOX_MODES
+
 
 @dataclass(frozen=True)
 class Command:
@@ -30,6 +32,9 @@ COMMANDS = (
     Command('/undo', (), '', '撤销最近一次已完成回合的文件和会话改动', '常用'),
     Command('/model', (), '', '查看当前模型配置', '常用'),
     Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '常用'),
+    Command('/sandbox', (), '[档位|approvals <档位>]',
+            '查看或切换执行档位（read-only|workspace-write|danger-full-access）与审批档位',
+            '常用'),
     Command('/fork', (), '[事件序号]', '从当前会话分叉出新会话（原会话保留）', '会话'),
     Command('/find', ('/search',), '<关键词>', '跨会话搜索历史内容', '会话'),
     Command('/rename', (), '<新主题>', '设置当前会话主题', '会话'),
@@ -79,6 +84,14 @@ def command_error(name: str, argument: str) -> str | None:
         if (len(tokens) != 2 or not tokens[0].isdigit()
                 or tokens[1] not in ('y', 'n')):
             return '用法：/approvals [序号] y|n，序号见 /approvals 列表。'
+    if name == '/sandbox' and argument:
+        # 与 harness.apply_sandbox_tier 接受的形状一致：[档位] 或 approvals [档位]
+        parts = [part.casefold() for part in argument.split()]
+        if parts[0] == 'approvals':
+            if len(parts) != 2 or parts[1] not in APPROVAL_POLICIES:
+                return f'用法：/sandbox approvals [{"|".join(APPROVAL_POLICIES)}]'
+        elif len(parts) != 1 or parts[0] not in SANDBOX_MODES:
+            return f'用法：/sandbox [{"|".join(SANDBOX_MODES)}]'
     if name == '/fork' and argument and not argument.strip().isdigit():
         return '用法：/fork [事件序号]，缺省复制全部历史。'
     if name == '/find' and not argument.strip():

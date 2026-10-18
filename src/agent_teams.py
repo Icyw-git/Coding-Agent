@@ -197,13 +197,8 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
     handlers = {n: harness.tool_registry[n] for n in names}
 
     def safe_bash(command: str) -> str:
-        # teammate 线程无人交互：DENY 硬拒 + DESTRUCTIVE 直接拒绝（拒绝比无人应答的询问安全）
-        for pattern in harness.DENY_LIST:
-            if pattern in command:
-                return f"Error: Dangerous command {pattern}, please do not execute"
-        for pattern in harness.DESTRUCTIVE:
-            if pattern in command:
-                return f"Error: Destructive command {pattern} rejected (teammate cannot confirm)"
+        # 判定已收敛到策略层：teammate 跳过 PreToolUse hook，run_bash 边界按无头路径
+        # 审批（进远程队列，超时拒绝），这里不再重复一套黑名单。
         return harness.tool_registry['bash'](command, cwd=_wt_cwd())
 
     handlers['bash'] = safe_bash
@@ -330,7 +325,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
 
             results = []
             for tool_call in message.tool_calls:
-                # 复用主循环执行路径：hooks=False（teammate 无人交互，bash 已由 safe_bash 内层兜底）；
+                # 复用主循环执行路径：hooks=False（teammate 无人交互，判定下移到工具
+                # 边界，run_bash / run_write 会按无头路径审批）；
                 # background=False（teammate 本身已是后台线程，不再嵌套后台任务）
                 _, _, tm = harness.exec_tool_call(tool_call, registry=sub_handlers,
                                                   hooks=False, background=False)

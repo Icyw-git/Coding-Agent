@@ -21,7 +21,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 聊天命令（@机器人 发送）：
     /help             命令清单（未知命令也会自动附带）
     /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
-    /logs <id> /stop <id> /perms /approve [req_id] y|n /quit(解绑)
+    /logs <id> /stop <id> /perms /approve [req_id] y|n /sandbox /quit(解绑)
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
@@ -44,6 +44,7 @@ from pathlib import Path
 import httpx
 
 from gateway_sim import GatewayClient
+from exec_policy import approval_class
 from turn_progress import format_duration
 from perf import record as perf_record, reset as perf_reset
 from session_views import group_sessions, session_details
@@ -94,13 +95,8 @@ def format_permission_prompt(req: dict, index: int | None = None) -> str:
             f"{tail}（也可直接点按钮）")
 
 
-def approval_class(tool: str, args) -> str:
-    """与 hooks.PermissionGate.approval_class 同规则：bash 按命令首词判定同类。"""
-    if tool == 'bash':
-        command = str(args.get('command', '') if isinstance(args, dict) else args).strip()
-        return command.split(None, 1)[0].casefold() if command else ''
-    return tool
-
+# approval_class 从 exec_policy 导入：发卡时的「同类」与决议时的「同类」必须是
+# 同一条规则，否则「本次会话允许同类」会登记到一个查不到的键上。
 
 CARD_MD_LIMIT = 24000   # 飞书卡片 JSON 上限约 30KB，留余量
 
@@ -701,6 +697,29 @@ class FeishuGateway:
         self._reply(chat_id, self._session_rows_text(rows) + f'\n\n{command} select <序号...> 多选。'
                     if rows else '没有符合条件的会话。当前绑定的会话不可处理；/archive all 查看其他会话。')
 
+    def _change_policy(self, chat_id: str, argument: str) -> None:
+        """/sandbox：读写 Agent 服务端的执行/审批档位（网关只转发，不自行判定）。"""
+        # 与 REPL 一致：档位名与 approvals 关键字都大小写不敏感（服务端 casefold 读）
+        tokens = [token.casefold() for token in argument.split()]
+        usage = ('用法: /sandbox [read-only|workspace-write|danger-full-access]\n'
+                 '或 /sandbox approvals [untrusted|on-request|never]')
+        try:
+            if not tokens:
+                policy = self.api.get_policy()
+            elif tokens[0] == 'approvals' and len(tokens) == 2:
+                policy = self.api.set_policy(approval_policy=tokens[1])
+            elif tokens[0] != 'approvals' and len(tokens) == 1:
+                policy = self.api.set_policy(sandbox_mode=tokens[0])
+            else:
+                self._reply(chat_id, usage)
+                return
+        except Exception as exc:   # 档位名写错时服务端 400 里带可选值，转给用户
+            self._reply(chat_id, f'[sandbox] {exc}')
+            return
+        self._reply(chat_id, f"执行档位: {policy['sandbox_mode']}\n"
+                      f"审批档位: {policy['approval_policy']}\n"
+                      '注意：以上是策略级判定（所有执行入口同一套规则），不是 OS 级沙箱。')
+
     def _help_text(self) -> str:
         return '\n'.join([
             '可用命令:',
@@ -716,6 +735,7 @@ class FeishuGateway:
             '/pwd                   查看当前会话工作区',
             '/model                  查看当前模型配置',
             '/approvals、/perms       查看待审批操作',
+            '/sandbox [档位|approvals <档位>]  查看/切换执行与审批档位',
             '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
             '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
             '/find <关键词>           跨会话搜索历史内容',
@@ -845,6 +865,8 @@ class FeishuGateway:
             elif command == '/model':
                 self._reply(chat_id, f"当前模型: {os.getenv('LLM_MODEL_ID', '未配置')}\n"
                               f"服务地址: {os.getenv('LLM_BASE_URL', '默认地址')}")
+            elif command == '/sandbox':
+                self._change_policy(chat_id, argument)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
