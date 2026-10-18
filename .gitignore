@@ -8,8 +8,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-*/
-.test-tmp/
-.test-tmp-*/
+.test-tmp*/
+.verify-*/
 .coverage
 htmlcov/
 
