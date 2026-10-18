@@ -97,6 +97,42 @@ def use_grants(grants):
         _GRANTS.reset(token)
 
 
+# 审批面只保留可读摘要：write 的 content、MCP 的大参数不该整份进入控制台、
+# API 响应和审批历史。
+_ARGS_PREVIEW_CHARS = 200
+_ARGS_MAX_ITEMS = 20
+_ARGS_MAX_DEPTH = 2
+
+
+def _compact_value(value, depth: int):
+    if isinstance(value, str):
+        if len(value) <= _ARGS_PREVIEW_CHARS:
+            return value
+        return value[:_ARGS_PREVIEW_CHARS] + f'… ({len(value)} chars)'
+    if depth <= 0:
+        return '…'
+    if isinstance(value, dict):
+        items = list(value.items())
+        compacted = {str(key): _compact_value(item, depth - 1)
+                     for key, item in items[:_ARGS_MAX_ITEMS]}
+        if len(items) > _ARGS_MAX_ITEMS:
+            compacted['…'] = f'{len(items) - _ARGS_MAX_ITEMS} more keys'
+        return compacted
+    if isinstance(value, (list, tuple)):
+        compacted = [_compact_value(item, depth - 1)
+                     for item in value[:_ARGS_MAX_ITEMS]]
+        if len(value) > _ARGS_MAX_ITEMS:
+            compacted.append(f'… ({len(value)} items)')
+        return compacted
+    return value
+
+
+def compact_args(args: dict) -> dict:
+    """把审批展示/持久化用的参数压到可控大小。"""
+    return {str(key): _compact_value(value, _ARGS_MAX_DEPTH)
+            for key, value in args.items()}
+
+
 @dataclass
 class PermissionRequest:
     """一次待审批操作：登记后可被控制台或远程网关决议。"""
@@ -141,7 +177,7 @@ class PermissionGate:
             tool=tool,
             reason=reason,
             created_at=time.time(),
-            args=dict(args),
+            args=compact_args(dict(args)),
             session_id=current_session_id() if session_id is None else session_id,
         )
         with self._lock:

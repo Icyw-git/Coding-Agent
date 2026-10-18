@@ -122,6 +122,15 @@ def test_session_allowlist_also_carries_the_grant(env):
     assert not GATE.pending()
 
 
+def test_approval_request_compacts_large_arguments(env):
+    """write 的 content 不该整份进入控制台、API 响应和审批历史。"""
+    req = GATE.request('write', {'path': 'notes.txt', 'content': 'x' * 5000},
+                       'write file')
+    assert req.args['path'] == 'notes.txt'
+    assert len(req.args['content']) < 300
+    assert '5000' in req.args['content']
+
+
 # ============================================================
 # 3：无头路径排队等远程决议，超时拒绝
 # ============================================================
