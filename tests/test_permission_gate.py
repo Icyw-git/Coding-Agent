@@ -32,6 +32,23 @@ def test_console_eof_denies_instead_of_crashing(monkeypatch):
     assert gate.history(1)[0].resolved_by == 'console(EOF)'
 
 
+def test_console_a_differs_from_y_only_by_the_session_allowlist(monkeypatch):
+    """CLI 的 a = 允许这一次 + 本会话同类免审（与审批卡片三个按钮对齐）。
+
+    第三方工具默认每次询问，没有卡片的 CLI 必须有这条免审出路；同类键仍由
+    服务端按被审批的内容推出，不是用户给的标签。
+    """
+    gate = PermissionGate()
+    monkeypatch.setattr('builtins.input', lambda prompt='': 'y')
+    allowed, _ = gate.decide('bash', {'command': 'del x'}, 'destructive')
+    assert allowed and not gate.session_allows('bash', {'command': 'del y'})
+
+    monkeypatch.setattr('builtins.input', lambda prompt='': 'a')
+    allowed, _ = gate.decide('bash', {'command': 'del a'}, 'destructive')
+    assert allowed and gate.session_allows('bash', {'command': 'del b'})
+    assert not gate.session_allows('bash', {'command': 'rm b'})
+
+
 def test_remote_resolve_unblocks_waiter():
     gate = PermissionGate()
     gate.backend = 'remote'

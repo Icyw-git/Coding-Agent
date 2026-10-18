@@ -1,4 +1,4 @@
-"""exec_policy 单测：档位矩阵、绕过语料、配置解析、同类/凭据键。
+"""exec_policy 单测：档位矩阵、绕过语料、第三方工具判定、配置解析、同类/凭据键。
 
 纯判定层，不碰运行时（不 import harness / hooks）—— 黑名单由调用方注入，
 所以这里用的是与生产一致的假列表。
@@ -238,6 +238,44 @@ def test_discarding_worktree_changes_needs_approval():
     assert Policy('read-only').evaluate(
         'remove_worktree', {'name': 'x'}).action == ASK
     assert Policy().evaluate('create_worktree', {'name': 'x'}).action == ALLOW
+
+
+# ============================================================
+# 第三方工具（MCP 注册进来的那批）
+# ============================================================
+
+def external(mode=DEFAULT_SANDBOX_MODE, policy=DEFAULT_APPROVAL_POLICY,
+             tool='browser_navigate'):
+    return Policy(mode, policy).evaluate(tool, {'url': 'http://x.example'},
+                                         external_tools=(tool,))
+
+
+@pytest.mark.parametrize('mode', SANDBOX_MODES)
+def test_external_tool_is_asked_in_every_tier(mode):
+    """第三方工具能写盘、能发请求，静态判不了 —— 三种档位都先问一次，
+    不因为它落在「策略层不认识的工具」里就默认放行。"""
+    decision = external(mode=mode)
+    assert decision.action == ASK and decision.code == 'external_tool'
+
+
+def test_external_tool_under_never_is_fail_closed():
+    """不问 == 放行只适用于用户显式选择的完全自主档。"""
+    assert external(policy='never').action == DENY
+    assert external(mode='read-only', policy='never').action == DENY
+    assert external(mode='danger-full-access', policy='never').action == ALLOW
+
+
+def test_tools_outside_the_external_list_keep_the_previous_behavior():
+    """内置工具（任务板 / cron / team）没有副作用分类，名单为空时判定不变。"""
+    assert Policy().evaluate('list_tasks', {}).action == ALLOW
+    assert Policy().evaluate('browser_navigate', {}).action == ALLOW
+
+
+def test_external_list_does_not_shadow_built_in_rules():
+    """分支顺序保证：名字撞上也先走内置规则，外部名单不能改写 bash 的判定。"""
+    decision = Policy().evaluate('bash', {'command': 'rm x'},
+                                 destructive=DESTRUCTIVE, external_tools=('bash',))
+    assert decision.code == 'destructive'
 
 
 # ============================================================

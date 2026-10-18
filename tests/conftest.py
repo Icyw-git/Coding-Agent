@@ -5,6 +5,7 @@ import os
 import pytest
 
 import harness
+import hooks
 import sandbox
 from hooks import GATE as permission_gate
 
@@ -65,6 +66,7 @@ def _restore_permission_backend():
     这里用 try/finally 手动管理，保证本恢复逻辑最后执行。
     """
     old_env = {key: os.environ.get(key) for key in _ENV_KEYS}
+    old_external_tools = set(hooks.EXTERNAL_TOOLS)
     os.environ['HARNESS_MEMORY_RECALL'] = 'llm'
     os.environ.pop('HARNESS_LOAD_MEMORIES', None)
     os.environ['HARNESS_APPROVAL_TIMEOUT'] = '3'
@@ -83,6 +85,10 @@ def _restore_permission_backend():
         permission_gate.backend = previous
         permission_gate.clear()
         permission_gate.timeout = previous_timeout
+        # 第三方工具名单按用例隔离：MCP 注册类用例会往里写，泄漏出去会让别的
+        # 用例的某个工具莫名变成「需要审批」。进程启动时已有的名单原样还原。
+        hooks.EXTERNAL_TOOLS.clear()
+        hooks.EXTERNAL_TOOLS.update(old_external_tools)
         for key, value in old_env.items():
             if value is None:
                 os.environ.pop(key, None)

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import harness
+import hooks
 from MCPclient import MCPclient
 from harness_api import create_app
 from harness_sdk import create_default_client
@@ -35,6 +36,14 @@ def test_default_sdk_registers_tools_once(shared_tools):
     assert shared_tools == ['connect']
     assert len(harness.TOOLS) == 1
     assert harness.tool_registry['mcp_echo'](text='sdk') == 'echo:sdk'
+
+
+def test_mcp_registration_marks_tools_as_external(shared_tools):
+    """注册进来的工具同时登记为第三方工具：策略层不知道它们的副作用，默认询问。"""
+    harness.initialize_mcp_tools()
+    assert 'mcp_echo' in hooks.EXTERNAL_TOOLS
+    decision = hooks.evaluate_call('mcp_echo', {'text': 'x'})
+    assert decision.action == 'ask' and decision.code == 'external_tool'
 
 
 def test_default_api_loads_mcp_in_lifespan_and_closes_it(shared_tools, tmp_path, monkeypatch):

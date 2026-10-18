@@ -1,7 +1,8 @@
 """审批分级（会话级白名单）测试：飞书卡片「本次会话允许同类」→ 后续同类免审。
 
 覆盖：GATE 白名单注册与命中、DENY_LIST 仍然优先、不同类仍需审批、
-clear() 清空、飞书卡片 scope=session 全链路（HTTP resolve 透传）。
+clear() 清空、飞书卡片 scope=session 全链路（HTTP resolve 透传）、
+「同类」键一律由服务端按被审批内容重算（客户端传 klass 无效）。
 
 运行: python test_approval_scope.py
 """
@@ -17,7 +18,7 @@ import pytest
 import gateway_sim
 import hooks
 import feishu_gateway
-from feishu_gateway import approval_class
+from exec_policy import approval_class
 from harness_api import create_app
 from hooks import GATE
 from agent_runtime import AgentRuntime
@@ -64,8 +65,7 @@ def test_session_allowlist_skips_second_ask(remote_gate, monkeypatch):
     _fake_hooks_config(monkeypatch)
     results = {}
     thread = _decide_async('rm -rf build', results)
-    GATE.resolve(GATE.pending()[0].req_id, True, by='test',
-                 scope='session', klass='rm')
+    GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
     thread.join(timeout=2)
     assert results['allowed'] is None   # 第一次：审批后放行
 
@@ -102,6 +102,18 @@ def test_different_class_still_requires_approval(remote_gate, monkeypatch):
     assert called == ['bash'], '不同类（del）应仍然走审批'
     GATE.resolve(GATE.pending()[0].req_id, False, by='test')
     thread.join(timeout=2)
+
+
+def test_resolve_derives_the_class_from_the_approved_call(remote_gate, monkeypatch):
+    """白名单的「同类」取自被审批的 args，不是调用方给的标签：
+    批准一条 del 不能顺手预授权 rm。"""
+    _fake_hooks_config(monkeypatch)
+    results = {}
+    thread = _decide_async('del file', results)
+    GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
+    thread.join(timeout=2)
+    assert GATE.session_allows('bash', {'command': 'del other'})
+    assert not GATE.session_allows('bash', {'command': 'rm other'})
 
 
 def test_clear_wipes_session_allowlist(remote_gate):
@@ -155,7 +167,7 @@ def test_feishu_session_scope_button_end_to_end(api_app, tmp_path):
 
         text, ok = gw.handle_card_action(
             None, {'approval': req['req_id'], 'allow': True,
-                   'scope': 'session', 'klass': 'rm'}, 'om_1')
+                   'scope': 'session'}, 'om_1')
         assert ok and '已允许' in text
         thread.join(timeout=2)
         assert results['allowed'] is None
@@ -164,3 +176,23 @@ def test_feishu_session_scope_button_end_to_end(api_app, tmp_path):
         monkey.undo()
         GATE.clear()
         api.close()
+
+
+def test_http_resolve_ignores_a_client_supplied_class(api_app):
+    """接口契约：多余的 klass 字段被忽略，白名单键仍按被审批的内容算。
+
+    旧实现把客户端传来的 klass 直接写进白名单，于是「批准这条 del，
+    顺带 klass=rm」可以给后续 rm 开门 —— 审批方给自己提权。
+    """
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_app)
+    headers = {'Authorization': 'Bearer t'}
+    req = GATE.request('bash', {'command': 'del file'}, 'potentially destructive')
+    response = client.post(f'/v1/permissions/{req.req_id}/resolve',
+                           json={'allow': True, 'scope': 'session', 'klass': 'rm'},
+                           headers=headers)
+
+    assert response.status_code == 200
+    assert GATE.session_allows('bash', {'command': 'del other'})
+    assert not GATE.session_allows('bash', {'command': 'rm other'})

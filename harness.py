@@ -1594,7 +1594,12 @@ def initialize_mcp_tools() -> None:
             register = globals().get('register_mcp_tools')
             if register is None:
                 from mcp_bridge import register_mcp_tools as register
-            TOOLS.extend(register(tool_registry))
+            schemas = register(tool_registry)
+            TOOLS.extend(schemas)
+            # 第三方工具的副作用不在策略层的已知集合里，登记后默认询问
+            # （hooks.EXTERNAL_TOOLS → exec_policy 的 external_tools 判定）。
+            hooks.register_external_tools(
+                schema['function']['name'] for schema in schemas)
             _mcp_initialized = True
 
 

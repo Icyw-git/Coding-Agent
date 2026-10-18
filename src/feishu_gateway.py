@@ -95,8 +95,9 @@ def format_permission_prompt(req: dict, index: int | None = None) -> str:
             f"{tail}（也可直接点按钮）")
 
 
-# approval_class 从 exec_policy 导入：发卡时的「同类」与决议时的「同类」必须是
-# 同一条规则，否则「本次会话允许同类」会登记到一个查不到的键上。
+# 「本次会话允许同类」的同类判定键不在网关侧算：网关只把「允许 + 扩到同类」这个
+# 意图发给服务端，服务端按登记时的 tool/args 重算（hooks.PermissionGate.resolve）。
+# 发卡时算一份、决议时算一份是旧实现的 bug 来源，而让客户端传 klass 更是提权入口。
 
 CARD_MD_LIMIT = 24000   # 飞书卡片 JSON 上限约 30KB，留余量
 
@@ -262,13 +263,16 @@ class LarkTransport:
 
     def send_approval_card(self, chat_id: str, prompt_md: str,
                            req: dict) -> str | None:
-        """带审批按钮的卡片；「本次会话允许同类」走 scope=session，
-        决议后同类操作（bash 按命令首词）在本会话内自动通过。"""
+        """带审批按钮的卡片；「本次会话允许同类」只传 scope=session，
+        同类键与决议一样由服务端按被审批的内容重算。"""
         self.validate_chat_id(chat_id)
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest, CreateMessageRequestBody)
         req_id = req['req_id']
+        # 按钮文案里的「同类」只是给人看的提示：真正的白名单键由服务端按同一规则
+        # （exec_policy.approval_class）重算，展示与生效不会分叉。
         klass = approval_class(str(req.get('tool', '?')), req.get('args') or {})
+        same_class = f'📌 本次会话允许同类（{klass}）' if klass else '📌 本次会话允许同类'
         card = {
             'config': {'wide_screen_mode': True},
             'elements': [
@@ -281,10 +285,10 @@ class LarkTransport:
                      'type': 'primary',
                      'value': {'approval': req_id, 'allow': True}},
                     {'tag': 'button',
-                     'text': {'tag': 'plain_text', 'content': '📌 本次会话允许同类'},
+                     'text': {'tag': 'plain_text', 'content': same_class},
                      'type': 'primary',
                      'value': {'approval': req_id, 'allow': True,
-                               'scope': 'session', 'klass': klass}},
+                               'scope': 'session'}},
                     {'tag': 'button',
                      'text': {'tag': 'plain_text', 'content': '⛔ 拒绝'},
                      'type': 'danger',
@@ -1004,10 +1008,8 @@ class FeishuGateway:
             return '⚠ 无效的审批按钮', False
         allow = bool((value or {}).get('allow'))
         scope = (value or {}).get('scope')
-        klass = (value or {}).get('klass')
         try:
-            record = self.api.resolve_permission(req_id, allow,
-                                                 scope=scope, klass=klass)
+            record = self.api.resolve_permission(req_id, allow, scope=scope)
         except Exception as exc:
             print(f'[feishu] approval failed: {exc}')
             return '⚠ 操作未能完成，请用 /perms 查看最新审批状态', False

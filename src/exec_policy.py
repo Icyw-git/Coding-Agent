@@ -94,13 +94,18 @@ class Policy:
 
     def evaluate(self, tool: str, args: dict, *,
                  deny_list=(), destructive=(),
-                 inside_workspace: bool = True) -> Decision:
+                 inside_workspace: bool = True,
+                 external_tools=()) -> Decision:
         """判定一次工具调用。
 
         deny_list / destructive 由调用方注入（生产上来自 harness 模块全局，
         测试里是自带的假列表）；inside_workspace 由已经解析过路径的调用方给出，
         本模块不重复实现路径逻辑。ASK 之后是问人还是直接拒，由调用方按自己是否
         处在可交互上下文里决定，本模块不关心。
+
+        external_tools 是调用方登记的第三方工具名（MCP 注册进来的那批）。本模块
+        只认识内置工具的副作用，第三方工具能写盘、能发请求，内容静态不可知 ——
+        一律询问，而不是猜一个 ALLOW。名单为空时行为与既往完全一致。
         """
         args = args if isinstance(args, dict) else {}
         if tool == 'bash':
@@ -110,6 +115,11 @@ class Policy:
             decision = self._evaluate_file(tool, args, inside_workspace)
         elif tool in WORKTREE_TOOLS:
             decision = self._evaluate_worktree(tool, args)
+        elif tool in external_tools:
+            decision = Decision(
+                ASK, 'external_tool',
+                f'{tool} is a third-party tool; its side effects are not '
+                'known to the policy layer')
         else:
             decision = Decision(ALLOW)
         return self._apply_approval_policy(decision)

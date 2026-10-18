@@ -279,13 +279,12 @@ class GatewayClient:
         return response.json()['title']
 
     def resolve_permission(self, req_id: str, allow: bool,
-                           scope: str | None = None,
-                           klass: str | None = None) -> dict:
+                           scope: str | None = None) -> dict:
+        """决议一个审批请求。只发意图（allow / 是否扩到同类），
+        「同类」的键由服务端按被审批的 tool/args 重算，客户端不传。"""
         body: dict = {'allow': allow}
         if scope:
             body['scope'] = scope
-        if klass:
-            body['klass'] = klass
         response = self.http.post(
             f'/v1/permissions/{req_id}/resolve', json=body)
         response.raise_for_status()

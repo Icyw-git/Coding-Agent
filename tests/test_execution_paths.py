@@ -7,6 +7,7 @@
     3. 无头路径（teammate、后台 worker、任务 runner）不抢 stdin，进远程队列，超时拒绝
     4. 会话白名单按会话分区，不跨会话泄漏
     5. 绕过 PreToolUse hook 的入口在边界上自己判一次（黑名单、工作区越界、档位）
+    6. 第三方（MCP）工具登记后默认询问，never 档失败而不是静默执行
 """
 import json
 import threading
@@ -174,7 +175,7 @@ def test_teammate_handler_is_gated_without_a_hook(env, monkeypatch):
 def test_session_allowlist_does_not_leak_across_sessions(env):
     env.session_id = 'A'
     GATE.resolve(GATE.request('bash', {'command': 'rm x'}, 'destructive').req_id,
-                 True, by='test', scope='session', klass='rm')
+                 True, by='test', scope='session')
     assert GATE.session_allows('bash', {'command': 'rm y'})
     env.session_id = 'B'
     assert not GATE.session_allows('bash', {'command': 'rm y'})
@@ -184,7 +185,7 @@ def test_allowlist_without_session_context_keeps_the_legacy_key(env):
     """取不到会话时退回进程级键（CLI 单会话与既有测试的前提）。"""
     assert env.session_id == ''
     GATE.resolve(GATE.request('bash', {'command': 'rm x'}, 'destructive').req_id,
-                 True, by='test', scope='session', klass='rm')
+                 True, by='test', scope='session')
     assert 'bash:rm' in GATE._session_allows
     assert GATE.session_allows('bash', {'command': 'rm y'})
 
@@ -295,6 +296,43 @@ def test_background_worker_without_approval_queues(env, monkeypatch, bg_clean):
     waiter.join(timeout=3)
     assert approved, 'worker 的审批请求应可被远程决议'
     assert background_task.background_results[bg_id] == 'ran'
+
+
+# ============================================================
+# 6：第三方工具（MCP）—— 策略层不认识它们的副作用，默认要审批
+# ============================================================
+
+def test_unknown_tool_without_registration_is_still_allowed(env):
+    """内置的任务板 / cron / team 工具就是「策略层不认识但自家实现」，
+    不登记进第三方名单就不该被拦——否则每次注册顺序变化都会误伤。"""
+    assert hooks.evaluate_call('mcp_echo', {'text': 'x'}).action == 'allow'
+
+
+def test_registered_external_tool_asks_at_the_gate(env, asks):
+    hooks.register_external_tools(['mcp_echo'])
+    decision = hooks.evaluate_call('mcp_echo', {'text': 'x'})
+    assert decision.action == 'ask' and decision.code == 'external_tool'
+
+    assert hooks.permission_hook('mcp_echo', {'text': 'x'}) is None
+    assert asks == [{'text': 'x'}]     # 问的就是这次调用的参数
+
+
+def test_external_tool_allowlist_is_keyed_by_the_tool_name(env, asks):
+    """免审的出路仍是既有的「本次会话允许同类」：第三方工具的同类键就是工具名。"""
+    hooks.register_external_tools(['mcp_echo'])
+    GATE._session_allows.add(session_allow_key('mcp_echo', 'mcp_echo', ''))
+    assert hooks.permission_hook('mcp_echo', {'text': 'y'}) is None
+    assert asks == [], '白名单命中不该再问'
+    assert hooks.current_grants(), '白名单命中同样把凭据带到工具边界'
+
+
+def test_external_tool_ask_under_never_fails_closed_without_asking(env, monkeypatch):
+    """never 档不问人，但第三方工具也不该静默执行：判定直接失败。"""
+    monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'never')
+    hooks.register_external_tools(['mcp_echo'])
+    denied = hooks.enforce('mcp_echo', {'text': 'z'}, interactive=False)
+    assert denied.startswith('Error:') and 'third-party tool' in denied
+    assert not GATE.pending(), 'fail-closed 不该产生审批请求'
 
 
 # ============================================================

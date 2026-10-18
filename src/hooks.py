@@ -6,7 +6,8 @@
 任务都经过它，区别只在 interactive —— 即调用线程能不能问人。
 
 权限审批中心（PermissionGate）：
-    console — CLI 交互，主线程 input()；stdin 不可用（服务器/管道）自动拒绝
+    console — CLI 交互，主线程 input()（y 允许 / n 拒绝 / a 允许且本会话同类免审）；
+              stdin 不可用（服务器/管道）自动拒绝
     remote  — 挂起 threading.Event，由 HTTP API（/v1/permissions）远程决议，
               飞书/TG 等消息网关轮询该端点并把决议送回
     工作线程（teammate / 后台 worker / 任务 runner）不能抢 stdin，走 decide_queued：
@@ -215,12 +216,16 @@ class PermissionGate:
         return rows[:max(1, limit)]
 
     def resolve(self, req_id: str, allow: bool, by: str = 'remote',
-                scope: str | None = None, klass: str | None = None) -> PermissionRequest:
+                scope: str | None = None) -> PermissionRequest:
         """远程决议一个 pending 请求并唤醒等待方。未知 id / 已决议 → 异常。
 
-        scope='session' 且 klass 非空、allow=True 时，把「该会话的同类操作」加入
-        白名单（键按登记时的 session_id 分区），之后同会话同类审批自动通过。
-        旧实现是进程级集合：一个会话批过的 rm，另一个会话也免审。
+        scope='session' 且 allow=True 时，把「该会话的同类操作」加入白名单
+        （键按登记时的 session_id 分区），之后同会话同类审批自动通过。
+
+        「同类」一律由服务端从登记时的参数重算（approval_class），不接受调用方
+        传入：审批请求的 tool/args 才是这次要批准的内容，客户端再带一个 klass
+        等于允许「批一个无害请求、顺手预授权 rm」这种提权写法。旧版参数摘要
+        只截尾部，bash 的命令首词不受影响，重算结果与发卡时一致。
         """
         with self._lock:
             req = self._requests.get(req_id)
@@ -230,8 +235,11 @@ class PermissionGate:
                 raise RuntimeError(f'request {req_id} already {req.status}')
             req.status = 'approved' if allow else 'denied'
             req.resolved_by = by
-            if allow and scope == 'session' and klass:
-                self._session_allows.add(session_allow_key(req.tool, klass, req.session_id))
+            if allow and scope == 'session':
+                klass = approval_class(req.tool, req.args)
+                if klass:
+                    self._session_allows.add(
+                        session_allow_key(req.tool, klass, req.session_id))
             req._event.set()
             return req
 
@@ -284,17 +292,24 @@ class PermissionGate:
         return allowed, message
 
     def _decide_console(self, req: PermissionRequest) -> bool:
+        """CLI 决议。与审批卡片的三个按钮对齐：y / n / a（同类）。
+
+        a 走的是和远程决议完全相同的一条路（self.resolve），同类键仍由服务端
+        按登记的 tool/args 重算。第三方工具默认每次询问，没有卡片的 CLI 必须
+        有一条免审出路，否则一个 fetch 类工具能把人问烦。
+        """
         print(f"\n\033[33m⚠  {req.reason}\033[0m")
         print(f"   操作: {req.tool}({req.args})")
         try:
-            choice = input('Allow? (y/n) ').strip().lower()
+            choice = input('Allow? (y=允许 / n=拒绝 / a=本会话允许同类) ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             print('  \033[31m[permission] stdin unavailable → denied\033[0m')
-            req.status, req.resolved_by = 'denied', 'console(EOF)'
+            self.resolve(req.req_id, False, by='console(EOF)')
             return False
-        req.status = 'approved' if choice in ('y', 'yes') else 'denied'
-        req.resolved_by = 'console'
-        return req.status == 'approved'
+        allow = choice in ('y', 'yes', 'a')
+        self.resolve(req.req_id, allow, by='console',
+                     scope='session' if choice == 'a' else None)
+        return allow
 
 
 GATE = PermissionGate()
@@ -312,6 +327,24 @@ def permission_hook(tool:str,args:dict):
     return enforce(tool, args, interactive=True)
 
 
+# ============================================================
+# 第三方工具名单（MCP）
+# ============================================================
+# 策略层只认识本项目实现的工具：bash 看命令文本，文件工具看路径，worktree 看
+# 名字。MCP 工具在 initialize_mcp_tools 时才注册进来，名字和副作用都不在这个
+# 已知集合里 —— 它可能写盘、可能发请求，静态判不了，所以登记进这份名单，由策略
+# 层一律询问（exec_policy.Policy.evaluate 的 external_tools 参数）。
+# 免审的出路是既有的「本次会话允许同类」：第三方工具的同类键就是工具名本身，
+# 批准一次后同会话内同名工具不再重复问。
+
+EXTERNAL_TOOLS: set[str] = set()
+
+
+def register_external_tools(names) -> None:
+    """登记第三方工具名；在 handler 注入 tool_registry 之后调用。"""
+    EXTERNAL_TOOLS.update(name for name in names if name)
+
+
 def evaluate_call(tool: str, args: dict):
     """纯策略判定（黑名单 / 档位 / 越界），不问人。测试与 /sandbox 预览用它。"""
     inside = True
@@ -320,7 +353,8 @@ def evaluate_call(tool: str, args: dict):
     return load_policy().evaluate(tool, args,
                                   deny_list=_h().DENY_LIST,
                                   destructive=_h().DESTRUCTIVE,
-                                  inside_workspace=inside)
+                                  inside_workspace=inside,
+                                  external_tools=EXTERNAL_TOOLS)
 
 
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:

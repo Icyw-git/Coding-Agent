@@ -2,7 +2,9 @@
 
 harness 的工具分发是同步的（tool_registry[name](**args)），而 MCP SDK 是 asyncio。
 本模块维护一个常驻事件循环线程，用 run_coroutine_threadsafe 桥接：connect 与 call_tool
-都投递到该循环执行，同步等待结果。接入后 MCP 工具对模型/子代理/teammate 无差别可见。
+都投递到该循环执行，同步等待结果。接入后 MCP 工具对模型/子代理/teammate 无差别可见，
+但它们的副作用不在策略层的已知集合里：注册方（harness.initialize_mcp_tools）会把工具名
+登记为第三方工具，调用默认需要审批（见 hooks.EXTERNAL_TOOLS / exec_policy.external_tools）。
 
 配置（环境变量或配置文件，二选一，都没有则不接入）：
   MCP_SERVERS       JSON 数组内联，如 [{"name":"fs","command":"npx","args":["-y","..."]}]
