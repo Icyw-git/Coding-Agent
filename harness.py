@@ -44,6 +44,7 @@ from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
 from cli_commands import parse_command, command_error, format_command_help
 from exec_policy import load_policy, set_tier
+import sandbox
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 from perf import segment as perf_segment, record as perf_record, reset as perf_reset
 
@@ -310,7 +311,10 @@ APPROVAL_POLICY_HELP = (
 def format_sandbox_tier() -> str:
     """档位清单 + 当前选中项，/status 与 --doctor 都复用这段说明。"""
     policy = load_policy()
-    lines = [f'  执行档位：{policy.sandbox_mode} · 审批档位：{policy.approval_policy}']
+    lines = [
+        f'  执行档位：{policy.sandbox_mode} · 审批档位：{policy.approval_policy}',
+        f'  OS 沙箱：{sandbox.status_line()}（{sandbox.ENV}）',
+    ]
     for title, options, current in (
             ('执行档位（/sandbox <档位>）', SANDBOX_MODE_HELP, policy.sandbox_mode),
             ('审批档位（/sandbox approvals <档位>）', APPROVAL_POLICY_HELP,
@@ -318,8 +322,10 @@ def format_sandbox_tier() -> str:
         lines.append(f'  {title}')
         lines.extend(f'    {"*" if name == current else " "}{name:<20}{note}'
                      for name, note in options)
-    lines.append('  说明：以上是策略级判定（四个执行入口同一套规则），不是 OS 级沙箱，'
+    lines.append('  说明：档位是策略级判定（四个执行入口同一套规则），本身不做 OS 强制，'
                  '不隔离文件读取与网络。')
+    lines.append(f'  OS 沙箱独立于此开关：require 时沙箱不可用则拒绝执行；'
+                 f'启用后命令以 Low IL 运行，工作区外写入被内核拒绝，读取与网络仍不隔离。')
     return '\n'.join(lines)
 
 
@@ -362,7 +368,8 @@ def format_status(session_store) -> str:
         f"  最近活跃：{relative_time(summary['updated'])}\n"
         f'  工作区：{WORKDIR}\n'
         f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
-        f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy}\n'
+        f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy} · '
+        f'OS 沙箱：{sandbox.configured_mode()}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
         f'{usage_line}'
@@ -435,7 +442,9 @@ def run_doctor() -> int:
     # 这类误差只能在事故发生后才发现。
     policy = load_policy()
     print(f'[policy] sandbox_mode={policy.sandbox_mode} '
-          f'approval_policy={policy.approval_policy}（策略级判定，非 OS 沙箱）')
+          f'approval_policy={policy.approval_policy}（策略级判定）')
+    print(f'[os-sandbox] {sandbox.ENV}={sandbox.configured_mode()}'
+          f'（Windows 低完整性，仅约束 shell 子进程）')
     return 0 if all(passed for _, passed in checks) else 1
 
 PROMPT_SECTIONS={
