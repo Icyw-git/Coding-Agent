@@ -54,7 +54,9 @@ _WRAP_FLAGS = frozenset({'-c', '/c', '-command'})
 _OPAQUE_FLAGS = ('-enc', '-encodedcommand', '/enc', '/e', '-enc', '--encodedcommand')
 
 # 分号/管道/逻辑串联都是「一条命令里的多个动作」，逐段判定。
-_SEGMENT_SPLIT = re.compile(r'\||&&|;|&')
+# 换行在 POSIX shell 里同样分隔命令；Windows cmd 行为不同，但判定层按会执行的
+# 最坏情况处理，不能因为平台差异把第二行漏掉。
+_SEGMENT_SPLIT = re.compile(r'\||&&|;|&|[\r\n]+')
 _PATH_SPLIT = re.compile(r'[\\/]+')
 # bash 里 su""do 会被解析成 sudo，所以命令名要在「去引号」的副本上再取一次
 _STRIP_QUOTES = re.compile(r'["\'`]')
@@ -344,6 +346,10 @@ def _wrapped_verbs(tokens: list[str]) -> set[str]:
 
 def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
     """识别内容不可静态判断的载荷形式，返回命中的特征串。"""
+    # 命令替换会执行括号里的真实命令，但只解析首词会把它当成 echo 的参数。
+    # 不做嵌套解析：识别到就交给人工审批，宁可多问一次。
+    if '$(' in normalized or '`' in normalized:
+        return 'command substitution'
     for flag in _OPAQUE_FLAGS:
         if f' {flag} ' in f' {normalized} ' or f' {flag}: ' in normalized:
             return flag
@@ -361,6 +367,8 @@ def _looks_read_only(normalized: str, verbs: set[str]) -> bool:
 
     解释器不进白名单，重定向写入也不放行。只检查整条命令的第一个 git 子命令会
     让 `git status && git push` 漏判；`git config` 也能修改全局配置，不能列为只读。
+    部分命令的「只读」取决于参数（`date -s`、`hostname NAME`、`git --output`），
+    一起在这里收紧，避免白名单本身成为写入口。
     """
     if not verbs or '>' in normalized:
         return False
@@ -373,6 +381,12 @@ def _looks_read_only(normalized: str, verbs: set[str]) -> bool:
             subcommand = _git_subcommand(segment)
             if subcommand not in GIT_READONLY_SUBCOMMANDS:
                 return False
+            if re.search(r'--output(?:=|\s|$)', segment):
+                return False
+        if 'date' in segment_verbs and re.search(r'(^|\s)(-s|--set)', segment):
+            return False
+        if 'hostname' in segment_verbs and len(segment.split()) > 1:
+            return False
     return True
 
 
