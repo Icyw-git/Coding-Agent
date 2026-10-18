@@ -99,7 +99,7 @@ SDK 对应 `client.sessions.workspace(id)`、`client.sessions.change_workspace(i
 
 ## 执行安全与审批
 
-所有会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
+所有内建工具中会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
 PreToolUse 钩子、工具边界（`run_bash` / `run_write` / `run_edit`）、Teammate 线程、后台与
 HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一份黑名单。
 
@@ -110,13 +110,16 @@ HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一
 | `sandbox_mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write`：工作区内写改放行，破坏性命令询问 |
 | `approval_policy` | `untrusted`、`on-request`、`never` | `on-request`：只在策略层判定有风险时询问 |
 
-- `read-only` 只放公认不改动的命令（`dir`、`ls`、`git status` 等）；解释器和带重定向的命令仍要审批。
+- `read-only` 只放公认不改动的命令（`dir`、`ls`、`git status` 等）；解释器、命令替换（`$()` / 反引号）
+  和带重定向的命令仍要审批。
 - `danger-full-access` 取消提示级限制和工作区路径约束，只保留黑名单硬拒。
-- `never` 的语义是「不用问我」：普通询问直接放行，但 `read-only` 档下无法放行的写改直接失败。
+- `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位没有 OS 沙箱兜底，
+  需要审批的操作直接失败（fail-closed），而不是静默执行。
 - 黑名单、根删（`rm -rf --no-preserve-root /`）、`cmd /c` 包装、`su""do` 拆引号等变体在硬拒层，
   档位和白名单都越不过去。
 - 默认档下，`read`/`write`/`edit` 文件工具的工作区外访问直接硬拒；`danger-full-access` 会放开这条路径检查。
   **这不约束 shell 命令的写入路径**：例如重定向、`mkdir` 或解释器代码可能访问工作区外；Stage 1 不能视为文件系统隔离。
+- 第三方 MCP 工具当前不经过这一层判定（P0.2 计划覆盖）；启用 MCP 时不要把 `read-only` 当成隔离。
 
 配置入口：`/sandbox` 查看和切换（CLI、飞书、`gateway_sim`、`GET/POST /v1/policy` 都走服务端同一份
 判定，运行时立即生效）；也可以写进环境 `HARNESS_SANDBOX_MODE` 与 `HARNESS_APPROVAL_POLICY`
