@@ -18,6 +18,7 @@
 """
 import contextlib
 import contextvars
+import json
 import os
 import sys
 import threading
@@ -29,6 +30,7 @@ import approval_view
 import checkpoints
 from agent_core import register_hook
 from exec_policy import (
+    ASK,
     PATH_WORKSPACE,
     READ_ONLY_FILE_TOOLS,
     READ_WRITE_TOOLS,
@@ -377,6 +379,193 @@ class PermissionGate:
 GATE = PermissionGate()
 
 
+# ============================================================
+# LLM 审查官：ASK 决策的自动复核（fail-closed）
+# ============================================================
+# 策略层 ASK 的噪音源（解释器命令、破坏性子串误伤、外发读请求）先经 LLM
+# 复核：判定为常规开发操作则自动放行并记入审批历史（resolved_by='llm-judge'），
+# 判定升级或审查不可用（超时/异常/输出不合法）一律回落人工审批 —— 只在
+# 「少问」方向起作用，绝不放松硬拒。
+# 边界：outside_workspace_write / external_tool 不归它管（缺用户意图上下文 /
+# 副作用不可见，人批 + 同类记忆）；untrusted 档「每条都问」与 never 档
+# 「问即拒」的档位语义不受影响；本模块 fail-closed，LLM 不是安全边界
+# （同 exec_policy 的定位：真边界属于 OS 级沙箱）。外传本机数据的请求
+# （带请求体/上传/改方法）必须 escalate。
+
+LLM_APPROVAL_ENV = 'HARNESS_LLM_APPROVAL'
+# L1 审查范围：调用内容对 LLM 可见可判、误放有提示词兜底的 ASK 类别。
+# network_egress：URL/方法/参数可见，普通读请求（公共 API/包源）可放行，
+# 带本机数据/凭据/内网敏感目标 escalate —— 顺带理顺旧倒挂（-d 外传走
+# opaque 已在 L1，纯 GET 反而人批）。工作区外写不进 L1：LLM 看不到目标
+# 文件现状与用户原始意图，缺上下文的放行等于盲批；第三方工具副作用
+# 不可见同理。untrusted / never 是显式档位语义，优先于 LLM。
+JUDGEABLE_CODES = frozenset({'opaque_command', 'destructive', 'network_egress'})
+# 已放行精确命令的缓存：键 = 会话|grant_key（有序去重，上限淘汰）
+_JUDGE_APPROVED: dict[str, None] = {}
+_JUDGE_APPROVED_MAX = 200
+
+JUDGE_SYSTEM_PROMPT = (
+    '你是 coding agent 的命令安全审查官。判断给定的工具调用能否不经人工确认'
+    '自动放行。参照 Codex workspace-write 沙箱的边界——沙箱内的常规操作'
+    '（工作区内文件的删除/重建、运行测试/构建/脚本、本地状态查询）默认放行：'
+    '只输出一个 JSON 对象：{"decision": "approve"} 或 '
+    '{"decision": "escalate", "reason": "<一句话>"}。'
+    '必须升级人工（escalate）的情况：'
+    '1) 删除/覆盖目标在工作区之外（系统目录、用户目录、绝对路径指向外部）；'
+    '2) 不可逆的系统修改（改环境/服务/注册表/全局配置）；'
+    '3) 本机数据外传——带请求体/上传文件/改方法的网络请求；'
+    '4) 读取或修改凭据/秘密文件；'
+    '5) 下载并执行、命令替换叠加重定向等意图不明的组合。'
+    '网络请求的例外：目标是公共 API/包源/localhost 的普通读请求（GET 类、'
+    '不带本机文件内容、不带凭据）可以放行。'
+    '信息不足以判断时也必须升级。宁可升级，不可误放。'
+)
+
+
+def llm_approval_enabled() -> bool:
+    """HARNESS_LLM_APPROVAL 开关，默认开；'0'/'false'/'off'/'no' 显式关闭。"""
+    return (os.getenv(LLM_APPROVAL_ENV) or '').strip().casefold() not in (
+        '0', 'false', 'off', 'no')
+
+
+def _llm_judge_review(tool: str, args: dict, decision) -> tuple[bool | None, str]:
+    """询问审查官。返回 (放行?, 升级理由)；审查不可用时 (None, '')。
+
+    异常、超时、输出缺 JSON 或 decision 字段不认识都按 (None, '') 处理 ——
+    调用方回落人工审批，绝不 fail-open。"""
+    import json as _json
+    detail = approval_view.detail(tool, dict(args))[:2000]
+    payload = (f'工具: {tool}\n'
+               f'触发原因: {decision.reason} [{decision.code}]\n'
+               f'参数:\n{detail}')
+    try:
+        response = _h().client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[{'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                      {'role': 'user', 'content': payload}],
+            temperature=0,
+            max_tokens=60,
+        )
+        raw = (response.choices[0].message.content or '').strip()
+        verdict = _json.loads(raw[raw.index('{'): raw.rindex('}') + 1])
+        if verdict.get('decision') == 'approve':
+            return True, ''
+        if verdict.get('decision') == 'escalate':
+            return False, str(verdict.get('reason', ''))[:200]
+        return None, ''
+    except Exception:
+        return None, ''
+
+
+def _judge_auto_approve(tool: str, args: dict, decision) -> bool:
+    """LLM 审查放行路径：命中返回 True（已登记历史并发放凭据）。"""
+    key = f'{current_session_id()}|{grant_key(tool, args)}'
+    if key in _JUDGE_APPROVED:
+        verdict, reason = True, 'cached'
+    else:
+        verdict, reason = _llm_judge_review(tool, args, decision)
+        if verdict is not True:
+            if reason:
+                print(f'  \033[33m[llm-judge] 建议人工确认：{reason}\033[0m')
+            return False
+        while len(_JUDGE_APPROVED) >= _JUDGE_APPROVED_MAX:
+            _JUDGE_APPROVED.pop(next(iter(_JUDGE_APPROVED)))
+        _JUDGE_APPROVED[key] = None
+    req = GATE.request(tool, args, f'LLM 审查放行 · {decision.reason}')
+    GATE.resolve(req.req_id, allow=True, by='llm-judge')
+    print(f'  \033[32m[permission] LLM 审查放行 · '
+          f'{approval_view.safe_text(decision.reason)}\033[0m')
+    return True
+
+
+JUDGE_BATCH_PROMPT = (
+    '你是 coding agent 的命令安全审查官。下面是编号的待执行命令列表，对每一条'
+    '独立判定能否不经人工确认自动放行。参照 Codex workspace-write 沙箱的边界'
+    '——沙箱内的常规操作（工作区内文件的删除/重建、运行测试/构建/脚本、本地'
+    '状态查询）默认放行。'
+    '必须升级人工（escalate）的情况：'
+    '1) 删除/覆盖目标在工作区之外（系统目录、用户目录、绝对路径指向外部）；'
+    '2) 不可逆的系统修改（改环境/服务/注册表/全局配置）；'
+    '3) 本机数据外传——带请求体/上传文件/改方法的网络请求；'
+    '4) 读取或修改凭据/秘密文件；'
+    '5) 下载并执行、命令替换叠加重定向等意图不明的组合。'
+    '网络请求的例外：目标是公共 API/包源/localhost 的普通读请求（GET 类、'
+    '不带本机文件内容、不带凭据）可以放行。'
+    '信息不足以判断时也必须升级。宁可升级，不可误放。'
+    '只输出一个 JSON 数组且必须覆盖每个编号：'
+    '[{"index": 0, "decision": "approve"}, '
+    '{"index": 1, "decision": "escalate", "reason": "<一句话>"}]'
+)
+
+
+def preflight_judge(tool_calls) -> int:
+    """批级合并审查：批内多条会 ASK 的 bash 命令打包成一次 LLM 调用。
+
+    agent_loop 每批 flush 前调用。bash 批是串行执行的（可变操作不并行），
+    逐条审查就是 N 次 LLM 往返；这里一次提交、按索引批量判定，放行的进
+    _JUDGE_APPROVED 缓存，enforce 单条路径命中缓存零开销。fail-closed：
+    档位不对 / 候选不足两条 / 输出解析失败或缺条目 → 全部不缓存，逐条路径
+    照旧（该单审的单审、该问人的问人）。只处理 bash；只读批零开销。"""
+    if not llm_approval_enabled():
+        return 0
+    policy = load_policy()
+    if policy.approval_policy != 'on-request':
+        return 0
+    candidates = []
+    seen_keys = set()
+    for tool_call in tool_calls or []:
+        function = getattr(tool_call, 'function', None)
+        if getattr(function, 'name', '') != 'bash':
+            continue
+        try:
+            args = json.loads(function.arguments or '{}')
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        decision = evaluate_call('bash', args, policy=policy)
+        if decision.action != ASK or decision.code not in JUDGEABLE_CODES:
+            continue
+        key = f'{current_session_id()}|{grant_key("bash", args)}'
+        if key in _JUDGE_APPROVED or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append((key, str(args.get('command', ''))))
+    if len(candidates) < 2:
+        return 0   # 单条候选走 enforce 内的既有单条审查路径
+    listing = '\n'.join(f'[{index}] {command}'
+                        for index, (_, command) in enumerate(candidates))
+    try:
+        response = _h().client.chat.completions.create(
+            model=os.getenv('LLM_MODEL_ID'),
+            messages=[{'role': 'system', 'content': JUDGE_BATCH_PROMPT},
+                      {'role': 'user', 'content': listing}],
+            temperature=0,
+            max_tokens=300,
+        )
+        raw = (response.choices[0].message.content or '').strip()
+        items = json.loads(raw[raw.index('['): raw.rindex(']') + 1])
+    except Exception:
+        return 0
+    if not isinstance(items, list):
+        return 0
+    approved = 0
+    for item in items:
+        try:
+            index = int(item.get('index'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if 0 <= index < len(candidates) and item.get('decision') == 'approve':
+            _JUDGE_APPROVED[candidates[index][0]] = None
+            approved += 1
+    while len(_JUDGE_APPROVED) > _JUDGE_APPROVED_MAX:
+        _JUDGE_APPROVED.pop(next(iter(_JUDGE_APPROVED)))
+    if approved:
+        print(f'  \033[32m[permission] LLM 批量审查放行 {approved}/{len(candidates)} '
+              f'条命令\033[0m')
+    return approved
+
+
 def is_tool_hook(tool:str,args:dict):
     if tool not in tool_registry.keys():
         return f'Error: unknown tool {tool}'
@@ -446,6 +635,13 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     if policy.approval_policy != 'untrusted' and GATE.session_allows(tool, args):
         print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
         issue_grant(tool, args)   # 白名单命中同样是一次「本调用已批准」
+        return None
+    # LLM 审查官：两个噪音源（解释器命令、破坏性子串误伤）先复核，
+    # 判定为常规开发操作则自动放行；升级或审查不可用则照常走人工审批。
+    if (llm_approval_enabled() and policy.approval_policy == 'on-request'
+            and decision.code in JUDGEABLE_CODES
+            and _judge_auto_approve(tool, args, decision)):
+        issue_grant(tool, args)
         return None
     ask = GATE.decide if interactive else GATE.decide_queued
     allowed, _message = ask(tool, args, decision.reason)

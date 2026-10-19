@@ -105,7 +105,7 @@ from cron_scheduler import (
     scheduled_jobs,
     wait_for_cron_idle,
 )
-from exec_policy import load_policy, set_tier
+from exec_policy import is_readonly_command, load_policy, set_tier
 from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
@@ -849,7 +849,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
 
 
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
-# 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为永不并行。
+# 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为默认串行；
+# 唯一例外见 _run_tool_batch 的只读 bash 批（exec_policy.is_readonly_command）。
 PARALLEL_SAFE_TOOLS = frozenset({
     'read', 'glob', 'grep', 'ls', 'list_tasks', 'get_task', 'list_crons',
     'check_inbox', 'load_skill',
@@ -857,14 +858,38 @@ PARALLEL_SAFE_TOOLS = frozenset({
 PARALLEL_MAX_WORKERS = 4
 
 
-def _run_tool_batch(tool_calls, session_store, tool_messages):
-    """执行一批 tool_call：全部只读时并行，任一可变则整批串行兜底。
+def _batch_bash_commands(tool_calls):
+    """整批 bash 的命令文本；混入其他工具或 JSON 解析失败返回 None（串行兜底）。"""
+    commands = []
+    for tool_call in tool_calls:
+        if tool_call.function.name != 'bash':
+            return None
+        try:
+            args = json.loads(tool_call.function.arguments or '{}')
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(args, dict):
+            return None
+        commands.append(str(args.get('command', '') or ''))
+    return commands
 
+
+def _run_tool_batch(tool_calls, session_store, tool_messages):
+    """执行一批 tool_call：全部无副作用时并行，任一可变则整批串行兜底。
+
+    无副作用 = 只读白名单工具，或整批 bash 且每条命令都落在只读命令白名单
+    （git status / ls / cat…，无重定向、无解释器、无外发 —— 判据与策略层
+    read-only 档同源，exec_policy.is_readonly_command）。write/edit 不并行：
+    同文件冲突与 checkpoint 前像顺序不值得冒，Codex 也串行。
     started 事件与结果**始终按模型给定的原序**写回 store —— append-only
     回放要求 tool 结果顺序与 assistant.tool_calls 对齐，乱序会产生孤儿。
     线程内用 copy_context 传播 checkpoint/perf 的 ContextVar。"""
     parallel = (len(tool_calls) > 1
                 and all(tc.function.name in PARALLEL_SAFE_TOOLS for tc in tool_calls))
+    if not parallel and len(tool_calls) > 1:
+        commands = _batch_bash_commands(tool_calls)
+        parallel = (commands is not None
+                    and all(is_readonly_command(command) for command in commands))
     if parallel:
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)   # 原序登记全部 started
@@ -1583,7 +1608,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
 
         def _flush_batch():
             # 本函数每轮重新定义，且只在本轮内同步调用：batch/tool_messages 不跨轮存活
-            _run_tool_batch(batch, session_store, tool_messages)  # noqa: B023
+            if batch:  # noqa: B023
+                # 批级合并审查：批内多条会 ASK 的 bash 打包成一次 LLM 审查，
+                # 放行结果进缓存（enforce 单条路径零开销命中）；升级的照旧问人
+                hooks.preflight_judge(batch)  # noqa: B023
+                _run_tool_batch(batch, session_store, tool_messages)  # noqa: B023
             batch.clear()  # noqa: B023
 
         for tool_call in message.tool_calls:

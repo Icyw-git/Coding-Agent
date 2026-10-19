@@ -216,10 +216,21 @@ class Policy:
         if self.sandbox_mode == 'danger-full-access':
             return Decision(ALLOW)
 
-        # 4) 询问：破坏性子串（保持既有条目语义）
+        # 4) 询问：破坏性命令。单词条目（rm / del / rd…）按「去引号后的 token 或
+        #    命令动词」匹配，不再子串匹配 —— 'confirm ' / 'delegate ' / 'delete '
+        #    含 'rm ' / 'del ' 曾把无害命令卷进审批。含空格/路径的条目
+        #    （chmod 777、> /etc/）保留子串语义，覆盖参数位置的写入。
+        tokens = set(_STRIP_QUOTES.sub(' ', normalized).split())
         for pattern in destructive:
-            text = str(pattern).casefold()
-            if text and text in normalized:
+            text = str(pattern).casefold().strip()
+            if not text:
+                continue
+            if _is_command_word_pattern(text):
+                if text in verbs or text in tokens:
+                    return Decision(ASK, 'destructive',
+                                    f'potentially destructive command ({pattern})',
+                                    pattern)
+            elif text in normalized:
                 return Decision(ASK, 'destructive',
                                 f'potentially destructive command ({pattern})',
                                 pattern)
@@ -607,6 +618,20 @@ def _looks_read_only(normalized: str, verbs: set[str]) -> bool:
         if 'hostname' in segment_verbs and len(segment.split()) > 1:
             return False
     return True
+
+
+def is_readonly_command(command: str) -> bool:
+    """单条 bash 命令是否落在只读白名单（无重定向、无解释器、无外发）。
+
+    供并行调度使用：整批 bash 全部只读时按无副作用处理，与只读文件工具一样
+    可并行执行。这是调度判据，不是安全边界 —— 安全判定仍在 evaluate()，
+    两条路径共用同一份白名单（READ_ONLY_COMMANDS / GIT_READONLY_SUBCOMMANDS）。"""
+    normalized = str(command or '').casefold()
+    if not normalized.strip():
+        return True
+    verbs = (_command_verbs(normalized)
+             | _command_verbs(_STRIP_QUOTES.sub('', normalized)))
+    return _looks_read_only(normalized, verbs)
 
 
 def _git_subcommand(command: str) -> str | None:

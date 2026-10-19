@@ -14,7 +14,11 @@ _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
              # 执行档位：本机 .env 配了 read-only/never 时，不能把「默认档即重构前
              # 行为」的测试前提一起改掉。需要特定档位的用例自己 setenv。
              'HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
-             'HARNESS_APPROVAL_ALL')
+             'HARNESS_APPROVAL_ALL',
+             # LLM 审查官默认关：开着会让审批类测试偷偷打真实 LLM API
+             # （test_approval_scope 曾因此慢 12s 且卡片断言落空）。专测文件自己
+             # delenv 打开。
+             'HARNESS_LLM_APPROVAL')
 _TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
               'HARNESS_APPROVAL_ALL')
 
@@ -74,6 +78,8 @@ def _restore_permission_backend():
     # 给测试目录打 Low 标签、拖慢甚至改变行为。需要沙箱的用例自己打开。
     os.environ['HARNESS_OS_SANDBOX'] = 'off'
     sandbox.reset_cache()
+    # LLM 审查官默认关（见 _ENV_KEYS 注释）：审批类测试不偷偷打真实 LLM。
+    os.environ['HARNESS_LLM_APPROVAL'] = '0'
     for key in _TIER_KEYS:
         os.environ.pop(key, None)   # 用例默认跑默认档，需要别的档位自己 setenv
     previous = permission_gate.backend

@@ -64,7 +64,10 @@
 ## 并发与安全
 
 只读工具白名单（read / glob / grep / ls / list_tasks / get_task / list_crons / check_inbox /
-load_skill）用 4 线程池并行，批内含任一可变工具则整批串行兜底；线程内
+load_skill）用 4 线程池并行，批内含任一可变工具则整批串行兜底；整批 bash 且每条
+命令都落在只读命令白名单（git status / ls / cat…，无重定向、无解释器、无外发，
+`exec_policy.is_readonly_command` 与 read-only 档同源）时同样并行。write / edit
+与第三方工具永不并行（同文件冲突、前像顺序、副作用未知）。线程内
 `contextvars.copy_context()` 传播 checkpoint 上下文。结果原序写回（见不变式）。
 
 远程权限审批走 `hooks.PermissionGate`：超时默认 300s、fail-safe deny、
@@ -84,6 +87,17 @@ secret / system）：PreToolUse 与 `tools.safe_path` 共用同一次解析，�
 `|` / 换行）要求每段同类一致才记——一条批准的含义是「这一条我认了」，不是
 「第一个动词我认了」。判定是文本分析，不是 shell 解析器；真正的出口约束
 属于 OS 级沙箱/防火墙，不属于这一层。
+
+ASK 决策的三个类别（解释器命令、破坏性命中、外发网络）先经 LLM 审查官复核
+（`HARNESS_LLM_APPROVAL`，默认开）。审查口径对齐 Codex workspace-write 沙箱：
+**沙箱内的常规操作默认放行**——工作区内文件的删除/重建、解释器与脚本、
+本地状态查询都不问人；只有沙箱外的事升级人工（工作区外删除/覆盖、系统修改、
+本机数据外传、秘密文件、下载并执行）。外发请求中普通读（公共 API/包源/
+localhost 的 GET 类）可放行，带请求体/改方法/上传必升级。放行记入审批历史
+（`resolved_by='llm-judge'`），升级或审查不可用一律回落人工——fail-closed，
+审查官只在「少问」方向起作用。工作区外写与第三方 MCP 工具不进 L1（缺用户
+意图上下文 / 副作用不可见，人批 + 同类记忆）；`untrusted` / `never` 档语义
+不受影响；破坏性列表按命令词匹配而非子串。
 
 飞书入口按个人单聊设计：未配置 `FEISHU_ALLOWED_USERS` 时 `main()` 拒绝启动
 （本地测试只能用 `FEISHU_ALLOW_ANY_USER=1` 显式放开），群聊/话题群消息在入口
