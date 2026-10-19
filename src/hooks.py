@@ -25,12 +25,19 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from agent_core import register_hook
 import approval_view
 import checkpoints
-from exec_policy import (PATH_WORKSPACE, READ_ONLY_FILE_TOOLS, READ_WRITE_TOOLS,
-                         approval_class, classify_path, grant_key, load_policy,
-                         session_allow_key)
+from agent_core import register_hook
+from exec_policy import (
+    PATH_WORKSPACE,
+    READ_ONLY_FILE_TOOLS,
+    READ_WRITE_TOOLS,
+    approval_class,
+    classify_path,
+    grant_key,
+    load_policy,
+    session_allow_key,
+)
 from tools import tool_registry
 
 

@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import time
 import uuid
 from pathlib import Path
 
-from perf import segment as perf_segment
 from exec_policy import is_secret_path
+from perf import segment as perf_segment
 
 DEFAULT_IGNORE = ('.cache', '.git', '.worktrees', '.mailbox', '__pycache__', '.pytest_cache')
 # 密钥材料：证书/私钥文件与 dot-env 的全部变体（.env.local、.env.production 常放真凭证），
@@ -46,7 +45,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + f'.tmp{uuid.uuid4().hex[:6]}')
         tmp.write_bytes(data)
-        os.replace(tmp, path)
+        tmp.replace(path)
 
 
 def _read_json(path: Path) -> dict:
@@ -263,7 +262,7 @@ class CheckpointManager:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 tmp = dest.with_name(dest.name + f'.tmp{uuid.uuid4().hex[:6]}')
                 shutil.copyfile(path, tmp)
-                os.replace(tmp, dest)
+                tmp.replace(dest)
         meta['files'][key] = record
         self._write_meta(node_dir, meta)
 
@@ -300,7 +299,9 @@ class CheckpointManager:
         }
 
     def _write_meta(self, node_dir: Path, meta: dict) -> None:
-        _atomic_write(node_dir / 'meta.json', json.dumps(meta, ensure_ascii=False, indent=2, default=str).encode('utf-8'))
+        _atomic_write(node_dir / 'meta.json',
+                      json.dumps(meta, ensure_ascii=False, indent=2,
+                                 default=str).encode('utf-8'))
 
     @staticmethod
     def _encode_messages(messages: list) -> bytes:

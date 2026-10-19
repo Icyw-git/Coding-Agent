@@ -38,21 +38,22 @@ import json
 import os
 import queue
 import re
+import secrets
 import threading
 import time
 import unicodedata
-import secrets
 from pathlib import Path
 
 import httpx
 
-from gateway_sim import GatewayClient
 import approval_view
 from exec_policy import approval_class
-from turn_progress import format_duration
-from perf import record as perf_record, reset as perf_reset
+from feishu_sessions import PAGE_SIZE, detail_card, list_card
+from gateway_sim import GatewayClient
+from perf import record as perf_record
+from perf import reset as perf_reset
 from session_views import group_sessions, session_details
-from feishu_sessions import PAGE_SIZE, list_card, detail_card
+from turn_progress import format_duration
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
@@ -143,7 +144,8 @@ def markdown_to_card_md(md_text: str) -> str:
             i += 2  # consume header and separator
             while i < len(lines) and '|' in lines[i] and lines[i].strip():
                 values = [cell.strip() for cell in lines[i].strip().strip('|').split('|')]
-                pairs = [f'{h}: {v}' for h, v in zip(headers, values)]
+                # 行内单元格可以少于表头（markdown 允许残缺行），缺的列直接不显示
+                pairs = [f'{h}: {v}' for h, v in zip(headers, values, strict=False)]
                 out.append(f'{indent}• ' + '；'.join(pairs))
                 i += 1
             continue
@@ -181,8 +183,7 @@ class LarkTransport:
 
     def send_text(self, chat_id: str, text: str) -> str | None:
         self.validate_chat_id(chat_id)
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest, CreateMessageRequestBody)
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         request = CreateMessageRequest.builder() \
             .receive_id_type('chat_id') \
             .request_body(
@@ -237,8 +238,7 @@ class LarkTransport:
 
     def _send_card(self, chat_id: str, content: str) -> str | None:
         self.validate_chat_id(chat_id)
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest, CreateMessageRequestBody)
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         request = CreateMessageRequest.builder() \
             .receive_id_type('chat_id') \
             .request_body(
@@ -276,8 +276,7 @@ class LarkTransport:
         """带审批按钮的卡片；「本次会话允许同类」只传 scope=session，
         同类键与决议一样由服务端按被审批的内容重算。"""
         self.validate_chat_id(chat_id)
-        from lark_oapi.api.im.v1 import (
-            CreateMessageRequest, CreateMessageRequestBody)
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         req_id = req['req_id']
         # 按钮文案里的「同类」只是给人看的提示：真正的白名单键由服务端按同一规则
         # （exec_policy.approval_class）重算，展示与生效不会分叉。
@@ -392,7 +391,7 @@ class FeishuGateway:
             temp = self.bindings_path.with_suffix('.tmp')
             temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2),
                             encoding='utf-8')
-            os.replace(temp, self.bindings_path)
+            temp.replace(self.bindings_path)
 
     # ---------- 消息入口（可测试核心） ----------
 
@@ -1022,7 +1021,7 @@ class FeishuGateway:
         # 决议完成（或超时）的请求退出通知集合与各聊天 FIFO，避免无界增长
         pending_ids = {req['req_id'] for req in pending}
         self._notified &= pending_ids
-        for chat_id, fifo in self._chat_pending.items():
+        for fifo in self._chat_pending.values():
             fifo[:] = [req_id for req_id in fifo if req_id in pending_ids]
 
     def _push_approval(self, chat_id: str, req: dict, index: int) -> None:
@@ -1224,8 +1223,10 @@ class FeishuGateway:
                     getattr(data.event.action, 'value', None),
                     getattr(data.event.context, 'open_message_id', None),
                     chat_id=getattr(data.event.context, 'open_chat_id', None))
-                from lark_oapi.event.callback.model.p2_card_action_trigger \
-                    import (CallBackToast, P2CardActionTriggerResponse)
+                from lark_oapi.event.callback.model.p2_card_action_trigger import (
+                    CallBackToast,
+                    P2CardActionTriggerResponse,
+                )
                 response = P2CardActionTriggerResponse()
                 response.toast = CallBackToast()
                 response.toast.type = 'success' if ok else 'failed'

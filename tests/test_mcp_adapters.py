@@ -106,7 +106,7 @@ def test_stdio_connection_can_be_opened_called_and_closed_in_different_tasks():
 def test_failed_connection_cleans_up_owner_task(tmp_path):
     async def scenario():
         client = MCPclient('missing', str(tmp_path / 'missing-command.exe'))
-        with pytest.raises(Exception):
+        with pytest.raises(OSError):   # 命令缺失：Windows/POSIX 都是 FileNotFoundError 一类
             await asyncio.create_task(client.connect(timeout=2))
         assert client.session is None
         assert client._session_task is None

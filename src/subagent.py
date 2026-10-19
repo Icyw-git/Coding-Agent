@@ -17,7 +17,7 @@ SUB_TOOLS=TOOLS.copy()
 SUB_HANDLERS=tool_registry.copy()
 
 def spawn_subagent(description:str)->str:
-    print(f'\n\033[35m[Subagent spawned]\033[0m')
+    print('\n\033[35m[Subagent spawned]\033[0m')
     messages=[{'role':'system','content':_h().build_sub_system()},{'role':'user','content':description}]
 
 
@@ -74,5 +74,5 @@ def spawn_subagent(description:str)->str:
                     break
         if not result:
             result="Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent done]\033[0m")
+    print("\033[35m[Subagent done]\033[0m")
     return result

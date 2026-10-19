@@ -476,7 +476,9 @@ def snip_compact(messages, max_messages=None, info=None):
             while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
                 head_end += 1
         # 情况 B：头部切断在分组中间（前后都是工具结果）→ 并入剩余工具结果
-        while head_end < len(messages) and _is_tool_result_message(messages[head_end - 1]) and _is_tool_result_message(messages[head_end]):
+        while (head_end < len(messages)
+               and _is_tool_result_message(messages[head_end - 1])
+               and _is_tool_result_message(messages[head_end])):
             head_end += 1
     # 尾部预算：head + 1 条 marker + tail <= max_messages
     keep_tail = max_messages - head_end - 1
@@ -491,7 +493,9 @@ def snip_compact(messages, max_messages=None, info=None):
     if info is not None:
         info.update(head_end=head_end, tail_start=tail_start,
                     snipped=tail_start - head_end)
-    return messages[:head_end] + [{'role': 'user', 'content': f"[snipped {tail_start - head_end} messages]"}] + messages[tail_start:]
+    return (messages[:head_end]
+            + [{'role': 'user', 'content': f"[snipped {tail_start - head_end} messages]"}]
+            + messages[tail_start:])
 
 
 def collect_tool_results(messages):  # 收集所有工具结果
@@ -650,8 +654,10 @@ def _summary_input(messages, budget=80_000):
     for m in reversed(messages):
         content = str(m.get('content') or '')
         if m.get('tool_calls'):
-            calls = '; '.join(f"{c.get('function', {}).get('name', '?')}({str(c.get('function', {}).get('arguments', ''))[:120]})"
-                              for c in m['tool_calls'])
+            calls = '; '.join(
+                f"{c.get('function', {}).get('name', '?')}"
+                f"({str(c.get('function', {}).get('arguments', ''))[:120]})"
+                for c in m['tool_calls'])
             content = f"{content or ''}[tool_calls: {calls}]" if content else f"[tool_calls: {calls}]"
         line = f"{m.get('role', '?')}: {content[:4000]}"
         if tail and total + len(line) > budget:

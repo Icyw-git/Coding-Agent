@@ -1,20 +1,19 @@
 import json
-import re
 import os
+import re
 import threading
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from team_protocols import (ProtocolState, pending_requests, new_request_id,
-                            handle_inbox_message)
 from autonomous_agent import idle_poll
 from task_system import load_task
+from team_protocols import ProtocolState, handle_inbox_message, new_request_id, pending_requests
 from worktree import WORKTREES_DIR
 
 load_dotenv()
-WORKDIR = Path(os.getcwd()).resolve()
+WORKDIR = Path.cwd().resolve()
 MAILBOX_DIR = WORKDIR / '.mailbox'
 MAILBOX_DIR.mkdir(exist_ok=True)
 
@@ -45,7 +44,7 @@ active_teammates = {}
 AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
-class MessageBus: 
+class MessageBus:
     """消息总线，用于团队成员之间的通信。"""
     def __init__(self):
         self._locks: dict[Path, threading.Lock] = {}
@@ -283,11 +282,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
         skip_micro_rounds = 0
         memories_content = harness.load_memories(messages)   # 记忆召回（只读，不提炼，避免污染全局记忆）
         should_stop=False # 是否停止线程
-        
+
         while not should_stop:
             # 收 inbox：协议消息（shutdown/plan_approval）走 handle_inbox_message，其余注入 <inbox>
             inbox = BUS.read_inbox(name)
-            
+
             non_protocol = []
             for msg in inbox:
                 result=handle_inbox_message(name, msg, messages)
@@ -296,7 +295,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
                     break
                 elif result=='awake':
                     pass
-            
+
                 else:
                     non_protocol.append(msg)
             if should_stop: #跳出循环
@@ -368,8 +367,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
     active_teammates[name] = True # 标记为活跃，等待主线程唤醒
-    from workspace_context import use_workspace
     import hooks
+    from workspace_context import use_workspace
     workspace = harness.get_workdir()
     # 派发线程还带着 lead 的会话，teammate 的新线程不会继承（ContextVar 不跨
     # 线程）：不显式带过去，teammate 的审批白名单就落到进程级键上，一个

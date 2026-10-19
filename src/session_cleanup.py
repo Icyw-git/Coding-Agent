@@ -25,7 +25,8 @@ class SessionArchive:
             raise ValueError('无效的会话标识')
         paths = (self.sessions / f'session_{session_id}.jsonl',
                  self.checkpoints / session_id, self.root / session_id)
-        for path, parent in zip(paths, (self.sessions, self.checkpoints, self.root)):
+        for path, parent in zip(paths, (self.sessions, self.checkpoints, self.root),
+                                strict=True):
             if path.resolve().parent != parent or path.is_symlink():
                 raise ValueError('会话路径超出存储目录或使用了链接，未执行改动')
         return paths

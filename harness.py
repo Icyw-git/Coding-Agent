@@ -29,60 +29,96 @@ def enforce_trusted_policy_env() -> None:
               f"（档位只认启动进程时的环境，运行中用 /sandbox 切换）", file=sys.stderr)
 
 
-from dotenv import load_dotenv
-import json
-import time
-import threading
-import subprocess
 import concurrent.futures
 import contextvars
+import json
+import subprocess
+import sys
+import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-import sys
-from types import SimpleNamespace
 from pathlib import Path
-from typing import Optional, List
+from types import SimpleNamespace
+from typing import List, Optional
+
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from workspace_context import current_workspace, use_workspace
-from background_task import (should_run_background, start_background_task, collect_background_results,
-                             background_lock, background_tasks)
+import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
+import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
-from task_system import create_task, list_tasks, get_task, claim_task, complete_task
-from cron_scheduler import (schedule_job, cancel_job, consume_cron_queue,
-                            cron_lock, scheduled_jobs, cron_scheduler_loop,
-                            load_durable_jobs, agent_lock,
-                            queue_processor_loop, wait_for_cron_idle)
-from agent_teams import spawn_teammate_thread, BUS, active_teammates
-from agent_core import (HOOKS, register_hook, trigger_hooks, _extract_text,
-                        _parse_frontmatter, write_memory_file, _rebuild_index,
-                        read_memory_index, read_memory_file, list_memory_files,
-                        select_relevant_memories, load_memories, extract_memories,
-                        consolidate_memories, estimate_size, _message_has_tool_use,
-                        _is_tool_result_message, collect_tool_results, snip_compact,
-                        micro_compact, persist_large_output, tool_result_budget,
-                        _bound_tool_output, write_transcript, summarize_history,
-                        _summary_input, _tail_within_budget,
-                        compact_history, reactive_compact, inject_memories)
-from tools import TOOLS, tool_registry, run_bash
-from skill_system import scan_skills, list_skills, load_skill
-from subagent import spawn_subagent
-from session_store import SessionEventStore, SessionReplayError
-from agent_runtime import AgentRuntime
-from checkpoints import CheckpointManager, CheckpointError
-from cli_commands import parse_command, command_error, format_command_help
-from exec_policy import load_policy, set_tier
-import approval_view   # 审批面的参数渲染（/approvals 列表要显示完整命令）
 import sandbox
-import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
-from perf import segment as perf_segment, record as perf_record, reset as perf_reset
-
-
+from agent_core import (
+    HOOKS,
+    _bound_tool_output,
+    _extract_text,
+    _is_tool_result_message,
+    _message_has_tool_use,
+    _parse_frontmatter,
+    _rebuild_index,
+    _summary_input,
+    _tail_within_budget,
+    collect_tool_results,
+    compact_history,
+    consolidate_memories,
+    estimate_size,
+    extract_memories,
+    inject_memories,
+    list_memory_files,
+    load_memories,
+    micro_compact,
+    persist_large_output,
+    reactive_compact,
+    read_memory_file,
+    read_memory_index,
+    register_hook,
+    select_relevant_memories,
+    snip_compact,
+    summarize_history,
+    tool_result_budget,
+    trigger_hooks,
+    write_memory_file,
+    write_transcript,
+)
+from agent_runtime import AgentRuntime
+from agent_teams import BUS, active_teammates, spawn_teammate_thread
+from background_task import (
+    background_lock,
+    background_tasks,
+    collect_background_results,
+    should_run_background,
+    start_background_task,
+)
+from checkpoints import CheckpointError, CheckpointManager
+from cli_commands import command_error, format_command_help, parse_command
+from cron_scheduler import (
+    agent_lock,
+    cancel_job,
+    consume_cron_queue,
+    cron_lock,
+    cron_scheduler_loop,
+    load_durable_jobs,
+    queue_processor_loop,
+    schedule_job,
+    scheduled_jobs,
+    wait_for_cron_idle,
+)
+from exec_policy import load_policy, set_tier
+from perf import record as perf_record
+from perf import reset as perf_reset
+from perf import segment as perf_segment
+from session_store import SessionEventStore, SessionReplayError
+from skill_system import list_skills, load_skill, scan_skills
+from subagent import spawn_subagent
+from task_system import claim_task, complete_task, create_task, get_task, list_tasks
+from tools import TOOLS, run_bash, tool_registry
+from workspace_context import current_workspace, use_workspace
 
 load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
-WORKDIR = Path(os.getcwd()).resolve()
+WORKDIR = Path.cwd().resolve()
 
 
 def get_workdir() -> Path:
@@ -103,7 +139,7 @@ class _LazyLLMClient:
 
     def _instance(self):
         if self._real is None:
-            import openai   # 首次使用时加载（import 即 ~1.5s）
+            import openai  # 首次使用时加载（import 即 ~1.5s）
             self._real = openai.OpenAI(
                 api_key=os.getenv("LLM_API_KEY"),
                 base_url=os.getenv("LLM_BASE_URL"),
@@ -355,8 +391,8 @@ def format_sandbox_tier() -> str:
                      for name, note in options)
     lines.append('  说明：档位是策略级判定（四个执行入口同一套规则），本身不做 OS 强制，'
                  '不隔离文件读取与网络。')
-    lines.append(f'  OS 沙箱独立于此开关：require 时沙箱不可用则拒绝执行；'
-                 f'启用后命令以 Low IL 运行，工作区外写入被内核拒绝，读取与网络仍不隔离。')
+    lines.append('  OS 沙箱独立于此开关：require 时沙箱不可用则拒绝执行；'
+                 '启用后命令以 Low IL 运行，工作区外写入被内核拒绝，读取与网络仍不隔离。')
     return '\n'.join(lines)
 
 
@@ -719,8 +755,10 @@ tool_registry['load_skill']=load_skill
 # 与记忆、hooks 已提取到 agent_core.py，此处只保留 agent_loop 的编排函数
 # ============================================================
 
+# 压缩逻辑，每轮开头的压缩预处理：micro → snip → budget →（仍超限）LLM 摘要。
+# 返回 (压缩后的 messages, 新的 skip_micro_rounds)。
 def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session_store=None,
-                         size=None, snip_state=None): #压缩逻辑，每轮开头的压缩预处理：micro → snip → budget →（仍超限）LLM 摘要。返回 (压缩后的 messages, 新的 skip_micro_rounds)。
+                         size=None, snip_state=None):
     """每轮开头的压缩预处理，判据优先用真实用量（P0）：
 
     - size：上一次请求的 prompt_tokens（供应商权威值）+ 本回合新增消息的估算
@@ -1368,8 +1406,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
         _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
 
-        pre_compress=[m if isinstance(m,dict) else {'role':m.get('role',''),'content':str(m.get('content',''))} for m in messages] #压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
-        
+        # 压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
+        pre_compress=[m if isinstance(m,dict)
+                      else {'role':m.get('role',''),'content':str(m.get('content',''))}
+                      for m in messages]
+
 
         messages, skip_micro_rounds = pre_compact_messages(
             messages, skip_micro_rounds,
@@ -1398,7 +1439,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             session_store.append_message(cron_message)
             print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
 
-        
+
 
 
 
@@ -1412,7 +1453,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                         else recovery.DEFAULT_MAX_TOKENS)
             kwargs = dict(
                 model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
-                messages=request_messages,
+                messages=request_messages,  # noqa: B023  本轮内同步交给 with_retry，无迟绑定
                 tools=TOOLS,
                 temperature=0.7,
                 max_tokens=max_tokens,
@@ -1529,7 +1570,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 _housekeeping_threads.append(housekeeping)
             housekeeping.start()
             return message.content or "No output"
-            
+
 
         # compact 工具：在 for 循环内按顺序处理——compact 之前的 tool_call 先正常执行，
         # 遇到 compact 时压缩历史并重开一轮。
@@ -1541,8 +1582,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         batch = []
 
         def _flush_batch():
-            _run_tool_batch(batch, session_store, tool_messages)
-            batch.clear()
+            # 本函数每轮重新定义，且只在本轮内同步调用：batch/tool_messages 不跨轮存活
+            _run_tool_batch(batch, session_store, tool_messages)  # noqa: B023
+            batch.clear()  # noqa: B023
 
         for tool_call in message.tool_calls:
             if tool_call.function.name == 'todo_write':
@@ -1598,7 +1640,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                     {
                         'role':'user',
                         'content':notification,
-                        
+
                     }
                 )
                 session_store.append_message(tool_messages[-1])
@@ -1703,7 +1745,7 @@ def run_repl(initial_messages:list, session_store=None):
     print(f'  工作区：{WORKDIR}')
     print('  输入消息开始对话；/ 查看命令，/resume 恢复会话，/quit 退出。')
 
-    from cli_input import create_reader, choose_session
+    from cli_input import choose_session, create_reader
 
     def session_choices():
         for row in session_rows(limit=None):

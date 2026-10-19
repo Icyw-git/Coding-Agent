@@ -57,7 +57,7 @@ def validate_pairs(msgs, label):
                 pending[tc["id"]] = False
         elif m.get("role") == "tool":
             if m.get("tool_call_id") not in pending:
-                assert False, f"{label}: orphan tool message {m.get('tool_call_id')}"
+                raise AssertionError(f"{label}: orphan tool message {m.get('tool_call_id')}")
             pending[m["tool_call_id"]] = True
         else:
             assert not pending or all(pending.values()), \

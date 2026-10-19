@@ -104,7 +104,7 @@ def validate_cron(cron_expr:str): #验证cron表达式是否有效，返回错�
         return f'Expected 5 fields,got {len(fields)}'
     bounds=[(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
     names=["minute", "hour", "day-of-month", "month", "day-of-week"]
-    for i,(field,(lo,hi),name) in enumerate(zip(fields,bounds,names)):
+    for field,(lo,hi),name in zip(fields,bounds,names,strict=True):
         err=_validate_cron_field(field,lo,hi)
         if err:
             return f'{name}:{err}'

@@ -9,18 +9,17 @@ import subprocess
 import tempfile
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-import sandbox
 import checkpoints
-from process_utils import close_process, kill_process_tree
-
+import sandbox
+from agent_teams import BUS, spawn_teammate_thread
+from cron_scheduler import cancel_job, cron_lock, schedule_job, scheduled_jobs
 from exec_policy import is_secret_path, resolve_tool_path
-from task_system import create_task, list_tasks, get_task, claim_task, complete_task
-from cron_scheduler import schedule_job, cancel_job, cron_lock, scheduled_jobs
-from agent_teams import spawn_teammate_thread, BUS
-from team_protocols import new_request_id, ProtocolState, pending_requests, consume_lead_inbox
-from worktree import create_worktree, remove_worktree, keep_worktree
+from process_utils import close_process, kill_process_tree
+from task_system import claim_task, complete_task, create_task, get_task, list_tasks
+from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
+from worktree import create_worktree, keep_worktree, remove_worktree
 
 
 def _h():
@@ -66,7 +65,8 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"read",
-        "description":"Read a file. Absolute paths and paths outside the workspace are allowed; protected secret files are denied.",
+        "description":"Read a file. Absolute paths and paths outside the workspace are allowed; protected secret "
+                      "files are denied.",
         "parameters":{
             "type":"object",
             "properties":{
@@ -90,7 +90,8 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"write",
-        "description":"Write a file. Workspace paths are written directly; paths outside the workspace require approval.",
+        "description":"Write a file. Workspace paths are written directly; paths outside the workspace require "
+                      "approval.",
         "parameters":{
             "type":"object",
             "properties":{
@@ -155,7 +156,8 @@ TOOLS=[{
                 },
                 "path":{
                     "type":"string",
-                    "description":"Root directory (or file). Relative to the workspace/cwd, or absolute; defaults to the workspace"
+                    "description":"Root directory (or file). Relative to the workspace/cwd, or absolute; defaults "
+                                  "to the workspace"
                 }
             },
             "required":[
@@ -179,7 +181,8 @@ TOOLS=[{
                 },
                 "path":{
                     "type":"string",
-                    "description":"File or directory to search. Relative to the workspace/cwd, or absolute; defaults to the workspace"
+                    "description":"File or directory to search. Relative to the workspace/cwd, or absolute; "
+                                  "defaults to the workspace"
                 },
                 "glob":{
                     "type":"string",
@@ -211,7 +214,8 @@ TOOLS=[{
             "properties":{
                 "path":{
                     "type":"string",
-                    "description":"Directory or file to list. Relative to the workspace/cwd, or absolute; defaults to the workspace"
+                    "description":"Directory or file to list. Relative to the workspace/cwd, or absolute; defaults "
+                                  "to the workspace"
                 },
                 "all":{
                     "type":"boolean",
@@ -362,13 +366,15 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"schedule_cron",
-        "description":"Schedule a cron job: at matching times the prompt is injected into the conversation as a scheduled task.",
+        "description":"Schedule a cron job: at matching times the prompt is injected into the conversation as a "
+                      "scheduled task.",
         "parameters":{
             "type":"object",
             "properties":{
                 "cron":{
                     "type":"string",
-                    "description":"5-field cron expression, e.g. '*/5 * * * *' (minute hour day-of-month month day-of-week)"
+                    "description":"5-field cron expression, e.g. '*/5 * * * *' (minute hour day-of-month month "
+                                  "day-of-week)"
                 },
                 "prompt":{
                     "type":"string",
@@ -938,7 +944,9 @@ TOOLS.append({
     "type":"function",
     "function":{
         "name":"load_skill",
-        "description":"Load a registered skill's instructions by its name. When the system prompt lists skills (e.g. 'file-summarizer'), call this tool with that exact name to get the skill body instead of searching the filesystem manually.",
+        "description":"Load a registered skill's instructions by its name. When the system prompt lists skills "
+                      "(e.g. 'file-summarizer'), call this tool with that exact name to get the skill body instead "
+                      "of searching the filesystem manually.",
         "parameters":{
             "type":"object",
             "properties":{
@@ -959,7 +967,8 @@ TOOLS.append({
     "type":"function",
     "function":{
         "name":"compact",
-        "description":"Summarize the conversation history to free up context. Call this when the conversation is getting too long or you want to clear old tool outputs.",
+        "description":"Summarize the conversation history to free up context. Call this when the conversation is "
+                      "getting too long or you want to clear old tool outputs.",
         "parameters":{
             "type":"object",
             "properties":{}

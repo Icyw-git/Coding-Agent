@@ -249,7 +249,8 @@ def test_preview_skips_injected_and_falls_back_to_assistant(tmp_path):
     store = SessionEventStore(tmp_path, session_id='inj')
     store.append_message({'role': 'user', 'content': '继续任务'})
     store.append_message({'role': 'user', 'content': '<reminder>Update your todos.</reminder>'})
-    store.append_message({'role': 'user', 'content': '<task_notification>\n <task_id>bg_1</task_id></task_notification>'})
+    store.append_message({'role': 'user',
+                          'content': '<task_notification>\n <task_id>bg_1</task_id></task_notification>'})
     store.append_message({'role': 'user', 'content': '[Compacted] Conversation history has been summarized.'})
     summary = store.session_summary()
     assert summary['last_user'] == '继续任务'

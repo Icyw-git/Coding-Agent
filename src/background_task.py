@@ -20,7 +20,7 @@ def is_slow_operation(tool_name:str,tool_input:dict)->bool:
 
 # 检查是否应该在后台运行任务
 def should_run_background(tool_name:str,tool_input:dict)->bool:
-    
+
     if tool_input.get('run_in_background'):
         return True
     return is_slow_operation(tool_name,tool_input)
@@ -75,7 +75,7 @@ def start_background_task(tool_call,registry:dict)->str: #启动后台任务，�
 
 
 def collect_background_results()->list[dict]: #收集后台任务结果，返回通知列表
-   
+
     with background_lock: # 加锁保护 background_tasks 和 background_results 访问
         ready_ids=[bid for bid,task in background_tasks.items()
                    if task['status'] in ('completed','failed')]

@@ -78,7 +78,9 @@ def command_error(name: str, argument: str) -> str | None:
         if unknown or len([p for p in parts if not p.startswith('--')]) > 1:
             return f'参数无效。用法：{command.usage}'
     if name == '/archive' and argument:
-        if argument not in ('all', 'empty', 'restore') and not (argument.isascii() and argument.isdigit() and 1 <= int(argument) <= 36500):
+        if (argument not in ('all', 'empty', 'restore')
+                and not (argument.isascii() and argument.isdigit()
+                         and 1 <= int(argument) <= 36500)):
             return '用法：/archive [天数|all|empty|restore]，天数需为 1～36500。'
     if name == '/approvals' and argument:
         tokens = argument.split()

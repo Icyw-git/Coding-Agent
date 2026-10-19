@@ -173,12 +173,17 @@ def test_preprocessors_order():
     names = ('micro_compact', 'snip_compact', 'tool_result_budget')
     originals = {n: getattr(harness, n) for n in names}
     order = []
+
+    def make_trace(name, orig):
+        def traced(m, *a, **kw):
+            order.append(name)
+            logger.debug("[preprocess] %s called on %d msgs", name, len(m))
+            return orig(m, *a, **kw)
+        return traced
+
     try:
         for n in names:
-            orig = originals[n]
-            setattr(harness, n, (lambda o, name: lambda m, *a, **kw: (order.append(name),
-                                                            logger.debug("[preprocess] %s called on %d msgs", name, len(m)),
-                                                            o(m, *a, **kw))[2])(orig, n))
+            setattr(harness, n, make_trace(n, originals[n]))
         fake = FakeCompletions([make_text_response('ok')])
         orig_create = harness.client.chat.completions.create
         harness.client.chat.completions.create = fake.create
@@ -389,9 +394,13 @@ def test_full_session_scenario():
     reactive_calls = []
     harness.CONTEXT_LIMIT = 100
     harness.estimate_size = lambda msgs: next(sizes)
-    harness.compact_history = lambda msgs: (compact_calls.append(len(msgs))
-                                            or logger.info("[scenario] compact_history called (auto/compact tool) on %d msgs", len(msgs))
-                                            or [{'role': 'user', 'content': '[Compacted] summary'}])
+
+    def compact_history(msgs):
+        compact_calls.append(len(msgs))
+        logger.info("[scenario] compact_history called (auto/compact tool) on %d msgs", len(msgs))
+        return [{'role': 'user', 'content': '[Compacted] summary'}]
+
+    harness.compact_history = compact_history
     harness.reactive_compact = lambda msgs, keep=5, budget_tokens=None: (
         reactive_calls.append(len(msgs))
         or logger.info("[scenario] reactive_compact called on %d msgs", len(msgs))

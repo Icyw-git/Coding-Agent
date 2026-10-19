@@ -9,11 +9,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
 from fastapi.testclient import TestClient
 
-import gateway_sim
 import feishu_gateway
+import gateway_sim
 from feishu_gateway import FeishuGateway, format_permission_prompt
 from harness_api import create_app
 from hooks import GATE as permission_gate
@@ -568,6 +567,7 @@ def test_main_allows_explicit_any_user_escape_hatch(monkeypatch):
 def test_lark_transport_sends_text(monkeypatch):
     """LarkTransport：成功发送不抛错；失败时带错误码抛 RuntimeError。"""
     import lark_oapi as lark
+
     from feishu_gateway import LarkTransport
 
     sent = {}
@@ -635,6 +635,7 @@ def test_markdown_to_card_md_conversions():
 def test_markdown_card_uses_lark_md_element():
     """飞书旧版交互卡片必须把 Markdown 放在 div.text/lark_md 中。"""
     import json
+
     from feishu_gateway import LarkTransport
 
     card = json.loads(LarkTransport._markdown_card('**加粗**\n- 项目'))
@@ -658,9 +659,12 @@ def test_reply_prefers_card_and_falls_back_to_text():
         def send_text(self, chat_id, text):
             self.texts.append((chat_id, text))
 
-    ok = CardTransport(); ok.cards = []; ok.texts = []
+    ok = CardTransport()
+    ok.cards = []
+    ok.texts = []
     ok.send_markdown('c', 'x')  # 预热属性存在
-    ok.cards.clear(); ok.texts.clear()
+    ok.cards.clear()
+    ok.texts.clear()
     gw.transport = ok
     gw._reply('c1', '渲染**加粗**')
     assert ok.cards and not ok.texts
@@ -669,7 +673,9 @@ def test_reply_prefers_card_and_falls_back_to_text():
         def send_markdown(self, chat_id, text):
             raise RuntimeError('card failed')
 
-    bad = BrokenCardTransport(); bad.cards = []; bad.texts = []
+    bad = BrokenCardTransport()
+    bad.cards = []
+    bad.texts = []
     gw.transport = bad
     gw._reply('c1', '回退文本')
     assert not bad.cards and bad.texts

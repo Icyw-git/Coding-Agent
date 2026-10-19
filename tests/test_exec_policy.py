@@ -6,12 +6,31 @@
 
 import pytest
 
-from exec_policy import (ALLOW, APPROVAL_POLICIES, ASK, DEFAULT_APPROVAL_POLICY,
-                         DEFAULT_SANDBOX_MODE, DENY, PATH_INVALID, PATH_OUTSIDE,
-                         PATH_SECRET, PATH_SYSTEM, PATH_WORKSPACE, SANDBOX_MODES,
-                         Policy, approval_class, classify_path, egress_hosts,
-                         grant_key, is_secret_path, load_policy, resolve_tool_path,
-                         session_allow_key, set_tier, system_roots)
+from exec_policy import (
+    ALLOW,
+    APPROVAL_POLICIES,
+    ASK,
+    DEFAULT_APPROVAL_POLICY,
+    DEFAULT_SANDBOX_MODE,
+    DENY,
+    PATH_INVALID,
+    PATH_OUTSIDE,
+    PATH_SECRET,
+    PATH_SYSTEM,
+    PATH_WORKSPACE,
+    SANDBOX_MODES,
+    Policy,
+    approval_class,
+    classify_path,
+    egress_hosts,
+    grant_key,
+    is_secret_path,
+    load_policy,
+    resolve_tool_path,
+    session_allow_key,
+    set_tier,
+    system_roots,
+)
 
 DENY_LIST = ['rm -rf /', 'sudo', 'shutdown', 'reboot', '> /dev/']
 DESTRUCTIVE = ['rm ', 'del ', 'rmdir ', 'rd ', 'remove-item ', 'erase ',

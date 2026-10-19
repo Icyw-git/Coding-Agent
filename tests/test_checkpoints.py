@@ -320,7 +320,7 @@ def test_last_falls_back_to_newest_when_nothing_changed(ws):
 def test_gc_keeps_head_and_labeled_and_reports(ws):
     mgr = _mgr(ws, max_nodes=2)
     nodes = [mgr.begin_turn(_msgs(f'm{i}'), label='keep' if i == 0 else '') for i in range(5)]
-    for cp_id in nodes:
+    for _ in nodes:
         mgr.seal()
 
     removed = mgr.gc()

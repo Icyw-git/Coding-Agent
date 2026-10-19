@@ -6,24 +6,23 @@ clear() 清空、飞书卡片 scope=session 全链路（HTTP resolve 透传）�
 
 运行: python test_approval_scope.py
 """
-import os
 import sys
 import threading
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
 
+import feishu_gateway
 import gateway_sim
 import hooks
-import feishu_gateway
+from agent_runtime import AgentRuntime
 from exec_policy import approval_class
 from harness_api import create_app
 from hooks import GATE
-from agent_runtime import AgentRuntime
 from session_store import SessionEventStore
-from test_feishu_gateway import _sync_asgi_transport, _drain_stale_permissions
+from test_feishu_gateway import _drain_stale_permissions, _sync_asgi_transport
 
 
 @pytest.fixture()

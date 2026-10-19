@@ -252,8 +252,9 @@ def test_session_title_is_persisted_and_legacy_title_is_derived(tmp_path):
     legacy = harness.SessionEventStore(tmp_path, session_id='legacy')
     legacy.append_message({'role': 'user', 'content': 'go'})
     legacy.append_message({'role': 'user', 'content': 'Tool results executed before compaction:\n- read completed'})
-    legacy.append_message({'role': 'assistant', 'content': 'I will inspect the project structure and explain the architecture.'})
-    assert legacy.session_title() == 'I will inspect the project structure and explain the architecture.'
+    assistant_text = 'I will inspect the project structure and explain the architecture.'
+    legacy.append_message({'role': 'assistant', 'content': assistant_text})
+    assert legacy.session_title() == assistant_text
 
     legacy.append_session_title('Project summary')
     reopened = harness.SessionEventStore.open(legacy.path)
