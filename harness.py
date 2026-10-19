@@ -319,7 +319,9 @@ def generate_session_title(messages: list[dict]) -> str:
                 {'role': 'user', 'content': '\n'.join(exchanges)},
             ],
             temperature=0,
-            max_tokens=40,
+            # 思考模式（deepseek-flash 默认）reasoning 先于正文消耗预算，
+            # 40 会得到空 content——标题静默退回本地兜底
+            max_tokens=8000,
         )
         title = (response.choices[0].message.content or '').strip().strip('"“”\'')
         if title:
@@ -538,16 +540,23 @@ PROMPT_SECTIONS={
         '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
         'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
         'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
+        '(3) Parallel tool calls: when several independent operations have no dependency between them '
+        '(e.g. reading multiple files, searching with glob/grep, running several read-only commands like '
+        'git status / git log / ls), issue ALL of them as multiple tool calls in the SAME turn instead of '
+        'one per turn — they will run in parallel. Calls whose input depends on an earlier result '
+        'must stay sequential. '
     ),
     'rules_sub':(
         'Rules: '
         '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
         '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
-        '(3) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
+        '(3) Independent tool calls with no dependency between them (multiple reads, read-only '
+        'commands) should be issued together in one turn as parallel tool calls. '
+        '(4) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
         'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
-        '(4) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
+        '(5) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
         'reasonable alternative, then report the situation honestly to the parent. '
-        '(5) Keep the final answer short and structured: what you did, what you found, any issues. '
+        '(6) Keep the final answer short and structured: what you did, what you found, any issues. '
         'Do not re-plan the parent task and do not spawn further sub-agents. '
     ),
     'skills_usage':(

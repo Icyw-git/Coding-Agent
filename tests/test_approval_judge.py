@@ -13,7 +13,8 @@ import pytest
 
 
 def make_client(replies):
-    """可脚本化的审查官假件：按队列返回回复或异常，记录每次入参。"""
+    """可脚本化的审查官假件：按队列返回回复或异常，记录每次入参。
+    reply 是 str → 包装成标准响应；是 SimpleNamespace → 视为完整响应直传。"""
     calls = []
 
     def create(**kwargs):
@@ -21,6 +22,8 @@ def make_client(replies):
         reply = replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
+        if isinstance(reply, SimpleNamespace):
+            return reply
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
             content=reply))])
 
@@ -33,11 +36,10 @@ def _clean_state(monkeypatch):
     monkeypatch.delenv('HARNESS_SANDBOX_MODE', raising=False)
     monkeypatch.delenv('HARNESS_APPROVAL_POLICY', raising=False)
     monkeypatch.delenv('HARNESS_LLM_APPROVAL', raising=False)
+    monkeypatch.delenv('HARNESS_JUDGE_TIMEOUT', raising=False)
     hooks.GATE.clear()
-    hooks._JUDGE_APPROVED.clear()
     yield
     hooks.GATE.clear()
-    hooks._JUDGE_APPROVED.clear()
 
 
 def test_judge_auto_approves_interpreter(monkeypatch):
@@ -69,8 +71,10 @@ def test_judge_escalates_to_human(monkeypatch):
     assert len(calls) == 1 and len(decided) == 1, "升级路径只走一次人工"
 
 
-def test_judge_failure_falls_back_to_human(monkeypatch):
-    """审查官不可用（超时/异常）→ fail-closed 回落人工，绝不 fail-open。"""
+def test_judge_failure_falls_back_to_human(monkeypatch, capsys):
+    """审查官不可用（超时/异常）→ fail-closed 回落人工，且失败原因必须可见
+    （静默回落会让人以为审查官在工作——实测 max_tokens=60 被思考模式吃光、
+    三个 ASK 全部无声落人工）。"""
     client, calls = make_client([RuntimeError('llm timeout')])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
@@ -79,6 +83,34 @@ def test_judge_failure_falls_back_to_human(monkeypatch):
 
     assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
     assert len(calls) == 1 and len(decided) == 1
+    out = capsys.readouterr().out
+    assert '审查不可用' in out, "失败原因必须打印"
+
+
+def test_judge_budget_fits_thinking_models(monkeypatch):
+    """审查官 max_tokens 必须给足：deepseek-flash 默认思考模式，思考 token
+    先于正文消耗（实测简单命令 reasoning 4000+，60 预算=空 content 静默失效）。"""
+    client, calls = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+
+    hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
+    assert calls[0]['max_tokens'] >= 8000
+
+
+def test_judge_empty_content_falls_back_visibly(monkeypatch, capsys):
+    """思考模式吃光预算 → content 为空 → 可见回落人工（不静默）。"""
+    empty_length = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=None),
+                                 finish_reason='length')])
+    client, calls = make_client([empty_length])
+    monkeypatch.setattr(harness, 'client', client)
+    decided = []
+    monkeypatch.setattr(hooks.GATE, 'decide',
+                        lambda *a, **kw: decided.append(a) or (True, ''))
+
+    assert hooks.enforce('bash', {'command': 'python build.py'}, interactive=True) is None
+    out = capsys.readouterr().out
+    assert '审查不可用' in out and len(decided) == 1
 
 
 def test_judge_malformed_output_falls_back(monkeypatch):
@@ -161,6 +193,56 @@ def test_judge_disabled_by_env(monkeypatch):
 
     assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
     assert not calls and len(decided) == 1
+
+
+def test_judge_skipped_for_headless_threads(monkeypatch):
+    """无头路径（teammate/后台/任务 runner）的审批语义是排队等远程决议，
+    审查官不得旁路——interactive=False 时直接进队列。"""
+    client, calls = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+    queued = []
+    monkeypatch.setattr(hooks.GATE, 'decide_queued',
+                        lambda tool, args, reason: queued.append(tool) or (True, ''))
+
+    assert hooks.enforce('bash', {'command': 'python -m pytest'},
+                         interactive=False) is None
+    assert not calls and len(queued) == 1, "无头路径不经 LLM 审查官"
+
+
+def test_judge_call_has_short_timeout(monkeypatch):
+    """审查官调用必须带独立超时（默认 30s，远小于审批的 300s）——否则供应商
+    卡住时绕过整个 fail-safe 语义。"""
+    client, calls = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+
+    hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
+    assert calls[0]['timeout'] == hooks.DEFAULT_JUDGE_TIMEOUT == 30.0
+    monkeypatch.setenv('HARNESS_JUDGE_TIMEOUT', '5')
+    client2, calls2 = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client2)
+    hooks.GATE._judge_approved.clear()
+    hooks.enforce('bash', {'command': 'python build.py'}, interactive=True)
+    assert calls2[0]['timeout'] == 5.0
+
+
+def test_revoke_and_tier_switch_clear_judge_cache(monkeypatch):
+    """/revoke 与档位切换必须连带清掉审查官放行缓存——撤销的意义是「此前
+    给出去的免审全部作废」，审查官批过的也是预授权。"""
+    client, calls = make_client(['{"decision": "approve"}',
+                                 '{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+
+    assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
+    key = f'|bash:python -m pytest'
+    assert hooks.GATE.judge_cache_hit(key), "放行后应入缓存"
+    hooks.GATE.revoke_session()
+    assert not hooks.GATE.judge_cache_hit(key), "撤销必须收回审查官的免审"
+
+    # 重新放行后 /revoke 命令路径同样生效
+    assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
+    assert hooks.GATE.judge_cache_hit(key)
+    hooks.GATE.clear()
+    assert not hooks.GATE.judge_cache_hit(key)
 
 
 # ---------- 批级合并审查（agent_loop flush 前的一次性判定） ----------

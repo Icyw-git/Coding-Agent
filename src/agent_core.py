@@ -199,7 +199,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
             model=os.getenv('LLM_MODEL_ID'),
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.7,
-            max_tokens=200,
+            max_tokens=8000,   # 思考模式 reasoning 先于正文，小预算=空 content
         )
         text = _extract_text(response.choices[0].message.content).strip()
         match = re.search(r'\[.*?\]', text, re.DOTALL)  # 解析JSON数组，如[0, 3]
@@ -295,7 +295,7 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             model=os.getenv('LLM_MODEL_ID'),
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.7,
-            max_tokens=4000,
+            max_tokens=8000,   # 思考模式 reasoning 先于正文（实测简单任务也 4000+）
         )
         msg = response.choices[0].message
         text = _extract_text(msg.content or '').strip()
@@ -371,7 +371,7 @@ def consolidate_memories():
         response = h.client.chat.completions.create(
             model=os.getenv('LLM_MODEL_ID'),
             messages=[{'role': 'user', 'content': prompt + reminder}],
-            max_tokens=4000, temperature=0.2,   # 结构化输出：低温提高 JSON 合规率
+            max_tokens=8000, temperature=0.2,   # 结构化输出：低温提高 JSON 合规率；思考模式需大预算防 JSON 截断
         )
         msg = response.choices[0].message
         text = _extract_text(msg.content or '').strip()
@@ -680,7 +680,7 @@ def summarize_history(messages):  # 总结对话记录，返回总结内容
         model=os.getenv("LLM_MODEL_ID"),
         messages=[{'role': 'user', 'content': prompt}],
         temperature=0.7,
-        max_tokens=4000,
+        max_tokens=8000,   # 思考模式 reasoning 先于正文
     )
     return (response.choices[0].message.content or "(empty summary)").strip()
 

@@ -206,6 +206,11 @@ class PermissionGate:
         # 会话级白名单（审批分级）：键 session_allow_key(tool, klass, session_id)，
         # 命中后同会话的同类操作免审
         self._session_allows: set[str] = set()
+        # LLM 审查官放行缓存：键 = 会话|grant_key（审查批过的精确命令）。
+        # 归 Gate 持有：clear()/revoke_session() 连带清空（撤销必须能收回
+        # 审查官批出去的免审），且与 _session_allows 同锁防竞态。
+        self._judge_approved: dict[str, None] = {}
+        self._judge_approved_max = 200
 
     # ---------- 登记 / 查询（供 API 与测试使用） ----------
 
@@ -236,24 +241,45 @@ class PermissionGate:
             self._requests.pop(req.req_id, None)
 
     def clear(self) -> None:
-        """清空请求历史、会话白名单与本上下文的审批凭据（测试隔离辅助）。"""
+        """清空请求历史、会话白名单、审查官缓存与本上下文的审批凭据（测试隔离辅助）。"""
         with self._lock:
             self._requests.clear()
             self._session_allows.clear()
+            self._judge_approved.clear()
         _GRANTS.set(frozenset())
 
     def revoke_session(self, session_id: str | None = None) -> int:
-        """撤销指定会话的预授权；没有会话上下文时撤销所有预授权。"""
+        """撤销指定会话的预授权；没有会话上下文时撤销所有预授权。
+
+        连带清掉 LLM 审查官的放行缓存（键同前缀格式）——撤销的意义是「本会话
+        此前给出去的免审全部作废」，审查官批过的命令也是预授权的一种。"""
         prefix = f'{session_id}|' if session_id else None
         with self._lock:
-            before = len(self._session_allows)
+            before = len(self._session_allows) + len(self._judge_approved)
             if prefix is None:
                 self._session_allows.clear()
+                self._judge_approved.clear()
             else:
                 self._session_allows = {
                     key for key in self._session_allows if not key.startswith(prefix)
                 }
-            return before - len(self._session_allows)
+                self._judge_approved = {
+                    key: None for key in self._judge_approved
+                    if not key.startswith(prefix)
+                }
+            return before - (len(self._session_allows) + len(self._judge_approved))
+
+    # ---------- LLM 审查官缓存（judge 批过的精确命令） ----------
+
+    def judge_cache_hit(self, key: str) -> bool:
+        with self._lock:
+            return key in self._judge_approved
+
+    def judge_cache_add(self, key: str) -> None:
+        with self._lock:
+            while len(self._judge_approved) >= self._judge_approved_max:
+                self._judge_approved.pop(next(iter(self._judge_approved)))
+            self._judge_approved[key] = None
 
     def pending(self) -> list[PermissionRequest]:
         with self._lock:
@@ -400,9 +426,6 @@ LLM_APPROVAL_ENV = 'HARNESS_LLM_APPROVAL'
 # 文件现状与用户原始意图，缺上下文的放行等于盲批；第三方工具副作用
 # 不可见同理。untrusted / never 是显式档位语义，优先于 LLM。
 JUDGEABLE_CODES = frozenset({'opaque_command', 'destructive', 'network_egress'})
-# 已放行精确命令的缓存：键 = 会话|grant_key（有序去重，上限淘汰）
-_JUDGE_APPROVED: dict[str, None] = {}
-_JUDGE_APPROVED_MAX = 200
 
 JUDGE_SYSTEM_PROMPT = (
     '你是 coding agent 的命令安全审查官。判断给定的工具调用能否不经人工确认'
@@ -428,12 +451,42 @@ def llm_approval_enabled() -> bool:
         '0', 'false', 'off', 'no')
 
 
-def _llm_judge_review(tool: str, args: dict, decision) -> tuple[bool | None, str]:
-    """询问审查官。返回 (放行?, 升级理由)；审查不可用时 (None, '')。
+JUDGE_TIMEOUT_ENV = 'HARNESS_JUDGE_TIMEOUT'
+DEFAULT_JUDGE_TIMEOUT = 30.0
 
-    异常、超时、输出缺 JSON 或 decision 字段不认识都按 (None, '') 处理 ——
-    调用方回落人工审批，绝不 fail-open。"""
-    import json as _json
+
+def judge_timeout() -> float:
+    """审查官单次 LLM 调用的超时（秒）。必须远小于审批超时（300s）——审查官
+    排在 GATE 之前，卡住的供应商不能占用 fail-safe 的等待预算。非法值告警
+    后按默认（同 approval_timeout 的风格）。"""
+    raw = (os.getenv(JUDGE_TIMEOUT_ENV) or '').strip()
+    if not raw:
+        return DEFAULT_JUDGE_TIMEOUT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        print(f'\033[33m[permission] ignoring {JUDGE_TIMEOUT_ENV}={raw!r} '
+              f'(not a number), using {DEFAULT_JUDGE_TIMEOUT:g}s\033[0m',
+              file=sys.stderr)
+        return DEFAULT_JUDGE_TIMEOUT
+    if seconds <= 0:
+        print(f'\033[33m[permission] ignoring {JUDGE_TIMEOUT_ENV}={raw!r} '
+              f'(must be positive), using {DEFAULT_JUDGE_TIMEOUT:g}s\033[0m',
+              file=sys.stderr)
+        return DEFAULT_JUDGE_TIMEOUT
+    return seconds
+
+
+def _llm_judge_review(tool: str, args: dict, decision) -> tuple[bool | None, str]:
+    """询问审查官。返回 (放行?, 升级理由)；审查不可用时 (None, 原因)。
+
+    异常、超时、输出缺 JSON 或 decision 字段不认识都按「不可用」处理 ——
+    调用方回落人工审批，绝不 fail-open。⚠ max_tokens 必须给足：deepseek-flash
+    默认思考模式，思考 token 先于正文消耗——实测一条简单命令的 reasoning 就
+    4000+，max_tokens=60 时 content 为空（finish_reason=length），审查官永远
+    静默失效。失败原因必须打印，静默回落会让人以为审查官在工作。
+    timeout 独立于审批超时（默认 30s）：审查官排在 GATE 之前，供应商卡住时
+    不能把 fail-safe 的 300s 语义拖到审查官这一环。"""
     detail = approval_view.detail(tool, dict(args))[:2000]
     payload = (f'工具: {tool}\n'
                f'触发原因: {decision.reason} [{decision.code}]\n'
@@ -444,33 +497,32 @@ def _llm_judge_review(tool: str, args: dict, decision) -> tuple[bool | None, str
             messages=[{'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
                       {'role': 'user', 'content': payload}],
             temperature=0,
-            max_tokens=60,
+            max_tokens=8000,
+            timeout=judge_timeout(),
         )
         raw = (response.choices[0].message.content or '').strip()
-        verdict = _json.loads(raw[raw.index('{'): raw.rindex('}') + 1])
+        verdict = json.loads(raw[raw.index('{'): raw.rindex('}') + 1])
         if verdict.get('decision') == 'approve':
             return True, ''
         if verdict.get('decision') == 'escalate':
             return False, str(verdict.get('reason', ''))[:200]
-        return None, ''
-    except Exception:
-        return None, ''
+        return None, f'审查官输出不认识: {raw[:80]!r}'
+    except Exception as exc:
+        return None, f'审查不可用: {type(exc).__name__}: {exc}'
 
 
 def _judge_auto_approve(tool: str, args: dict, decision) -> bool:
     """LLM 审查放行路径：命中返回 True（已登记历史并发放凭据）。"""
     key = f'{current_session_id()}|{grant_key(tool, args)}'
-    if key in _JUDGE_APPROVED:
+    if GATE.judge_cache_hit(key):
         verdict, reason = True, 'cached'
     else:
         verdict, reason = _llm_judge_review(tool, args, decision)
         if verdict is not True:
             if reason:
-                print(f'  \033[33m[llm-judge] 建议人工确认：{reason}\033[0m')
+                print(f'  \033[33m[llm-judge] {reason}，转人工审批\033[0m')
             return False
-        while len(_JUDGE_APPROVED) >= _JUDGE_APPROVED_MAX:
-            _JUDGE_APPROVED.pop(next(iter(_JUDGE_APPROVED)))
-        _JUDGE_APPROVED[key] = None
+        GATE.judge_cache_add(key)
     req = GATE.request(tool, args, f'LLM 审查放行 · {decision.reason}')
     GATE.resolve(req.req_id, allow=True, by='llm-judge')
     print(f'  \033[32m[permission] LLM 审查放行 · '
@@ -527,7 +579,7 @@ def preflight_judge(tool_calls) -> int:
         if decision.action != ASK or decision.code not in JUDGEABLE_CODES:
             continue
         key = f'{current_session_id()}|{grant_key("bash", args)}'
-        if key in _JUDGE_APPROVED or key in seen_keys:
+        if GATE.judge_cache_hit(key) or key in seen_keys:
             continue
         seen_keys.add(key)
         candidates.append((key, str(args.get('command', ''))))
@@ -541,7 +593,8 @@ def preflight_judge(tool_calls) -> int:
             messages=[{'role': 'system', 'content': JUDGE_BATCH_PROMPT},
                       {'role': 'user', 'content': listing}],
             temperature=0,
-            max_tokens=300,
+            max_tokens=8000,   # 思考模式 reasoning 先于正文（见 _llm_judge_review）
+            timeout=judge_timeout(),
         )
         raw = (response.choices[0].message.content or '').strip()
         items = json.loads(raw[raw.index('['): raw.rindex(']') + 1])
@@ -556,10 +609,8 @@ def preflight_judge(tool_calls) -> int:
         except (TypeError, ValueError, AttributeError):
             continue
         if 0 <= index < len(candidates) and item.get('decision') == 'approve':
-            _JUDGE_APPROVED[candidates[index][0]] = None
+            GATE.judge_cache_add(candidates[index][0])
             approved += 1
-    while len(_JUDGE_APPROVED) > _JUDGE_APPROVED_MAX:
-        _JUDGE_APPROVED.pop(next(iter(_JUDGE_APPROVED)))
     if approved:
         print(f'  \033[32m[permission] LLM 批量审查放行 {approved}/{len(candidates)} '
               f'条命令\033[0m')
@@ -638,7 +689,10 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         return None
     # LLM 审查官：两个噪音源（解释器命令、破坏性子串误伤）先复核，
     # 判定为常规开发操作则自动放行；升级或审查不可用则照常走人工审批。
-    if (llm_approval_enabled() and policy.approval_policy == 'on-request'
+    # 仅限 interactive 路径：无头线程（teammate/后台/任务 runner）的审批
+    # 语义是「排队等远程决议」，不能被 LLM 旁路——它们的 ASK 照旧进队列。
+    if (interactive and llm_approval_enabled()
+            and policy.approval_policy == 'on-request'
             and decision.code in JUDGEABLE_CODES
             and _judge_auto_approve(tool, args, decision)):
         issue_grant(tool, args)

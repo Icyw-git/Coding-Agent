@@ -442,9 +442,14 @@ def classify_path(path: str, *, cwd=None, workspace, secrets=()) -> str:
 
     秘密与系统目录的判定先于工作区判定：工作区内的 `.env`、把工作区设在
     `C:\\Windows` 下，同样不该自动读写。
+    ⚠ NUL 字节显式检查：Windows 的 Path.resolve() 对含 \\x00 的路径不抛异常
+    （str 尾部静默截断），invalid 分支会不可达、含 NUL 路径被当工作区文件放行。
     """
+    text = str(path or '')
+    if '\x00' in text:
+        return PATH_INVALID
     try:
-        resolved = resolve_tool_path(path, cwd=cwd, workspace=workspace)
+        resolved = resolve_tool_path(text, cwd=cwd, workspace=workspace)
         workspace = Path(workspace).resolve()
     except (OSError, RuntimeError, ValueError):
         return PATH_INVALID

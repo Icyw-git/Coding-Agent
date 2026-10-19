@@ -111,10 +111,10 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_glob` / `run_g
 
 两档配置，命名与 Codex 对齐：
 
-| 档位 | 取值 | 默认 |
-| --- | --- | --- |
-| `sandbox_mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write`：工作区内写改放行，越界写改询问，破坏性命令询问 |
-| `approval_policy` | `untrusted`、`on-request`、`never` | `on-request`：只在策略层判定有风险时询问 |
+| 档位              | 取值                                                 | 默认                                                              |
+| ----------------- | ---------------------------------------------------- | ----------------------------------------------------------------- |
+| `sandbox_mode`    | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write`：工作区内写改放行，越界写改询问，破坏性命令询问 |
+| `approval_policy` | `untrusted`、`on-request`、`never`                   | `on-request`：只在策略层判定有风险时询问                          |
 
 - `read-only` 只放公认不改动的命令（`dir`、`ls`、`git status` 等）；解释器、命令替换（`$()` / 反引号）
   和带重定向的命令仍要审批。
@@ -127,6 +127,14 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_glob` / `run_g
   而是「本机要不要把东西交给外面」；审批文案会带上目标主机，`curl … | sh` 按「远程脚本」归类。
   这些命令大多数不提供「本会话允许同类」——按可执行文件名免审等于批一次就放行后续任意载荷
   （代价是 `docker ps`、`kubectl get pods` 这类只读子命令也要问，判定层不认它们的子命令语义）。
+  在弹到人之前，其中解释器命令、破坏性命令命中和外发请求会先经 **LLM 审查官**自动复核
+  （`HARNESS_LLM_APPROVAL`，默认开；`HARNESS_JUDGE_TIMEOUT` 控制单次审查超时，默认 30s）：
+  对齐 Codex workspace-write 的口径，工作区内的删除/重建、测试/构建/脚本默认放行并显示
+  `[permission] LLM 审查放行`（历史记 `resolved_by='llm-judge'`）；工作区外删除/覆盖、系统修改、
+  本机数据外传（带请求体/上传/改方法）、秘密文件、下载并执行一律升级人工；审查不可用
+  （超时/异常/输出不合法）也回落人工，绝不 fail-open。审查官只在交互式主循环生效，
+  teammate/后台/任务线程照旧排队等远程决议；`/revoke` 与档位切换会连带收回审查官批出的
+  全部免审。定位是降噪——硬拒与秘密文件在策略层，不由 LLM 覆盖，它不是安全边界。
 - 外发命令的「同类」按 `命令:主机` 记账，只给 curl/wget 的普通读请求：批准一条 GET 只免审再向
   同一台主机发起的读请求；改方法（`-X`/`--request`）、带请求体（`-d`/`-F`/`-T`/`--post-data`…）、
   目标多于一个或只写裸主机名（`nc host 1234`）都没有免审出路。httpie 把方法写在位置参数里，
@@ -200,11 +208,11 @@ content 不会刷进控制台和审批历史。被截断的命令不提供「本
 `HARNESS_OS_SANDBOX` 控制是否用 Windows 强制完整性控制（MIC）把 shell 子进程降到
 **低完整性级别（Low IL）**。它独立于执行/审批档位，默认 `off`：
 
-| 取值 | 行为 |
-| --- | --- |
-| `off`（默认） | 不启用，shell 以普通权限运行 |
-| `auto` | 尝试启用；本机不支持或初始化失败时退回普通执行，并在 stderr 提示一次 |
-| `require` | 必须启用；失败时命令直接返回 `Error: OS 沙箱不可用：…`，不会降级执行 |
+| 取值          | 行为                                                                 |
+| ------------- | -------------------------------------------------------------------- |
+| `off`（默认） | 不启用，shell 以普通权限运行                                         |
+| `auto`        | 尝试启用；本机不支持或初始化失败时退回普通执行，并在 stderr 提示一次 |
+| `require`     | 必须启用；失败时命令直接返回 `Error: OS 沙箱不可用：…`，不会降级执行 |
 
 启用后：
 
@@ -342,23 +350,23 @@ python entrypoint.py --resume <session_id>
 
 启动 HTTP API（可选）：
 
-  ```bash
-  python -m pip install -r requirements.txt
-  python -m pip install -r requirements-api.txt
-  # PowerShell: $env:HARNESS_API_TOKEN = "replace-with-a-long-random-token"
-  uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
-  ```
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-api.txt
+# PowerShell: $env:HARNESS_API_TOKEN = "replace-with-a-long-random-token"
+uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
+```
 
-  API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
-  `GET /v1/sessions/{id}/events`（SSE）；`GET/POST /v1/tasks` 系列管理长命令，
-  `GET /v1/permissions` 与 `POST /v1/permissions/{id}/resolve` 用于远程决议审批，
-  `GET/POST /v1/policy` 读写执行/审批档位。所有 `/v1/` 请求都需要
-  `Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
-  通过 SDK/应用工厂传入 `access_log_path`）。API 默认启用每个客户端和路径每分钟 60 次的轻量限流。
+API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
+`GET /v1/sessions/{id}/events`（SSE）；`GET/POST /v1/tasks` 系列管理长命令，
+`GET /v1/permissions` 与 `POST /v1/permissions/{id}/resolve` 用于远程决议审批，
+`GET/POST /v1/policy` 读写执行/审批档位。所有 `/v1/` 请求都需要
+`Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
+通过 SDK/应用工厂传入 `access_log_path`）。API 默认启用每个客户端和路径每分钟 60 次的轻量限流。
 
-  局域网手机访问：将监听地址改为 `--host 0.0.0.0`，确保电脑和手机在同一 Wi-Fi，查找电脑 IPv4 地址后在手机打开
-  `http://<电脑IPv4>:8000/docs`。首次使用时在 Swagger 页面点击 **Authorize**，填入
-  `Bearer <HARNESS_API_TOKEN>`。Windows 防火墙需要允许该端口的专用网络访问；不要在公网直接暴露此端口。
+局域网手机访问：将监听地址改为 `--host 0.0.0.0`，确保电脑和手机在同一 Wi-Fi，查找电脑 IPv4 地址后在手机打开
+`http://<电脑IPv4>:8000/docs`。首次使用时在 Swagger 页面点击 **Authorize**，填入
+`Bearer <HARNESS_API_TOKEN>`。Windows 防火墙需要允许该端口的专用网络访问；不要在公网直接暴露此端口。
 
 ## 启动可视化界面
 
@@ -395,21 +403,21 @@ python -m pytest --basetemp /tmp/harness-pytest
 
 ## 项目结构
 
-| 路径 | 说明 |
-| --- | --- |
-| `entrypoint.py` | 命令行入口、服务启动和退出清理 |
-| `harness.py` | Agent 主循环、REPL 和运行时编排 |
-| `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
-| `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
-| `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
-| `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
-| `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |
-| `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
-| `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
-| `tests/` | 自动化测试与测试辅助程序 |
-| `docs/` | 架构、检查点设计和开发记录 |
-| `archive/legacy/` | 已停用的历史实现 |
-| `visualizer/` | React/Vite Web 可视化前端 |
+| 路径                   | 说明                                                                 |
+| ---------------------- | -------------------------------------------------------------------- |
+| `entrypoint.py`        | 命令行入口、服务启动和退出清理                                       |
+| `harness.py`           | Agent 主循环、REPL 和运行时编排                                      |
+| `src/`                 | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码       |
+| `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用                    |
+| `src/exec_policy.py`   | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制）           |
+| `src/sandbox.py`       | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
+| `src/hooks.py`         | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端）        |
+| `src/harness_sdk.py`   | Python SDK facade，封装会话和消息操作                                |
+| `src/harness_api.py`   | FastAPI app factory 和 HTTP/SSE 适配层                               |
+| `tests/`               | 自动化测试与测试辅助程序                                             |
+| `docs/`                | 架构、检查点设计和开发记录                                           |
+| `archive/legacy/`      | 已停用的历史实现                                                     |
+| `visualizer/`          | React/Vite Web 可视化前端                                            |
 
 ## 分支说明
 
