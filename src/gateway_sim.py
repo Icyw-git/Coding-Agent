@@ -34,6 +34,7 @@ import time
 
 import httpx
 
+import approval_view
 from turn_progress import relative_time
 
 
@@ -404,9 +405,13 @@ def repl(client: GatewayClient) -> int:
                     if not pending:
                         print('  (no pending permission requests)')
                     for index, req in enumerate(pending, 1):
-                        print(f"  #{index}  {req['tool']}  "
-                              f"{req['reason'][:60]}")
-                        print(f"    参数: {req.get('args', {})}")
+                        tool = str(req['tool'])
+                        print(f"  #{index}  {tool}  "
+                              f"{approval_view.safe_text(req['reason'])[:60]}")
+                        # 决议要看的就是这条命令，参数摘要不能替人做决定
+                        detail = approval_view.detail(tool, req.get('args') or {})
+                        for line in detail.splitlines():
+                            print(f'        {line}')
                         print(f"    → /approve {index} y|n")
                 elif command == '/approve':
                     tokens = argument.split()

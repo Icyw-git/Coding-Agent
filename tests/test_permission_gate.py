@@ -20,6 +20,17 @@ def test_console_backend_approve_and_deny(monkeypatch, capsys):
     assert 'perm_' not in capsys.readouterr().out
 
 
+def test_console_prompt_shows_the_whole_command_and_escapes_control_chars(monkeypatch, capsys):
+    """审批提示是人做决定的地方：命令尾部切不得，也不能让命令自己改写终端。"""
+    gate = PermissionGate()
+    monkeypatch.setattr('builtins.input', lambda prompt='': 'n')
+    command = 'echo ' + 'a' * 1500 + ' | tee ~/.bashrc\x1b[2K'
+    gate.decide('bash', {'command': command}, 'destructive')
+    out = capsys.readouterr().out
+    assert 'tee ~/.bashrc' in out      # 旧版 200 字符摘要正好把它切没
+    assert '\\x1b[2K' in out          # 命令里的 ESC 换成可见转义，不被终端解析
+
+
 def test_console_eof_denies_instead_of_crashing(monkeypatch):
     gate = PermissionGate()
 
@@ -83,6 +94,22 @@ def test_remote_timeout_denies_by_default():
     assert not allowed
     assert 'timeout' in message
     assert gate.history(1)[0].status == 'timeout'
+
+
+def test_approval_timeout_config_is_parsed_not_crashing(monkeypatch, capsys):
+    """审批门在 import 时构造：笔误既不该让进程起不来，也不该静默回落。"""
+    import hooks
+
+    for value in ('5m', '0', '-3'):
+        monkeypatch.setenv('HARNESS_APPROVAL_TIMEOUT', value)
+        assert hooks.approval_timeout() == hooks.DEFAULT_APPROVAL_TIMEOUT
+    printed = capsys.readouterr().err
+    assert printed.count('HARNESS_APPROVAL_TIMEOUT') == 3
+
+    monkeypatch.setenv('HARNESS_APPROVAL_TIMEOUT', '12.5')
+    assert hooks.approval_timeout() == 12.5
+    assert PermissionGate().timeout == 12.5
+    assert PermissionGate(timeout=0.5).timeout == 0.5   # 显式参数优先于环境
 
 
 def test_resolve_unknown_id_and_double_resolve():

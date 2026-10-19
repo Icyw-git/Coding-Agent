@@ -190,6 +190,37 @@ def test_allowlist_without_session_context_keeps_the_legacy_key(env):
     assert GATE.session_allows('bash', {'command': 'rm y'})
 
 
+def test_use_session_has_to_be_carried_into_a_new_thread():
+    """ContextVar 不随 threading.Thread 继承：新线程里会话是空的。
+
+    这正是 teammate / 后台 worker 要显式 use_session 的原因 —— 少了这一步，
+    它们的审批落回进程级键，白名单就不再按会话分区。
+    """
+    with hooks.use_session('A'):
+        seen = {}
+        thread, _out = _run_in_thread(
+            lambda: seen.update(id=hooks.current_session_id()))
+        thread.join(timeout=2)
+        assert seen['id'] == ''
+        assert hooks.current_session_id() == 'A'
+
+
+def test_untrusted_tier_does_not_honor_the_session_allowlist(env, monkeypatch):
+    """「每条都问」的档位不能被一次预授权改回 on-request。
+
+    会话白名单本身就是一次预授权（点「本次会话允许同类」之后同类免审），所以在
+    untrusted 下不参与短路，否则一个按钮就把档位悄悄改掉了。
+    """
+    monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'untrusted')
+    GATE._session_allows.add(session_allow_key('bash', 'rm', ''))
+    assert hooks.permission_hook('bash', {'command': 'rm x'}) \
+        == 'Permission denied by user'
+    assert GATE.history(), '白名单命中不该省掉这次审批'
+
+    monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'on-request')
+    assert hooks.permission_hook('bash', {'command': 'rm x'}) is None
+
+
 # ============================================================
 # 5：绕过 hook 的入口自己判
 # ============================================================
@@ -296,6 +327,33 @@ def test_background_worker_without_approval_queues(env, monkeypatch, bg_clean):
     waiter.join(timeout=3)
     assert approved, 'worker 的审批请求应可被远程决议'
     assert background_task.background_results[bg_id] == 'ran'
+
+
+def test_background_worker_carries_the_dispatching_session(env, monkeypatch, bg_clean):
+    """worker 的审批要按派发会话分区。
+
+    ContextVar 不跨线程，所以 start_background_task 得把会话 id 显式带进 worker
+    （与凭据同一套传递）。带不过去时白名单键退回进程级的 `bash:del`：A 会话的
+    后台任务批了 del，B 会话的后台任务也免审 —— 白名单形同虚设。
+    """
+    monkeypatch.setattr(GATE, 'timeout', 5.0)
+    seen = []
+
+    def resolver():
+        req = _await_pending()
+        seen.append(req.session_id)
+        GATE.resolve(req.req_id, True, by='test', scope='session')
+
+    waiter = threading.Thread(target=resolver, daemon=True)
+    waiter.start()
+    with hooks.use_session('A'):   # 派发线程有会话；worker 不会自动继承
+        _dispatch('del f')
+    waiter.join(timeout=3)
+    assert seen == ['A'], '审批请求应记下派发时的会话'
+    assert session_allow_key('bash', 'del', 'A') in GATE._session_allows
+    assert 'bash:del' not in GATE._session_allows
+
+    assert not GATE.session_allows('bash', {'command': 'del g'}), '别的会话不该免审'
 
 
 # ============================================================

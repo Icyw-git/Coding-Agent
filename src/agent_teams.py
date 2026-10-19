@@ -355,10 +355,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
 
     active_teammates[name] = True # 标记为活跃，等待主线程唤醒
     from workspace_context import use_workspace
+    import hooks
     workspace = harness.get_workdir()
+    # 派发线程还带着 lead 的会话，teammate 的新线程不会继承（ContextVar 不跨
+    # 线程）：不显式带过去，teammate 的审批白名单就落到进程级键上，一个
+    # teammate 批过的 rm 在所有会话里都免审。
+    session_id = hooks.current_session_id()
 
     def run_in_workspace():
-        with use_workspace(workspace):
+        with use_workspace(workspace), hooks.use_session(session_id):
             run()
 
     threading.Thread(target=run_in_workspace, daemon=True).start()

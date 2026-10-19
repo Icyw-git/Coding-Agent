@@ -159,6 +159,7 @@ def test_background_tool_keeps_workspace_after_parent_turn_ends(tmp_path):
 
 def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path, monkeypatch):
     import agent_teams
+    import hooks
 
     harness, root = _loop_env(tmp_path, monkeypatch)
     release = threading.Event()
@@ -172,7 +173,10 @@ def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path,
 
     def build_tools(*args):
         assert release.wait(3)
-        seen.append((harness.get_workdir(), harness.active_checkpoint_manager()))
+        # 会话要跟着进 teammate 线程（审批白名单按它分区），checkpoint manager 不跟：
+        # teammate 不该把快照打在 lead 的会话上。
+        seen.append((harness.get_workdir(), harness.active_checkpoint_manager(),
+                     hooks.current_session_id()))
         return [], {}
 
     monkeypatch.setattr(agent_teams.threading, 'Thread', thread_factory)
@@ -181,14 +185,14 @@ def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path,
     monkeypatch.setattr(agent_teams, 'BUS', SimpleNamespace(
         read_inbox=lambda name: [{}], send=lambda *args: None))
     monkeypatch.setattr(agent_teams, 'handle_inbox_message', lambda *args: 'shutdown')
-    token = harness._checkpoint_manager.set(object())
+    token = harness._checkpoint_manager.set(SimpleNamespace(session_id='parent'))
     try:
         with use_workspace(root):
             agent_teams.spawn_teammate_thread('test-worker', 'tester', 'inspect')
         release.set()
         threads[0].join(3)
         assert not threads[0].is_alive()
-        assert seen == [(root, None)]
+        assert seen == [(root, None, 'parent')]
         assert not agent_teams.active_teammates
     finally:
         release.set()

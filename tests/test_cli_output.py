@@ -78,15 +78,18 @@ def test_model_command_does_not_expose_api_key(monkeypatch, capsys):
     assert 'secret-value' not in output
 
 
-def test_pending_approvals_hide_internal_ids(monkeypatch):
+def test_pending_approvals_show_the_command_and_hide_internal_ids(monkeypatch):
     import harness
 
-    request = SimpleNamespace(req_id='perm_secret', tool='run_bash',
-                              reason='运行测试命令')
+    request = SimpleNamespace(
+        req_id='perm_secret', tool='bash', reason='破坏性命令',
+        args={'command': 'pytest -q\ngit push --force-with-lease'})
     monkeypatch.setattr(harness.hooks.GATE, 'pending', lambda: [request])
     output = harness.format_pending_approvals()
-    assert '运行测试命令' in output
-    assert 'run_bash' in output
+    assert '破坏性命令' in output
+    assert 'bash' in output
+    # 决议要看的就是这条命令：只列工具名等于让人盲批
+    assert 'pytest -q' in output and 'git push --force-with-lease' in output
     assert 'perm_secret' not in output
 
 

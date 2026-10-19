@@ -44,6 +44,7 @@ from agent_runtime import AgentRuntime
 from checkpoints import CheckpointManager, CheckpointError
 from cli_commands import parse_command, command_error, format_command_help
 from exec_policy import load_policy, set_tier
+import approval_view   # 审批面的参数渲染（/approvals 列表要显示完整命令）
 import sandbox
 import hooks   # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 from perf import segment as perf_segment, record as perf_record, reset as perf_reset
@@ -417,7 +418,10 @@ def format_pending_approvals() -> str:
     for index, request in enumerate(pending, 1):
         reason = str(request.reason or '').strip() or '未提供原因'
         tool = str(request.tool or '未知操作')
-        lines.append(f'    {index}. {tool} · {reason}')
+        lines.append(f'    {index}. {approval_view.safe_text(f"{tool} · {reason}")}')
+        # 批的就是这条命令：只列工具名等于让人盲批（旧版就是这样）
+        detail = approval_view.detail(tool, request.args)
+        lines.extend(f'         {line}' for line in detail.splitlines())
     lines.append('  请使用飞书 /approve 或审批卡片处理；CLI 可回复 /approvals <序号> y|n 决议。')
     return '\n'.join(lines)
 

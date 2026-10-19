@@ -11,12 +11,15 @@
     remote  — 挂起 threading.Event，由 HTTP API（/v1/permissions）远程决议，
               飞书/TG 等消息网关轮询该端点并把决议送回
     工作线程（teammate / 后台 worker / 任务 runner）不能抢 stdin，走 decide_queued：
-    只排队等远程决议，超时同样拒绝。
+    只排队等远程决议，超时同样拒绝。会话与凭据都要在派发时显式带走
+    （use_session / use_grants）—— ContextVar 不随线程继承，漏带的那次审批会
+    落回进程级白名单键，跨会话免审。
     超时未决议一律拒绝（fail-safe），默认 300s（HARNESS_APPROVAL_TIMEOUT 可调）。
 """
 import contextlib
 import contextvars
 import os
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_core import register_hook
+import approval_view
 from exec_policy import (READ_WRITE_TOOLS, approval_class, grant_key, load_policy,
                          session_allow_key)
 from tools import tool_registry
@@ -38,13 +42,37 @@ def _h():
 # 会话上下文（审批白名单分区）
 # ============================================================
 
-def current_session_id() -> str:
-    """当前会话 id，取不到就返回空串（白名单退回进程级键，行为与旧版一致）。
+_SESSION_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'harness_session_id', default='')
 
-    借用 checkpoint manager 的会话绑定：它已经在 agent_loop 里按回合设好，
-    再引入一个「当前会话」全局变量只会多一处需要同步的状态。
+
+@contextlib.contextmanager
+def use_session(session_id: str):
+    """把会话 id 带进另一个线程（与 use_workspace / use_grants 同构）。
+
+    ContextVar 不随 threading.Thread 继承，teammate 和后台 worker 的新线程因此
+    会丢掉会话。丢掉的后果不只是「多问一遍」：白名单键退回进程级的 `bash:rm`
+    （session_allow_key 的空会话分支），一个 teammate 里批准的 rm，别的会话的
+    teammate 也免审。派发时把会话显式带走，决议就还按会话分区。
+    """
+    token = _SESSION_ID.set(session_id or '')
+    try:
+        yield
+    finally:
+        _SESSION_ID.reset(token)
+
+
+def current_session_id() -> str:
+    """当前会话 id，取不到就返回空串（白名单退回进程级键）。
+
+    优先取 use_session 显式带过来的值；主循环/会话线程不需要额外接线，那里已经
+    由 agent_loop 把 checkpoint manager 按回合设进 ContextVar，会话 id 就在它
+    身上。再引入一个「当前会话」全局变量只会多一处需要同步的状态。
     测试里的假 harness 配置没有这个属性 → 无会话上下文。
     """
+    session_id = _SESSION_ID.get()
+    if session_id:
+        return session_id
     try:
         manager = _h().active_checkpoint_manager()
     except AttributeError:
@@ -98,40 +126,38 @@ def use_grants(grants):
         _GRANTS.reset(token)
 
 
-# 审批面只保留可读摘要：write 的 content、MCP 的大参数不该整份进入控制台、
-# API 响应和审批历史。
-_ARGS_PREVIEW_CHARS = 200
-_ARGS_MAX_ITEMS = 20
-_ARGS_MAX_DEPTH = 2
+# 审批面的参数摘要与终端可读性都在 approval_view：那里说明「命令留头尾、其余
+# 限长」的分工，以及为什么展示前要转义控制字符。
+
+# 审批超时：未决议一律拒绝（fail-safe）。环境只在构造时读一次，之后 timeout 就是
+# 普通属性，改它即刻生效。
+TIMEOUT_ENV = 'HARNESS_APPROVAL_TIMEOUT'
+DEFAULT_APPROVAL_TIMEOUT = 300.0
 
 
-def _compact_value(value, depth: int):
-    if isinstance(value, str):
-        if len(value) <= _ARGS_PREVIEW_CHARS:
-            return value
-        return value[:_ARGS_PREVIEW_CHARS] + f'… ({len(value)} chars)'
-    if depth <= 0:
-        return '…'
-    if isinstance(value, dict):
-        items = list(value.items())
-        compacted = {str(key): _compact_value(item, depth - 1)
-                     for key, item in items[:_ARGS_MAX_ITEMS]}
-        if len(items) > _ARGS_MAX_ITEMS:
-            compacted['…'] = f'{len(items) - _ARGS_MAX_ITEMS} more keys'
-        return compacted
-    if isinstance(value, (list, tuple)):
-        compacted = [_compact_value(item, depth - 1)
-                     for item in value[:_ARGS_MAX_ITEMS]]
-        if len(value) > _ARGS_MAX_ITEMS:
-            compacted.append(f'… ({len(value)} items)')
-        return compacted
-    return value
+def approval_timeout() -> float:
+    """解析 HARNESS_APPROVAL_TIMEOUT；非法值提示一声后按默认档。
+
+    PermissionGate 在 import 时构造，一个笔误（'5m'）抛出的 ValueError 会连累整个
+    CLI；但静默回落更糟 —— 用户以为等 5 秒，其实还是 300 秒。0 和负数同样回落：
+    那等于「任何审批都立刻超时拒绝」，不是人能配出来的意图。
+    """
+    raw = (os.getenv(TIMEOUT_ENV) or '').strip()
+    if not raw:
+        return DEFAULT_APPROVAL_TIMEOUT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _timeout_fallback(raw, 'not a number of seconds')
+    if seconds <= 0:
+        return _timeout_fallback(raw, 'must be a positive number of seconds')
+    return seconds
 
 
-def compact_args(args: dict) -> dict:
-    """把审批展示/持久化用的参数压到可控大小。"""
-    return {str(key): _compact_value(value, _ARGS_MAX_DEPTH)
-            for key, value in args.items()}
+def _timeout_fallback(raw: str, problem: str) -> float:
+    print(f'\033[33m[permission] ignoring {TIMEOUT_ENV}={raw!r} ({problem}), '
+          f'using {DEFAULT_APPROVAL_TIMEOUT:g}s\033[0m', file=sys.stderr)
+    return DEFAULT_APPROVAL_TIMEOUT
 
 
 @dataclass
@@ -154,14 +180,16 @@ class PermissionRequest:
 
 
 class PermissionGate:
-    """登记请求并等待决议；双后端 + 超时熔断 + 审批历史（有界）。"""
+    """登记请求并等待决议；双后端 + 超时熔断 + 审批历史（有界）。
+
+    timeout 是普通属性：构造后直接改 GATE.timeout 即刻生效，长驻服务调参不必重启。
+    """
 
     MAX_HISTORY = 200   # 已决议请求的保留上限，防止长驻服务器无限积累
 
     def __init__(self, timeout: float | None = None) -> None:
-        self.timeout = float(
-            timeout if timeout is not None
-            else os.getenv('HARNESS_APPROVAL_TIMEOUT', '300'))
+        self.timeout = (float(timeout) if timeout is not None
+                        else approval_timeout())
         self.backend = 'console'   # console | remote
         self._lock = threading.RLock()
         self._requests: dict[str, PermissionRequest] = {}
@@ -178,7 +206,7 @@ class PermissionGate:
             tool=tool,
             reason=reason,
             created_at=time.time(),
-            args=compact_args(dict(args)),
+            args=approval_view.summarize(tool, dict(args)),
             session_id=current_session_id() if session_id is None else session_id,
         )
         with self._lock:
@@ -224,8 +252,8 @@ class PermissionGate:
 
         「同类」一律由服务端从登记时的参数重算（approval_class），不接受调用方
         传入：审批请求的 tool/args 才是这次要批准的内容，客户端再带一个 klass
-        等于允许「批一个无害请求、顺手预授权 rm」这种提权写法。旧版参数摘要
-        只截尾部，bash 的命令首词不受影响，重算结果与发卡时一致。
+        等于允许「批一个无害请求、顺手预授权 rm」这种提权写法。登记时的摘要保留
+        命令首尾（approval_view.summarize），首词一定还在，重算结果与发卡时一致。
         """
         with self._lock:
             req = self._requests.get(req_id)
@@ -271,7 +299,8 @@ class PermissionGate:
         一次询问。所以只登记进队列等远程决议（/approvals、审批卡片、HTTP），
         超时同样拒绝。阻塞的是这个工作线程，主循环不受影响。"""
         req = self.request(tool, args, reason)
-        print(f'  \033[33m[permission] {tool} 等待审批：{reason}'
+        print(f'  \033[33m[permission] {approval_view.safe_text(tool)} 等待审批：'
+              f'{approval_view.safe_text(reason)}'
               f'（/approvals 或审批卡片处理，{int(self.timeout)}s 未决议则拒绝）\033[0m')
         self._await_remote(req)
         return self._conclude(req)
@@ -287,8 +316,9 @@ class PermissionGate:
         allowed = req.status == 'approved'
         message = f'{req.status} [{req.req_id}] {req.tool}: {req.reason}'
         status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}[req.status]
+        shown = approval_view.safe_text(f'{req.tool}: {req.reason}')
         print(f'  \033[{"32" if allowed else "31"}m[permission] {status} · '
-              f'{req.tool}: {req.reason}\033[0m')
+              f'{shown}\033[0m')
         return allowed, message
 
     def _decide_console(self, req: PermissionRequest) -> bool:
@@ -298,8 +328,10 @@ class PermissionGate:
         按登记的 tool/args 重算。第三方工具默认每次询问，没有卡片的 CLI 必须
         有一条免审出路，否则一个 fetch 类工具能把人问烦。
         """
-        print(f"\n\033[33m⚠  {req.reason}\033[0m")
-        print(f"   操作: {req.tool}({req.args})")
+        print(f"\n\033[33m⚠  {approval_view.safe_text(req.reason)}\033[0m")
+        print(f'   操作: {req.tool}')
+        for line in approval_view.detail(req.tool, req.args).splitlines():
+            print(f'     {line}')
         try:
             choice = input('Allow? (y=允许 / n=拒绝 / a=本会话允许同类) ').strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -345,16 +377,21 @@ def register_external_tools(names) -> None:
     EXTERNAL_TOOLS.update(name for name in names if name)
 
 
-def evaluate_call(tool: str, args: dict):
-    """纯策略判定（黑名单 / 档位 / 越界），不问人。测试与 /sandbox 预览用它。"""
+def evaluate_call(tool: str, args: dict, policy=None):
+    """纯策略判定（黑名单 / 档位 / 越界），不问人。测试与 /sandbox 预览用它。
+
+    policy 可以传入已解析的档位快照，免得调用方（enforce）读一次环境、判定再读
+    一次；省略时按当前环境即时解析。
+    """
     inside = True
     if tool == 'read' or tool in READ_WRITE_TOOLS:
         inside = _inside_workspace(str(args.get('path', '')), args.get('cwd'))
-    return load_policy().evaluate(tool, args,
-                                  deny_list=_h().DENY_LIST,
-                                  destructive=_h().DESTRUCTIVE,
-                                  inside_workspace=inside,
-                                  external_tools=EXTERNAL_TOOLS)
+    return (policy or load_policy()).evaluate(
+        tool, args,
+        deny_list=_h().DENY_LIST,
+        destructive=_h().DESTRUCTIVE,
+        inside_workspace=inside,
+        external_tools=EXTERNAL_TOOLS)
 
 
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
@@ -365,13 +402,16 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     False：工作线程（teammate / 后台 worker / 任务 runner），询问进远程审批队列，
     超时拒绝。
     """
-    decision = evaluate_call(tool, args)
+    policy = load_policy()
+    decision = evaluate_call(tool, args, policy=policy)
     if decision.allowed:
         return None
     if decision.denied:
         print(f'\n\033[31m⛔ Blocked: {decision.pattern or decision.reason}\033[0m')
         return deny_message(decision)
-    if GATE.session_allows(tool, args):
+    # untrusted 档的语义是「每条都问」，而会话白名单是一种预授权：命中它就等于
+    # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单。
+    if policy.approval_policy != 'untrusted' and GATE.session_allows(tool, args):
         print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
         issue_grant(tool, args)   # 白名单命中同样是一次「本调用已批准」
         return None

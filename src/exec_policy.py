@@ -154,6 +154,8 @@ class Policy:
 
         # 2) 全量审批档（旧 HARNESS_APPROVAL_ALL=1 的等价语义）。排在档位短路之前，
         #    这样 danger-full-access + untrusted = 「不做启发式拦截，但每条都问我」。
+        #    「每条都问」还要求 hooks.enforce 不在会话白名单上短路：白名单本身就是一次
+        #    预授权，命中它等于用一个按钮把档位悄悄改回 on-request。
         if self.approval_policy == 'untrusted':
             return Decision(ASK, 'untrusted', 'all bash commands require approval')
 
@@ -337,21 +339,32 @@ def _command_verbs(command: str) -> set[str]:
     return {verb for verb in verbs if verb}
 
 
-def _wrapped_verbs(tokens: list[str]) -> set[str]:
-    """从 `cmd /c "del x"` 这类包装里取出被包的命令名，只解一层。
+def _wrapped_tokens(tokens: list[str]) -> list[str]:
+    """cmd /c "…"、bash -c '…' 里被包装的那段原文；不是包装器写法返回空表。
 
     标志位按原文比对：_basename 会把 '/c' 拆成 'c'（它按路径分段取末段），
     用归一后的值匹配 '/c' 永远匹配不上。
     """
     for index in range(1, min(len(tokens), 4)):
-        if tokens[index].strip('"\'').casefold() not in _WRAP_FLAGS:
-            continue
-        if index + 1 >= len(tokens):
-            break
-        inner = tokens[index + 1].strip('"\'')
-        return {_basename(nested.split()[0])
-                for nested in _segments(inner) if nested.split()}
-    return set()
+        if tokens[index].strip('"\'').casefold() in _WRAP_FLAGS:
+            return tokens[index + 1:]
+    return []
+
+
+def _wrapped_verbs(tokens: list[str]) -> set[str]:
+    """从 `cmd /c "del x"` 这类包装里取出所有被包的命令名，只解一层。"""
+    return {_basename(nested.split()[0])
+            for nested in _segments(' '.join(_wrapped_tokens(tokens)))
+            if nested.split()}
+
+
+def _wrapped_verb(tokens: list[str]) -> str:
+    """包装器载荷里的第一个命令名：`cmd /c "del x"` → del。解不出来返回空串。"""
+    for nested in _segments(' '.join(_wrapped_tokens(tokens))):
+        words = nested.split()
+        if words:
+            return _basename(words[0])
+    return ''
 
 
 def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
@@ -410,15 +423,25 @@ def _git_subcommand(command: str) -> str | None:
 # ============================================================
 
 def approval_class(tool: str, args) -> str:
-    """同类判定：bash 按命令首词（rm/del/git…），其余按工具名。
+    """同类判定：bash 按命令名（rm/del/git…），其余按工具名。
 
     hooks 与 feishu_gateway 原本各有一份同规则实现（决议时 / 发卡时两个时机），
     现在统一到这里，两边都从这里导入。args 允许是非 dict（网关侧的宽松输入）。
+
+    包装器先解一层：`cmd /c del x` 的动作在 del 上，按 cmd 归类等于「批准一条
+    cmd /c 就免审所有 cmd /c」，把 `cmd /c rd /s /q` 一起放进去。解不出载荷时
+    （起交互式 shell）仍按包装器自身归类。解释器不在包装器名单里：
+    `python -c "import os"` 的第一个词是 import，拿它当同类键没有意义。
     """
     if tool == 'bash':
         raw = args.get('command', '') if isinstance(args, dict) else args
-        command = str(raw or '').strip()
-        return command.split(None, 1)[0].casefold() if command else ''
+        words = str(raw or '').strip().split()
+        if not words:
+            return ''
+        verb = _basename(words[0])
+        if verb in _WRAPPERS:
+            return _wrapped_verb(words) or verb
+        return verb
     return tool
 
 

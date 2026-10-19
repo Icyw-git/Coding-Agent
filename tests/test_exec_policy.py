@@ -338,11 +338,27 @@ def test_tier_names_are_the_documented_sets():
 # 同类判定 / 授权凭据 / 会话分区
 # ============================================================
 
-def test_approval_class_uses_the_first_word_for_bash():
+def test_approval_class_uses_the_command_name_for_bash():
     assert approval_class('bash', {'command': '  RM -rf x'}) == 'rm'
     assert approval_class('bash', {'command': ''}) == ''
     assert approval_class('bash', 'rm x') == 'rm'      # 网关侧允许非 dict
     assert approval_class('write', {'path': 'a'}) == 'write'
+
+
+def test_approval_class_unwraps_command_wrappers():
+    """按 cmd /c 归类等于「批一条 cmd /c，免审所有 cmd /c」（含 rd /s /q）。"""
+    assert approval_class('bash', {'command': 'cmd /c "del x"'}) == 'del'
+    assert approval_class('bash', {'command': 'cmd.exe /c rd /s /q build'}) == 'rd'
+    assert approval_class('bash', {'command': "bash -c 'rm -rf /tmp/a'"}) == 'rm'
+    assert approval_class(
+        'bash', {'command': 'powershell -Command "Remove-Item x"'}) == 'remove-item'
+    # 绝对路径调用归一到同一个键
+    assert approval_class('bash', {
+        'command': 'C:\\Windows\\System32\\cmd.exe /c del x'}) == 'del'
+    # 解释器的载荷是程序不是 shell 命令，解出来的第一个词没有归类意义
+    assert approval_class('bash', {'command': 'python -c "import os"'}) == 'python'
+    # 没有载荷（起交互式 shell）仍按包装器自身归类
+    assert approval_class('bash', {'command': 'cmd'}) == 'cmd'
 
 
 def test_grant_key_ignores_arguments_without_security_meaning():

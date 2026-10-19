@@ -196,6 +196,18 @@ def _drain_stale_permissions():
             pass
 
 
+def test_approval_prompt_shows_the_whole_command():
+    """命令完整性归展示层：网关再切一刀（旧版 [:160]）会把重定向目标弄没。"""
+    command = 'echo ' + 'x' * 900 + ' >> ~/.bashrc\x1b[31m'
+    text = format_permission_prompt({'req_id': 'p1', 'tool': 'bash',
+                                     'reason': 'destructive',
+                                     'args': {'command': command}})
+    assert text.startswith('⚠ 需要审批')
+    assert '~/.bashrc' in text
+    assert text.count('```') == 2          # 命令在代码块里，按原样成段
+    assert '\x1b' not in text and '\\x1b' in text
+
+
 def test_permission_approval_via_chat(gateway):
     gw, fake = gateway
     _drain_stale_permissions()

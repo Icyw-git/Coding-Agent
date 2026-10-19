@@ -44,6 +44,7 @@ from pathlib import Path
 import httpx
 
 from gateway_sim import GatewayClient
+import approval_view
 from exec_policy import approval_class
 from turn_progress import format_duration
 from perf import record as perf_record, reset as perf_reset
@@ -81,18 +82,24 @@ def permission_result(record: dict) -> str:
 
 
 def format_permission_prompt(req: dict, index: int | None = None) -> str:
-    """审批提醒文案：点卡片按钮，或直接回复 y / n（多条时 y2、n2 按序号选）。"""
-    preview = str(req.get('args', ''))[:160]
-    head = '⚠ 需要审批' + (f' #{index}' if index else '') \
-        + f" · {req.get('tool', '?')}"
+    """审批提醒文案：点卡片按钮，或直接回复 y / n（多条时 y2、n2 按序号选）。
+
+    命令不在网关这里截断：服务端登记时已按「命令留头尾、其余字段限长」压好大小
+    （approval_view.summarize），网关再切一刀只会把要审批的后半段动作弄没 ——
+    审批人看不到重定向目标，就等于盲批。命令按代码块完整显示，卡片支持代码块。
+    """
+    tool = str(req.get('tool', '?'))
+    head = '⚠ 需要审批' + (f' #{index}' if index else '') + f' · {tool}'
+    reason = approval_view.safe_text(req.get('reason', ''))
+    detail = approval_view.detail(tool, req.get('args') or {})
     if index in (None, 1):
         tail = '回复 y（允许）或 n（拒绝）'
     else:
         tail = f'回复 y{index}（允许）或 n{index}（拒绝）'
     return (f"{head}\n"
-            f"原因: {req.get('reason', '')}\n"
-            f"参数: {preview}\n"
-            f"{tail}（也可直接点按钮）")
+            f"原因: {reason}\n"
+            + (f"```\n{detail}\n```\n" if detail else '')
+            + f"{tail}（也可直接点按钮）")
 
 
 # 「本次会话允许同类」的同类判定键不在网关侧算：网关只把「允许 + 扩到同类」这个

@@ -116,6 +116,18 @@ def test_resolve_derives_the_class_from_the_approved_call(remote_gate, monkeypat
     assert not GATE.session_allows('bash', {'command': 'rm other'})
 
 
+def test_wrapped_command_only_whitelists_the_wrapped_action(remote_gate, monkeypatch):
+    """批准 `cmd /c del a` 不免审 `cmd /c rd /s /q b`：同类键解一层包装。"""
+    _fake_hooks_config(monkeypatch)
+    results = {}
+    thread = _decide_async('cmd /c "del a"', results)
+    GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
+    thread.join(timeout=2)
+    assert approval_class('bash', {'command': 'cmd /c "del a"'}) == 'del'
+    assert GATE.session_allows('bash', {'command': 'cmd /c "del other"'})
+    assert not GATE.session_allows('bash', {'command': 'cmd /c "rd /s /q build"'})
+
+
 def test_clear_wipes_session_allowlist(remote_gate):
     GATE._session_allows.add('bash:rm')
     GATE.clear()
