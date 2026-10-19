@@ -684,6 +684,7 @@ Stage 1/2 把判定收敛到一处、把 `never` 改成 fail-closed、加上了 
   展示要用的话自己算着玩，不进请求体。
 - **`compact_args` 截断会不会影响同类判定**：不会。摘要只截长字符串的尾部，
   bash 的首词、非 bash 的工具名都在头部，决议与发卡拿到的 class 一致。
+  （第 17 部分把命令摘要改成「留头尾」，这条结论仍然成立，而且是被测试钉住的。）
 - **旧卡片还在飞书里**：删掉模型字段后 pydantic 忽略多余键，历史卡片带 `klass` 照样能点，
   不需要迁移。
 - **`EXTERNAL_TOOLS` 是进程级集合**：测试里注册一个 `mcp_echo` 会泄漏给后面的用例，
@@ -707,6 +708,89 @@ Stage 1/2 把判定收敛到一处、把 `never` 改成 fail-closed、加上了 
 
 ---
 
+# 第 17 部分：审批面的五个洞——从"看得见"到"按会话算数"（新增）
+
+## 问题：判定收敛之后，剩下的问题是"人在这一步到底掌握了什么"
+
+第 16 部分补的是信任边界。review 之后还剩五条，都不在判定逻辑里，而在审批这一层
+实际生不生效上：
+
+- **审批面看不到要批准的东西**：参数摘要一刀切 200 字符，飞书文案又在网关再切 160。
+  `echo … | tee ~/.bashrc` 里真正危险的正好是被切掉的尾部；命令文本直接 print，
+  里面的 ESC/CR/BEL 会被终端解析，等于被审批的字符串能反过来改写审批提示。
+- **无头路径把会话丢了**：`ContextVar` 不随 `threading.Thread` 继承，teammate 与后台
+  worker 里 `current_session_id()` 拿到空串 → 白名单退回进程级键 `bash:rm`。
+  "按会话分区"恰恰在最需要它的两条路径上没生效。
+- **同类键粗到覆盖整个包装器**：`cmd /c "del x"` 归类成 `cmd`，点一次"允许同类"
+  把 `cmd /c rd /s /q build` 一起免审了。
+- **untrusted 档能被一次预授权改掉**：白名单短路在档位判定之后、问人之前，
+  所以"每条都问"的档位里点一次 `a` 就退化成 on-request。
+- **审批超时配置在 import 时崩**：`float(os.getenv(...))` 遇到
+  `HARNESS_APPROVAL_TIMEOUT=5m` 直接抛 ValueError，整个 CLI 起不来；`0`/负数则
+  静默地把所有审批变成秒拒。
+
+## 做法
+
+- 新增 `src/approval_view.py`，把两个时机分开：登记时的 `summarize(tool, args)` 决定
+  审批历史/API/卡片里的参数上限，展示时的 `detail(tool, args)` 决定人看见什么。
+  命令按「留头 1200 / 留尾 400 / 中间省略 N 字符」摘要，其余字段仍限长（`write` 的
+  整份 content 不该进审批历史）。四个展示位（CLI 提示、`/approvals`、`/perms`、
+  审批卡片代码块）都改为调用同一份渲染，网关不再自己截断；`safe_text` 把 C0
+  （tab、换行除外）与 DEL 换成 `\xNN` 可见写法。
+- `hooks.use_session(session_id)` 与 `use_grants` 同构：派发线程读一次
+  `current_session_id()`，在 worker 里显式包住执行体（`background_task`、
+  `agent_teams.spawn_teammate_thread`）。`current_session_id()` 先读显式值，再回落
+  checkpoint manager 的绑定，所以主循环不必额外接线。
+- `approval_class` 解一层包装器（复用策略层已有的 `_WRAPPERS` / `_WRAP_FLAGS`），
+  命令名统一走 `_basename`：绝对路径、`.exe`、大小写都归一到同一个键。
+  解释器载荷（`python -c`）不解——它的第一个词是 `import`，当同类键没有意义。
+- `enforce` 持有本次判定的 `Policy` 快照（`evaluate_call(..., policy=)`），
+  `untrusted` 档跳过白名单短路；档位语义只在一个地方兑现。
+- `approval_timeout()` 解析配置：非数字与 ≤0 都在 stderr 提示后按默认 300s，
+  不再在 import 时抛；`GATE.timeout` 仍是普通属性，长驻服务运行时直接改即刻生效。
+
+## 踩过的坑
+
+- **repr 早就"顺手"转义了**：旧代码 print 的是 `{req.args}`，dict 的 repr 会把
+  `\x1b` 写成可见字符，所以注入问题一直没暴露。改成"命令单独成段"之后必须显式转义，
+  这正是把展示逻辑抽出来的理由。
+- **摘要规则与同类判定互相制约**：只留尾部会让 `approval_class` 算错，只留头部会把
+  重定向目标切掉。"留头尾"是唯一同时满足两边的规则，测试直接钉住这条约束
+  （摘要后重算仍是 `rm`）。
+- **测试假 harness 把会话挂在类属性上**：`Config.session_id` 是进程级的，新线程照样
+  读得到，于是"带不带会话"的用例怎么改都能过。改成在派发线程用 `use_session` 造上下文，
+  用例才真的抓到漏带——去掉 carry 后 `test_background_worker_carries_the_dispatching_session`
+  确实失败（验证过）。
+- **teammate 用例的假 manager 是一个裸 `object()`**：它只想验证"checkpoint 不跟过去"，
+  结果 `current_session_id()` 读 `.session_id` 就炸。换成带 session_id 的假 manager，
+  顺便让这个用例同时证明"会话要跟过去、checkpoint 不跟"。
+- **`_wrapped_verbs` 顺带改严**：抽 `_wrapped_tokens` 时把"只看标志位后第一个 token"
+  改成"看整段载荷"，`cmd /c "dir && del x"` 内层第二个命令名现在也看得见。
+  方向是变严（多问一次），不会让既有黑名单漏网。
+
+## 测试
+
+`tests/test_approval_view.py` 新增（命令留头尾、控制字符转义、多行渲染、非 bash 参数摘要）；
+`test_permission_gate.py` 补 CLI 提示显示完整命令尾部 + 超时配置的三条回落；
+`test_execution_paths.py` 补"会话不跨线程继承""后台 worker 带上派发会话""untrusted 不走白名单"；
+`test_exec_policy.py` 补包装器归类矩阵；`test_approval_scope.py` 补
+"批准 `cmd /c del a` 不免审 `cmd /c rd /s /q b`"；`test_cli_output.py`、
+`test_feishu_gateway.py`、`test_session_workspace.py` 更新到新的展示与传递契约。
+全量 532 passed。
+
+## 收获
+
+- **审批的质量取决于审批人能看到什么**：把危险的那半句截掉，闸门就只剩"打断"；
+  展示逻辑分散在各入口时，每个入口都会自己长出一个截断点，抽成一份渲染才有契约可言。
+- **跨线程上下文是一张清单，不是一次修补**：工作区、审批凭据、会话 id 都得显式带走，
+  少带一项，对应的分区就退化成进程级。新增执行路径时三件一起抄。
+- **档位语义要在唯一的短路点兑现**：`untrusted` 写在策略层、白名单短路在闸门里，
+  两边各说各话时，实际生效的是较弱的那条。
+- **配置解析的默认档不该由一个笔误决定**：import 期抛异常等于把"打错一个字符"升级成
+  "整个进程起不来"；提示 + 回落才是可运维的做法（与第 14 部分的档位名解析同理）。
+
+---
+
 ## 核心教训总纲
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。
@@ -725,3 +809,4 @@ Stage 1/2 把判定收敛到一处、把 `never` 改成 fail-closed、加上了 
 14. **判定只能有一处**——同一套黑名单写三遍，实际边界就是最弱的那条路径；策略层收敛后，档位、审批分级、凭据都只需要解释一次，四条执行入口的行为才可验证。
 15. **"不问"不等于"允许"**——没有 OS 沙箱兜底时，`never` 必须 fail-closed；把"不打断"实现成"静默放行"，等于关掉最后一道闸。
 16. **审批只接受意图，不接受结论**——同类判定键、白名单范围这类"结论"要由服务端从被审批的内容推出；让客户端传 `klass` 等于让审批人自己划免审边界。同理，运行时扩充进来的第三方工具默认询问：不认识 ≠ 没有副作用。
+17. **审批要看得见、且按会话算数**——命令摘要留头尾（截掉的往往就是危险的后半句）、控制字符转义（别让被审批的字符串改写审批界面）、会话 id 与凭据一样显式跨线程带走（ContextVar 不随线程继承，漏带就退回进程级白名单）、`untrusted` 档不走白名单短路，同类键解开 `cmd /c` 这类包装器。
