@@ -69,6 +69,7 @@ Enter 切换、Esc 返回，Ctrl+A 切换当前/全部工作区。Tab/Shift+Tab 
 - `/archive select 1 3`：选择列表中的会话，预览后用 `/confirm` 执行，或 `/cancel` 取消。
 - `/delete`、`/delete select 1 3`：选择已归档会话；必须用 `/confirm 删除` 才永久删除。
 - `/sandbox [档位|approvals <档位>]`：查看或切换服务端的执行/审批档位，对所有会话立即生效。
+- `/revoke`：撤销当前会话已批准的「同类」预授权（换档时服务端会连带全部撤销）。
 
 会话列表最多读取 1000 条，每次重新展示列表会让旧列表按钮失效，10 分钟后也需重新 `/sessions`。
 按钮受用户白名单及聊天来源校验，会话已删除或目录失效时不切换。
@@ -115,6 +116,10 @@ HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一
 - `danger-full-access` 取消提示级限制和工作区路径约束，只保留黑名单硬拒。
 - `untrusted` 的语义是「每条都问」：bash 命令一律审批，且会话白名单（「本次会话允许同类」）在这一档
   不参与短路——否则点一次 `a` 就把档位悄悄改回了 on-request。
+- 默认档下，解释器调用（`python -c`、`node -e`、`pwsh -Command`…）、SSH/容器/K8s/包管理操作、
+  Git 写操作（`push`/`clean`/`reset`/`checkout`…）和 curl/wget 的上传或改写请求需要审批；
+  这些命令不提供「本会话允许同类」——按可执行文件名免审等于批一次就放行后续任意载荷
+  （代价是 `docker ps`、`kubectl get pods` 这类只读子命令也要问，判定层不认它们的子命令语义）。
 - `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位下需要审批的
   操作直接失败（fail-closed），而不是静默执行。开启 OS 沙箱也不改变这一点——沙箱只约束写入，
   不替代审批。
@@ -130,8 +135,11 @@ HTTP 任务——共用同一套规则和同一句拒绝文案，不再各写一
   同名工具不再重复问。
 
 配置入口：`/sandbox` 查看和切换（CLI、飞书、`gateway_sim`、`GET/POST /v1/policy` 都走服务端同一份
-判定，运行时立即生效）；也可以写进环境 `HARNESS_SANDBOX_MODE` 与 `HARNESS_APPROVAL_POLICY`
-（旧开关 `HARNESS_APPROVAL_ALL=1` 等价于 `approval_policy=untrusted`，仅在没有显式配置新档位时兜底）。
+判定，运行时立即生效，只影响当前进程）；也可以在启动服务前设置环境 `HARNESS_SANDBOX_MODE` 与
+`HARNESS_APPROVAL_POLICY`（旧开关 `HARNESS_APPROVAL_ALL=1` 等价于 `approval_policy=untrusted`，
+仅在没有显式配置新档位时兜底）。这两个键只认启动进程时的真实环境，`.env` 里的值会被忽略，
+原因见「快速开始」。换档是一次安全状态变更，会连带撤销所有会话已批的「同类」预授权；
+不想等到换档，也可以用 `/revoke` 撤掉当前会话的预授权。
 档位名写错不会静默回落到默认档：`/sandbox` 报用法，环境变量按默认档并在 stderr 提示一次，
 `/status` 和 `--doctor` 始终显示实际生效的档位。
 
@@ -219,18 +227,18 @@ HARNESS_UI=ansi
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
 
-# 可选：执行档位 read-only / workspace-write（默认）/ danger-full-access
-HARNESS_SANDBOX_MODE=workspace-write
-
-# 可选：审批档位 untrusted / on-request（默认）/ never；也可运行中用 /sandbox 切换
-HARNESS_APPROVAL_POLICY=on-request
-
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
 
 # 可选：启用分段计时，启动前设置
 HARNESS_PERF=1
 ```
+
+执行档位与审批档位不在这里配置：`.env`（以及任何 `load_dotenv` 读进来的文件）里的
+`HARNESS_SANDBOX_MODE` / `HARNESS_APPROVAL_POLICY` / `HARNESS_APPROVAL_ALL` 会被忽略，
+只认启动进程时环境里已有的值——`.env` 就在工作区里，Agent 写得动，把它当配置来源等于
+让被约束的一方自己降档。要固定档位，请在启动脚本、服务管理器或用户级环境里设置，
+运行中随时用 `/sandbox` 切换（只对当前进程生效）。
 
 `local` 使用中英文关键词匹配，语义召回能力与 `llm` 不同；不设置时默认 `local`（每轮省一次 LLM 筛选往返，约 2s）。
 旧开关 `HARNESS_LOAD_MEMORIES=0` 仍会关闭召回。
@@ -239,8 +247,9 @@ HARNESS_PERF=1
 嵌套分段存在包含关系，不能直接相加。
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动）、`/compact`（保存完整记录后压缩当前上下文）、
-`/undo`（回到最近一次快照）和 `/approvals`（查看待审批操作）。飞书网关同步支持
-`/model`、`/approvals`、`/perms` 和 `/sandbox`；文件查看与上下文压缩仍建议在 CLI 中执行。
+`/undo`（回到最近一次快照）、`/revoke`（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
+飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke` 和 `/sandbox`；
+文件查看与上下文压缩仍建议在 CLI 中执行。
 
 请勿提交 `.env` 或任何真实 API 密钥；`.gitignore` 已默认忽略该文件。
 
