@@ -291,6 +291,12 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['request']
 
+    def revoke_permissions(self, session_id: str | None = None) -> int:
+        response = self.http.post('/v1/permissions/revoke',
+                                  json={'session_id': session_id})
+        response.raise_for_status()
+        return int(response.json().get('revoked', 0))
+
     # ---------- 执行档位 ----------
 
     def get_policy(self) -> dict:

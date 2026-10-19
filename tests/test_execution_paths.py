@@ -10,6 +10,7 @@
     6. 第三方（MCP）工具登记后默认询问，never 档失败而不是静默执行
 """
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -420,6 +421,33 @@ def test_sandbox_command_switches_tiers(line, sandbox, approval, capsys):
     policy = load_policy()          # 档位写进环境：下一条工具调用即生效
     assert (policy.sandbox_mode, policy.approval_policy) == (sandbox, approval)
     assert '已切换' in capsys.readouterr().out
+
+
+def test_tier_switch_drops_session_preauthorizations():
+    """换档 = 一次安全状态变更：批过的「同类」不能跟着跨档活下来。"""
+    GATE._session_allows.add(session_allow_key('bash', 'rm', 'A'))
+    harness.handle_command('/sandbox read-only', [], None)
+    assert not GATE._session_allows
+
+
+def test_no_op_tier_switch_keeps_preauthorizations():
+    """重复设同一档位不是状态变更，不该把人已经批过的免审清掉。"""
+    GATE._session_allows.add(session_allow_key('bash', 'rm', 'A'))
+    harness.handle_command('/sandbox workspace-write', [], None)
+    assert session_allow_key('bash', 'rm', 'A') in GATE._session_allows
+
+
+def test_dotenv_is_not_a_source_of_the_policy_tier(monkeypatch, capsys):
+    """.env 就在工作区里、Agent 写得动，所以档位只认进程启动时的真实环境。"""
+    monkeypatch.setattr(harness, '_TRUSTED_POLICY_ENV',
+                        {'HARNESS_SANDBOX_MODE': 'read-only'})
+    monkeypatch.setenv('HARNESS_SANDBOX_MODE', 'danger-full-access')
+    monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'never')
+    harness.enforce_trusted_policy_env()
+    assert load_policy().sandbox_mode == 'read-only'
+    assert load_policy().approval_policy == 'on-request'   # .env 里的 never 被丢弃
+    assert 'HARNESS_APPROVAL_POLICY' not in os.environ
+    assert '已忽略配置文件里的' in capsys.readouterr().err   # 不静默回落
 
 
 def test_unknown_tier_is_rejected_not_silently_downgraded(capsys):

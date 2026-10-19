@@ -32,6 +32,7 @@ COMMANDS = (
     Command('/undo', (), '', '撤销最近一次已完成回合的文件和会话改动', '常用'),
     Command('/model', (), '', '查看当前模型配置', '常用'),
     Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '常用'),
+    Command('/revoke', (), '', '撤销当前会话已允许的同类操作', '常用'),
     Command('/sandbox', (), '[档位|approvals <档位>]',
             '查看或切换执行档位（read-only|workspace-write|danger-full-access）与审批档位',
             '常用'),

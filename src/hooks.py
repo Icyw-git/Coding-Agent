@@ -232,6 +232,19 @@ class PermissionGate:
             self._session_allows.clear()
         _GRANTS.set(frozenset())
 
+    def revoke_session(self, session_id: str | None = None) -> int:
+        """撤销指定会话的预授权；没有会话上下文时撤销所有预授权。"""
+        prefix = f'{session_id}|' if session_id else None
+        with self._lock:
+            before = len(self._session_allows)
+            if prefix is None:
+                self._session_allows.clear()
+            else:
+                self._session_allows = {
+                    key for key in self._session_allows if not key.startswith(prefix)
+                }
+            return before - len(self._session_allows)
+
     def pending(self) -> list[PermissionRequest]:
         with self._lock:
             return [req for req in self._requests.values()
@@ -327,18 +340,26 @@ class PermissionGate:
         a 走的是和远程决议完全相同的一条路（self.resolve），同类键仍由服务端
         按登记的 tool/args 重算。第三方工具默认每次询问，没有卡片的 CLI 必须
         有一条免审出路，否则一个 fetch 类工具能把人问烦。
+
+        approval_class 为空的那一类（解释器、ssh/docker/kubectl、Git 写操作）
+        没有「同类」可以记：卡片隐藏这个按钮，CLI 也不能摆一个不起作用的选项，
+        否则用户以为自己买了整会话免审，其实只放了这一次。
         """
         print(f"\n\033[33m⚠  {approval_view.safe_text(req.reason)}\033[0m")
         print(f'   操作: {req.tool}')
         for line in approval_view.detail(req.tool, req.args).splitlines():
             print(f'     {line}')
+        klass = approval_class(req.tool, req.args)
         try:
-            choice = input('Allow? (y=允许 / n=拒绝 / a=本会话允许同类) ').strip().lower()
+            choice = input('Allow? (y=允许 / n=拒绝 / a=本会话允许同类) ' if klass
+                           else 'Allow? (y=允许 / n=拒绝) ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             print('  \033[31m[permission] stdin unavailable → denied\033[0m')
             self.resolve(req.req_id, False, by='console(EOF)')
             return False
         allow = choice in ('y', 'yes', 'a')
+        if choice == 'a' and not klass:
+            print('  \033[33m[permission] 这类命令不记「同类」，本次只放行这一次\033[0m')
         self.resolve(req.req_id, allow, by='console',
                      scope='session' if choice == 'a' else None)
         return allow

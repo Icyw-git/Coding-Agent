@@ -116,6 +116,34 @@ def test_resolve_derives_the_class_from_the_approved_call(remote_gate, monkeypat
     assert not GATE.session_allows('bash', {'command': 'rm other'})
 
 
+@pytest.mark.parametrize('command', [
+    'python -c "print(1)"', 'pwsh -Command "Get-ChildItem"',
+    'ssh host echo ok', 'docker run image', 'git push origin main',
+])
+def test_sensitive_commands_cannot_grant_session_wide_allow(remote_gate, monkeypatch,
+                                                            command):
+    _fake_hooks_config(monkeypatch)
+    results = {}
+    thread = _decide_async(command, results)
+    for _ in range(100):
+        if GATE.pending():
+            break
+        time.sleep(0.01)
+    if GATE.pending():
+        GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
+    thread.join(timeout=2)
+    assert results['allowed'] is None
+    assert not GATE._session_allows
+
+
+def test_revoke_session_only_removes_that_sessions_grants(remote_gate):
+    GATE._session_allows.update({'A|bash:rm', 'B|bash:rm'})
+    assert GATE.revoke_session('A') == 1
+    assert GATE._session_allows == {'B|bash:rm'}
+    assert GATE.revoke_session() == 1
+    assert not GATE._session_allows
+
+
 def test_wrapped_command_only_whitelists_the_wrapped_action(remote_gate, monkeypatch):
     """批准 `cmd /c del a` 不免审 `cmd /c rd /s /q b`：同类键解一层包装。"""
     _fake_hooks_config(monkeypatch)

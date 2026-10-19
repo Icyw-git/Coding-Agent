@@ -31,6 +31,19 @@ def test_console_prompt_shows_the_whole_command_and_escapes_control_chars(monkey
     assert '\\x1b[2K' in out          # 命令里的 ESC 换成可见转义，不被终端解析
 
 
+def test_console_hides_the_session_option_for_classless_commands(monkeypatch, capsys):
+    """解释器 / ssh / docker 没有「同类」可记，CLI 不能摆一个不起作用的 a。"""
+    gate = PermissionGate()
+    prompts = []
+    monkeypatch.setattr('builtins.input',
+                        lambda prompt='': prompts.append(prompt) or 'a')
+    allowed, _ = gate.decide('bash', {'command': 'python -c "import os"'}, 'opaque')
+    assert allowed
+    assert 'a=本会话允许同类' not in prompts[0]
+    assert '不记「同类」' in capsys.readouterr().out
+    assert not gate._session_allows
+
+
 def test_console_eof_denies_instead_of_crashing(monkeypatch):
     gate = PermissionGate()
 

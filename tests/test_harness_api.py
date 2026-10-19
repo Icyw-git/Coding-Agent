@@ -19,6 +19,20 @@ def api_client():
         yield lambda app: stack.enter_context(TestClient(app))
 
 
+def _approve_task_command(client, headers, task_id):
+    for _ in range(100):
+        pending = client.get('/v1/permissions', headers=headers).json()['pending']
+        if pending:
+            request = pending[0]
+            response = client.post(
+                f"/v1/permissions/{request['req_id']}/resolve",
+                json={'allow': True}, headers=headers)
+            assert response.status_code == 200
+            return
+        time.sleep(0.01)
+    raise AssertionError(f'task {task_id} did not request approval')
+
+
 class Result:
     def __init__(self, session_id, content):
         self.session_id = session_id
@@ -233,6 +247,7 @@ def test_task_end_to_end_flow(tmp_path, api_client):
                           headers=headers)
     assert created.status_code == 201
     task_id = created.json()["task"]["id"]
+    _approve_task_command(client, headers, task_id)
 
     record = created.json()["task"]
     for _ in range(100):
@@ -267,6 +282,7 @@ def test_task_stop_and_not_found(tmp_path, api_client):
         headers=headers,
     ).json()["task"]
     task_id = created["id"]
+    _approve_task_command(client, headers, task_id)
     for _ in range(100):
         if client.get(f"/v1/tasks/{task_id}", headers=headers).json()["task"]["status"] == "running":
             break
@@ -346,6 +362,7 @@ def test_api_shutdown_stops_tasks_and_releases_log(tmp_path):
         record = client.post('/v1/tasks',
                              json={'command': 'python -c "import time; time.sleep(30)"'},
                              headers={'Authorization': 'Bearer t'}).json()['task']
+        _approve_task_command(client, {'Authorization': 'Bearer t'}, record['id'])
         for _ in range(100):
             data = json.loads((tmp_path / 'tasks' / f"{record['id']}.json").read_text())
             if data['status'] == 'running':

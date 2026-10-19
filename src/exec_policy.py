@@ -52,6 +52,13 @@ _WRAPPERS = frozenset({'cmd', 'sh', 'bash', 'zsh', 'powershell', 'pwsh'})
 _WRAP_FLAGS = frozenset({'-c', '/c', '-command'})
 # 不透明载荷：无法静态判断内容，一律询问（不是拒绝——本地跑一次性脚本是正常需求）。
 _OPAQUE_FLAGS = ('-enc', '-encodedcommand', '/enc', '/e', '-enc', '--encodedcommand')
+_INTERPRETERS = frozenset({'python', 'python2', 'python3', 'pypy', 'node', 'deno',
+                           'ruby', 'perl', 'php', 'lua'})
+_OPAQUE_SCRIPT_FLAGS = frozenset({'-c', '-e', '--eval', '-command', '/command'})
+_NO_SESSION_GRANT = frozenset({
+    'ssh', 'scp', 'sftp', 'docker', 'podman', 'kubectl', 'terraform',
+    'npm', 'npx', 'pip', 'uv', 'git-lfs',
+})
 
 # 分号/管道/逻辑串联都是「一条命令里的多个动作」，逐段判定。
 # 换行在 POSIX shell 里同样分隔命令；Windows cmd 行为不同，但判定层按会执行的
@@ -378,6 +385,38 @@ def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
             return flag
     if 'invoke-expression' in normalized or 'iex(' in normalized:
         return 'invoke-expression'
+    for segment in _segments(normalized):
+        tokens = [token.strip('"\'') for token in segment.split()]
+        if not tokens:
+            continue
+        verb = _basename(tokens[0])
+        flags = {token.casefold() for token in tokens[1:]}
+        if verb in _INTERPRETERS:
+            if flags & {'--version', '-v', '-V', '--help', '-h'}:
+                continue
+            return f'{verb} script payload'
+        if verb in ('powershell', 'pwsh') and any(
+                token.casefold() in ('-command', '-c', '-encodedcommand', '-enc')
+                for token in tokens[1:]):
+            return f'{verb} command payload'
+        if verb in ('curl', 'wget') and any(
+                token.casefold() in ('-t', '--upload-file', '--data', '--data-binary',
+                                     '--data-raw', '-d', '-x', '--request')
+                for token in tokens[1:]):
+            return f'{verb} network mutation'
+        if verb in ('ssh', 'scp', 'sftp', 'docker', 'podman', 'kubectl',
+                    'terraform', 'npm'):
+            return f'{verb} external operation'
+        if verb == 'git':
+            subcommand = _git_subcommand(segment)
+            if subcommand in ('clean', 'push', 'reset', 'checkout', 'switch',
+                              'commit', 'rebase', 'merge', 'tag'):
+                return f'git {subcommand} operation'
+        if verb in _WRAPPERS:
+            nested = ' '.join(_wrapped_tokens(tokens))
+            if nested and _opaque_payload(nested, nested.casefold(),
+                                          _command_verbs(nested)):
+                return 'wrapped command payload'
     # curl ... | sh / wget ... | bash
     if ('curl' in verbs or 'wget' in verbs) and (
             normalized.count('|') and ('sh' in verbs or 'bash' in verbs or 'zsh' in verbs)):
@@ -439,8 +478,18 @@ def approval_class(tool: str, args) -> str:
         if not words:
             return ''
         verb = _basename(words[0])
+        if verb in ('pwsh', 'powershell'):
+            return ''
         if verb in _WRAPPERS:
-            return _wrapped_verb(words) or verb
+            verb = _wrapped_verb(words) or verb
+        if verb in _NO_SESSION_GRANT or verb in _INTERPRETERS:
+            return ''
+        if verb == 'git':
+            subcommand = _git_subcommand(str(raw or '').casefold()) or verb
+            if subcommand in {'clean', 'push', 'reset', 'checkout', 'switch',
+                              'commit', 'rebase', 'merge', 'tag'}:
+                return ''
+            return subcommand
         return verb
     return tool
 

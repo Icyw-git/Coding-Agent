@@ -163,7 +163,13 @@ def test_card_patch_gate_throttles_per_instance(tmp_path):
 
 
 def test_shell_timeout_returns_without_waiting_for_child_output(tmp_path, monkeypatch):
+    """这一条测的是超时回收（子进程还在睡也要立刻返回），不是审批。
+
+    `python -c` 在默认档要审批（exec_policy 的解释器载荷判定），所以这里显式
+    切到 danger-full-access，让判定层只剩黑名单。
+    """
     import tools
+    monkeypatch.setenv('HARNESS_SANDBOX_MODE', 'danger-full-access')
     monkeypatch.setattr(tools, 'BASH_TIMEOUT', 0.2)
     started = time.monotonic()
     result = tools.run_bash(f'"{sys.executable}" -c "import time; time.sleep(3)"', cwd=str(tmp_path))

@@ -280,27 +280,32 @@ class LarkTransport:
         # （exec_policy.approval_class）重算，展示与生效不会分叉。
         klass = approval_class(str(req.get('tool', '?')), req.get('args') or {})
         same_class = f'📌 本次会话允许同类（{klass}）' if klass else '📌 本次会话允许同类'
+        actions = [{
+            'tag': 'button',
+            'text': {'tag': 'plain_text', 'content': '✅ 允许'},
+            'type': 'primary',
+            'value': {'approval': req_id, 'allow': True},
+        }]
+        if klass:
+            actions.append({
+                'tag': 'button',
+                'text': {'tag': 'plain_text', 'content': same_class},
+                'type': 'primary',
+                'value': {'approval': req_id, 'allow': True, 'scope': 'session'},
+            })
+        actions.append({
+            'tag': 'button',
+            'text': {'tag': 'plain_text', 'content': '⛔ 拒绝'},
+            'type': 'danger',
+            'value': {'approval': req_id, 'allow': False},
+        })
         card = {
             'config': {'wide_screen_mode': True},
             'elements': [
                 {'tag': 'markdown',
                  'content': markdown_to_card_md(prompt_md)},
                 {'tag': 'hr'},
-                {'tag': 'action', 'actions': [
-                    {'tag': 'button',
-                     'text': {'tag': 'plain_text', 'content': '✅ 允许'},
-                     'type': 'primary',
-                     'value': {'approval': req_id, 'allow': True}},
-                    {'tag': 'button',
-                     'text': {'tag': 'plain_text', 'content': same_class},
-                     'type': 'primary',
-                     'value': {'approval': req_id, 'allow': True,
-                               'scope': 'session'}},
-                    {'tag': 'button',
-                     'text': {'tag': 'plain_text', 'content': '⛔ 拒绝'},
-                     'type': 'danger',
-                     'value': {'approval': req_id, 'allow': False}},
-                ]},
+                {'tag': 'action', 'actions': actions},
             ],
         }
         request = CreateMessageRequest.builder() \
@@ -746,6 +751,7 @@ class FeishuGateway:
             '/pwd                   查看当前会话工作区',
             '/model                  查看当前模型配置',
             '/approvals、/perms       查看待审批操作',
+            '/revoke                 撤销当前会话已允许的同类操作',
             '/sandbox [档位|approvals <档位>]  查看/切换执行与审批档位',
             '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
             '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
@@ -873,6 +879,16 @@ class FeishuGateway:
                     self._reply(chat_id, '(无待审批请求)')
                 for i, req in enumerate(pending, 1):
                     self._push_approval(chat_id, req, i)
+            elif command == '/revoke':
+                if argument:
+                    self._reply(chat_id, '用法: /revoke')
+                    return
+                try:
+                    count = self.api.revoke_permissions(self.bindings.get(chat_id))
+                except Exception as exc:
+                    self._reply(chat_id, f'[revoke] {exc}')
+                    return
+                self._reply(chat_id, f'已撤销 {count} 条当前会话预授权。')
             elif command == '/model':
                 self._reply(chat_id, f"当前模型: {os.getenv('LLM_MODEL_ID', '未配置')}\n"
                               f"服务地址: {os.getenv('LLM_BASE_URL', '默认地址')}")

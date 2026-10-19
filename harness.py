@@ -1,5 +1,34 @@
 import argparse
 import os
+
+# 执行/审批档位只认「启动进程时的真实环境」：项目根的 .env 就在工作区里，
+# write/edit 在默认档免审，Agent 改一行就能把下次启动的权限降到 never。
+# 所以先记住进程起来时环境里有什么，load_dotenv 之后再把这几个键换回去。
+POLICY_ENV_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
+                   'HARNESS_APPROVAL_ALL')
+_TRUSTED_POLICY_ENV = {key: os.environ[key] for key in POLICY_ENV_KEYS
+                       if key in os.environ}
+
+
+def enforce_trusted_policy_env() -> None:
+    """把档位键恢复成进程启动时的样子；.env 提供的档位一律忽略。
+
+    忽略时要说出来而不是悄悄回落：用户以为 `.env` 里写了 read-only，实际跑的是
+    默认档，等于一个反向的静默降级（与「档位名写错不静默回落」同一个原则）。
+    """
+    ignored = set()
+    for key in POLICY_ENV_KEYS:
+        if key in _TRUSTED_POLICY_ENV:
+            os.environ[key] = _TRUSTED_POLICY_ENV[key]
+        else:
+            if os.environ.get(key):      # 这个值只可能来自 dotenv 文件
+                ignored.add(key)
+            os.environ.pop(key, None)
+    if ignored:
+        print(f"[policy] 已忽略配置文件里的 {'、'.join(sorted(ignored))}"
+              f"（档位只认启动进程时的环境，运行中用 /sandbox 切换）", file=sys.stderr)
+
+
 from dotenv import load_dotenv
 import json
 import time
@@ -52,6 +81,7 @@ from perf import segment as perf_segment, record as perf_record, reset as perf_r
 
 
 load_dotenv()
+enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
 WORKDIR = Path(os.getcwd()).resolve()
 
 
@@ -335,6 +365,7 @@ def apply_sandbox_tier(argument: str) -> str:
     # 档位名大小写不敏感（load_policy 也是 casefold 读的）；分支判定同样要归一，
     # 否则 '/sandbox APPROVALS never' 校验通过却走进执行档位分支。
     parts = [part.casefold() for part in argument.split()]
+    previous = load_policy()
     if parts[0] == 'approvals':
         policy = set_tier(approval_policy=parts[1])
         changed = f'审批档位 → {policy.approval_policy}'
@@ -342,6 +373,10 @@ def apply_sandbox_tier(argument: str) -> str:
         policy = set_tier(sandbox_mode=parts[0])
         changed = f'执行档位 → {policy.sandbox_mode}'
     # 档位写进环境：load_policy 即时读取，下一条工具调用就生效，子进程也继承
+    if policy != previous:
+        # 换档本身就是一次安全状态变更：丢掉所有「本会话允许同类」预授权，
+        # 否则切到 read-only 还会吃到 workspace-write 时批下的键（/v1/policy 同理）
+        hooks.GATE.revoke_session()
     return (f'  已切换 {changed}'
             f'（当前 {policy.sandbox_mode} · {policy.approval_policy}）')
 
@@ -1008,6 +1043,10 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f'  已决议：{record.status} · {req.tool}')
         else:
             print(format_pending_approvals())
+
+    elif command == '/revoke':
+        count = hooks.GATE.revoke_session(hooks.current_session_id() or None)
+        print(f'  已撤销 {count} 条当前会话预授权。')
 
     elif command == '/compact':
         if not messages:

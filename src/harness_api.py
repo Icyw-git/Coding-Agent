@@ -68,6 +68,10 @@ if BaseModel is not None:
         # 调用方只能决定「允许吗、要不要扩到同类」，不能决定扩到哪一类。
 
 
+    class RevokePermissionRequest(BaseModel):
+        session_id: str | None = None
+
+
     class PolicyRequest(BaseModel):
         sandbox_mode: str | None = None       # 缺省表示不改这一档
         approval_policy: str | None = None
@@ -405,6 +409,11 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"request": record.to_dict()}
 
+    @app.post("/v1/permissions/revoke")
+    def revoke_permissions(request: RevokePermissionRequest):
+        """撤销一个会话的预授权；未指定会话时撤销全部。"""
+        return {"revoked": permission_gate.revoke_session(request.session_id)}
+
     @app.get('/v1/policy')
     def get_policy():
         """当前执行/审批档位；消息网关的 /sandbox 读这里。"""
@@ -413,11 +422,14 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     @app.post('/v1/policy')
     def change_policy(request: PolicyRequest):
         """运行时切档（写进服务端环境，对所有会话与后续工具调用立即生效）。"""
+        previous = load_policy()
         try:
             policy = set_tier(sandbox_mode=request.sandbox_mode,
                               approval_policy=request.approval_policy)
         except ValueError as exc:      # 打错档位名：400 说清可选值，绝不静默回落
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if policy != previous:
+            permission_gate.revoke_session()
         return {'policy': asdict(policy)}
 
     @app.post("/v1/sessions/{session_id}/messages")
