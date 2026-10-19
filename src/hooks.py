@@ -24,11 +24,12 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from agent_core import register_hook
 import approval_view
-from exec_policy import (READ_WRITE_TOOLS, approval_class, grant_key, load_policy,
+import checkpoints
+from exec_policy import (PATH_WORKSPACE, READ_ONLY_FILE_TOOLS, READ_WRITE_TOOLS,
+                         approval_class, classify_path, grant_key, load_policy,
                          session_allow_key)
 from tools import tool_registry
 
@@ -266,7 +267,8 @@ class PermissionGate:
         「同类」一律由服务端从登记时的参数重算（approval_class），不接受调用方
         传入：审批请求的 tool/args 才是这次要批准的内容，客户端再带一个 klass
         等于允许「批一个无害请求、顺手预授权 rm」这种提权写法。登记时的摘要保留
-        命令首尾（approval_view.summarize），首词一定还在，重算结果与发卡时一致。
+        命令首尾（approval_view.summarize），重算结果与发卡时一致；命令被截断时
+        省略标记会打断分段归类，这一类拿不到免审键 —— 没看全的命令不预授权。
         """
         with self._lock:
             req = self._requests.get(req_id)
@@ -345,7 +347,7 @@ class PermissionGate:
         没有「同类」可以记：卡片隐藏这个按钮，CLI 也不能摆一个不起作用的选项，
         否则用户以为自己买了整会话免审，其实只放了这一次。
         """
-        print(f"\n\033[33m⚠  {approval_view.safe_text(req.reason)}\033[0m")
+        print(f"\n\033[33m[approval] {approval_view.safe_text(req.reason)}\033[0m")
         print(f'   操作: {req.tool}')
         for line in approval_view.detail(req.tool, req.args).splitlines():
             print(f'     {line}')
@@ -404,14 +406,16 @@ def evaluate_call(tool: str, args: dict, policy=None):
     policy 可以传入已解析的档位快照，免得调用方（enforce）读一次环境、判定再读
     一次；省略时按当前环境即时解析。
     """
-    inside = True
-    if tool == 'read' or tool in READ_WRITE_TOOLS:
-        inside = _inside_workspace(str(args.get('path', '')), args.get('cwd'))
+    zone = PATH_WORKSPACE
+    if tool in READ_ONLY_FILE_TOOLS or tool in READ_WRITE_TOOLS:
+        # grep / ls / glob 的 path 缺省是工作区；用它参与分区判定，显式指向
+        # 秘密文件时同样在策略层硬拒。
+        zone = _path_zone(str(args.get('path') or '.'), args.get('cwd'))
     return (policy or load_policy()).evaluate(
         tool, args,
         deny_list=_h().DENY_LIST,
         destructive=_h().DESTRUCTIVE,
-        inside_workspace=inside,
+        path_zone=zone,
         external_tools=EXTERNAL_TOOLS)
 
 
@@ -428,7 +432,7 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     if decision.allowed:
         return None
     if decision.denied:
-        print(f'\n\033[31m⛔ Blocked: {decision.pattern or decision.reason}\033[0m')
+        print(f'\n\033[31m[blocked] {decision.pattern or decision.reason}\033[0m')
         return deny_message(decision)
     # untrusted 档的语义是「每条都问」，而会话白名单是一种预授权：命中它就等于
     # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单。
@@ -466,14 +470,10 @@ def deny_message(decision) -> str:
     return f'Error: {decision.reason}'
 
 
-def _inside_workspace(path: str, cwd: str | None = None) -> bool:
-    """与 tools.safe_path 同一套解析 —— 两处判定不一致时，批准了也会被路径检查拒绝。"""
-    try:
-        workspace = _h().get_workdir()
-        base = Path(cwd).resolve() if cwd else workspace
-        return (base / path).resolve().is_relative_to(workspace)
-    except (OSError, ValueError):
-        return False
+def _path_zone(path: str, cwd: str | None = None) -> str:
+    """与 tools.safe_path 同一套解析 —— 两处不一致时，批准后工具会写到另一个地方。"""
+    return classify_path(path, cwd=cwd, workspace=_h().get_workdir(),
+                         secrets=checkpoints.DEFAULT_SECRETS)
 
 
 def log_hook(tool:str,args:dict,output:str):
@@ -483,7 +483,7 @@ def log_hook(tool:str,args:dict,output:str):
 
 def large_output_hook(tool:str,args:dict,output:str):
     if len(str(output))>100000:
-        print(f"\033[33m[HOOK] ⚠ Large output from {tool}: {len(str(output))} chars\033[0m")
+        print(f"\033[33m[HOOK] Large output from {tool}: {len(str(output))} chars\033[0m")
     return None
 
 

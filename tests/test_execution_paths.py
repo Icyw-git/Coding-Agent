@@ -52,6 +52,9 @@ def env(monkeypatch, tmp_path):
                 if Config.session_id else None
 
     monkeypatch.setattr(hooks, '_h', lambda: Config)
+    # 路径解析也走同一个假工作区：策略层判「越界」、safe_path 落在别处，
+    # 这条路径就不再是同一个测试对象了。
+    monkeypatch.setattr(tools, '_h', lambda: Config)
     monkeypatch.setattr(GATE, 'backend', 'remote')
     monkeypatch.setattr(GATE, 'timeout', 0.2)
     GATE.clear()
@@ -169,6 +172,14 @@ def test_teammate_handler_is_gated_without_a_hook(env, monkeypatch):
     spawn.assert_not_called()
 
 
+def test_teammate_read_still_denies_secret_paths(env, tmp_path):
+    """teammate 跳过 PreToolUse：秘密文件的拒绝要在 run_read 边界上生效。"""
+    (tmp_path / 'ws' / '.env').write_text('TOKEN=1', encoding='utf-8')
+    _tools, handlers = agent_teams._build_team_tools('worker')
+    assert handlers['read']('.env') == 'Error: access to protected path (.env)'
+    assert not GATE.history(), '硬拒不产生审批请求'
+
+
 # ============================================================
 # 4：会话白名单分区
 # ============================================================
@@ -245,12 +256,52 @@ def test_run_bash_runs_an_already_approved_command(env, asks, monkeypatch):
     assert not GATE.pending()
 
 
-def test_run_write_refuses_outside_the_workspace_without_asking(env, tmp_path):
-    """旧实现先问一次「越界」再让 safe_path 报错——一个不起作用的按钮，现在硬拒。"""
-    assert tools.run_write('../evil.txt', 'boom') \
-        == 'Error: access outside workspace (../evil.txt)'
+def test_run_write_outside_workspace_asks_and_writes_where_the_card_said(env, tmp_path):
+    """越界写是一次可批准的询问：卡片显示路径，批准后必须真写到那个路径。"""
+    thread, out = _run_in_thread(lambda: tools.run_write('../outside.txt', 'ok'))
+    req = _await_pending()
+    assert req.tool == 'write'
+    assert 'outside workspace' in req.reason
+    GATE.resolve(req.req_id, True, by='test')
+    thread.join(timeout=2)
+    assert out['value'] == 'Wrote 2 bytes to ../outside.txt'
+    assert (tmp_path / 'outside.txt').read_text(encoding='utf-8') == 'ok'
+
+
+def test_run_write_outside_workspace_denied_leaves_no_file(env, tmp_path):
+    thread, out = _run_in_thread(lambda: tools.run_write('../evil.txt', 'boom'))
+    GATE.resolve(_await_pending().req_id, False, by='test')
+    thread.join(timeout=2)
+    assert out['value'] == 'Permission denied by user'
     assert not (tmp_path / 'evil.txt').exists()
+
+
+def test_run_read_allows_paths_outside_the_workspace(env, tmp_path):
+    """读是开放的：个人助手读项目外的文档不该先弹审批。"""
+    (tmp_path / 'notes.txt').write_text('outside notes', encoding='utf-8')
+    assert tools.run_read('../notes.txt') == 'outside notes'
+    assert not GATE.history()
+
+
+def test_file_tools_hard_deny_secret_paths_without_asking(env, tmp_path):
+    """秘密文件在策略层硬拒，连审批请求都不产生（按钮也不该给）。"""
+    (tmp_path / 'ws' / '.env').write_text('TOKEN=1', encoding='utf-8')
+    (tmp_path / 'id_rsa').write_text('PRIVATE', encoding='utf-8')
+
+    assert tools.run_read('.env') == 'Error: access to protected path (.env)'
+    assert tools.run_write('.env', 'TOKEN=2') \
+        == 'Error: access to protected path (.env)'
+    assert tools.run_read('../id_rsa') \
+        == 'Error: access to protected path (../id_rsa)'
     assert not GATE.history(), '硬拒不产生审批请求'
+
+
+def test_full_access_does_not_open_secret_paths(env, monkeypatch, tmp_path):
+    """完全自主档放开工作区边界，但秘密文件仍是硬拒。"""
+    monkeypatch.setenv('HARNESS_SANDBOX_MODE', 'danger-full-access')
+    (tmp_path / 'id_rsa').write_text('PRIVATE', encoding='utf-8')
+    assert tools.run_read('../id_rsa') \
+        == 'Error: access to protected path (../id_rsa)'
 
 
 def test_danger_full_access_actually_opens_the_boundary(env, monkeypatch, tmp_path):

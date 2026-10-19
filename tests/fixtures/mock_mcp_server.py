@@ -7,8 +7,9 @@
 运行：python mock_mcp_server.py  （被 .cache/mcp_servers.json 里的 command 拉起）
 """
 import asyncio
+
 from mcp import types
-from mcp.server import Server, InitializationOptions
+from mcp.server import InitializationOptions, Server
 from mcp.server.stdio import stdio_server
 
 TOOL_DEFS = [

@@ -3,11 +3,11 @@
 运行: python test_tool_parallel.py
 """
 import json
-import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 import test_context_manage as tcm
 from session_store import SessionEventStore

@@ -31,6 +31,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+
 from process_utils import close_process, kill_process_tree
 from sandbox import SandboxProcess, spawn_shell
 
@@ -254,12 +255,12 @@ class TaskManager:
         path = self.root / f'{record.id}.json'
         payload = json.dumps(asdict(record), ensure_ascii=False, indent=2)
         # 唯一临时名：并发写者（不同 manager 实例/线程）互不踩踏；Windows 上
-        # os.replace 目标被短暂占用（杀毒/索引器）时退避重试。
+        # Path.replace 目标被短暂占用（杀毒/索引器）时退避重试。
         tmp = path.with_name(f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
         for attempt in range(3):
             try:
                 tmp.write_text(payload, encoding='utf-8')
-                os.replace(tmp, path)
+                tmp.replace(path)
                 return
             except PermissionError:
                 if attempt == 2:

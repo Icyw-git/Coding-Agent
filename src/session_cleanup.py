@@ -1,8 +1,8 @@
 """Recoverable session archival. Never touches workspace files."""
 
-import time
 import shutil
 import stat
+import time
 from pathlib import Path
 
 from session_store import SessionEventStore

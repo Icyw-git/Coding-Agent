@@ -175,7 +175,7 @@ def test_approval_dispatch_bypasses_chat_lock(tmp_path):
 
     gw = FeishuGateway(API(), bindings_path=tmp_path / 'bindings.json')
     called = threading.Event()
-    gw.on_message = lambda chat_id, text, sender_id=None: called.set()
+    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None: called.set()
     lock = gw._chat_lock('c1')
     lock.acquire()
     try:
@@ -378,7 +378,7 @@ def test_card_button_resolves_permission(gateway):
     gw.poll_permissions()
 
     text, ok = gw.handle_card_action(
-        'ou_me', {'approval': req_id, 'allow': True}, 'om_1')
+        'ou_me', {'approval': req_id, 'allow': True}, 'om_1', chat_id='c1')
     assert ok and '已允许' in text
     thread.join(timeout=2)
     assert results['allowed'] is True
@@ -413,20 +413,156 @@ def test_card_button_respects_allowlist(api_app, tmp_path, monkeypatch):
                 break
             time.sleep(0.02)
         req_id = permission_gate.pending()[0].req_id
+        gw.bindings['c1'] = 'session-allowlist'
+        gw.poll_permissions()   # 推送并登记 FIFO，按钮才有归属
 
         text, ok = gw.handle_card_action(
-            'ou_stranger', {'approval': req_id, 'allow': True}, 'om_1')
+            'ou_stranger', {'approval': req_id, 'allow': True}, 'om_1',
+            chat_id='c1')
         assert not ok and '没有审批权限' in text
         assert results == {}    # waiter 仍阻塞，未决议
 
         text, ok = gw.handle_card_action(
-            'ou_me', {'approval': req_id, 'allow': False}, 'om_1')
+            'ou_me', {'approval': req_id, 'allow': False}, 'om_1',
+            chat_id='c1')
         assert ok
         thread.join(timeout=2)
         assert results['allowed'] is False
     finally:
         api.close()
         monkeypatch.setattr(permission_gate, 'backend', 'console')
+
+
+def test_group_messages_are_ignored_by_default(gateway):
+    """个人助手只收单聊：群聊/话题群不建会话、不回复；p2p 正常。"""
+    gw, fake = gateway
+    gw.on_message('g1', 'hello', sender_id='ou_me', chat_type='group')
+    gw.on_message('g1', 'hello', sender_id='ou_me', chat_type='topic')
+    assert gw.bindings == {}
+    assert fake.sent == []
+
+    gw.on_message('g1', 'hello', sender_id='ou_me', chat_type='p2p')
+    assert 'agent-reply-ok' in fake.last()
+    assert gw.bindings['g1']
+
+
+def test_dispatch_forwards_chat_type(tmp_path):
+    """分发队列要把来源带过去；否则群消息在 worker 里丢掉 chat_type 就漏检。"""
+    gw = FeishuGateway(object(), bindings_path=tmp_path / 'bindings.json')
+    seen = []
+    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None: \
+        seen.append((chat_id, text, chat_type))
+    gw.start_dispatcher(workers=1)
+    try:
+        gw.dispatch('g1', 'hello', sender_id='ou_me', chat_type='group')
+        gw._events.join()
+    finally:
+        gw.stop()
+    assert seen == [('g1', 'hello', 'group')]
+
+
+def test_approvals_route_only_to_the_bound_session_chat(gateway):
+    """审批只推给绑定其登记会话的聊天；/perms 也不能列出别人的请求。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    sid_a = gw.api.create_session()
+    sid_b = gw.api.create_session()
+    gw.bindings.update({'c1': sid_a, 'c2': sid_b})
+    fake.sent.clear()
+
+    req = permission_gate.request('bash', {'command': 'del x'}, 'destructive',
+                                  session_id=sid_a)
+    try:
+        gw.poll_permissions()
+        assert any(chat_id == 'c1' for chat_id, _ in fake.sent)
+        assert all(chat_id != 'c2' for chat_id, _ in fake.sent)
+        assert req.req_id in gw._chat_pending['c1']
+        assert req.req_id not in gw._chat_pending.get('c2', [])
+
+        # /perms 同样按会话过滤：c2 看不到 c1 的请求，也不会登记进它的 FIFO
+        fake.sent.clear()
+        gw.on_message('c2', '/perms')
+        assert fake.last() == '(无待审批请求)'
+        assert req.req_id not in gw._chat_pending.get('c2', [])
+    finally:
+        permission_gate.resolve(req.req_id, False, by='test')
+
+
+def test_approval_cannot_be_resolved_from_another_chat(gateway):
+    """卡片按钮和 /approve <id> 都要求请求已推给本聊天。"""
+    gw, fake = gateway
+    _drain_stale_permissions()
+    sid_a = gw.api.create_session()
+    sid_b = gw.api.create_session()
+    gw.bindings.update({'c1': sid_a, 'c2': sid_b})
+    req = permission_gate.request('bash', {'command': 'del x'}, 'destructive',
+                                  session_id=sid_a)
+    try:
+        gw.poll_permissions()   # 只推给 c1
+
+        text, ok = gw.handle_card_action(
+            'ou_me', {'approval': req.req_id, 'allow': True}, 'om_1',
+            chat_id='c2')
+        assert not ok and '不属于当前聊天' in text
+        assert req.status == 'pending'
+
+        fake.sent.clear()
+        gw.on_message('c2', f'/approve {req.req_id} y')
+        assert '不属于当前聊天' in fake.last()
+        assert req.status == 'pending'
+
+        text, ok = gw.handle_card_action(
+            'ou_me', {'approval': req.req_id, 'allow': True}, 'om_2',
+            chat_id='c1')
+        assert ok and req.status == 'approved'
+    finally:
+        if req.status == 'pending':
+            permission_gate.resolve(req.req_id, False, by='test')
+
+
+def test_main_refuses_to_start_without_allowlist(monkeypatch, capsys):
+    """没配置白名单就拒绝启动，不把“谁都能用真 shell”当默认。"""
+    monkeypatch.setenv('FEISHU_APP_ID', 'cli_x')
+    monkeypatch.setenv('FEISHU_APP_SECRET', 'secret')
+    monkeypatch.setenv('HARNESS_API_TOKEN', 't')
+    monkeypatch.setenv('FEISHU_ALLOWED_USERS', '')
+    monkeypatch.setenv('FEISHU_ALLOW_ANY_USER', '')
+    assert feishu_gateway.main() == 1
+    assert 'FEISHU_ALLOWED_USERS is required' in capsys.readouterr().out
+
+
+def test_main_allows_explicit_any_user_escape_hatch(monkeypatch):
+    """本地测试可显式放开；启动后仍照常构造网关。"""
+    monkeypatch.setenv('FEISHU_APP_ID', 'cli_x')
+    monkeypatch.setenv('FEISHU_APP_SECRET', 'secret')
+    monkeypatch.setenv('HARNESS_API_TOKEN', 't')
+    monkeypatch.setenv('FEISHU_ALLOWED_USERS', '')
+    monkeypatch.setenv('FEISHU_ALLOW_ANY_USER', '1')
+    seen = {}
+
+    class FakeApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            seen['closed'] = True
+
+    class FakeGateway:
+        def __init__(self, api, transport=None, allowed_users=None):
+            seen['allowed'] = allowed_users
+
+        def run(self, app_id, app_secret):
+            seen['ran'] = True
+
+        def stop(self):
+            seen['stopped'] = True
+
+    monkeypatch.setattr(feishu_gateway, 'GatewayClient', FakeApi)
+    monkeypatch.setattr(feishu_gateway, 'LarkTransport', lambda *a, **k: None)
+    monkeypatch.setattr(feishu_gateway, 'FeishuGateway', FakeGateway)
+    assert feishu_gateway.main() == 0
+    assert seen == {'allowed': None, 'ran': True, 'stopped': True,
+                    'closed': True}
 
 
 def test_lark_transport_sends_text(monkeypatch):

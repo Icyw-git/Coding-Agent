@@ -1,14 +1,14 @@
 import threading
 
-import pytest
 import httpx
+import pytest
 
 from agent_runtime import AgentRuntime
-from session_store import SessionEventStore
-from harness_api import create_app
-from gateway_sim import GatewayClient
 from feishu_gateway import FeishuGateway
-from test_feishu_gateway import _sync_asgi_transport, FakeTransport
+from gateway_sim import GatewayClient
+from harness_api import create_app
+from session_store import SessionEventStore
+from test_feishu_gateway import FakeTransport, _sync_asgi_transport
 
 
 @pytest.fixture

@@ -3,7 +3,7 @@
 import json
 import os
 
-from agent_core import trigger_hooks, _extract_text
+from agent_core import _extract_text, trigger_hooks
 from tools import TOOLS, tool_registry
 
 

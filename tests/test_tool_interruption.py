@@ -64,8 +64,8 @@ def test_history_repairs_old_gap_without_writing_or_closing_active_tail(tmp_path
 
 
 def test_gateway_reads_then_streams_legacy_broken_history(tmp_path):
-    from harness_api import create_app
     from gateway_sim import GatewayClient
+    from harness_api import create_app
     from test_feishu_gateway import _sync_asgi_transport
 
     def run_turn(messages, session_store, on_delta=None):

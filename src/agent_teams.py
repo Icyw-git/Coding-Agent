@@ -108,7 +108,7 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
     """teammate 工具集 = harness 核心工具子集 + send_message/submit_plan + 任务工具。
 
     wt_ctx：{'path': str|None} 当前任务 worktree 目录；非空时 bash/read/write/edit
-    在 worktree 内执行（隔离），认领/完成任务时切换/清空。
+    与 glob/grep/ls 在 worktree 内执行（隔离），认领/完成任务时切换/清空。
     harness 懒导入（在 spawn 时才 import），避免模块级循环导入。
     """
     import harness
@@ -118,7 +118,7 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
         p = wt_ctx.get('path')
         return str(p) if p else None
 
-    names = ['bash', 'read', 'write', 'edit', 'glob']
+    names = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'ls']
     tools = [t for t in harness.TOOLS if t['function']['name'] in names]
     tools.append({
         'type': 'function',
@@ -212,9 +212,23 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
     def safe_edit(path: str, old_text: str, new_text: str) -> str:
         return harness.tool_registry['edit'](path, old_text, new_text, cwd=_wt_cwd())
 
+    def safe_glob(pattern: str, path: str = None) -> str:
+        return harness.tool_registry['glob'](pattern, path, cwd=_wt_cwd())
+
+    def safe_grep(pattern: str, path: str = '.', glob: str = None,
+                  case_insensitive: bool = False, max_results: int = 100) -> str:
+        return harness.tool_registry['grep'](
+            pattern, path, glob, case_insensitive, max_results, cwd=_wt_cwd())
+
+    def safe_ls(path: str = '.', all: bool = False) -> str:
+        return harness.tool_registry['ls'](path, all, cwd=_wt_cwd())
+
     handlers['read'] = safe_read
     handlers['write'] = safe_write
     handlers['edit'] = safe_edit
+    handlers['glob'] = safe_glob
+    handlers['grep'] = safe_grep
+    handlers['ls'] = safe_ls
 
     def send_message(to: str = 'lead', content: str = ''):
         BUS.send(agent_name, to, content, 'message')

@@ -4,15 +4,18 @@
 import ast
 import json
 import os
+import re
 import subprocess
 import tempfile
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Optional, List
 
 import sandbox
+import checkpoints
 from process_utils import close_process, kill_process_tree
 
-from exec_policy import load_policy
+from exec_policy import is_secret_path, resolve_tool_path
 from task_system import create_task, list_tasks, get_task, claim_task, complete_task
 from cron_scheduler import schedule_job, cancel_job, cron_lock, scheduled_jobs
 from agent_teams import spawn_teammate_thread, BUS
@@ -63,13 +66,13 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"read",
-        "description":"Read the contents of a file in the workspace",
+        "description":"Read a file. Absolute paths and paths outside the workspace are allowed; protected secret files are denied.",
         "parameters":{
             "type":"object",
             "properties":{
                 "path":{
                     "type":"string",
-                    "description":"Relative path to the file from the workspace root"
+                    "description":"File path: relative to the workspace (or cwd), or absolute"
                 },
                 "limit":{
                     "type":"integer",
@@ -87,13 +90,13 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"write",
-        "description":"Write content to a file in the workspace",
+        "description":"Write a file. Workspace paths are written directly; paths outside the workspace require approval.",
         "parameters":{
             "type":"object",
             "properties":{
                 "path":{
                     "type":"string",
-                    "description":"Relative path to the file from the workspace root"
+                    "description":"File path: relative to the workspace (or cwd), or absolute"
                 },
                 "content":{
                     "type":"string",
@@ -112,13 +115,13 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"edit",
-        "description":"Replace a unique text fragment in a workspace file",
+        "description":"Replace a unique text fragment in a file. Paths outside the workspace require approval.",
         "parameters":{
             "type":"object",
             "properties":{
                 "path":{
                     "type":"string",
-                    "description":"Relative path to the file from the workspace root"
+                    "description":"File path: relative to the workspace (or cwd), or absolute"
                 },
                 "old_text":{
                     "type":"string",
@@ -142,18 +145,79 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"glob",
-        "description":"List files in the workspace matching a glob pattern",
+        "description":"List files matching a glob pattern. Read-only; the root may be outside the workspace.",
         "parameters":{
             "type":"object",
             "properties":{
                 "pattern":{
                     "type":"string",
-                    "description":"Glob pattern, e.g. '*.py' or 'src/**/*.ts'"
+                    "description":"Glob pattern relative to the root, e.g. '*.py' or 'src/**/*.ts'"
+                },
+                "path":{
+                    "type":"string",
+                    "description":"Root directory (or file). Relative to the workspace/cwd, or absolute; defaults to the workspace"
                 }
             },
             "required":[
                 "pattern"
             ]
+
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"grep",
+        "description":"Search file contents with a regular expression. Read-only; protected secret files are skipped.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "pattern":{
+                    "type":"string",
+                    "description":"Python regular expression to search for"
+                },
+                "path":{
+                    "type":"string",
+                    "description":"File or directory to search. Relative to the workspace/cwd, or absolute; defaults to the workspace"
+                },
+                "glob":{
+                    "type":"string",
+                    "description":"Only search files matching this glob, e.g. '*.py' or 'src/**/*.ts'"
+                },
+                "case_insensitive":{
+                    "type":"boolean",
+                    "description":"Case-insensitive matching (default false)"
+                },
+                "max_results":{
+                    "type":"integer",
+                    "description":"Maximum matching lines to return (default 100, capped at 1000)"
+                }
+            },
+            "required":[
+                "pattern"
+            ]
+
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"ls",
+        "description":"List a directory. Read-only; the path may be outside the workspace.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "path":{
+                    "type":"string",
+                    "description":"Directory or file to list. Relative to the workspace/cwd, or absolute; defaults to the workspace"
+                },
+                "all":{
+                    "type":"boolean",
+                    "description":"Include hidden entries (default false)"
+                }
+            }
 
         }
     }
@@ -467,15 +531,13 @@ def run_bash(command:str, cwd: str = None)->str:
         close_process(proc)
 
 def safe_path(p: str, cwd: str = None) -> Path:
-    workspace = _h().get_workdir()
-    base = Path(cwd) if cwd else workspace
-    path = (base / p).resolve()
-    # danger-full-access 档必须在这里也生效：否则「全量访问」档位对文件工具是个
-    # 不起作用的按钮（bash 早就能读任意路径），策略层与路径检查也会给出相反结论。
-    if not path.is_relative_to(workspace) \
-            and load_policy().sandbox_mode != 'danger-full-access':
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+    """解析工具路径。
+
+    能不能读/写由 _gate_file（无头路径）和 PreToolUse hook 判定，这里不再按
+    工作区做二次拦截：读可以越界；越界写在审批通过后也必须落到卡片上显示的
+    那个路径，否则按钮仍然不起作用。路径解析与 hooks._path_zone 共用同一份。
+    """
+    return resolve_tool_path(p, cwd=cwd, workspace=_h().get_workdir())
 
 def _capture_checkpoint(path: Path) -> None:
     """把「写入前」的内容交给当前活跃 checkpoint 节点；无活跃 manager 时静默跳过。"""
@@ -484,6 +546,11 @@ def _capture_checkpoint(path: Path) -> None:
         manager.capture_pre_image(path)
 
 def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
+    # 读默认放行，但秘密路径是硬拒；teammate 等无头路径不走 PreToolUse，
+    # 边界上必须自己判一次。
+    denied = _gate_file('read', path, cwd)
+    if denied:
+        return denied
     try:
         lines = safe_path(path, cwd).read_text(encoding='utf-8', errors='replace').splitlines()
         if limit is None and len(lines) > 500:
@@ -525,15 +592,152 @@ def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def run_glob(pattern: str) -> str:
+MAX_SEARCH_BYTES = 2 * 1024 * 1024
+_SEARCH_IGNORE = frozenset(checkpoints.DEFAULT_IGNORE) | {
+    'node_modules', '.venv', 'venv', '.tox', '.mypy_cache'}
+
+
+def _search_root(path: str, cwd: str | None) -> tuple[Path | None, str | None]:
+    """只读搜索工具的根路径：显式秘密路径先拒，其余与 read 共用同一解析。"""
+    denied = _gate_file('read', path, cwd)
+    if denied:
+        return None, denied
     try:
-        base = _h().get_workdir()
-        if '**' in pattern:
-            matches = [p for p in base.rglob(pattern) if p.is_file() and p.resolve().is_relative_to(base)]
-        else:
-            matches = [p for p in base.glob(pattern) if p.is_file() and p.resolve().is_relative_to(base)]
-        results = sorted(str(p.relative_to(base)) for p in matches)
+        return safe_path(path, cwd), None
+    except Exception as exc:
+        return None, f'Error: {exc}'
+
+
+def _secret_file(path: Path) -> bool:
+    """按最终目标判断：名为 notes.txt 的链接指向 .env 时，同样不能搜内容。"""
+    if is_secret_path(path, checkpoints.DEFAULT_SECRETS):
+        return True
+    if path.is_symlink():
+        try:
+            return is_secret_path(path.resolve(), checkpoints.DEFAULT_SECRETS)
+        except OSError:
+            return True
+    return False
+
+
+def _search_files(root: Path):
+    """遍历搜索根；跳过忽略目录、指向目录的链接与秘密文件。"""
+    if root.is_file():
+        if not _secret_file(root):
+            yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if name not in _SEARCH_IGNORE
+            and not (Path(dirpath) / name).is_symlink())
+        for name in sorted(filenames):
+            candidate = Path(dirpath) / name
+            if candidate.is_file() and not _secret_file(candidate):
+                yield candidate
+
+
+def _match_search_glob(path: Path, root: Path, pattern: str | None) -> bool:
+    if not pattern:
+        return True
+    if '/' in pattern or '\\' in pattern:
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+        return fnmatchcase(rel, pattern.replace('\\', '/'))
+    return fnmatchcase(path.name, pattern)
+
+
+def run_glob(pattern: str, path: str = None, cwd: str = None) -> str:
+    root, error = _search_root(path or '.', cwd)
+    if error:
+        return error
+    try:
+        if not root.exists():
+            return f'Error: path not found: {path}'
+        matches = [p for p in root.glob(pattern) if p.is_file()]
+        results = sorted(str(p.relative_to(root)) for p in matches)
         return "\n".join(results) if results else "(no matches)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_grep(pattern: str, path: str = '.', glob: str = None,
+             case_insensitive: bool = False, max_results: int = 100,
+             cwd: str = None) -> str:
+    """按正则搜索文件内容，返回 `path:line: text`。
+
+    只读工具：根路径走 read 的分区判定；目录遍历跳过秘密文件与常见忽略目录。
+    二进制与超过 MAX_SEARCH_BYTES 的文件不搜，避免把一次检索变成整盘扫描。
+    """
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if case_insensitive else 0)
+    except re.error as exc:
+        return f'Error: invalid pattern: {exc}'
+    root, error = _search_root(path, cwd)
+    if error:
+        return error
+    if not root.exists():
+        return f'Error: path not found: {path}'
+    limit = max(1, min(int(max_results), 1000))
+    hits: list[str] = []
+    try:
+        for candidate in _search_files(root):
+            if not _match_search_glob(candidate, root, glob):
+                continue
+            try:
+                if candidate.stat().st_size > MAX_SEARCH_BYTES:
+                    continue
+                data = candidate.read_bytes()
+            except OSError:
+                continue
+            if b'\x00' in data[:4096]:
+                continue
+            text = data.decode('utf-8', errors='replace')
+            try:
+                display = str(candidate.relative_to(root)) \
+                    if root.is_dir() else str(root)
+            except ValueError:
+                display = str(candidate)
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if not regex.search(line):
+                    continue
+                if len(line) > 400:
+                    line = line[:400] + '…'
+                hits.append(f'{display}:{lineno}: {line}')
+                if len(hits) >= limit:
+                    return '\n'.join(hits) + f'\n(truncated at {limit} matches)'
+    except Exception as e:
+        return f'Error: {e}'
+    return '\n'.join(hits) if hits else "(no matches)"
+
+
+def run_ls(path: str = '.', all: bool = False, cwd: str = None) -> str:
+    """列目录（只读）。隐藏项需要 all=True；路径可以在工作区外。"""
+    root, error = _search_root(path, cwd)
+    if error:
+        return error
+    try:
+        if not root.exists():
+            return f'Error: path not found: {path}'
+        if root.is_file():
+            return f'f  {root.name}  {root.stat().st_size} B'
+        if not root.is_dir():
+            return f'Error: not a file or directory: {path}'
+        rows = []
+        for item in sorted(root.iterdir(),
+                           key=lambda p: (not p.is_dir(), p.name.lower())):
+            if not all and item.name.startswith('.'):
+                continue
+            try:
+                if item.is_dir():
+                    rows.append(f'd  {item.name}/')
+                else:
+                    rows.append(f'f  {item.name}  {item.stat().st_size} B')
+            except OSError:
+                rows.append(f'?  {item.name}')
+        return "\n".join(rows) if rows else "(empty)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -680,7 +884,7 @@ def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
-tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'todo_write':run_todo_write,
+tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'grep':run_grep,'ls':run_ls,'todo_write':run_todo_write,
                'create_task':run_create_task,'list_tasks':run_list_tasks,'get_task':run_get_task,
                'claim_task':run_claim_task,'complete_task':run_complete_task,
                'schedule_cron':run_schedule_cron,'list_crons':run_list_crons,'cancel_cron':run_cancel_cron,

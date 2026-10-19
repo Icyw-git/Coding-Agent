@@ -9,7 +9,6 @@ from approval_view import detail, safe_text, summarize
 from exec_policy import approval_class
 from hooks import GATE as permission_gate
 
-
 # ============================================================
 # 登记摘要：命令留头尾，其余字段限长
 # ============================================================
@@ -20,8 +19,9 @@ def test_long_command_keeps_both_ends():
     assert text.startswith('rm -rf aaa')
     assert text.endswith('authorized_keys')
     assert '中间省略' in text
-    # 「本次会话允许同类」的键取命令首词：摘要后仍然是 rm
-    assert approval_class('bash', {'command': text}) == 'rm'
+    # 截断意味着审批人没看到全貌：不提供「本次会话允许同类」。
+    # 省略标记独占一行，按段归类时与头尾不一致，判定键自然为空。
+    assert approval_class('bash', {'command': text}) == ''
 
 
 def test_short_command_passes_through_and_other_fields_stay_bounded():

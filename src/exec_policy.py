@@ -9,8 +9,9 @@
     sandbox_mode     read-only | workspace-write(默认) | danger-full-access
     approval_policy  untrusted | on-request(默认) | never
 
-    workspace-write + on-request = 重构前的实际行为：黑名单硬拒、破坏性命令询问、
-                                   工作区内文件工具读写放行、越界文件工具硬拒。
+    workspace-write + on-request = 黑名单硬拒、破坏性命令询问、工作区内文件工具读写
+                                   放行、工作区外写改询问、秘密文件读写硬拒、
+                                   外发网络请求询问。
                                    shell 命令是文本启发式，不能保证写入路径受工作区约束。
 
 调用方负责注入黑名单（hooks / tools 从 harness 读），本模块不 import harness，
@@ -20,13 +21,32 @@
 import os
 import re
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from pathlib import Path
 
 ALLOW = 'allow'
 ASK = 'ask'
 DENY = 'deny'
 
+# 文件工具的路径分区：
+#   workspace — 当前工作区内，写改免审（read-only 档仍要审批）
+#   outside   — 工作区外，可读；写改需审批
+#   secret    — 秘密文件，读写都硬拒（与工作区位置无关）
+#   system    — 系统目录，默认档只读；写改硬拒（danger-full-access 才放开）
+#   invalid   — 路径本身解析不了（空字节、符号链接环），拒绝而不是让 hook 抛异常
+PATH_WORKSPACE = 'workspace'
+PATH_OUTSIDE = 'outside'
+PATH_SECRET = 'secret'
+PATH_SYSTEM = 'system'
+PATH_INVALID = 'invalid'
+
 SANDBOX_MODES = ('read-only', 'workspace-write', 'danger-full-access')
 APPROVAL_POLICIES = ('untrusted', 'on-request', 'never')
+
+# 公开的秘密文件模板：命中 DEFAULT_SECRETS 的通配但不算凭证（见 is_secret_path）。
+PUBLIC_SECRET_NAMES = frozenset({
+    '.env.example', '.env.sample', '.env.template', '.env.dist', '.env.defaults',
+})
 
 SANDBOX_ENV = 'HARNESS_SANDBOX_MODE'
 APPROVAL_ENV = 'HARNESS_APPROVAL_POLICY'
@@ -71,6 +91,28 @@ _STRIP_QUOTES = re.compile(r'["\'`]')
 _ROOT_DELETE_FLAGS = ('--no-preserve-root', '-rf /', '-fr /')
 
 READ_WRITE_TOOLS = ('write', 'edit')
+# 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
+READ_ONLY_FILE_TOOLS = ('read', 'glob', 'grep', 'ls')
+
+# 外发命令：读已经按路径放开，「发得出去」就是这一轮新增的唯一能力面。
+# 这里不问「这个 GET 危不危险」，只保证本机内容离开本机必须经过人同意；
+# 名单刻意保守，只收公认的一次性网络客户端，不追求穷尽（python/node 的载荷
+# 已经由 _opaque_payload 走审批）。
+EGRESS_COMMANDS = frozenset({
+    'curl', 'wget', 'http', 'https', 'aria2c', 'nc', 'netcat', 'telnet',
+    'invoke-webrequest', 'iwr', 'invoke-restmethod', 'irm',
+})
+_URL_TARGET = re.compile(r'(?:https?|ftp|ws|wss)://(?:[^/@\s]+@)?([^/?#\s]+)',
+                        re.IGNORECASE)
+# 带内容或改方法的请求。这类命令即使目标是同一台主机也不记「同类」：
+# 批准一次 GET 就免审整会话向该主机发任意文件/任意方法，是一条完整的外传通路。
+# `-x` 在 curl 里是代理、在部分客户端里是方法，大小写折叠后一并从严。
+EGRESS_SEND_FLAGS = frozenset({
+    '-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--json',
+    '-f', '--form', '--form-string', '-t', '--upload-file',
+    '-body', '-infile', '--post-data', '--post-file',
+    '-x', '--request',
+})
 WORKTREE_TOOLS = {'create_worktree': 'create worktree',
                   'remove_worktree': 'remove worktree',
                   'keep_worktree': 'keep worktree'}
@@ -80,7 +122,7 @@ WORKTREE_TOOLS = {'create_worktree': 'create worktree',
 class Decision:
     """一次工具调用的策略结论。code 是给日志/测试用的稳定标识，reason 给人看。"""
     action: str                     # ALLOW | ASK | DENY
-    code: str = ''                  # deny_pattern | destructive | out_of_workspace | ...
+    code: str = ''                  # deny_pattern | destructive | outside_workspace_write | ...
     reason: str = ''
     pattern: str = ''               # 命中的黑名单条目（用于还原既有拒绝文案）
 
@@ -101,14 +143,17 @@ class Policy:
 
     def evaluate(self, tool: str, args: dict, *,
                  deny_list=(), destructive=(),
-                 inside_workspace: bool = True,
+                 path_zone: str = PATH_OUTSIDE,
                  external_tools=()) -> Decision:
         """判定一次工具调用。
 
         deny_list / destructive 由调用方注入（生产上来自 harness 模块全局，
-        测试里是自带的假列表）；inside_workspace 由已经解析过路径的调用方给出，
-        本模块不重复实现路径逻辑。ASK 之后是问人还是直接拒，由调用方按自己是否
-        处在可交互上下文里决定，本模块不关心。
+        测试里是自带的假列表）；path_zone 由调用方用 classify_path 解析后给出，
+        本模块不重复实现路径逻辑。省略 path_zone 时按 outside 处理：漏判分类的
+        文件写入走审批，而不是因为默认「在工作区内」被静默放行。
+
+        ASK 之后是问人还是直接拒，由调用方按自己是否处在可交互上下文里决定，
+        本模块不关心。
 
         external_tools 是调用方登记的第三方工具名（MCP 注册进来的那批）。本模块
         只认识内置工具的副作用，第三方工具能写盘、能发请求，内容静态不可知 ——
@@ -118,8 +163,8 @@ class Policy:
         if tool == 'bash':
             decision = self._evaluate_bash(str(args.get('command', '') or ''),
                                            deny_list, destructive)
-        elif tool in READ_WRITE_TOOLS or tool == 'read':
-            decision = self._evaluate_file(tool, args, inside_workspace)
+        elif tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
+            decision = self._evaluate_file(tool, args, path_zone)
         elif tool in WORKTREE_TOOLS:
             decision = self._evaluate_worktree(tool, args)
         elif tool in external_tools:
@@ -185,7 +230,19 @@ class Policy:
             return Decision(ASK, 'opaque_command',
                             f'opaque command payload ({opaque})')
 
-        # 6) read-only 档：只放公认不改动的命令
+        # 6) 询问：外发网络请求。GET 也算——边界问的不是「这个请求危不危险」，
+        #    而是「本机要不要把东西交出去」；读放开之后，没有这一条就等于把
+        #    exfiltration 通道留在审批面之外。排在载荷判定之后，是因为
+        #    `curl … | sh` 更需要「远程脚本」这个标签，而不是「一次请求」。
+        egress = verbs & EGRESS_COMMANDS
+        if egress:
+            hosts = egress_hosts(command)
+            target = f'to {", ".join(sorted(hosts))}' if hosts \
+                else 'to an unrecognized destination'
+            return Decision(ASK, 'network_egress',
+                            f'outbound network request ({sorted(egress)[0]} {target})')
+
+        # 7) read-only 档：只放公认不改动的命令
         if self.sandbox_mode == 'read-only' and not _looks_read_only(normalized, verbs):
             return Decision(ASK, 'sandbox_read_only',
                             'sandbox is read-only; command may modify state')
@@ -193,21 +250,31 @@ class Policy:
 
     # ---------- 文件工具 ----------
 
-    def _evaluate_file(self, tool: str, args: dict, inside_workspace: bool) -> Decision:
+    def _evaluate_file(self, tool: str, args: dict, path_zone: str) -> Decision:
+        path = str(args.get('path', '') or '')
+        if path_zone == PATH_INVALID:
+            return Decision(DENY, 'invalid_path', f'invalid path ({path})')
+        if path_zone == PATH_SECRET:
+            return Decision(DENY, 'secret_path',
+                            f'access to protected path ({path})')
+        # 系统目录是防误操作，不是数据保护：完全自主档可以写，默认档不允许
+        # 一次「批准」就把文件写进 Windows / Program Files。
+        if path_zone == PATH_SYSTEM:
+            if tool in READ_ONLY_FILE_TOOLS or self.sandbox_mode == 'danger-full-access':
+                return Decision(ALLOW)
+            return Decision(DENY, 'system_path',
+                            f'write to protected system path ({path})')
         if self.sandbox_mode == 'danger-full-access':
             return Decision(ALLOW)
-        if not inside_workspace:
-            # 工作区边界是 tools.safe_path 的硬检查，批准也改不了结果。旧实现先问
-            # 一次「越界访问」再让 safe_path 报错，等于给用户一个不起作用的按钮：
-            # 这里直接判硬拒，确需越界读写请切 danger-full-access 档。
-            path = str(args.get('path', '') or '')
-            return Decision(DENY, 'out_of_workspace',
-                            f'access outside workspace ({path})')
-        if tool == 'read':
+        if tool in READ_ONLY_FILE_TOOLS:
+            # 读是开放的：项目外的文档、日志、配置本来就是个人助手的日常输入。
             return Decision(ALLOW)
         if self.sandbox_mode == 'read-only':
             return Decision(ASK, 'sandbox_read_only',
                             f'sandbox is read-only; {tool} needs approval')
+        if path_zone == PATH_OUTSIDE:
+            return Decision(ASK, 'outside_workspace_write',
+                            f'write outside workspace needs approval ({path})')
         return Decision(ALLOW)
 
     # ---------- worktree ----------
@@ -307,6 +374,79 @@ def _warn(message: str) -> None:
 
 
 # ============================================================
+# 路径分类（文件工具与策略层共用）
+# ============================================================
+
+def resolve_tool_path(path: str, *, cwd=None, workspace) -> Path:
+    """把工具参数解析成绝对路径。
+
+    相对路径基于 cwd（会话/工作树），没有 cwd 时基于工作区；`~` 按用户目录
+    展开。先 resolve 再判分区，符号链接/junction 指向哪里就按哪里算。
+    """
+    base = Path(cwd).expanduser().resolve() if cwd else Path(workspace).resolve()
+    candidate = Path(path).expanduser()
+    return (candidate if candidate.is_absolute() else base / candidate).resolve()
+
+
+def is_secret_path(path, secrets=()) -> bool:
+    """文件名是否命中秘密列表（大小写不敏感，与 Windows 文件名语义一致）。
+
+    `.env.*` 会连 `.env.example` 这类公开模板一起盖住；模板本来就是给开发者抄的，
+    硬拒只会把正常工作流赶进 bash，所以在这里点名放行（仍不匹配私钥同名文件）。
+    """
+    name = Path(path).name.casefold()
+    if name in PUBLIC_SECRET_NAMES:
+        return False
+    return any(fnmatchcase(name, str(pattern).casefold())
+               for pattern in secrets if str(pattern))
+
+
+def system_roots() -> tuple[Path, ...]:
+    """系统目录的写保护范围（读不受限）。
+
+    Windows 取 SystemRoot 与 Program Files 两项；POSIX 取常见的系统前缀。
+    不追求穷尽——这里是防误写的硬拦，不是完整的 ACL 复刻。
+    """
+    if os.name == 'nt':
+        names = ('SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)')
+        raw = [os.environ.get(name) for name in names]
+        raw.append(r'C:\Windows')
+    else:
+        raw = ['/etc', '/usr', '/bin', '/sbin', '/boot', '/dev', '/proc', '/sys']
+    roots = []
+    for value in raw:
+        if not value:
+            continue
+        try:
+            root = Path(value).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def classify_path(path: str, *, cwd=None, workspace, secrets=()) -> str:
+    """返回 PATH_WORKSPACE / PATH_OUTSIDE / PATH_SECRET / PATH_SYSTEM / PATH_INVALID。
+
+    秘密与系统目录的判定先于工作区判定：工作区内的 `.env`、把工作区设在
+    `C:\\Windows` 下，同样不该自动读写。
+    """
+    try:
+        resolved = resolve_tool_path(path, cwd=cwd, workspace=workspace)
+        workspace = Path(workspace).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return PATH_INVALID
+    if is_secret_path(resolved, secrets):
+        return PATH_SECRET
+    if any(resolved.is_relative_to(root) for root in system_roots()):
+        return PATH_SYSTEM
+    if resolved.is_relative_to(workspace):
+        return PATH_WORKSPACE
+    return PATH_OUTSIDE
+
+
+# ============================================================
 # 命令文本分析（尽力而为，不是解析器）
 # ============================================================
 
@@ -344,6 +484,26 @@ def _command_verbs(command: str) -> set[str]:
         if verb in _WRAPPERS:
             verbs |= _wrapped_verbs(tokens)
     return {verb for verb in verbs if verb}
+
+
+def egress_hosts(text: str) -> set[str]:
+    """命令里出现的网络目标主机（去 userinfo、去单段端口、IPv6 去括号）。
+
+    只认 URL 写法：`nc host 1234` 这类裸主机名参数没有可靠的取值边界，猜出来的
+    键会把免审范围放大到任意主机，所以这里宁可不返回目标（同类键为空、每次问）。
+    """
+    hosts = set()
+    for match in _URL_TARGET.finditer(text):
+        # 命令里常见带引号的 URL：引号不是主机名的一部分，留着会让两次相同的
+        # 请求算出不同的同类键。
+        host = match.group(1).casefold().rstrip('"\'')
+        if host.startswith('['):                      # [::1]:21 形式
+            host = host[1:host.index(']')] if ']' in host else host.strip('[]')
+        elif host.count(':') == 1:                    # host:port
+            host = host.split(':')[0]
+        if host:
+            hosts.add(host)
+    return hosts
 
 
 def _wrapped_tokens(tokens: list[str]) -> list[str]:
@@ -390,7 +550,7 @@ def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
         if not tokens:
             continue
         verb = _basename(tokens[0])
-        flags = {token.casefold() for token in tokens[1:]}
+        flags = {token.casefold().split('=', 1)[0] for token in tokens[1:]}
         if verb in _INTERPRETERS:
             if flags & {'--version', '-v', '-V', '--help', '-h'}:
                 continue
@@ -399,11 +559,8 @@ def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
                 token.casefold() in ('-command', '-c', '-encodedcommand', '-enc')
                 for token in tokens[1:]):
             return f'{verb} command payload'
-        if verb in ('curl', 'wget') and any(
-                token.casefold() in ('-t', '--upload-file', '--data', '--data-binary',
-                                     '--data-raw', '-d', '-x', '--request')
-                for token in tokens[1:]):
-            return f'{verb} network mutation'
+        if verb in ('curl', 'wget') and flags & EGRESS_SEND_FLAGS:
+            return f'{verb} state-changing request'
         if verb in ('ssh', 'scp', 'sftp', 'docker', 'podman', 'kubectl',
                     'terraform', 'npm'):
             return f'{verb} external operation'
@@ -461,8 +618,43 @@ def _git_subcommand(command: str) -> str | None:
 # 同类判定与授权凭据
 # ============================================================
 
+def _bash_segment_class(segment: str) -> str | None:
+    """一段命令的可免审类别；返回 None 表示这段没有「同类」可记。"""
+    words = segment.split()
+    if not words:
+        return None
+    verb = _basename(words[0])
+    if verb in ('pwsh', 'powershell'):
+        return None
+    if verb in _WRAPPERS:
+        verb = _wrapped_verb(words) or verb
+    if verb in _NO_SESSION_GRANT or verb in _INTERPRETERS:
+        return None
+    if verb in EGRESS_COMMANDS:
+        # httpie 把方法写成位置参数（`http POST host x=1`），aria2c/iwr 也有自己的
+        # 写操作开关：静态分不清读写就不记同类，只给 curl/wget 的普通读请求留出路。
+        if verb not in ('curl', 'wget'):
+            return None
+        flags = {token.strip('"\'').casefold().split('=', 1)[0]
+                 for token in words[1:]}
+        if flags & EGRESS_SEND_FLAGS:
+            return None
+        hosts = egress_hosts(segment)
+        # 「批准这条 curl」买的是「再向这台主机发几次读请求」，不是「任意网络访问」；
+        # 带请求体的发送、改方法的请求、目标多于一个或写成裸主机名（nc host 1234）
+        # 都不给免审出路。
+        return f'{verb}:{hosts.pop()}' if len(hosts) == 1 else None
+    if verb == 'git':
+        subcommand = _git_subcommand(segment.casefold()) or verb
+        if subcommand in {'clean', 'push', 'reset', 'checkout', 'switch',
+                          'commit', 'rebase', 'merge', 'tag'}:
+            return None
+        return subcommand
+    return verb
+
+
 def approval_class(tool: str, args) -> str:
-    """同类判定：bash 按命令名（rm/del/git…），其余按工具名。
+    """同类判定：bash 按命令名（rm/del/git…）+ 外发目标主机，其余按工具名。
 
     hooks 与 feishu_gateway 原本各有一份同规则实现（决议时 / 发卡时两个时机），
     现在统一到这里，两边都从这里导入。args 允许是非 dict（网关侧的宽松输入）。
@@ -471,26 +663,25 @@ def approval_class(tool: str, args) -> str:
     cmd /c 就免审所有 cmd /c」，把 `cmd /c rd /s /q` 一起放进去。解不出载荷时
     （起交互式 shell）仍按包装器自身归类。解释器不在包装器名单里：
     `python -c "import os"` 的第一个词是 import，拿它当同类键没有意义。
+
+    复合命令（&&、;、|、换行）要每段归类一致才免审：只按第一段归类的话，批准
+    `ls && rm x` 会写下 bash:ls，之后 `ls; rm -rf ~` 就被同一个键放行了 ——
+    按钮的含义是「这一条我认了」，不是「第一个动词我认了」。
+
+    文件工具返回空串：一次「写 a.txt」的批准不该免审同会话的任意路径写入，
+    尤其是越界写。按目录的范围授权需要先解析 cwd/工作区，留到路径范围化那一轮。
     """
+    if tool in ('read', 'write', 'edit'):
+        return ''
     if tool == 'bash':
         raw = args.get('command', '') if isinstance(args, dict) else args
-        words = str(raw or '').strip().split()
-        if not words:
-            return ''
-        verb = _basename(words[0])
-        if verb in ('pwsh', 'powershell'):
-            return ''
-        if verb in _WRAPPERS:
-            verb = _wrapped_verb(words) or verb
-        if verb in _NO_SESSION_GRANT or verb in _INTERPRETERS:
-            return ''
-        if verb == 'git':
-            subcommand = _git_subcommand(str(raw or '').casefold()) or verb
-            if subcommand in {'clean', 'push', 'reset', 'checkout', 'switch',
-                              'commit', 'rebase', 'merge', 'tag'}:
+        classes: set[str] = set()
+        for segment in _segments(str(raw or '')):
+            klass = _bash_segment_class(segment)
+            if klass is None or (classes and klass not in classes):
                 return ''
-            return subcommand
-        return verb
+            classes.add(klass)
+        return classes.pop() if len(classes) == 1 else ''
     return tool
 
 
@@ -504,7 +695,11 @@ def grant_key(tool: str, args: dict) -> str:
     if tool == 'bash':
         return f'bash:{str(args.get("command", "")).strip()}'
     if tool in ('read', 'write', 'edit'):
-        return f'{tool}:{str(args.get("path", "")).strip()}'
+        # 相对路径只有和 cwd 一起才指向唯一目标；worktree 里同名的 a.py
+        # 不能消费主工作区那次批准。
+        cwd = str(args.get('cwd', '') or '').strip()
+        suffix = f'{tool}:{str(args.get("path", "")).strip()}'
+        return f'{suffix}@{cwd}' if cwd else suffix
     if tool in WORKTREE_TOOLS:
         return f'{tool}:{str(args.get("name", args.get("path", ""))).strip()}'
     return f'{tool}:{sorted((str(k), str(v)) for k, v in args.items())}'

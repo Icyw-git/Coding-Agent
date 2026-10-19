@@ -8,8 +8,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
 from cli_commands import COMMANDS, parse_command
-from session_views import (display_text, group_sessions, relative_time,
-                           session_details, session_status)
+from session_views import display_text, group_sessions, relative_time, session_details, session_status
 
 
 def session_label(row):
@@ -61,9 +60,9 @@ class SessionPicker:
 
     def __init__(self, rows, current_id=None, workspace=None, **application_kwargs):
         from prompt_toolkit.application import Application
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.layout import HSplit, VSplit, Layout, Window, ConditionalContainer
         from prompt_toolkit.filters import Condition
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout.dimension import Dimension
         from prompt_toolkit.styles import Style

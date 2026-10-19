@@ -2,28 +2,30 @@
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 import logging
 import os
 import queue
-import threading
 import secrets
-import time
 import sys
+import threading
+import time
 import traceback
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 
-from harness_sdk import HarnessClient
 from agent_runtime import AgentRuntime, SessionAlreadyExistsError
+from exec_policy import load_policy, set_tier
+from harness_sdk import HarnessClient
+from hooks import GATE as permission_gate
+from hooks import enforce_headless
 from session_store import SessionReplayError
 from task_manager import TaskManager
 from turn_progress import TurnProgress, format_duration
-from exec_policy import load_policy, set_tier
-from hooks import GATE as permission_gate, enforce_headless
 
 STREAM_PROGRESS_INTERVAL = float(os.getenv('HARNESS_PROGRESS_INTERVAL', '1'))
 STREAM_DIAGNOSTIC_INTERVAL = 60

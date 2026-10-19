@@ -11,7 +11,6 @@ from feishu_gateway import FeishuGateway
 from gateway_sim import GatewayClient
 from harness_api import create_app
 from session_store import SessionEventStore
-from test_feishu_gateway import _sync_asgi_transport
 from turn_progress import TurnProgress
 
 

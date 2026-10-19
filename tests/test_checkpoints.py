@@ -1,8 +1,9 @@
 import json
+import subprocess
 
 import pytest
 
-from checkpoints import CheckpointManager, CheckpointError
+from checkpoints import CheckpointError, CheckpointManager
 from session_store import SessionEventStore
 
 
@@ -147,6 +148,30 @@ def test_ignored_and_sensitive_paths_are_not_snapshotted(ws):
     assert '.cache/x.txt' not in files
     assert files['.env']['sensitive'] is True
     assert not (ws / '.cache' / 'checkpoints' / 'sid' / cp_id / 'files' / '.env').exists()
+
+
+@pytest.mark.parametrize(('name', 'sensitive'), [
+    ('.env.local', True),
+    ('.env.production', True),
+    ('id_ed25519', True),
+    ('deploy.key', True),
+    ('cert.pem', True),
+    ('.env.example', False),   # 公开模板要能正常回滚
+    ('notes.md', False),
+])
+def test_secret_flag_uses_the_shared_policy_list(ws, name, sensitive):
+    """快照层与策略层共用 is_secret_path：名单只有一份，模板例外也只有一个地方解释。"""
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs())
+    target = ws / name
+    target.write_text('x', encoding='utf-8')
+    mgr.capture_pre_image(target)
+    mgr.seal()
+
+    entry = mgr.get(cp_id)['files'][name]
+    assert entry['sensitive'] is sensitive
+    stored = ws / '.cache' / 'checkpoints' / 'sid' / cp_id / 'files' / name
+    assert stored.exists() is not sensitive
 
 
 def test_rewind_is_idempotent(ws):
@@ -472,8 +497,6 @@ def _index_rows(ws):
 
 
 # ---------- _git_baseline：单次 git 查询（v2→v1 行转换）回归 ----------
-
-import subprocess
 
 
 def _git_run(path, *args):

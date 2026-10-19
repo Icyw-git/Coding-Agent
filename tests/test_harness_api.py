@@ -7,7 +7,6 @@ import pytest
 
 from harness_api import create_app
 
-
 fastapi_available = importlib.util.find_spec("fastapi") is not None
 
 
@@ -87,7 +86,6 @@ def test_api_streams_message_deltas(api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_routes_use_runtime(monkeypatch, api_client):
-    from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
     client = api_client(create_app(runtime, api_token="test-token"))
@@ -111,7 +109,6 @@ def test_api_routes_use_runtime(monkeypatch, api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_maps_missing_session_to_404(api_client):
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(FakeRuntime(), api_token="test-token"))
     response = client.get("/v1/sessions/missing", headers={"Authorization": "Bearer test-token"})
@@ -120,7 +117,6 @@ def test_api_maps_missing_session_to_404(api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_maps_duplicate_session_to_409(api_client):
-    from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
     client = api_client(create_app(runtime, api_token="test-token"))
@@ -132,7 +128,6 @@ def test_api_maps_duplicate_session_to_409(api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_requires_token_and_limits_requests(tmp_path, api_client):
-    from fastapi.testclient import TestClient
 
     runtime = FakeRuntime()
     client = api_client(create_app(runtime, api_token="secret", rate_limit=1,
@@ -150,7 +145,6 @@ def test_api_requires_token_and_limits_requests(tmp_path, api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_lists_sessions(api_client):
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(FakeRuntime(), api_token="t"))
     headers = {"Authorization": "Bearer t"}
@@ -174,7 +168,6 @@ def _stream_runtime(tmp_path):
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_stream_replays_session_events(tmp_path, api_client):
     """SSE 端点回放既有事件流（含非 message 事件）；once=1 回放即关闭。"""
-    from fastapi.testclient import TestClient
 
     runtime = _stream_runtime(tmp_path)
     client = api_client(create_app(runtime, api_token="t"))
@@ -201,7 +194,6 @@ def test_stream_follow_picks_up_new_events(tmp_path, api_client):
     """follow 阶段能增量拾取连接之后新写入的事件（实时监控的核心路径）。"""
     import threading
 
-    from fastapi.testclient import TestClient
 
     runtime = _stream_runtime(tmp_path)
     client = api_client(create_app(runtime, api_token="t"))
@@ -223,7 +215,6 @@ def test_stream_follow_picks_up_new_events(tmp_path, api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_stream_maps_missing_session_to_404(tmp_path, api_client):
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(_stream_runtime(tmp_path), api_token="t"))
     response = client.get("/v1/sessions/nope/stream",
@@ -236,7 +227,6 @@ def test_stream_maps_missing_session_to_404(tmp_path, api_client):
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_task_end_to_end_flow(tmp_path, api_client):
     """网关核心链路：创建任务 → 轮询状态 → 拉取日志 → 列表。"""
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks",
                                    rate_limit=10000))
@@ -267,7 +257,6 @@ def test_task_end_to_end_flow(tmp_path, api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_task_stop_and_not_found(tmp_path, api_client):
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks",
                                    rate_limit=10000))
@@ -297,7 +286,6 @@ def test_task_stop_and_not_found(tmp_path, api_client):
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_task_rejects_empty_command(tmp_path, api_client):
-    from fastapi.testclient import TestClient
 
     client = api_client(create_app(FakeRuntime(), api_token="t", task_root=tmp_path / "tasks"))
     response = client.post("/v1/tasks", json={"command": "   "},
@@ -353,6 +341,7 @@ def test_task_storage_root_does_not_change_workspace(tmp_path, monkeypatch, api_
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_shutdown_stops_tasks_and_releases_log(tmp_path):
     import json
+
     from fastapi.testclient import TestClient
 
     log = tmp_path / 'access.log'

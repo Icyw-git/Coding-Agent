@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
-
 _workspace = ContextVar('workspace', default=None)
 
 

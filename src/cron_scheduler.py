@@ -1,12 +1,11 @@
 import json
-import os
-import random
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+
 
 @dataclass
 class CronJob:
@@ -51,7 +50,7 @@ def cron_matches(cron_expr:str,dt:datetime)->bool: #对外接口，判断cron表
 
     if not (m and h and month_ok):
         return False
-    
+
     dom_unconstrained=dom=="*"
     dow_unconstrained=dow=="*"
     if dom_unconstrained and dow_unconstrained:
@@ -118,12 +117,12 @@ def save_durable_jobs(): #保存持久化任务
         durable=[asdict(j) for j in scheduled_jobs.values() if j.durable]
         tmp=DURABLE_PATH.with_suffix('.tmp')
         tmp.write_text(json.dumps(durable,ensure_ascii=False,indent=2),encoding='utf-8')
-        os.replace(tmp,DURABLE_PATH)
+        tmp.replace(DURABLE_PATH)
 
 def load_durable_jobs(): #加载持久化任务，将有效任务添加到scheduled_jobs中
     if not DURABLE_PATH.exists():
 
-        return 
+        return
     try:
         jobs=json.loads(DURABLE_PATH.read_text())
         for j in jobs:
@@ -143,7 +142,7 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #�
     """
     Register a cron job with the scheduler.
     """
-    
+
     err=validate_cron(cron)
     if err:
         return err
@@ -203,7 +202,7 @@ def consume_cron_queue()->list[CronJob]: #消费cron队列中的任务，返回�
     with cron_lock:
         fired=list(cron_queue) # 复制队列，避免并发修改
         cron_queue.clear() # 清空队列
-    return fired 
+    return fired
 
 def _has_cron_queue()->bool: #检查cron队列是否为空
     with cron_lock:

@@ -1,13 +1,11 @@
-import dataclasses
-from dataclasses import dataclass, asdict, field
-from re import S
-from typing import Optional, List,Literal
-from pathlib import Path
-
 import json
-import os
+import random
 import threading
+import time
 import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import List, Literal, Optional
 
 # 任务持久化目录：与仓库 .cache 约定一致，保存时按需自动创建
 TASK_DIR = Path(__file__).resolve().parents[1] / '.cache' / 'tasks'
@@ -16,7 +14,7 @@ task_lock = threading.RLock()
 
 
 
-@dataclass 
+@dataclass
 class Task:
     id:str
     subject:str
@@ -26,8 +24,7 @@ class Task:
     blockedBy:List[str] = field(default_factory=list)
     worktree:str = ''   # 关联的 git worktree 名（空 = 无隔离目录）
 
-import time
-import random
+
 def random_hex(n:int):
     return ''.join(random.choices('0123456789abcdef',k=n))
 
@@ -103,7 +100,7 @@ def save_task(task:Task): #保存任务到文件
         path = _task_path(task.id)
         tmp = path.with_suffix('.tmp')
         tmp.write_text(json.dumps(asdict(task),indent=2), encoding='utf-8')
-        os.replace(tmp, path)
+        tmp.replace(path)
 
 def load_task(task_id:str)->Task: #从文件加载任务
     with task_lock:

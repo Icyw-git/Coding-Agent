@@ -58,7 +58,8 @@ def test_approval_class_bash_uses_first_word():
     assert approval_class('bash', {'command': 'rm -rf x'}) == 'rm'
     assert approval_class('bash', {'command': '  DEL file'}) == 'del'
     assert approval_class('bash', {'command': ''}) == ''
-    assert approval_class('write', {'path': 'a'}) == 'write'
+    # 文件审批是按路径的；一次写批准不能变成整会话任意路径免审
+    assert approval_class('write', {'path': 'a'}) == ''
 
 
 def test_session_allowlist_skips_second_ask(remote_gate, monkeypatch):
@@ -156,6 +157,39 @@ def test_wrapped_command_only_whitelists_the_wrapped_action(remote_gate, monkeyp
     assert not GATE.session_allows('bash', {'command': 'cmd /c "rd /s /q build"'})
 
 
+def test_egress_grant_is_scoped_to_the_approved_host(remote_gate, monkeypatch):
+    """批一条 GET 买的是「再向这台主机读几次」，不是「整会话任意联网」。
+
+    带请求体的发送连这个键都不给：同一台主机上也可能是把数据传出去。
+    """
+    _fake_hooks_config(monkeypatch)
+    results = {}
+    thread = _decide_async('curl -s https://api.example.invalid/v1/items', results)
+    GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
+    thread.join(timeout=2)
+    assert results['allowed'] is None
+
+    assert hooks.permission_hook(
+        'bash', {'command': 'curl https://api.example.invalid/v2/items'}) is None
+    assert not GATE.pending()
+    assert not GATE.session_allows('bash', {'command': 'curl https://other.invalid/'})
+    assert not GATE.session_allows(
+        'bash', {'command': 'curl -d token=1 https://api.example.invalid/v1'})
+
+
+def test_composite_command_approval_does_not_grant_its_first_verb(remote_gate,
+                                                                  monkeypatch):
+    """批准 `curl … && ls` 后，`ls; rm -rf x` 不能靠 bash:ls 免审。"""
+    _fake_hooks_config(monkeypatch)
+    results = {}
+    thread = _decide_async('curl https://api.example.invalid/x && ls', results)
+    GATE.resolve(GATE.pending()[0].req_id, True, by='test', scope='session')
+    thread.join(timeout=2)
+    assert results['allowed'] is None
+    assert not GATE.session_allows('bash', {'command': 'ls'})
+    assert not GATE.session_allows('bash', {'command': 'ls; rm -rf x'})
+
+
 def test_clear_wipes_session_allowlist(remote_gate):
     GATE._session_allows.add('bash:rm')
     GATE.clear()
@@ -207,7 +241,7 @@ def test_feishu_session_scope_button_end_to_end(api_app, tmp_path):
 
         text, ok = gw.handle_card_action(
             None, {'approval': req['req_id'], 'allow': True,
-                   'scope': 'session'}, 'om_1')
+                   'scope': 'session'}, 'om_1', chat_id='c1')
         assert ok and '已允许' in text
         thread.join(timeout=2)
         assert results['allowed'] is None

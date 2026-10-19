@@ -6,9 +6,9 @@ import pytest
 
 import harness
 import hooks
-from MCPclient import MCPclient
 from harness_api import create_app
 from harness_sdk import create_default_client
+from MCPclient import MCPclient
 
 
 @pytest.fixture
@@ -73,6 +73,7 @@ def test_default_api_loads_mcp_in_lifespan_and_closes_it(shared_tools, tmp_path,
 
 def test_injected_runtime_does_not_start_or_stop_global_mcp(shared_tools, tmp_path):
     from fastapi.testclient import TestClient
+
     from agent_runtime import AgentRuntime
     from session_store import SessionEventStore
 

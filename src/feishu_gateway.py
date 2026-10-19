@@ -14,9 +14,12 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 环境变量：
     FEISHU_APP_ID / FEISHU_APP_SECRET   应用凭证
-    FEISHU_ALLOWED_USERS                用户白名单（open_id，逗号分隔）；
-                                        不配置则任何能 @ 到机器人的人都可触发
+    FEISHU_ALLOWED_USERS                用户白名单（open_id，逗号分隔）；必填。
+                                        缺失时拒绝启动，只有本地测试可以显式设置
+                                        FEISHU_ALLOW_ANY_USER=1 放开
     HARNESS_API_URL / HARNESS_API_TOKEN Agent API 地址与令牌
+
+只处理单聊（p2p）：群聊/话题群消息默认忽略，审批也只推给绑定该会话的聊天。
 
 聊天命令（@机器人 发送）：
     /help             命令清单（未知命令也会自动附带）
@@ -330,11 +333,15 @@ class FeishuGateway:
 
     def __init__(self, api: GatewayClient, transport=None,
                  bindings_path: Path | None = None,
-                 allowed_users: set[str] | None = None) -> None:
+                 allowed_users: set[str] | None = None,
+                 p2p_only: bool = True) -> None:
         self.api = api
         self.transport = transport          # 需实现 send_text(chat_id, text)
         self.bindings_path = Path(bindings_path or BINDINGS_PATH)
         self.bindings: dict[str, str] = {}   # chat_id → session_id
+        # 个人助手只服务单聊；群聊里任何人都能 @ 机器人，审批也只该归属
+        # 绑定会话的那个聊天。
+        self.p2p_only = p2p_only
         self._bindings_lock = threading.RLock()
         # 用户白名单（飞书 open_id）：None=不限制；配置后仅名单内用户可触发 agent。
         # 机器人一旦被拉进群，群内任何人都能 @ 它——真 shell 工具必须有这道闸。
@@ -390,10 +397,18 @@ class FeishuGateway:
     # ---------- 消息入口（可测试核心） ----------
 
     def on_message(self, chat_id: str, text: str,
-                   sender_id: str | None = None) -> None:
-        """飞书文本消息入口。命令本地处理；普通文本转发给 agent 会话。"""
+                   sender_id: str | None = None,
+                   chat_type: str | None = None) -> None:
+        """飞书文本消息入口。命令本地处理；普通文本转发给 agent 会话。
+
+        chat_type=None 表示来自测试/模拟器（无来源信息）；真实飞书事件一定带
+        p2p/group/topic，只放行 p2p。
+        """
         text = (text or '').strip()
         if not text:
+            return
+        if self.p2p_only and chat_type not in (None, 'p2p'):
+            print(f'[feishu] ignored {chat_type!r} message in chat {chat_id!r}')
             return
         if self.allowed_users is not None and sender_id not in self.allowed_users:
             # 未授权用户：静默忽略（不回执、不建会话），避免暴露机器人行为
@@ -874,9 +889,13 @@ class FeishuGateway:
                 task = self.api.stop_task(argument)
                 self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
             elif command in ('/perms', '/approvals'):
-                pending = self.api.pending_permissions()
+                pending = [req for req in self.api.pending_permissions()
+                           if self._request_belongs_to(chat_id, req)]
                 if not pending:
                     self._reply(chat_id, '(无待审批请求)')
+                    return
+                # 手动查看也重建 FIFO：后面 y2/n2 的序号与这里显示的一致
+                self._chat_pending[chat_id] = [req['req_id'] for req in pending]
                 for i, req in enumerate(pending, 1):
                     self._push_approval(chat_id, req, i)
             elif command == '/revoke':
@@ -938,6 +957,9 @@ class FeishuGateway:
                     self._reply(chat_id, '用法: /approve y|n，或直接回复 y/n'
                                           '\n多条待审批时，用 y2/n2 选择第 2 条；/perms 查看操作内容。')
                     return
+                if tokens[0] not in self._chat_pending.get(chat_id, []):
+                    self._reply(chat_id, '该审批不属于当前聊天（或已失效），用 /perms 查看。')
+                    return
                 record = self.api.resolve_permission(tokens[0], tokens[1] == 'y')
                 self._forget_pending(record['req_id'])
                 self._reply(chat_id, permission_result(record))
@@ -959,19 +981,37 @@ class FeishuGateway:
 
     # ---------- 权限轮询（推送给绑定聊天） ----------
 
+    def _request_belongs_to(self, chat_id: str, req: dict) -> bool:
+        """审批归属登记时的会话；无会话上下文的请求（后台任务）对所有聊天可见。"""
+        session_id = req.get('session_id') or ''
+        bound = self.bindings.get(chat_id)
+        return not session_id or (bool(bound) and bound == session_id)
+
     def poll_permissions(self) -> None:
-        """把新出现的 pending 请求推给所有绑定的聊天（由定时线程调用）。"""
+        """把新出现的 pending 请求推给绑定其会话的聊天（由定时线程调用）。
+
+        后台任务没有会话上下文（session_id 为空），仍推给所有聊天；有会话的
+        请求一旦广播，任何绑定聊天都能替别的会话批操作——这是审批归属漏洞。
+        """
         try:
             pending = self.api.pending_permissions()
         except Exception:
             return
-        chats = list(self.bindings)
+        with self._bindings_lock:
+            bindings = dict(self.bindings)
         for req in pending:
             req_id = req['req_id']
             if req_id in self._notified:
                 continue
+            session_id = req.get('session_id') or ''
+            targets = ([chat_id for chat_id, bound in bindings.items()
+                        if bound == session_id] if session_id
+                       else list(bindings))
+            if not targets:
+                # 会话还没绑定到任何聊天：先不标记，等绑定出现后的下一轮再推
+                continue
             self._notified.add(req_id)
-            for chat_id in chats:
+            for chat_id in targets:
                 fifo = self._chat_pending.setdefault(chat_id, [])
                 if req_id not in fifo:
                     fifo.append(req_id)
@@ -1007,8 +1047,8 @@ class FeishuGateway:
                            message_id: str | None, chat_id: str | None = None) -> tuple[str, bool]:
         """Card callbacks: resolve approvals directly; queue session navigation.
 
-        返回 (toast 文案, 是否成功)。open_id 受用户白名单约束——
-        群里任何能点按钮的人都算，必须过同一道闸。
+        返回 (toast 文案, 是否成功)。open_id 受用户白名单约束；审批按钮
+        还必须属于本聊天已收到的请求。
         """
         if self.allowed_users is not None and open_id not in self.allowed_users:
             return ('⛔ 你没有会话操作权限' if (value or {}).get('session_view')
@@ -1022,13 +1062,17 @@ class FeishuGateway:
             if action not in ('page', 'details', 'switch', 'fork') or type(index) is not int or not 0 <= index < limit:
                 return '无效的会话按钮，请重新 /sessions', False
             try:
-                self._events.put_nowait((chat_id, value, open_id))
+                self._events.put_nowait((chat_id, value, open_id, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理会话操作…', True
         req_id = (value or {}).get('approval')
         if not req_id:
             return '⚠ 无效的审批按钮', False
+        if not chat_id or req_id not in self._chat_pending.get(chat_id, []):
+            # 按钮只对「推送过这条审批的聊天」有效。群成员或别的单聊即使拿到
+            # req_id，也不能替绑定会话决议。
+            return '⚠ 该审批不属于当前聊天，请用 /perms 查看', False
         allow = bool((value or {}).get('allow'))
         scope = (value or {}).get('scope')
         try:
@@ -1066,7 +1110,8 @@ class FeishuGateway:
     # ---------- WS 事件分发（长任务不阻塞回调线程） ----------
 
     def dispatch(self, chat_id: str, text: str,
-                 sender_id: str | None = None) -> None:
+                 sender_id: str | None = None,
+                 chat_type: str | None = None) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
         norm = unicodedata.normalize('NFKC', text or '').strip().lower()
         is_approval = (norm.split()[:1] == ['/approve'] or
@@ -1074,7 +1119,7 @@ class FeishuGateway:
                         and bool(self._chat_pending.get(chat_id))))
         events = self._approval_events if is_approval else self._events
         try:
-            events.put_nowait((chat_id, text, sender_id))
+            events.put_nowait((chat_id, text, sender_id, chat_type))
         except queue.Full:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
@@ -1088,7 +1133,7 @@ class FeishuGateway:
                     item = events.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                chat_id, text, sender_id = item
+                chat_id, text, sender_id, chat_type = item
                 try:
                     if approval:
                         if self.allowed_users is not None and sender_id not in self.allowed_users:
@@ -1100,13 +1145,15 @@ class FeishuGateway:
                                 and not self._chat_pending.get(chat_id)):
                             self._reply(chat_id, '没有待审批请求，可能已处理或已过期。')
                             continue
-                        self.on_message(chat_id, text, sender_id=sender_id)
+                        self.on_message(chat_id, text, sender_id=sender_id,
+                                        chat_type=chat_type)
                     else:
                         with self._chat_lock(chat_id):
                             if isinstance(text, dict):
                                 self._handle_session_action(chat_id, text, sender_id)
                             else:
-                                self.on_message(chat_id, text, sender_id=sender_id)
+                                self.on_message(chat_id, text, sender_id=sender_id,
+                                                chat_type=chat_type)
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
@@ -1161,10 +1208,11 @@ class FeishuGateway:
                 sender_id = getattr(
                     getattr(getattr(data.event, 'sender', None),
                             'sender_id', None), 'open_id', None)
+                chat_type = getattr(message, 'chat_type', None)
                 print(f'[feishu] message from {sender_id!r} '
-                      f'in chat {message.chat_id!r}')
+                      f'in chat {message.chat_id!r} ({chat_type})')
                 self.dispatch(message.chat_id, text,
-                              sender_id=sender_id)
+                              sender_id=sender_id, chat_type=chat_type)
             except Exception as exc:
                 print(f'[feishu] event error: {exc}')
 
@@ -1210,8 +1258,15 @@ def main(argv=None) -> int:
     allowed_raw = os.getenv('FEISHU_ALLOWED_USERS', '').strip()
     allowed_users = {u.strip() for u in allowed_raw.split(',') if u.strip()} \
         or None
+    allow_any = os.getenv('FEISHU_ALLOW_ANY_USER', '').strip().lower() \
+        in ('1', 'true', 'yes')
     if not (app_id and app_secret and token):
         print('FEISHU_APP_ID / FEISHU_APP_SECRET / HARNESS_API_TOKEN are required')
+        return 1
+    if not allowed_users and not allow_any:
+        # 机器人背后是真 shell：没有名单就不启动，避免“默认谁都能用”。
+        print('FEISHU_ALLOWED_USERS is required (comma-separated open_id). '
+              'Set FEISHU_ALLOW_ANY_USER=1 only for local testing.')
         return 1
     api = GatewayClient(base_url, token)
     transport = LarkTransport(app_id, app_secret)
@@ -1220,8 +1275,9 @@ def main(argv=None) -> int:
     if allowed_users:
         print(f'[feishu] user allowlist active: {", ".join(sorted(allowed_users))}')
     else:
-        print('[feishu] WARNING: no FEISHU_ALLOWED_USERS set — anyone who can '
+        print('[feishu] WARNING: FEISHU_ALLOW_ANY_USER=1 — anyone who can '
               'reach this bot can run commands on this machine')
+    print('[feishu] p2p only: group/topic messages are ignored')
     try:
         gateway.run(app_id, app_secret)
     except KeyboardInterrupt:

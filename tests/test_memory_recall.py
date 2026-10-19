@@ -7,12 +7,11 @@
 
 运行: python test_memory_recall.py
 """
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
 
 import agent_core

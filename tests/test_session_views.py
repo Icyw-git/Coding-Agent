@@ -3,13 +3,13 @@ import json
 import time
 
 import pytest
+from prompt_toolkit.data_structures import Size
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from cli_input import SessionPicker, fit_cells, text_width
 from feishu_gateway import FeishuGateway
 from feishu_sessions import list_card
-from prompt_toolkit.input import create_pipe_input
-from prompt_toolkit.output import DummyOutput
-from prompt_toolkit.data_structures import Size
 from session_store import SessionEventStore
 from session_views import group_sessions, session_details, session_status
 

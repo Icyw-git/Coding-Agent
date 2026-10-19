@@ -12,7 +12,6 @@ import json
 import os
 import re
 import time
-from pathlib import Path
 
 import yaml
 
@@ -719,7 +718,8 @@ def compact_history(messages, keep=6, budget_tokens=None):  # 使用 llm 进行�
 
 def reactive_compact(messages, keep=5, budget_tokens=None):
     """保存完整对话记录，摘要 + 按预算保留最近现场（reactive 重试会逐次缩 keep/预算）。"""
-    transcript = write_transcript(messages)
+    transcript_path = write_transcript(messages)
+    print(f'[transcript saved:{transcript_path}]')
     tail_start = _tail_within_budget(messages, keep, budget_tokens)
     summary = summarize_history(messages[:tail_start])
     result = [{'role': 'user', 'content': f'[Reactive compact]\n\n{summary}'}]

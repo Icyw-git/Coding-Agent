@@ -1,0 +1,10 @@
+# 开发工具链，不参与运行时安装（运行时与测试依赖见 requirements.txt）。
+# 与回归测试用同一个解释器：D:\Anaconda_envs\envs\aitest01_py310
+#
+#   <env>\python.exe -m ruff check                    # lint，规则见 ruff.toml
+#   <env>\python.exe -m ruff format <本次改动的文件>   # 增量格式化，不跑全库
+#
+# 不做全库 ruff format：84 个文件里 82 个会被重排（约 1.1 万行 diff），
+# 一次提交毁掉全库 blame。空行规则（docs/coding-standards.md 的表格）由
+# format 在改动文件上顺带保证。
+ruff==0.17.1

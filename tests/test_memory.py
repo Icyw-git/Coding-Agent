@@ -8,14 +8,13 @@
 运行: python test_memory.py
 """
 import json
-import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 import test_context_manage as tcm
 

@@ -3,11 +3,9 @@
 BUS 由 agent_teams 持有，这里通过 _bus() 延迟引用，避免模块级循环导入
 （agent_teams 会在模块级 import 本模块）。
 """
-import json
 import random
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal
 
 

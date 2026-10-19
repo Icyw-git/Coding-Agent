@@ -21,7 +21,7 @@ class RecoveryState:
         self.consecutive_529=0 # 连续529错误次数
         self.has_attempted_reactive_compact=False # 是否尝试过反应式紧凑模型
         self.current_model=os.getenv('LLM_MODEL_ID') # 当前模型
-        
+
 def retry_delay(attempt,retry_after=None): # 计算重试延迟时间，计算方式为2^attempt * BASE_DELAY_MS + random jitter
     if retry_after:
         return retry_after
@@ -30,12 +30,15 @@ def retry_delay(attempt,retry_after=None): # 计算重试延迟时间，计算�
     return base+jitter
 
 def with_retry(fn,state:RecoveryState):
+    last_error=None
     for attempt in range(MAX_RETRIES):
         try:
             result=fn()
             state.consecutive_529=0
             return result
         except Exception as e:
+            # except 块结束时 Python 会删除 e，重试耗尽那条路只能靠这份引用取到原因
+            last_error=e
             name=type(e).__name__
             msg=str(e).lower()
 
@@ -57,7 +60,7 @@ def with_retry(fn,state:RecoveryState):
                       f" wait {delay:.1f}s\033[0m")
                 time.sleep(delay) # 等待重试延迟时间
                 continue
-                
+
             if 'ratelimit' in name.lower() or '429' in msg: #429错误，需要重试
                 delay=retry_delay(attempt)
                 print(f"  \033[33m[429 rate limit] retry {attempt+1}/{MAX_RETRIES},"
@@ -66,7 +69,7 @@ def with_retry(fn,state:RecoveryState):
                 continue
 
             raise
-    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded. {e}") # 最大重试次数超过，抛出异常
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded. {last_error}") # 最大重试次数超过，抛出异常
 
 def is_prompt_too_long_error(e:Exception)->bool: # 判断是否是提示过长错误
     msg=str(e).lower()
@@ -75,12 +78,3 @@ def is_prompt_too_long_error(e:Exception)->bool: # 判断是否是提示过长�
             or "context_length_exceeded" in msg
             or "max_context_window" in msg)
 
-
-def reactive_compact(message:list)->list: # 反应式紧凑模型
-    if not message:
-        return []
-    tail=message[-5:]
-    return [{'role':'user','content':"[Reactive compact] Earlier conversation trimmed. "
-                        "Continue from where you left off."}, *tail]
-    
-    

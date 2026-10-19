@@ -1,5 +1,6 @@
-from session_store import SessionEventStore
 import pytest
+
+from session_store import SessionEventStore
 
 
 def test_summary_records_workspace_changes_and_task(tmp_path):
@@ -18,8 +19,8 @@ def test_summary_records_workspace_changes_and_task(tmp_path):
 
 @pytest.mark.parametrize('command', ['/resume', '/sessions'])
 def test_resume_restores_workspace(tmp_path, monkeypatch, capsys, command):
-    import harness
     import cli_input
+    import harness
 
     workspace = tmp_path / 'project'
     workspace.mkdir()
@@ -41,8 +42,8 @@ def test_resume_restores_workspace(tmp_path, monkeypatch, capsys, command):
 
 
 def test_missing_workspace_does_not_switch_session(tmp_path, monkeypatch, capsys):
-    import harness
     import cli_input
+    import harness
 
     monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
     monkeypatch.setattr(harness, 'WORKDIR', tmp_path)
@@ -60,8 +61,9 @@ def test_missing_workspace_does_not_switch_session(tmp_path, monkeypatch, capsys
 
 
 def test_picker_cancel_keeps_current_session(tmp_path, monkeypatch):
-    import cli_input
     from types import SimpleNamespace
+
+    import cli_input
 
     monkeypatch.setattr(cli_input.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(cli_input.sys.stdout, 'isatty', lambda: True)
@@ -86,7 +88,7 @@ def test_title_is_automatically_generated_after_turn(tmp_path, monkeypatch):
 
 
 def test_compact_labels_and_filtering():
-    from cli_input import filter_session_rows, session_label, relative_time
+    from cli_input import filter_session_rows, relative_time, session_label
 
     row = dict(id='internal-id', title='修复代码', preview='修复代码',
                workspace='D:/project', updated=10, events=99)
@@ -103,9 +105,11 @@ def test_compact_labels_and_filtering():
 
 def test_picker_search_and_enter(tmp_path):
     import asyncio
-    from cli_input import SessionPicker
+
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
+
+    from cli_input import SessionPicker
 
     rows = [dict(id='first', title='修复代码', preview='修复代码', workspace=str(tmp_path), updated=10),
             dict(id='second', title='检查测试', preview='检查测试', workspace='other', updated=20)]

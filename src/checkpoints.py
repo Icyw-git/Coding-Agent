@@ -17,9 +17,13 @@ import uuid
 from pathlib import Path
 
 from perf import segment as perf_segment
+from exec_policy import is_secret_path
 
 DEFAULT_IGNORE = ('.cache', '.git', '.worktrees', '.mailbox', '__pycache__', '.pytest_cache')
-DEFAULT_SECRETS = ('.env', '*.pem', '*_rsa')
+# 密钥材料：证书/私钥文件与 dot-env 的全部变体（.env.local、.env.production 常放真凭证），
+# 以及 OpenSSH 私钥的默认文件名。公开可写的示例模板在 exec_policy 里放行。
+DEFAULT_SECRETS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx',
+                   '*_rsa', 'id_ecdsa', 'id_ed25519', 'id_dsa')
 MAX_FILE_BYTES = 5 * 1024 * 1024
 
 
@@ -320,7 +324,8 @@ class CheckpointManager:
         return any(part in self.ignore for part in parts)
 
     def _is_secret(self, name: str) -> bool:
-        return any(Path(name).match(pattern) for pattern in self.secrets)
+        # 与策略层同一个判定：秘密名单只有一份，模板例外也只有一个地方解释。
+        return is_secret_path(name, self.secrets)
 
     # ---------- git 基线 ----------
 

@@ -2,12 +2,10 @@
 
 运行: python test_compress.py
 """
-import json
-import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 from session_store import SessionEventStore
 

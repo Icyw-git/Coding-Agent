@@ -8,7 +8,7 @@ import subprocess
 def kill_process_tree(proc) -> None:
     if proc.poll() is not None:
         return
-    from sandbox import SandboxProcess   # 局部导入：避免与 task_manager 的导入顺序耦合
+    from sandbox import SandboxProcess  # 局部导入：避免与 task_manager 的导入顺序耦合
     if isinstance(proc, SandboxProcess):
         proc.kill_tree()
         return

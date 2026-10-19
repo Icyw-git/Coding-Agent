@@ -813,7 +813,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
 # 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为永不并行。
 PARALLEL_SAFE_TOOLS = frozenset({
-    'read', 'glob', 'list_tasks', 'get_task', 'list_crons', 'check_inbox', 'load_skill',
+    'read', 'glob', 'grep', 'ls', 'list_tasks', 'get_task', 'list_crons',
+    'check_inbox', 'load_skill',
 })
 PARALLEL_MAX_WORKERS = 4
 

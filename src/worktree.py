@@ -1,6 +1,5 @@
 """Git worktree 隔离：每个任务一个独立工作目录，teammate 在其内干活。"""
 import json
-import os
 import re
 import subprocess
 import time
@@ -8,7 +7,7 @@ from pathlib import Path
 
 from task_system import load_task, save_task
 
-WORKDIR = Path(os.getcwd()).resolve()
+WORKDIR = Path.cwd().resolve()
 WORKTREES_DIR = WORKDIR / '.worktrees'
 WORKTREES_DIR.mkdir(exist_ok=True)
 

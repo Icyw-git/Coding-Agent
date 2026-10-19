@@ -1,8 +1,8 @@
 """TaskManager unit tests: state machine, logs, persistence, stop, isolation."""
 
 import json
-import time
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -163,6 +163,7 @@ def test_posix_stop_signals_process_group(monkeypatch):
 
 def test_failed_termination_does_not_claim_cancellation(tmp_path, monkeypatch, manager_factory):
     from unittest.mock import Mock
+
     from task_manager import TaskRecord
 
     manager = manager_factory(tmp_path)

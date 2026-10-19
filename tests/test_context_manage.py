@@ -12,13 +12,14 @@
 import copy
 import json
 import logging
-import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import harness
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
+
+import harness
 
 
 @pytest.fixture(autouse=True)

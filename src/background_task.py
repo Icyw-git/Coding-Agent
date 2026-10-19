@@ -1,6 +1,7 @@
 import json
 import threading
 from pathlib import Path
+
 from workspace_context import current_workspace, use_workspace
 
 _bg_counter=0
@@ -46,7 +47,7 @@ def start_background_task(tool_call,registry:dict)->str: #启动后台任务，�
         }
 
     workspace = current_workspace(Path.cwd())
-    import hooks   # 延迟导入：hooks 模块级依赖 tools，反向按需取
+    import hooks  # 延迟导入：hooks 模块级依赖 tools，反向按需取
     grants = hooks.take_grants()   # 凭据转移给 worker，父上下文不再保留副本
     # 会话 id 同样要显式带走：ContextVar 不跨线程继承，丢了 worker 的审批白名单
     # 就落到进程级键上（一个会话批的 rm 在所有会话的后台任务里都免审）。

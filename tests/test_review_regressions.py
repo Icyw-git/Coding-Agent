@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from checkpoints import CheckpointManager, CheckpointError
-from session_store import SessionEventStore
+from checkpoints import CheckpointError, CheckpointManager
 from session_cleanup import SessionArchive
+from session_store import SessionEventStore
 
 
 def test_checkpoint_refuses_other_workspace_and_mixed_chain(tmp_path):

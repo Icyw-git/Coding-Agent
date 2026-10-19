@@ -4,11 +4,14 @@ import time
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 import agent_teams
 import background_task
 import cron_scheduler
-import hooks
 import harness
+import hooks
+import recovery
 import task_system
 
 
@@ -359,3 +362,25 @@ def test_saved_session_title_source_defaults_for_legacy_events(tmp_path):
     store.append_session_title('手动命名', source='user')
     assert store.saved_session_title_source() == 'user'
     assert store.saved_session_title() == '手动命名'
+
+
+def test_with_retry_reports_last_error_when_retries_exhausted(monkeypatch):
+    """重试耗尽要抛 RuntimeError 并带上最后一次失败原因。
+
+    except 块结束时 Python 会删除 e，旧实现在这条路上引用 e 得到的是 NameError，
+    模型侧的真实错误被吞掉；该分支此前零覆盖。
+    """
+    monkeypatch.setattr(recovery, 'MAX_RETRIES', 3)
+    monkeypatch.setattr(recovery, 'retry_delay', lambda attempt, retry_after=None: 0)
+
+    attempts = []
+
+    def always_throttled():
+        attempts.append(1)
+        raise Exception('HTTP 429: too many requests')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        recovery.with_retry(always_throttled, recovery.RecoveryState())
+
+    assert len(attempts) == 3
+    assert '429' in str(excinfo.value), "失败原因必须留在异常消息里"

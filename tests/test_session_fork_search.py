@@ -3,24 +3,22 @@
 运行: python test_session_fork_search.py
 """
 import json
-import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
 
 import cli_input
 import gateway_sim
 import harness
-import feishu_gateway
 from agent_runtime import AgentRuntime
 from feishu_gateway import FeishuGateway
 from harness_api import create_app
 from session_store import SessionEventStore
 from test_feishu_gateway import FakeTransport, _sync_asgi_transport
 from turn_progress import relative_time
-
 
 # ---------- SessionEventStore.fork ----------
 
