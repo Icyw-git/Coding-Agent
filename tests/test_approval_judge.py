@@ -2,14 +2,15 @@
 
 运行: python test_approval_judge.py
 """
-import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pytest
+
 import harness
 import hooks
-import pytest
 
 
 def make_client(replies):
@@ -233,7 +234,7 @@ def test_revoke_and_tier_switch_clear_judge_cache(monkeypatch):
     monkeypatch.setattr(harness, 'client', client)
 
     assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
-    key = f'|bash:python -m pytest'
+    key = '|bash:python -m pytest'
     assert hooks.GATE.judge_cache_hit(key), "放行后应入缓存"
     hooks.GATE.revoke_session()
     assert not hooks.GATE.judge_cache_hit(key), "撤销必须收回审查官的免审"
@@ -313,7 +314,7 @@ def test_preflight_failclosed_on_bad_output(monkeypatch):
 # ---------- 破坏性列表的词边界匹配（exec_policy 层） ----------
 
 def test_destructive_word_boundary():
-    from exec_policy import Policy, ALLOW, ASK
+    from exec_policy import ALLOW, ASK, Policy
 
     policy = Policy()
     # 误伤修复：confirm/delegate/delete 含 'rm '/'del ' 子串，但命令词不是 rm/del
