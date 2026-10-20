@@ -64,13 +64,26 @@ class TaskRecord:
 class TaskManager:
     """Create, observe, and stop background commands with persisted state."""
 
-    def __init__(self, root, allowed_root=None, enforce=None) -> None:
+    def __init__(self, root, allowed_root=None, enforce=None, allowed_roots=None) -> None:
         """enforce: 可选的 command -> 拒绝语|None 判定（执行策略层接线用）。"""
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.allowed_root = (
-            Path(allowed_root).resolve() if allowed_root else None
-        )
+        if allowed_roots is None:
+            allowed_roots = ()
+        elif isinstance(allowed_roots, (str, os.PathLike)):
+            allowed_roots = (allowed_roots,)
+        roots = []
+        seen = set()
+        for value in (*allowed_roots, allowed_root):
+            if value is None:
+                continue
+            candidate = Path(value).resolve()
+            key = os.path.normcase(str(candidate))
+            if key not in seen:
+                seen.add(key)
+                roots.append(candidate)
+        self.allowed_roots = roots or None
+        self.allowed_root = roots[0] if roots else None
         self._enforce = enforce
         self._lock = threading.RLock()
         self._tasks: dict[str, TaskRecord] = {}
@@ -175,10 +188,12 @@ class TaskManager:
         )
         if not base.is_dir():
             raise ValueError(f'cwd does not exist: {base}')
-        if self.allowed_root is not None and base != self.allowed_root \
-                and self.allowed_root not in base.parents:
+        if self.allowed_roots and not any(
+                base == root or root in base.parents for root in self.allowed_roots):
+            shown = (self.allowed_roots[0] if len(self.allowed_roots) == 1
+                     else self.allowed_roots)
             raise ValueError(
-                f'cwd {base} is outside the allowed root {self.allowed_root}'
+                f'cwd {base} is outside the allowed root {shown}'
             )
         return base
 
@@ -206,10 +221,18 @@ class TaskManager:
                 try:
                     handle.write(f'$ {record.command}\n[cwd] {record.cwd}\n')
                     handle.flush()
+                    sandbox_root = None
+                    if self.allowed_roots:
+                        cwd_path = Path(record.cwd)
+                        # 嵌套根取最具体的一条：否则 [C:\, C:\proj] 会把沙箱
+                        # 放宽到 C:\，多根反而比单根更松。
+                        sandbox_root = max(
+                            (root for root in self.allowed_roots
+                             if cwd_path.is_relative_to(root)),
+                            key=lambda root: len(root.parts), default=cwd_path)
                     proc = spawn_shell(
                         record.command, cwd=record.cwd, stdout=handle,
-                        workspace=str(self.allowed_root)
-                        if self.allowed_root is not None else None,
+                        workspace=str(sandbox_root) if sandbox_root is not None else None,
                     )
                     record.pid = proc.pid
                     self._procs[record.id] = proc

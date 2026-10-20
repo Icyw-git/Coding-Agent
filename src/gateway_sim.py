@@ -98,6 +98,22 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['workspace']
 
+    def list_workspaces(self, current: str | None = None) -> dict:
+        params = {'current': current} if current else None
+        response = self.http.get('/v1/workspaces', params=params)
+        response.raise_for_status()
+        return response.json()
+
+    def add_workspace(self, path: str, name: str | None = None) -> dict:
+        response = self.http.post('/v1/workspaces', json={'path': path, 'name': name})
+        response.raise_for_status()
+        return response.json()['workspace']
+
+    def remove_workspace(self, workspace_id: str) -> dict:
+        response = self.http.delete(f'/v1/workspaces/{workspace_id}')
+        response.raise_for_status()
+        return response.json()['removed']
+
     def list_archives(self) -> list[dict]:
         response = self.http.get('/v1/session-archives')
         response.raise_for_status()

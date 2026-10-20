@@ -98,6 +98,61 @@ def test_cwd_outside_allowed_root_rejected(tmp_path, manager_factory):
     assert record.cwd == str(inside)
 
 
+def test_multiple_allowed_roots_accept_each_root(tmp_path, manager_factory):
+    first = tmp_path / 'first'
+    second = tmp_path / 'second'
+    outside = tmp_path / 'outside'
+    for directory in (first, second, outside):
+        directory.mkdir()
+    manager = manager_factory(tmp_path / 'tasks', allowed_roots=[first, second])
+
+    assert manager.allowed_root == first
+    assert manager.create('echo hi', cwd=str(first)).cwd == str(first)
+    assert manager.create('echo hi', cwd=str(second)).cwd == str(second)
+    with pytest.raises(ValueError, match='outside the allowed root'):
+        manager.create('echo hi', cwd=str(outside))
+
+
+def test_nested_roots_sandbox_uses_most_specific_root(
+        tmp_path, manager_factory, monkeypatch):
+    import task_manager
+
+    outer = tmp_path / 'outer'
+    inner = outer / 'inner'
+    inner.mkdir(parents=True)
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+        def wait(self):
+            return 0
+
+    def fake_spawn(command, *, cwd, stdout, workspace=None):
+        captured['workspace'] = workspace
+        return FakeProc()
+
+    monkeypatch.setattr(task_manager, 'spawn_shell', fake_spawn)
+    manager = manager_factory(tmp_path / 'tasks', allowed_roots=[outer, inner])
+    record = manager.create('echo hi', cwd=str(inner))
+    for _ in range(100):
+        record = manager.get(record.id)
+        if record.status in ('succeeded', 'failed'):
+            break
+        time.sleep(0.05)
+
+    assert record.status == 'succeeded'
+    assert captured['workspace'] == str(inner)
+
+
+def test_allowed_root_keyword_still_works(tmp_path, manager_factory):
+    inside = tmp_path / 'inside'
+    inside.mkdir()
+    manager = manager_factory(tmp_path / 'tasks', allowed_root=inside)
+    assert manager.allowed_roots == [inside]
+    assert manager.allowed_root == inside
+
+
 def test_list_orders_newest_first(tmp_path, manager_factory):
     manager = manager_factory(tmp_path)
     first = manager.create('echo one')

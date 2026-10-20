@@ -26,6 +26,7 @@ from hooks import enforce_headless
 from session_store import SessionReplayError
 from task_manager import TaskManager
 from turn_progress import TurnProgress, format_duration
+from workspace_context import workspace_roots
 
 STREAM_PROGRESS_INTERVAL = float(os.getenv('HARNESS_PROGRESS_INTERVAL', '1'))
 STREAM_DIAGNOSTIC_INTERVAL = 60
@@ -55,6 +56,11 @@ if BaseModel is not None:
 
     class WorkspaceRequest(BaseModel):
         path: str = Field(min_length=1)
+
+
+    class CreateWorkspaceRequest(BaseModel):
+        path: str = Field(min_length=1)
+        name: str | None = None
 
 
     class CreateTaskRequest(BaseModel):
@@ -112,15 +118,17 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     # 独立命名空间：.cache/tasks 已被 task_system（agent TODO 列表）占用
     task_base = Path(task_root or os.getenv("HARNESS_TASK_ROOT")
                      or Path.cwd() / ".cache" / "os_tasks")
+    allowed_roots = workspace_roots(
+        workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd())
     tasks = TaskManager(
         task_base,
-        allowed_root=workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd(),
+        allowed_roots=allowed_roots,
         # 执行策略层接线：任务命令不经过 PreToolUse hook，由 runner 在 Popen 前判定
         # （需要审批时进 /v1/permissions 队列，超时拒绝）。
         enforce=lambda command: enforce_headless('bash', {'command': command}),
     )
     if isinstance(runtime, AgentRuntime):
-        runtime.configure_workspace_root(tasks.allowed_root)
+        runtime.configure_workspace_roots(allowed_roots)
     # 服务器模式：权限审批走远程端点（消息网关轮询 /v1/permissions）；
     # CLI 入口不经过 create_app，保持 console 后端不受影响。
     permission_gate.backend = 'remote'
@@ -294,6 +302,28 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get('/v1/workspaces')
+    def list_workspaces(current: str | None = None):
+        return runtime.list_workspaces(current)
+
+    @app.post('/v1/workspaces', status_code=201)
+    def add_workspace(request: CreateWorkspaceRequest):
+        try:
+            entry = runtime.add_workspace(request.path, request.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {'workspace': entry}
+
+    @app.delete('/v1/workspaces/{workspace_id}')
+    def remove_workspace(workspace_id: str):
+        try:
+            removed = runtime.remove_workspace(workspace_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail='workspace not found') from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {'removed': removed}
 
     @app.get("/v1/sessions/{session_id}/stream")
     def stream_session(session_id: str, after: int = 0, poll: float = 0.3,

@@ -263,3 +263,51 @@ def test_workspace_api_auth_validation_and_busy_session(tmp_path):
             release.set()
             thread.join(5)
         assert client.put(url, json={'path': '.'}, headers=headers).status_code == 200
+
+
+def test_workspace_registry_api_and_multiple_authorized_roots(tmp_path, monkeypatch):
+    primary = tmp_path / 'primary'
+    extra = tmp_path / 'extra'
+    outside = tmp_path / 'outside'
+    for directory in (primary, extra, outside):
+        directory.mkdir()
+    monkeypatch.setenv('HARNESS_WORKSPACE_ROOTS', str(extra))
+    runtime = AgentRuntime(lambda *a, **kw: 'done', SessionEventStore,
+                           tmp_path / 'sessions', workspace=primary)
+    app = create_app(runtime, api_token='t', workspace=primary,
+                     task_root=tmp_path / 'tasks')
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        headers = {'Authorization': 'Bearer t'}
+
+        listing = client.get('/v1/workspaces', headers=headers).json()
+        assert listing['roots'] == [str(primary), str(extra)]
+        assert listing['current'] == str(primary)
+        assert listing['workspaces'][0]['path'] == str(primary)
+
+        added = client.post('/v1/workspaces',
+                            json={'path': str(extra), 'name': 'Extra'},
+                            headers=headers)
+        assert added.status_code == 201
+        entry = added.json()['workspace']
+        assert entry['name'] == 'Extra'
+        row = next(row for row in
+                   client.get('/v1/workspaces', headers=headers).json()['workspaces']
+                   if row['path'] == str(extra))
+        assert row['saved'] is True and row['allowed'] is True
+
+        created = client.post('/v1/sessions',
+                              json={'id': 'in-extra', 'workspace': str(extra)},
+                              headers=headers)
+        assert created.status_code == 201
+        assert runtime.get_workspace('in-extra') == str(extra)
+        rejected = client.post('/v1/sessions',
+                               json={'id': 'outside', 'workspace': str(outside)},
+                               headers=headers)
+        assert rejected.status_code == 400
+
+        removed = client.delete(f"/v1/workspaces/{entry['id']}", headers=headers)
+        assert removed.status_code == 200
+        assert removed.json()['removed']['path'] == str(extra)
+        assert client.delete('/v1/workspaces/missing',
+                             headers=headers).status_code == 404

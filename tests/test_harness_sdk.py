@@ -50,3 +50,20 @@ def test_sdk_can_create_generated_session():
 
     assert session.id == 'generated'
     assert session.history == []
+
+
+def test_sdk_exposes_the_workspace_registry():
+    class Runtime:
+        def list_workspaces(self, current=None):
+            return {'current': current, 'workspaces': []}
+
+        def add_workspace(self, path, name=None):
+            return {'id': 'ws1', 'path': path, 'name': name or path}
+
+        def remove_workspace(self, workspace_id):
+            return {'id': workspace_id}
+
+    client = HarnessClient(Runtime())
+    assert client.workspaces.list('here')['current'] == 'here'
+    assert client.workspaces.add('p', 'Name')['name'] == 'Name'
+    assert client.workspaces.remove('ws1')['id'] == 'ws1'

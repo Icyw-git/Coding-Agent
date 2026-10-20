@@ -21,7 +21,8 @@ class Command:
 
 COMMANDS = (
     Command('/help', ('/?',), '[命令]', '显示帮助；如 /help rewind', '常用'),
-    Command('/new', ('/n',), '[会话ID]', '选择工作区开始新会话；Enter 用当前目录', '会话'),
+    Command('/new', ('/n',), '[--ws <序号|名称|路径>|会话ID]',
+            '选择工作区开始新会话；--ws 直接指定，Enter 用当前目录', '会话'),
     Command('/resume', ('/r',), '[last|会话ID或前缀]', '选择并恢复会话及其工作目录；last 直达最近会话', '会话'),
     Command('/sessions', ('/s',), '', '打开会话管理；按工作区分组、预览和切换', '会话'),
     Command('/archive', (), '[天数|all|empty|restore]', '归档旧会话；默认 30 天，可查看全部或恢复归档', '会话'),
@@ -41,6 +42,9 @@ COMMANDS = (
     Command('/rename', (), '<新主题>', '设置当前会话主题', '会话'),
     Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
     Command('/cd', (), '[路径]', '切换当前会话工作区；换项目建议 /new', '工作区'),
+    Command('/workspaces', (), '', '列出已登记工作区', '工作区'),
+    Command('/workspace', (), '[add <路径> [--name 名称]|remove <序号|名称|路径>]',
+            '登记、命名或移除工作区', '工作区'),
     Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
     Command('/checkpoint', ('/cp',), '[标签]', '创建手动快照', '快照'),
     Command('/rewind', (), '[ID|last|head] [--force] [--session] [--yes]',
@@ -101,6 +105,19 @@ def command_error(name: str, argument: str) -> str | None:
         return '用法：/find <关键词>。'
     if name == '/rename' and not argument.strip():
         return '用法：/rename <新主题>。'
+    if name == '/workspaces' and argument.strip():
+        return '用法：/workspaces（不带参数）。'
+    if name == '/workspace':
+        tokens = argument.split(maxsplit=1)
+        action = tokens[0].lower() if tokens else 'list'
+        if action not in ('list', 'add', 'remove'):
+            return ('用法：/workspaces；/workspace add <路径> [--name 名称]；'
+                    '/workspace remove <序号|名称|路径>')
+        if action in ('add', 'remove') and (
+                len(tokens) < 2 or not tokens[1].strip()):
+            if action == 'add':
+                return '用法：/workspace add <路径> [--name 名称]'
+            return '用法：/workspace remove <序号|名称|路径>'
     return None
 
 

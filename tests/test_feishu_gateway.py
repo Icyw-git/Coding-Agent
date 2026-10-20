@@ -958,3 +958,161 @@ def test_sandbox_command_reports_tiers_and_errors(gateway, monkeypatch):
     monkeypatch.setattr(gw, 'api', BrokenAPI())
     gw.on_message('c1', '/sandbox nope')
     assert '[sandbox] unknown' in fake.last(), '服务端的 400 说明要转给用户'
+
+
+class _WorkspaceCardTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.cards = []
+
+    def send_workspace_card(self, chat_id, card):
+        self.cards.append((chat_id, card))
+
+
+def _workspace_values(card):
+    return [element['actions'][0]['value'] for element in card['elements']
+            if element.get('tag') == 'action']
+
+
+def test_new_lists_the_default_workspace_before_any_session(gateway, tmp_path):
+    gw, _ = gateway
+    gw.transport = _WorkspaceCardTransport()
+
+    gw.on_message('c1', '/new')
+
+    assert not gw.bindings, '/new without a choice must not create a session'
+    assert gw.transport.cards
+    card = gw.transport.cards[-1][1]
+    assert '选择工作区' in card['header']['title']['content']
+    texts = [element['text']['content'] for element in card['elements']
+             if element.get('tag') == 'div']
+    assert any(str(tmp_path) in text for text in texts)
+    values = _workspace_values(card)
+    assert len(values) == 1
+    assert values[0]['index'] == 0 and values[0]['workspace_view']
+
+
+def test_workspace_card_button_creates_a_session_in_that_directory(gateway, tmp_path):
+    gw, _ = gateway
+    gw.transport = _WorkspaceCardTransport()
+    gw.on_message('c1', '/new')
+    value = _workspace_values(gw.transport.cards[-1][1])[0]
+
+    gw._handle_workspace_action('c1', value, 'ou_me')
+
+    assert gw.api.get_workspace(gw.bindings['c1']) == str(tmp_path.resolve())
+    assert '已创建新会话' in gw.transport.last()
+    assert 'c1' not in gw._workspace_views      # 用掉的快照立即失效
+
+
+def test_expired_workspace_view_rejects_numbers_and_buttons(gateway, monkeypatch):
+    gw, fake = gateway
+    gw.on_message('c1', '/new')
+    token = gw._workspace_views['c1'][0]
+    expires = (gw._workspace_views['c1'][2]
+               + feishu_gateway.WORKSPACE_VIEW_TTL + 1)
+    monkeypatch.setattr(feishu_gateway.time, 'monotonic', lambda: expires)
+
+    gw.on_message('c1', '/new 1')
+    assert '已失效' in fake.last()
+    assert not gw.bindings
+
+    text, ok = gw.handle_card_action(
+        'ou_me', {'workspace_view': token, 'index': 0}, 'om_1', chat_id='c1')
+    assert not ok and '已失效' in text
+
+
+def test_workspace_card_rejects_bad_tokens_and_indexes(gateway):
+    gw, _ = gateway
+    gw.on_message('c1', '/new')
+    token = gw._workspace_views['c1'][0]
+
+    text, ok = gw.handle_card_action(
+        'ou_me', {'workspace_view': 'stale', 'index': 0}, 'om_1', chat_id='c1')
+    assert not ok and '已失效' in text
+    text, ok = gw.handle_card_action(
+        'ou_me', {'workspace_view': token, 'index': 99}, 'om_1', chat_id='c1')
+    assert not ok and '无效' in text
+    assert not gw.bindings
+
+
+def test_workspace_card_refuses_an_unauthorized_entry(gateway, tmp_path):
+    import workspaces
+
+    gw, _ = gateway
+    workspaces.add_workspace(tmp_path.parent, name='Parent',
+                             file=tmp_path / 'workspaces.json')
+    gw.transport = _WorkspaceCardTransport()
+    gw.on_message('c1', '/new')
+    values = _workspace_values(gw.transport.cards[-1][1])
+    assert len(values) == 2
+
+    gw._handle_workspace_action('c1', values[1], 'ou_me')
+
+    assert '未授权' in gw.transport.last()
+    assert not gw.bindings
+
+
+def test_new_accepts_ws_name_relative_path_and_id(gateway, tmp_path):
+    gw, _ = gateway
+    project = tmp_path / 'project'
+    project.mkdir()
+    (project / 'sub').mkdir()
+
+    gw.on_message('c1', f'/workspace add "{project}" --name proj')
+    gw.on_message('c1', '/new ws:proj')
+    assert gw.api.get_workspace(gw.bindings['c1']) == str(project.resolve())
+
+    gw.on_message('c1', '/new id:named-session')
+    assert gw.bindings['c1'] == 'named-session'
+    assert gw.api.get_workspace('named-session') == str(project.resolve())
+
+    gw.on_message('c1', '/new ./sub')
+    assert gw.api.get_workspace(gw.bindings['c1']) == str((project / 'sub').resolve())
+
+
+def test_feishu_workspace_commands_add_list_and_remove(gateway, tmp_path):
+    gw, fake = gateway
+    project = tmp_path / 'project'
+    project.mkdir()
+
+    gw.on_message('c1', f'/workspace add "{project}" --name proj')
+    assert '已登记' in fake.last()
+    gw.on_message('c1', '/workspaces')
+    assert 'proj' in fake.last() and str(project.resolve()) in fake.last()
+    gw.on_message('c1', '/workspace remove proj')
+    assert '已移除' in fake.last()
+    gw.on_message('c1', '/workspaces')
+    assert '尚未登记' in fake.last()
+
+
+def test_switching_workspace_invalidates_the_pending_selection(gateway):
+    gw, _ = gateway
+    gw.on_message('c1', '/new')
+    assert 'c1' in gw._workspace_views
+
+    gw.on_message('c1', '/cd .')
+
+    assert 'c1' not in gw._workspace_views
+
+    gw.on_message('c1', '/new')
+    assert 'c1' in gw._workspace_views
+    gw.on_message('c1', '/quit')
+    assert 'c1' not in gw._workspace_views
+
+
+def test_workspaces_lists_all_registered_entries_beyond_the_picker_limit(
+        gateway, tmp_path):
+    gw, fake = gateway
+    for index in range(8):
+        directory = tmp_path / f'ws{index}'
+        directory.mkdir()
+        gw.api.add_workspace(str(directory), f'ws{index}')
+
+    gw.on_message('c1', '/workspaces')
+    text = fake.last()
+    for index in range(8):
+        assert f'ws{index}' in text
+
+    gw.on_message('c1', '/workspace remove ws0')
+    assert '已移除' in fake.last()

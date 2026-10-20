@@ -16,6 +16,9 @@ class RuntimeClient(Protocol):
     def rename_session(self, session_id: str, title: str) -> str: ...
     def get_workspace(self, session_id: str) -> str: ...
     def set_workspace(self, session_id: str, path: str) -> str: ...
+    def list_workspaces(self, current: str | None = None) -> dict: ...
+    def add_workspace(self, path: str, name: str | None = None) -> dict: ...
+    def remove_workspace(self, workspace_id: str) -> dict: ...
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,20 @@ class Sessions:
         return self._runtime.set_workspace(session_id, path)
 
 
+class Workspaces:
+    def __init__(self, runtime: RuntimeClient) -> None:
+        self._runtime = runtime
+
+    def list(self, current: str | None = None) -> dict:
+        return self._runtime.list_workspaces(current)
+
+    def add(self, path: str, name: str | None = None) -> dict:
+        return self._runtime.add_workspace(path, name)
+
+    def remove(self, workspace_id: str) -> dict:
+        return self._runtime.remove_workspace(workspace_id)
+
+
 class Messages:
     def __init__(self, runtime: RuntimeClient) -> None:
         self._runtime = runtime
@@ -78,6 +95,7 @@ class HarnessClient:
 
     def __init__(self, runtime: RuntimeClient) -> None:
         self.sessions = Sessions(runtime)
+        self.workspaces = Workspaces(runtime)
         self.messages = Messages(runtime)
 
 

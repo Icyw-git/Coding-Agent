@@ -33,6 +33,7 @@ import concurrent.futures
 import contextvars
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -51,6 +52,7 @@ import approval_view  # 审批面的参数渲染（/approvals 列表要显示完
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
 import sandbox
+import workspaces
 from agent_core import (
     HOOKS,
     _bound_tool_output,
@@ -118,6 +120,7 @@ from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from tools import TOOLS, run_bash, tool_registry
+from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
 
@@ -265,7 +268,22 @@ def start_new_session(workspace=None, session_id=None):
     except Exception:
         set_workspace(str(previous))
         raise
+    workspaces.remember_workspace(WORKDIR, file=workspace_registry_path())
     return store
+
+
+def workspace_registry_path() -> Path:
+    return workspaces.default_path(SESSIONS_DIR)
+
+
+def registered_workspaces() -> list[dict]:
+    return workspaces.list_workspaces(file=workspace_registry_path())
+
+
+def workspace_catalog() -> list[dict]:
+    """当前目录 + 登记表 + 最近会话目录：与 API/飞书共用同一合并规则。"""
+    return workspace_choices(session_rows(limit=None, include_empty=True), WORKDIR,
+                             saved=registered_workspaces())
 
 
 def _workspace_for_new_session():
@@ -273,15 +291,90 @@ def _workspace_for_new_session():
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return WORKDIR
     from cli_input import browse_for_workspace, choose_workspace
-    from workspace_choices import workspace_choices
 
-    rows = workspace_choices(session_rows(limit=None, include_empty=True), WORKDIR)
-    choice = choose_workspace(rows)
+    choice = choose_workspace(workspace_catalog())
     if choice is None:
         return None
     if choice.get('browse'):
         return browse_for_workspace(WORKDIR)
     return choice['path']
+
+
+def format_workspace_list() -> str:
+    entries = registered_workspaces()
+    if not entries:
+        return ('  尚未登记工作区。\n'
+                '  /workspace add <路径> [--name 名称] 可登记；/new 也能直接选最近目录。')
+    from turn_progress import relative_time
+    counts: dict[str, int] = {}
+    for row in session_rows(limit=None, include_empty=True):
+        value = str(row.get('workspace') or '').strip()
+        if value:
+            key = workspace_key(value)
+            counts[key] = counts.get(key, 0) + 1
+    current_key = workspace_key(WORKDIR)
+    lines = ['  已登记工作区：']
+    for index, entry in enumerate(entries, 1):
+        key = workspace_key(entry['path'])
+        mark = '（当前）' if key == current_key else ''
+        when = (f" · {relative_time(entry.get('last_used_at'))}"
+                if entry.get('last_used_at') else '')
+        lines.append(f"  {index}. {entry['name']}  {entry['path']}{mark}"
+                     f" · {counts.get(key, 0)} 个会话{when}")
+    lines.append('  /workspace remove <序号|名称|路径> 移除；/new --ws <序号|名称|路径> 直接使用。')
+    return '\n'.join(lines)
+
+
+def _split_workspace_add(argument: str):
+    text = argument.strip()
+    name = None
+    match = re.search(r'\s+--name\s+(.+)$', text)
+    if match:
+        name = match.group(1).strip().strip('"\'')
+        text = text[:match.start()].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    return text, name
+
+
+def handle_workspace_command(command: str, argument: str) -> None:
+    parts = argument.split(maxsplit=1)
+    action = parts[0].lower() if parts else 'list'
+    if command == '/workspaces' or action in ('', 'list'):
+        print(format_workspace_list())
+        return
+    if action == 'add':
+        path, name = _split_workspace_add(parts[1] if len(parts) > 1 else '')
+        if not path:
+            print('  用法：/workspace add <路径> [--name 名称]')
+            return
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = WORKDIR / candidate
+        try:
+            entry = workspaces.add_workspace(candidate, name=name,
+                                             file=workspace_registry_path())
+        except (OSError, ValueError) as exc:
+            print(f'  [workspace] {exc}')
+            return
+        print(f"  已登记工作区：{entry['name']}  {entry['path']}")
+        return
+    if action == 'remove':
+        selector = parts[1].strip() if len(parts) > 1 else ''
+        if not selector:
+            print('  用法：/workspace remove <序号|名称|路径>')
+            return
+        try:
+            entry = find_workspace(registered_workspaces(), selector)
+            removed = workspaces.remove_workspace(entry['id'],
+                                                  file=workspace_registry_path())
+        except (KeyError, OSError, ValueError) as exc:
+            print(f'  [workspace] {exc}')
+            return
+        print(f"  已移除登记：{removed['name']}  {removed['path']}")
+        return
+    print('  用法：/workspaces；/workspace add <路径> [--name 名称]；'
+          '/workspace remove <序号|名称|路径>')
 
 
 def session_rows(limit: int | None = 100, *, include_empty: bool = False,
@@ -1330,6 +1423,9 @@ def handle_command(line:str,messages:list,session_store)->None:
             '记录及关联快照不可恢复，项目文件未改动。' if deleting else
             '用 /archive restore 可恢复；项目文件未改动。' if not restoring else '可用 /resume 继续会话。'))
 
+    elif command in ('/workspaces', '/workspace'):
+        handle_workspace_command(command, argument)
+
     elif command == '/pwd':
         print(f'  工作区：{WORKDIR}')
 
@@ -1986,17 +2082,42 @@ def run_repl(initial_messages:list, session_store=None):
             if command in ('/n', '/new'):
                 parts = line.split(maxsplit=1)
                 requested = parts[1].strip() if len(parts) > 1 else None
-                if requested and not requested.replace('-', '').replace('_', '').isalnum():
-                    print('  [session] invalid session id')
-                    continue
                 target = WORKDIR
-                if not requested:
+                session_id = None
+                lowered = requested.lower() if requested else ''
+                if lowered.startswith('--'):
+                    if lowered != '--ws' and not lowered.startswith('--ws '):
+                        print('  [workspace] 未知参数；用法：'
+                              '/new [--ws <序号|名称|路径>|会话ID]')
+                        continue
+                    selector = requested[4:].strip()
+                    if not selector:
+                        print('  [workspace] 用法：/new --ws <序号|名称|路径>')
+                        continue
+                    try:
+                        target = find_workspace(registered_workspaces(), selector)['path']
+                    except ValueError as exc:
+                        # 直接给路径也允许（未登记时不必先 /workspace add）
+                        candidate = Path(selector).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = WORKDIR / candidate
+                        if candidate.is_dir():
+                            target = str(candidate.resolve())
+                        else:
+                            print(f'  [workspace] {exc}')
+                            continue
+                elif requested:
+                    if not requested.replace('-', '').replace('_', '').isalnum():
+                        print('  [session] invalid session id')
+                        continue
+                    session_id = requested
+                else:
                     target = _workspace_for_new_session()
                     if target is None:
                         print('  [session] 已取消新建会话。')
                         continue
                 try:
-                    session_store = start_new_session(workspace=target, session_id=requested)
+                    session_store = start_new_session(workspace=target, session_id=session_id)
                 except (ValueError, FileExistsError) as exc:
                     print(f'  [session] {exc}')
                     continue

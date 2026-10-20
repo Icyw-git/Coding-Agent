@@ -27,9 +27,13 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 `/resume ` 可补全会话 ID，`/cd ` 可补全当前工作区下的目录（支持带空格的路径），
 `/help ` 和 `/rewind --` 也支持补全。普通对话不弹出命令菜单，非交互输入仍按纯文本读取。
 
-- `/new`（`/n`）：新建会话；先选择工作区（默认当前目录，路径来自最近会话；也可以选
-  「浏览电脑中的文件夹…」逐级挑选：在首行「进入此文件夹」按 Enter 确认，在子目录上按
-  Enter 进入，不需要输入路径）。非交互环境（管道/脚本）直接在当前目录新建。
+- `/new`（`/n`）：新建会话；先选择工作区（当前目录、已登记工作区和最近会话目录按最近
+  活跃排序；也可以选「浏览电脑中的文件夹…」逐级挑选：在首行「进入此文件夹」按 Enter
+  确认，在子目录上按 Enter 进入，不需要输入路径）。`/new --ws <序号|名称|路径>` 直接
+  指定，适合脚本；非交互环境不带参数时仍在当前目录新建。
+- `/workspaces`：列出已登记工作区（名称、路径、会话数和最近使用时间）。
+- `/workspace add <路径> [--name 名称]`、`/workspace remove <序号|名称|路径>`：维护登记表。
+  登记表默认在 `.cache/workspaces.json`，跨重启保留；它只用于发现和排序，不扩大授权。
 - `/resume`（`/r`）：打开会话选择器，展示名称、工作目录、最近任务和更新时间；也可用主题、目录、ID 前缀搜索后直接恢复。
 - `/sessions`（`/s`）：打开会话管理，与不带参数的 `/resume` 使用同一界面。
 - `/cd "D:\My Project"`：切换当前会话的工作区，支持带空格的路径；`/pwd` 查看路径。
@@ -84,18 +88,28 @@ Enter 切换、Esc 返回，Ctrl+A 切换当前/全部工作区。Tab/Shift+Tab 
 可先在对应聊天 `/quit` 解绑。API 会拒绝处理本进程正在执行任务的会话。
 飞书 `/cd <目录>` 切换当前会话工作区，普通对话的文件工具、shell、提示词和 `/run` 使用同一目录；
 `/cd` 或 `/pwd` 查看当前目录。相对路径基于当前会话工作区，支持带引号的空格路径。
-`/new` 不带参数时先列出工作区候选（当前 + 最近使用），回复 `/new <序号>` 选择；
-`/new <路径>` 直接指定目录，`/new <会话ID>` 兼容旧用法并沿用当前工作区。
+`/new` 不带参数时发送工作区选择卡片（当前 + 已登记 + 最近使用；卡片不可用时发文本列表），
+回复 `/new <序号>` 选择；也可 `/new ws:<序号|名称|路径>`、`/new <路径>`、`/new id:<会话ID>`。
+序号和卡片按钮只对最近一次列表有效（10 分钟），`/cd`、`/resume`、`/fork` 后失效；
+`/new id:<会话ID>` 与 `/new <会话ID>` 兼容旧用法并沿用当前工作区。
+`/workspaces` 列出登记项；`/workspace add <路径> [--name 名称]`、`/workspace remove <序号|名称|路径>`
+维护登记表。相对路径 `add` 基于当前会话工作区。
 `/resume` 恢复所选会话目录；目录保存在会话日志中，重启后仍有效。
-工作区必须存在并位于服务端 `HARNESS_WORKSPACE`（默认启动目录）下；目录失效时拒绝执行，
-可用绝对路径重新 `/cd`。Agent 正在执行当前回合时暂不允许切换目录，其他会话不受影响；
-已启动的后台任务继续使用启动时的目录。
+工作区必须存在，且位于服务端启动授权的根内：`HARNESS_WORKSPACE`（默认启动目录）加
+`HARNESS_WORKSPACE_ROOTS`（额外根，`os.pathsep` 分隔）。登记表不参与授权——手工往
+`workspaces.json` 里写一个未授权目录，只会显示为「未授权」，创建前仍被拒绝。
+目录失效时拒绝执行，可用绝对路径重新 `/cd`。Agent 正在执行当前回合时暂不允许切换目录，
+其他会话不受影响；已启动的后台任务继续使用启动时的目录。
 会话日志、快照、记忆和任务的存储位置仍由服务端配置管理，不随 `/cd` 移动。
 
 API 使用 `GET /v1/sessions/{id}/workspace` 查看、`PUT /v1/sessions/{id}/workspace`
 （请求体 `{"path":"子目录"}`）切换；创建会话时也可传 `workspace`。
-SDK 对应 `client.sessions.workspace(id)`、`client.sessions.change_workspace(id, path)`，
-以及 `client.sessions.create(workspace=path)`。
+工作区登记表对应 `GET /v1/workspaces?current=`、`POST /v1/workspaces`
+（请求体 `{"path":"...","name":"..."}`）和 `DELETE /v1/workspaces/{id}`；
+远程登记只接受已授权根内的路径，返回项带 `saved` / `exists` / `allowed` 状态。
+SDK 对应 `client.sessions.workspace(id)`、`client.sessions.change_workspace(id, path)`、
+`client.sessions.create(workspace=path)`，以及
+`client.workspaces.list()` / `add(path, name)` / `remove(id)`。
 
 审批消息使用独立处理通道；即使普通消息处理线程全部占用，仍可通过审批卡片、
 `/approve y|n` 或 `y/n` 回复解除等待，用户白名单同样生效。
@@ -283,9 +297,20 @@ HARNESS_MEMORY_RECALL=local
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
 
+# 可选：额外授权的工作区根，os.pathsep 分隔（Windows 为 ;，Linux/macOS 为 :）
+# 与 HARNESS_WORKSPACE 一起构成服务端的全部授权根；登记表不参与授权。
+HARNESS_WORKSPACE_ROOTS=D:\Projects;E:\Work
+
+# 可选：工作区登记表位置；默认 SESSIONS_DIR 的父目录下 workspaces.json
+HARNESS_WORKSPACE_FILE=.cache/workspaces.json
+
 # 可选：启用分段计时，启动前设置
 HARNESS_PERF=1
 ```
+
+`HARNESS_WORKSPACE` / `HARNESS_WORKSPACE_ROOTS` 是授权配置，应当放在启动脚本、服务管理器
+或用户级环境里；不要让它们来自工作区内 Agent 可写的 `.env`，否则等于把「能访问哪些目录」
+交给被约束的一方。`HARNESS_WORKSPACE_FILE` 只影响发现列表，不扩大权限。
 
 执行档位与审批档位不在这里配置：`.env`（以及任何 `load_dotenv` 读进来的文件）里的
 `HARNESS_SANDBOX_MODE` / `HARNESS_APPROVAL_POLICY` / `HARNESS_APPROVAL_ALL` 会被忽略，
@@ -428,6 +453,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
+| `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
 | `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
 | `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |

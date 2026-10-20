@@ -23,7 +23,9 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 聊天命令（@机器人 发送）：
     /help             命令清单（未知命令也会自动附带）
-    /new [序号|id|路径] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
+    /new [序号|路径|ws:名称|id:会话ID]  选择工作区新建会话
+    /workspaces      列出已登记工作区；/workspace add|remove 维护登记表
+    /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
     /logs <id> /stop <id> /perms /approve [req_id] y|n /sandbox /quit(解绑)
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
@@ -48,17 +50,18 @@ import httpx
 
 import approval_view
 from exec_policy import approval_class
-from feishu_sessions import PAGE_SIZE, detail_card, list_card
+from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
 from gateway_sim import GatewayClient
 from perf import record as perf_record
 from perf import reset as perf_reset
 from session_views import group_sessions, session_details
 from turn_progress import format_duration
-from workspace_choices import workspace_choices
+from workspace_choices import find_workspace
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
+WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须重新 /new
 
 # 卡片更新的合流：多会话并发逐秒刷新时，同一网关实例内合并到全局
 # 最小间隔，避免飞书卡片 PATCH 接口被高频调用触发频控
@@ -352,7 +355,8 @@ class FeishuGateway:
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
         self._session_choices: dict[str, list[dict]] = {}
-        self._workspace_choices: dict[str, list[dict]] = {}
+        # chat_id → (token, rows, created_at)：卡片按钮与「/new 序号」共用同一快照
+        self._workspace_views: dict[str, tuple[str, list[dict], float]] = {}
         self._session_views: dict[str, tuple] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
@@ -609,6 +613,7 @@ class FeishuGateway:
             self.bindings[chat_id] = row['id']
             self._save_bindings()
         self._session_confirmation.pop(chat_id, None)
+        self._invalidate_workspace_view(chat_id)
         self._reply(chat_id, f"已切换到会话\n主题: {row['title']}\n工作区: {workspace}")
 
     def _handle_session_action(self, chat_id, value, sender_id):
@@ -655,9 +660,32 @@ class FeishuGateway:
             with self._bindings_lock:
                 self.bindings[chat_id] = new_id
                 self._save_bindings()
+            self._invalidate_workspace_view(chat_id)
             self._reply(chat_id, f'已分叉出新会话 {new_id}（原会话保留），已切换。')
         else:
             self._reply(chat_id, '没有这一页，请重新 /sessions 查看会话列表。')
+
+    def _handle_workspace_action(self, chat_id, value, sender_id):
+        view = self._workspace_view(chat_id)
+        if not view or view[0] != value.get('workspace_view'):
+            self._reply(chat_id, '工作区列表已失效，请重新 /new。')
+            return
+        index = value.get('index')
+        if type(index) is not int or not 0 <= index < len(view[1]):
+            self._reply(chat_id, '无效的工作区按钮，请重新 /new。')
+            return
+        choice = view[1][index]
+        if not choice.get('exists', True):
+            self._reply(chat_id, f"目录不存在：{choice['path']}")
+            return
+        if not choice.get('allowed', True):
+            self._reply(chat_id,
+                        '该目录未授权；请把它加入 HARNESS_WORKSPACE_ROOTS 后重启服务。')
+            return
+        try:
+            self._start_session_at(chat_id, choice['path'])
+        except Exception as exc:
+            self._reply(chat_id, f'[new] 创建失败: {exc}')
 
     def _manage_sessions(self, chat_id, command, argument):
         if command == '/cancel':
@@ -760,7 +788,9 @@ class FeishuGateway:
     def _help_text(self) -> str:
         return '\n'.join([
             '可用命令:',
-            '/new [序号|id|路径]     选择工作区新建会话并绑定到本聊天',
+            '/new [序号|路径|ws:名称|id:会话ID]  选择工作区新建会话并绑定到本聊天',
+            '/workspaces            列出已登记工作区',
+            '/workspace add|remove  登记或移除工作区（add 支持 --name 名称）',
             '/sessions [页码]       会话卡片列表、详情与切换',
             '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
             '/archive [天数|empty|all|restore]  选择归档或恢复会话',
@@ -789,49 +819,219 @@ class FeishuGateway:
             '其余文本 → 作为消息发给当前绑定的 agent 会话',
         ])
 
-    def _handle_new(self, chat_id: str, argument: str) -> None:
-        """新建会话：先列工作区候选再按序号选，也接受显式路径与会话 ID。
+    def _bound_workspace(self, chat_id: str) -> str:
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            return ''
+        try:
+            return self.api.get_workspace(session_id)
+        except Exception:
+            return ''
 
-        不带参数只列候选、不建会话；候选来自会话摘要，和 CLI 的选择器同一套
-        去重与排序。序号只在最近一次列表内有效，避免旧按钮点到别的目录。
-        """
-        previous = self.bindings.get(chat_id)
-        current = self.api.get_workspace(previous) if previous else ''
-        if not argument:
-            rows = self.api.list_sessions(limit=1000)
-            if not current:
-                if not rows:
-                    self._reply(chat_id, '还没有会话；直接发消息即可在当前工作区创建。')
-                    return
-                # 未绑定时没有「当前目录」可查：用最近一条会话的工作区做列表基准。
-                current = rows[0]['workspace']
-            choices = workspace_choices(rows, current)
-            self._workspace_choices[chat_id] = choices
-            lines = ['新建会话 · 选择工作区']
-            for index, choice in enumerate(choices, 1):
-                mark = '（当前）' if choice['current'] else ''
-                lines.append(
-                    f"{index}. {choice['path']}{mark}（{choice['sessions']} 个会话）")
-            lines.append('回复 /new <序号> 选择；也可以用 /new <路径> 指定其他目录。')
-            self._reply(chat_id, '\n'.join(lines))
-            return
-        value = argument.strip().strip('"\'')
-        choices = self._workspace_choices.get(chat_id, [])
-        session_id = None
-        if value.isdigit() and 0 < int(value) <= len(choices):
-            workspace = choices[int(value) - 1]['path']
-        elif any(char in value for char in (':', '/', '\\')) or value.startswith('.'):
-            workspace = value
-        else:
-            workspace = current or None   # 兼容旧语义：/new <会话ID> 沿用当前工作区
-            session_id = value
+    def _remember_workspace_view(self, chat_id: str, choices) -> str:
+        token = secrets.token_urlsafe(12)
+        self._workspace_views[chat_id] = (token, list(choices), time.monotonic())
+        return token
+
+    def _workspace_view(self, chat_id: str):
+        view = self._workspace_views.get(chat_id)
+        if view is None:
+            return None
+        if time.monotonic() - view[2] > WORKSPACE_VIEW_TTL:
+            self._workspace_views.pop(chat_id, None)
+            return None
+        return view
+
+    def _workspace_choices_now(self, chat_id: str) -> list[dict]:
+        view = self._workspace_view(chat_id)
+        return list(view[1]) if view else []
+
+    def _invalidate_workspace_view(self, chat_id: str) -> None:
+        self._workspace_views.pop(chat_id, None)
+
+    def _send_workspace_view(self, chat_id, card, fallback):
+        for name in ('send_workspace_card', 'send_session_card'):
+            sender = getattr(self.transport, name, None)
+            if sender is None:
+                continue
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] workspace card failed, fallback to text: {exc}')
+                break
+        self._reply(chat_id, fallback)
+
+    def _resolve_workspace_target(self, chat_id, selector, choices, current):
+        selector = selector.strip()
+        if not selector:
+            self._reply(chat_id, '用法：/new ws:<序号|名称|路径>')
+            return None
+        if not choices:
+            # 没先 /new 也可以按名称直接指定：补一次当前快照，只是不展示列表。
+            listing = self.api.list_workspaces(current=current or None)
+            choices = listing.get('workspaces') or []
+        try:
+            return find_workspace(choices, selector)['path']
+        except ValueError as exc:
+            candidate = Path(selector).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(current or '.').expanduser() / candidate
+            if candidate.is_dir():
+                return str(candidate.resolve())
+            self._reply(chat_id, f'[workspace] {exc}')
+            return None
+
+    def _start_session_at(self, chat_id, workspace, session_id=None):
         created = self.api.create_session(session_id, workspace=workspace)
         with self._bindings_lock:
             self.bindings[chat_id] = created
             self._save_bindings()
-        self._workspace_choices.pop(chat_id, None)
+        self._invalidate_workspace_view(chat_id)
         self._reply(chat_id,
                     f'已创建新会话，工作区：{self.api.get_workspace(created)}')
+        return created
+
+    @staticmethod
+    def _looks_like_path(value: str) -> bool:
+        return bool(value) and (value.startswith(('.', '~', '/', '\\'))
+                                or ':' in value or '/' in value or '\\' in value)
+
+    def _handle_new(self, chat_id: str, argument: str) -> None:
+        """新建会话：先列工作区候选再按序号选，也接受路径、名称与会话 ID。
+
+        不带参数只列候选、不建会话；候选由 API 按「当前目录 + 登记表 +
+        最近会话」合并。序号与卡片只在最近一次列表内有效（10 分钟）。
+        """
+        current = self._bound_workspace(chat_id)
+        if not argument:
+            listing = self.api.list_workspaces(current=current or None)
+            choices = listing.get('workspaces') or []
+            if not choices:
+                self._reply(chat_id, '暂无可选工作区；先发消息或 /cd <路径> 创建。')
+                return
+            token = self._remember_workspace_view(chat_id, choices)
+            lines = ['新建会话 · 选择工作区']
+            for index, choice in enumerate(choices, 1):
+                marks = []
+                if choice.get('current'):
+                    marks.append('当前')
+                if not choice.get('exists', True):
+                    marks.append('目录不存在')
+                elif not choice.get('allowed', True):
+                    marks.append('未授权')
+                mark = f"（{'，'.join(marks)}）" if marks else ''
+                lines.append(f"{index}. {choice['path']}{mark} · {choice['sessions']} 个会话")
+            lines.append('回复 /new <序号> 选择；也可 /new ws:<名称|序号>、'
+                         '/new <路径> 或 /new id:<会话ID>。')
+            self._send_workspace_view(chat_id, workspace_card(choices, token),
+                                      '\n'.join(lines))
+            return
+        value = argument.strip().strip('"\'')
+        choices = self._workspace_choices_now(chat_id)
+        session_id = None
+        workspace = None
+        lower = value.casefold()
+        if lower.startswith('id:'):
+            session_id = value[3:].strip()
+            workspace = current or None   # 兼容旧语义：会话 ID 沿用当前工作区
+        elif lower.startswith('ws:'):
+            workspace = self._resolve_workspace_target(
+                chat_id, value[3:].strip(), choices, current)
+            if workspace is None:
+                return
+        elif value.isdigit():
+            # 序号只对最近一次 /new 的列表有效；过期后不悄悄当会话 ID 用。
+            if not choices or not 0 < int(value) <= len(choices):
+                self._reply(chat_id, '工作区列表已失效，请重新 /new 后再选。')
+                return
+            workspace = choices[int(value) - 1]['path']
+        elif self._looks_like_path(value):
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(current or '.').expanduser() / candidate
+            workspace = str(candidate)
+        else:
+            if not choices:
+                listing = self.api.list_workspaces(current=current or None)
+                choices = listing.get('workspaces') or []
+            match = next((row for row in choices
+                          if str(row.get('name') or '').casefold() == value.casefold()),
+                         None)
+            if match is not None:
+                workspace = match['path']
+            else:
+                workspace = current or None
+                session_id = value
+        if session_id is not None and (
+                not session_id
+                or not session_id.replace('-', '').replace('_', '').isalnum()):
+            self._reply(chat_id, '会话 ID 只能包含字母、数字、- 和 _。')
+            return
+        self._start_session_at(chat_id, workspace, session_id)
+
+    def _handle_workspaces(self, chat_id: str, command: str, argument: str) -> None:
+        parts = argument.split(maxsplit=1)
+        action = parts[0].lower() if parts else 'list'
+        current = self._bound_workspace(chat_id)
+        if command == '/workspaces' or action in ('', 'list'):
+            listing = self.api.list_workspaces(current=current or None)
+            saved = listing.get('saved') or [
+                row for row in listing.get('workspaces') or [] if row.get('saved')]
+            if not saved:
+                self._reply(chat_id, '尚未登记工作区。'
+                            '用 /workspace add <路径> [--name 名称] 登记。')
+                return
+            lines = ['已登记工作区：']
+            for index, row in enumerate(saved, 1):
+                mark = '（当前）' if row.get('current') else ''
+                lines.append(f"{index}. {row['name']}  {row['path']}{mark}"
+                             f" · {row['sessions']} 个会话")
+            lines.append('新增 /workspace add <路径> [--name 名称]；'
+                         '移除 /workspace remove <序号|名称|路径>。')
+            self._reply(chat_id, '\n'.join(lines))
+            return
+        if action == 'add':
+            text = parts[1].strip() if len(parts) > 1 else ''
+            name = None
+            match = re.search(r'\s+--name\s+(.+)$', text)
+            if match:
+                name = match.group(1).strip().strip('"\'')
+                text = text[:match.start()].strip()
+            text = text.strip('"\'')
+            if not text:
+                self._reply(chat_id, '用法：/workspace add <路径> [--name 名称]')
+                return
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(current or '.').expanduser() / candidate
+            try:
+                entry = self.api.add_workspace(str(candidate), name)
+            except Exception as exc:
+                self._reply(chat_id, f'[workspace] {exc}')
+                return
+            self._invalidate_workspace_view(chat_id)
+            self._reply(chat_id, f"已登记工作区：{entry['name']}  {entry['path']}")
+            return
+        if action == 'remove':
+            selector = parts[1].strip() if len(parts) > 1 else ''
+            if not selector:
+                self._reply(chat_id, '用法：/workspace remove <序号|名称|路径>')
+                return
+            listing = self.api.list_workspaces(current=current or None)
+            saved = listing.get('saved') or [
+                row for row in listing.get('workspaces') or [] if row.get('saved')]
+            try:
+                row = find_workspace(saved, selector)
+                removed = self.api.remove_workspace(row['id'])
+            except Exception as exc:
+                self._reply(chat_id, f'[workspace] {exc}')
+                return
+            self._invalidate_workspace_view(chat_id)
+            self._reply(chat_id, f"已移除登记：{removed['name']}  {removed['path']}")
+            return
+        self._reply(chat_id, '用法：/workspaces；/workspace add <路径> [--name 名称]；'
+                             '/workspace remove <序号|名称|路径>')
 
     def _handle_command(self, chat_id: str, text: str, sender_id: str | None = None) -> None:
         parts = text.split(maxsplit=1)
@@ -844,6 +1044,8 @@ class FeishuGateway:
                 self._reply(chat_id, self._help_text())
             elif command == '/new':
                 self._handle_new(chat_id, argument)
+            elif command in ('/workspaces', '/workspace'):
+                self._handle_workspaces(chat_id, command, argument)
             elif command == '/sessions':
                 if argument.isdigit() and int(argument) > 0:
                     view = self._session_views.get(chat_id)
@@ -895,6 +1097,7 @@ class FeishuGateway:
                     with self._bindings_lock:
                         self.bindings[chat_id] = session_id
                         self._save_bindings()
+                    self._invalidate_workspace_view(chat_id)
                     self._reply(chat_id, f'当前工作区: {self.api.get_workspace(session_id)}'
                                 '\n已创建新会话，后续对话和 /run 使用此目录。')
                     return
@@ -902,6 +1105,7 @@ class FeishuGateway:
                     self._reply(chat_id, f'当前工作区: {self.api.get_workspace(session_id)}')
                     return
                 workspace = self.api.set_workspace(session_id, argument)
+                self._invalidate_workspace_view(chat_id)
                 self._reply(chat_id, f'工作区已切换: {workspace}\n后续对话和 /run 使用此目录。')
             elif command == '/run':
                 if not argument:
@@ -1011,6 +1215,7 @@ class FeishuGateway:
                 with self._bindings_lock:
                     self.bindings.pop(chat_id, None)
                     self._save_bindings()
+                self._invalidate_workspace_view(chat_id)
                 self._reply(chat_id, '会话绑定已解除')
             else:
                 self._reply(chat_id,
@@ -1095,8 +1300,21 @@ class FeishuGateway:
         还必须属于本聊天已收到的请求。
         """
         if self.allowed_users is not None and open_id not in self.allowed_users:
-            return ('⛔ 你没有会话操作权限' if (value or {}).get('session_view')
+            return ('⛔ 你没有会话操作权限'
+                    if (value or {}).get('session_view') or (value or {}).get('workspace_view')
                     else '⛔ 你没有审批权限'), False
+        if (value or {}).get('workspace_view'):
+            view = self._workspace_view(chat_id)
+            index = value.get('index')
+            if not view or view[0] != value['workspace_view']:
+                return '工作区列表已失效，请重新 /new', False
+            if type(index) is not int or not 0 <= index < len(view[1]):
+                return '无效的工作区按钮，请重新 /new', False
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在创建会话…', True
         if (value or {}).get('session_view'):
             view = self._session_views.get(chat_id)
             if not view or view[0] != value['session_view'] or time.monotonic() - view[2] > 600:
@@ -1194,7 +1412,10 @@ class FeishuGateway:
                     else:
                         with self._chat_lock(chat_id):
                             if isinstance(text, dict):
-                                self._handle_session_action(chat_id, text, sender_id)
+                                if text.get('workspace_view'):
+                                    self._handle_workspace_action(chat_id, text, sender_id)
+                                else:
+                                    self._handle_session_action(chat_id, text, sender_id)
                             else:
                                 self.on_message(chat_id, text, sender_id=sender_id,
                                                 chat_type=chat_type)

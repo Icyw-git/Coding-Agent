@@ -291,6 +291,18 @@ class SlashCompleter(Completer):
                     yield Completion(option, start_position=-len(prefix))
         elif command == '/cd':
             yield from self._directories(argument)
+        elif command == '/workspace':
+            if not argument.strip() or (
+                    len(argument.split()) == 1 and not argument.endswith(' ')):
+                prefix = argument.strip()
+                for option, description in (('add', '登记目录'), ('remove', '移除登记'),
+                                            ('list', '查看已登记工作区')):
+                    if option.startswith(prefix):
+                        yield Completion(option, start_position=-len(prefix),
+                                         display_meta=description)
+            elif argument.split()[0].lower() == 'add':
+                parts = argument.split(maxsplit=1)
+                yield from self._directories(parts[1] if len(parts) > 1 else '')
 
     def _directories(self, argument):
         yield from directory_completions(argument, self.workspace)
@@ -474,7 +486,7 @@ class WorkspacePicker:
             self.list_window,
             Window(height=1, char='─'),
             Window(FormattedTextControl(
-                '↑↓ 选择 · Enter 确认 · Esc 取消；选「浏览」可逐级挑任意文件夹'), height=1),
+                '↑↓ 选择 · Enter 确认 · Esc 取消；选「浏览」可逐级挑任意文件夹，不需要输入路径'), height=1),
         ])
         application_kwargs.setdefault('style', Style.from_dict({
             'heading': 'bold', 'muted': 'ansibrightblack',
@@ -504,13 +516,25 @@ class WorkspacePicker:
         for index, row in enumerate(rows):
             marker = '› ' if index == self.index else '  '
             if row.get('browse'):
-                line = '  ── 浏览其他目录…（输入路径）'
+                line = '  ── 浏览电脑中的文件夹…'
             else:
-                mark = '● ' if row.get('current') else '○ '
-                meta = f"{row['sessions']} 个会话"
+                if row.get('current'):
+                    mark = '● '
+                elif row.get('saved'):
+                    mark = '★ '
+                else:
+                    mark = '○ '
+                meta = []
+                if row.get('sessions'):
+                    meta.append(f"{row['sessions']} 个会话")
                 if row.get('last_active'):
-                    meta += f" · {relative_time(row['last_active'])}"
-                line = f"  {mark}{row['name']}  {row['path']}  （{meta}）"
+                    meta.append(relative_time(row['last_active']))
+                if not row.get('exists', True):
+                    meta.append('目录不存在')
+                elif not row.get('allowed', True):
+                    meta.append('未授权')
+                detail = f"  （{' · '.join(meta)}）" if meta else ''
+                line = f"  {mark}{row['name']}  {row['path']}{detail}"
             output.append(('class:selected' if index == self.index else '', marker + line + '\n'))
         return output
 

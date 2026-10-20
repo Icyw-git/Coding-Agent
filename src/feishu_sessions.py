@@ -46,6 +46,40 @@ def list_card(rows, token, current_id=None, page=0):
             'elements': elements}
 
 
+def workspace_card(rows, token):
+    """新建会话的工作区选择卡：一行一个目录，按钮回传服务端快照序号。"""
+    elements = []
+    for index, row in enumerate(rows):
+        marks = []
+        if row.get('current'):
+            marks.append('当前')
+        if row.get('saved'):
+            marks.append('已登记')
+        if not row.get('exists', True):
+            marks.append('目录不存在')
+        elif not row.get('allowed', True):
+            marks.append('未授权')
+        details = []
+        if row.get('sessions'):
+            details.append(f"{row['sessions']} 个会话")
+        if row.get('last_active'):
+            details.append(relative_time(row['last_active']))
+        details.extend(marks)
+        meta = f"\n{' · '.join(details)}" if details else ''
+        elements.append(_text(f"{index + 1}. {row['name']}\n{row['path']}{meta}"))
+        elements.append({'tag': 'action', 'actions': [{
+            'tag': 'button',
+            'text': {'tag': 'plain_text',
+                     'content': '使用当前目录' if row.get('current') else '选择此目录'},
+            'type': 'primary' if row.get('current') else 'default',
+            'value': {'workspace_view': token, 'index': index},
+        }]})
+    elements.append(_text('旧卡片失效后请重新 /new；也可以 /new <路径> 直接指定目录。'))
+    return {'config': {'wide_screen_mode': True},
+            'header': {'title': {'tag': 'plain_text', 'content': '新建会话 · 选择工作区'}},
+            'elements': elements}
+
+
 def detail_card(row, token, index, current_id=None, reply_markdown=None):
     elements = []
     for label, value in session_details(row, current_id):

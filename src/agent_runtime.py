@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Type
 
+import workspaces
+from workspace_choices import RECENT_LIMIT, workspace_choices
 from workspace_context import resolve_workspace, use_workspace
 
 
@@ -65,6 +67,7 @@ class AgentRuntime:
         checkpoints_dir: Path | None = None,
         before_session_change: Callable | None = None,
         workspace: Path | None = None,
+        workspace_file: Path | None = None,
     ) -> None:
         self._run_turn = run_turn
         self._session_store_cls = session_store_cls
@@ -76,12 +79,40 @@ class AgentRuntime:
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
         self._default_workspace = Path(workspace or Path.cwd()).resolve()
-        self._workspace_root: Path | None = None
+        self._workspace_roots: list[Path] | None = None
+        self._workspace_file = Path(workspace_file).expanduser() if workspace_file else None
+
+    @property
+    def sessions_dir(self) -> Path:
+        return self._sessions_dir
+
+    @property
+    def default_workspace(self) -> Path:
+        return self._default_workspace
+
+    @property
+    def allowed_roots(self) -> list[Path]:
+        return list(self._workspace_roots or ())
+
+    @property
+    def workspace_file(self) -> Path:
+        return self._workspace_file or workspaces.default_path(self._sessions_dir)
+
+    def configure_workspace_roots(self, roots) -> None:
+        """Constrain remote workspaces to startup-authorized roots."""
+        resolved = []
+        for root in roots:
+            path = resolve_workspace(root, base=Path.cwd())
+            if path not in resolved:
+                resolved.append(path)
+        if not resolved:
+            raise ValueError('At least one workspace root is required')
+        self._workspace_roots = resolved
+        self._default_workspace = resolved[0]
 
     def configure_workspace_root(self, root: Path) -> None:
-        """Constrain remote workspaces during application setup."""
-        self._default_workspace = resolve_workspace(root, base=Path.cwd())
-        self._workspace_root = self._default_workspace
+        """Backward-compatible single-root setup."""
+        self.configure_workspace_roots([root])
 
     def create_session(self, session_id: str | None = None, *, workspace: str | None = None) -> str:
         """Create an empty persisted session and return its identifier."""
@@ -93,16 +124,19 @@ class AgentRuntime:
             if path.exists():
                 raise SessionAlreadyExistsError(f"Session {session_id} already exists")
             directory = resolve_workspace(workspace if workspace is not None else self._default_workspace,
-                                          base=self._default_workspace, allowed_root=self._workspace_root)
+                                          base=self._default_workspace,
+                                          allowed_roots=self._workspace_roots)
             store = self._session_store_cls(self._sessions_dir, session_id=session_id)
             store.append("session_created")
             store.record_workspace(directory)
+            workspaces.remember_workspace(directory, file=self.workspace_file)
             return store.session_id
 
     def _workspace_for(self, store) -> Path:
         saved = store.session_summary()['workspace']
         return resolve_workspace(saved or self._default_workspace,
-                                 base=self._default_workspace, allowed_root=self._workspace_root)
+                                 base=self._default_workspace,
+                                 allowed_roots=self._workspace_roots)
 
     def get_workspace(self, session_id: str) -> str:
         return str(self._workspace_for(self._open_session(session_id)))
@@ -114,11 +148,38 @@ class AgentRuntime:
         try:
             store = self._open_session(session_id)
             base = Path(store.session_summary()['workspace'] or self._default_workspace)
-            workspace = resolve_workspace(path, base=base, allowed_root=self._workspace_root)
+            workspace = resolve_workspace(path, base=base, allowed_roots=self._workspace_roots)
             store.record_workspace(workspace)
             return str(workspace)
         finally:
             lock.release()
+
+    def list_workspaces(self, current: str | None = None) -> dict:
+        """Current + registered + recently used workspaces for pickers/API."""
+        current_path = (Path(current).expanduser() if current
+                        else self._default_workspace)
+        saved = workspaces.list_workspaces(file=self.workspace_file)
+        # 选择器只展示最近几条；/workspaces 需要完整登记表，所以一次算全、
+        # 再按选择器上限截取，避免两套排序规则漂移。
+        all_choices = workspace_choices(self.list_sessions(limit=1000), current_path,
+                                        saved=saved, allowed_roots=self._workspace_roots,
+                                        limit=None)
+        picker_limit = RECENT_LIMIT + (
+            1 if all_choices and all_choices[0]['current'] else 0)
+        return {
+            'current': str(current_path),
+            'roots': [str(root) for root in self._workspace_roots or ()],
+            'workspaces': all_choices[:picker_limit],
+            'saved': [row for row in all_choices if row.get('saved')],
+        }
+
+    def add_workspace(self, path: str, name: str | None = None) -> dict:
+        directory = resolve_workspace(path, base=self._default_workspace,
+                                      allowed_roots=self._workspace_roots)
+        return workspaces.add_workspace(directory, name=name, file=self.workspace_file)
+
+    def remove_workspace(self, workspace_id: str) -> dict:
+        return workspaces.remove_workspace(workspace_id, file=self.workspace_file)
 
     def send(self, session_id: str, content: str, on_delta=None) -> AgentResult:
         """Append a user message, run one turn, and return the assistant content."""
