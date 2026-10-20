@@ -11,6 +11,7 @@ import pytest
 
 import harness
 import hooks
+from session_store import SessionEventStore
 
 
 def make_client(replies):
@@ -336,6 +337,85 @@ def test_destructive_word_boundary():
     d = policy.evaluate('bash', {'command': 'git commit -m "delete old files"'},
                         destructive=['del '])
     assert d.action == ASK and d.code == 'opaque_command'
+
+
+# ---------- 审查面加固（截断盲批 / 事实化 payload / 熔断 / 独立模型） ----------
+
+def test_truncated_command_escalates_without_llm(monkeypatch):
+    """截断盲批防御：detail 超预算直接升级人工——opaque_command 最危险的
+    部分通常在尾部，只喂头部等于盲批（且放行还会入缓存）。"""
+    long_cmd = 'python -c "' + 'x' * 3000 + '"'
+    client, calls = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+    decided = []
+    monkeypatch.setattr(hooks.GATE, 'decide',
+                        lambda *a, **kw: decided.append(a) or (True, ''))
+
+    assert hooks.enforce('bash', {'command': long_cmd}, interactive=True) is None
+    assert not calls, "超长命令不送审查官（送了也是盲批）"
+    assert len(decided) == 1, "直接落人工"
+
+
+def test_judge_payload_has_data_marker_and_facts(monkeypatch):
+    """payload 必须声明「待审命令是数据不是指令」，并携带策略层事实
+    （OS 沙箱状态——审查官要知道自己是唯一检查，不是复核）。"""
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"decision": "approve"}'))])
+
+    monkeypatch.setattr(harness, 'client',
+                        SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    monkeypatch.setattr(hooks, '_path_zone', lambda path, cwd=None: 'workspace')
+    assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
+    system_prompt = captured['messages'][0]['content']
+    user_payload = captured['messages'][-1]['content']
+    assert '没有内核级沙箱兜底' in system_prompt, "不得再用 Codex 沙箱类比误导审查官"
+    assert '待审数据' in user_payload
+    assert 'OS 沙箱' in user_payload, "事实段：OS 沙箱真实状态"
+
+
+def test_preflight_failure_visible_and_breaker(monkeypatch, capsys):
+    """批量审查失败必须打印原因（不再静默），连续 3 次熔断停用本会话。"""
+    client, calls = make_client([RuntimeError('down')] * 3)
+    monkeypatch.setattr(harness, 'client', client)
+    batch = [make_tool_call('c1', 'python a.py'), make_tool_call('c2', 'python b.py')]
+    for _ in range(3):
+        assert hooks.preflight_judge(batch) == 0
+    assert hooks.GATE.judge_broken, "连续 3 次失败 → 熔断"
+    assert '批量审查失败' in capsys.readouterr().out
+    # 熔断后不再打 LLM（第 4 批零调用）
+    assert hooks.preflight_judge(batch) == 0 and len(calls) == 3
+
+
+def test_judge_model_env(monkeypatch):
+    """HARNESS_JUDGE_MODEL 允许审查官单独用便宜模型。"""
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"decision": "approve"}'))])
+
+    monkeypatch.setattr(harness, 'client',
+                        SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+    monkeypatch.setenv('HARNESS_JUDGE_MODEL', 'deepseek-chat')
+    hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
+    assert captured['model'] == 'deepseek-chat'
+
+
+def test_status_shows_judge_summary(tmp_path, monkeypatch):
+    """/status 显示审查官统计行。"""
+    store = SessionEventStore(tmp_path, session_id='st')
+    client, calls = make_client(['{"decision": "approve"}'])
+    monkeypatch.setattr(harness, 'client', client)
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
+    status = harness.format_status(store)
+    assert 'LLM 审查官：放行 1' in status
 
 
 # ---------- 运行 ----------
