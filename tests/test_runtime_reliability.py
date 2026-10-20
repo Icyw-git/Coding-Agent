@@ -2,6 +2,7 @@ import json
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +146,10 @@ def test_shell_permission_check_is_case_insensitive(monkeypatch):
     class HarnessConfig:
         DENY_LIST = ['sudo']
         DESTRUCTIVE = ['del ', 'remove-item ', 'clear-content ']
+
+        @staticmethod
+        def get_workdir():
+            return Path.cwd()
 
     monkeypatch.setattr(hooks, '_h', lambda: HarnessConfig)
     monkeypatch.setattr('builtins.input', lambda _prompt: 'n')

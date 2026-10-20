@@ -12,7 +12,8 @@
     workspace-write + on-request = 黑名单硬拒、破坏性命令询问、工作区内文件工具读写
                                    放行、工作区外写改询问、秘密文件读写硬拒、
                                    外发网络请求询问。
-                                   shell 命令是文本启发式，不能保证写入路径受工作区约束。
+                                   shell 是文本启发式：命令里明写的越界路径会询问，
+                                   藏在解释器/命令替换里的看不到（那是 OS 沙箱的事）。
 
 调用方负责注入黑名单（hooks / tools 从 harness 读），本模块不 import harness，
 因此可脱离运行时单测，也不会因新增全局属性而打爆既有的 monkeypatch 点。
@@ -146,6 +147,15 @@ EGRESS_SEND_FLAGS = frozenset({
 # 卷挂载、不是版本，按工具区分版本开关不值得，少放行一个不会误事。
 QUERY_FLAGS = frozenset({'-V', '--version', '-h', '--help'})
 
+# 会写盘的命令：只有它们的路径参数参与「写到工作区外」判定。读命令
+# （cat / find / du …）不进表——读放开是既定策略，不因为路径在工作区外就弹审批。
+FILE_WRITE_COMMANDS = frozenset({
+    'cp', 'mv', 'install', 'tee', 'dd', 'ln', 'touch', 'mkdir', 'md',
+    'sed', 'tar', 'unzip', '7z', 'copy', 'xcopy', 'robocopy', 'move', 'ren',
+    'set-content', 'add-content', 'out-file', 'new-item', 'copy-item',
+    'move-item',
+})
+
 WORKTREE_TOOLS = {'create_worktree': 'create worktree',
                   'remove_worktree': 'remove worktree',
                   'keep_worktree': 'keep worktree'}
@@ -177,7 +187,7 @@ class Policy:
     def evaluate(self, tool: str, args: dict, *,
                  deny_list=(), destructive=(), secrets=(),
                  path_zone: str = PATH_OUTSIDE,
-                 external_tools=()) -> Decision:
+                 external_tools=(), workspace: str | None = None) -> Decision:
         """判定一次工具调用。
 
         deny_list / destructive / secrets 由调用方注入（生产上分别来自 harness
@@ -186,6 +196,8 @@ class Policy:
         生产入口 hooks.evaluate_call 必须传；path_zone 由调用方用 classify_path
         解析后给出，本模块不重复实现路径逻辑。省略 path_zone 时按 outside 处理：
         漏判分类的文件写入走审批，而不是因为默认「在工作区内」被静默放行。
+        workspace 是 bash 越界写检查的根：生产入口传 get_workdir()，省略时
+        退回进程 cwd（不 fail-open：相对路径按 cwd 解析，越界的绝对路径照样问）。
 
         ASK 之后是问人还是直接拒，由调用方按自己是否处在可交互上下文里决定，
         本模块不关心。
@@ -197,7 +209,9 @@ class Policy:
         args = args if isinstance(args, dict) else {}
         if tool == 'bash':
             decision = self._evaluate_bash(str(args.get('command', '') or ''),
-                                           deny_list, destructive, secrets)
+                                           deny_list, destructive, secrets,
+                                           cwd=args.get('cwd'),
+                                           workspace=workspace)
         elif tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
             decision = self._evaluate_file(tool, args, path_zone)
         elif tool in WORKTREE_TOOLS:
@@ -214,7 +228,8 @@ class Policy:
     # ---------- bash ----------
 
     def _evaluate_bash(self, command: str, deny_list, destructive,
-                       secrets=()) -> Decision:
+                       secrets=(), *, cwd: str | None = None,
+                       workspace: str | None = None) -> Decision:
         if not command.strip():
             return Decision(ALLOW)
         # 0) 前缀包装器：真正执行的是内层命令。按外层名字判定，等于
@@ -307,7 +322,20 @@ class Policy:
             return Decision(ASK, 'network_egress',
                             f'outbound network request ({sorted(egress)[0]} {target})')
 
-        # 7) read-only 档：只放公认不改动的命令
+        # 7) 询问：命令里明写着写到工作区外（或系统目录）的路径。文件工具有
+        #    路径分区，bash 的 argv 没有；这里补的是「命令里写着路径」的那部分。
+        #    只认显式写法（盘符/根/`..` 逃逸），相对路径按 cwd 解析后本来就在
+        #    工作区内；读命令不参与（读放开），解释器字符串与命令替换里的路径
+        #    看不见——文本分析的边界，真正的写入约束属于 OS 沙箱。
+        if self.sandbox_mode == 'workspace-write':
+            root = workspace or str(Path.cwd())
+            outside = _outside_write_targets(command, cwd=cwd or root,
+                                             workspace=root, secrets=secrets)
+            if outside:
+                return Decision(ASK, 'outside_workspace_write',
+                                f'write outside workspace needs approval ({outside[0]})')
+
+        # 8) read-only 档：只放公认不改动的命令
         if self.sandbox_mode == 'read-only' and not _looks_read_only(normalized, verbs):
             return Decision(ASK, 'sandbox_read_only',
                             'sandbox is read-only; command may modify state')
@@ -707,6 +735,89 @@ def _strip_wrappers_in_segments(command: str) -> str | None:
     return ' '.join(pieces)
 
 
+_REDIRECT_TOKEN = re.compile(r'^[0-9&]*>>?')
+_PATHISH_PREFIX = re.compile(r'^(?:[A-Za-z]:|\\\\|~)')
+_POSIX_ABSOLUTE = re.compile(r'^/[^/]+/')
+
+
+def _looks_pathish(token: str) -> bool:
+    """显式指向某处的路径：盘符/UNC/家目录/`..` 段，或含两段的 POSIX 绝对路径。
+
+    单段的 `/x` 不认：cmd 与 PowerShell 的开关就长这样（`cmd /c`、`xcopy /s`），
+    当路径处理会让包装器命令白白丢掉同类键。URL 不算路径；`build/out.txt`
+    这类相对路径按 cwd 解析后本来就在工作区里，不值当为它多问一次。
+    """
+    token = token.strip('"\'')
+    if not token or '://' in token:
+        return False
+    if _PATHISH_PREFIX.match(token) or _POSIX_ABSOLUTE.match(token):
+        return True
+    return any(part == '..' for part in re.split(r'[\\/]+', token))
+
+
+def _write_targets(segment: str) -> list[str]:
+    """这一段里会写盘的路径：重定向目标，或写命令的路径参数。
+
+    引号不做语法解析（同其余文本分析）：含空格的路径只会取到前半截，但那段
+    通常已足以判定分区；取不到的部分属于 OS 沙箱的职责。
+    """
+    tokens = segment.split()
+    if not tokens:
+        return []
+    write_verb = _basename(tokens[0]) in FILE_WRITE_COMMANDS
+    targets = []
+    for index, raw in enumerate(tokens):
+        token = raw.strip('"\'')
+        redirect = _REDIRECT_TOKEN.match(token)
+        if redirect:
+            rest = token[redirect.end():]
+            if rest:
+                targets.append(rest)
+            elif index + 1 < len(tokens):
+                targets.append(tokens[index + 1].strip('"\''))
+            continue
+        if not write_verb:
+            continue
+        # `of=C:/x`、`--output=C:/x`：目标在等号后面
+        candidate = token.rsplit('=', 1)[-1] if '=' in token else token
+        if _looks_pathish(candidate):
+            targets.append(candidate)
+    return targets
+
+
+def _all_write_targets(command: str) -> list[str]:
+    """整条命令能静态看到的写目标，含 shell 包装器载荷里的（保序去重）。
+
+    只扫外层段会漏掉 `bash -c 'cp a C:/x'`：外层动词是 bash，候选路径看起来
+    只是参数。包装器载荷本来就要按内层命令判定（同 _command_verbs 的规则），
+    这里下钻同样一层；总段数设个上限，无限嵌套不是这一层的职责。
+    """
+    targets = []
+    pending = _segments(command)
+    budget = 32
+    while pending and budget:
+        budget -= 1
+        segment = pending.pop(0)
+        targets.extend(_write_targets(segment))
+        tokens = segment.split()
+        if tokens and _basename(tokens[0]) in _WRAPPERS:
+            nested = ' '.join(_wrapped_tokens(tokens))
+            inner = _strip_wrappers_in_segments(nested) if nested else None
+            if inner:
+                pending.extend(_segments(inner))
+    return list(dict.fromkeys(targets))
+
+
+def _outside_write_targets(command: str, *, cwd, workspace, secrets) -> list[str]:
+    """命令里显式写到工作区外或系统目录的目标（去重保序）。"""
+    found = []
+    for target in _all_write_targets(command):
+        if classify_path(target, cwd=cwd, workspace=workspace,
+                         secrets=secrets) in (PATH_OUTSIDE, PATH_SYSTEM):
+            found.append(target)
+    return found
+
+
 def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
     """识别内容不可静态判断的载荷形式，返回命中的特征串。"""
     # 命令替换会执行括号里的真实命令，但只解析首词会把它当成 echo 的参数。
@@ -834,6 +945,13 @@ def _bash_segment_class(segment: str) -> str | None:
         if not words:
             return None
         verb = _basename(words[0])
+    # 写上下文里的路径会触发 outside_workspace_write，而会话白名单排在审批
+    # 之前：照旧记 'cp' 的话，批准一次工作区内的拷贝就能免审 `cp .env C:/…`，
+    # 刚加的越界写检查被原地旁路。重定向同理（`echo hi > x` 的键不该覆盖
+    # `echo hi > C:/…`）。读命令不在此列（读本来放开）；删除命令的免审键
+    # 本来就不承诺路径范围，另行处理。
+    if _all_write_targets(segment):
+        return None
     if verb in _WRAPPERS:
         verb = _wrapped_verb(words) or verb
     if verb in _NO_SESSION_GRANT or verb in _INTERPRETERS:

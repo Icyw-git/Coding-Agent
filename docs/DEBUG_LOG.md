@@ -1128,7 +1128,64 @@ full-access 仍拒秘密；`test_approval_scope.py` 与 `test_exec_policy.py` �
 
 ---
 
-## 核心教训总纲
+## 问题：bash 的越界写在 workspace-write 档一次都不问
+
+文件工具早就按路径分区：工作区内写免审，工作区外、系统目录要审批，秘密文件硬拒。
+bash 却没有这一步——`cp a.txt C:/Users/someone/x.txt`、`echo hi > C:/Windows/x.txt`
+在 workspace-write 档全部 ALLOW。默认档的名字叫「工作区写」，实际上只约束了文件工具，
+约束不到命令；而模型完全可以用 `cp`/`tee`/`dd` 绕过一次文件工具审批。
+
+补第一版时又核出两个同类缺口：shell 包装器载荷（`bash -c 'cp a C:/x'`、
+`cmd /c "copy a C:\x"`）外层动词不是写命令，扫描看不见里面的写目标；以及会话白名单
+排在审批之前——批准一次工作区内的 `cp a b` 并勾选「本会话允许同类」后，`cp .env
+C:/…` 会凭同一个 `bash:cp` 键直接放行，新加的越界写检查被原地旁路。
+
+## 做法
+
+- `FILE_WRITE_COMMANDS`（`cp`/`mv`/`tee`/`dd`/`tar`/`unzip`/`mkdir`/`install`/PowerShell
+  的 `*-Item` 等）与重定向目标共同构成写目标；`_write_targets()` 同时认 `> x`、`2> x`、
+  `of=C:/x`、`--output=C:/x` 几种写法。
+- `_looks_pathish()` 只认显式指向某处的路径：盘符、UNC、`~`、含 `..` 的段，或带两段的
+  POSIX 绝对路径。单段 `/x` 不认——`cmd /c`、`xcopy /s` 的开关就长这样，误认会让包装器
+  命令白白丢掉同类键。相对路径按 cwd 解析后本来就在工作区内，不单独升级。
+- `_outside_write_targets()` 用 `classify_path()` 判分区，与文件工具同一套工作区/秘密/
+  系统目录规则；`_all_write_targets()` 下钻 `bash -c`/`cmd /c` 载荷（有段数预算），
+  前缀包装器仍由 `_strip_wrappers_in_segments()` 逐段剥。
+- `Policy.evaluate()` 在 workspace-write 档多一步 §7：命中越界写目标 → ASK
+  `outside_workspace_write`；读命令（`cat`/`find`/`ls`…）不在写名单里，读照旧放开。
+  工作区由 `hooks.evaluate_call()` 传入 `get_workdir()`；漏传时退回进程 cwd，是退化不是放行。
+- 同类键收紧：带写目标的段返回 `None`（`_bash_segment_class`），「本会话允许同类」按钮
+  不出现、也不写键。第一版写成「任何显式路径都没有同类键」，结果把 `rm -rf /tmp/a`
+  （测试明确要求键是 `rm`）和绝对路径调用 `C:\Windows\System32\cmd.exe /c del x`
+  （键应为 `del`）一起误伤——路径出现在参数/动词位置，和「写目标」不是一回事。
+
+## 踩过的坑
+
+- **开关与 POSIX 绝对路径同形**：`/c`、`/s` 看起来就是绝对路径；判定必须要求
+  `/a/b` 这种两段形式，否则 `cmd /c`、`xcopy /s` 全部丢掉同类键。
+- **判定必须和免审键同源**：越界写扫描只扫外层段时，`bash -c 'cp a C:/x'` 是 ALLOW；
+  而同类键又会把整个 `cp` 类放进白名单。两处都必须看穿包装器载荷。
+- **新 ASK 类别要先问「白名单能不能绕过它」**：`enforce` 的会话白名单在审批之前，
+  任何新加的询问条件如果不收紧同类键，都只是给「批一次同类」多送一个可绕过的分支。
+- **文本分析的边界要写进文档**：引号不做语法解析，含空格的路径只取到前半截；藏在解释器
+  字符串、变量展开、命令替换里的路径看不到。真边界仍是 OS 沙箱，这一层只负责「命令里
+  明写的目标」。
+
+## 测试
+
+`test_exec_policy.py` 新增越界写矩阵（`cp`/`mv`/`tee`/`dd`/`unzip`/`install`/重定向/
+`nohup`/`bash -c`/`cmd /c`）、读与工作区内写放行矩阵、三档行为，以及「带写目标的段
+没有同类键」；`test_execution_paths.py` 钉住 hooks 传给策略层的是 harness 工作区；
+`test_approval_scope.py` 验证一次工作区内 `cp` 的会话批准不覆盖越界写。
+
+## 收获
+
+- **档位的名字要对得上实际约束**：叫 workspace-write 就不能只约束一半工具。
+- **新增询问点的同时检查预授权**：否则询问是新的，绕过的老路还通着。
+- **启发式规则要窄**：只抑制真正危险的键（写目标），别把「出现过路径」当成「可能越界」；
+  前者误伤面小，后者会把正常的绝对路径调用也变成每次都问。
+
+
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。
 2. **安全是分层防御**——黑名单 + 询问 + 拒绝记忆 + 提示词，单靠一层永远不够。

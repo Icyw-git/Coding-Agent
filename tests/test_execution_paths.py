@@ -458,6 +458,20 @@ def test_bash_secret_egress_uses_the_production_secret_list(env):
     assert hooks.evaluate_call('bash', {'command': 'cat .env'}).action == 'allow'
 
 
+def test_bash_outside_write_uses_the_harness_workdir(env, tmp_path):
+    """锁接线：evaluate_call 必须把 get_workdir() 传进策略层，否则越界写会退化成
+    按进程 cwd 判定——cwd 恰好是工作区时看不出来，换目录启动就漏。"""
+    outside = tmp_path / 'leak.txt'
+    decision = hooks.evaluate_call('bash', {'command': f'cp a.txt {outside}'})
+    assert decision.action == 'ask' and decision.code == 'outside_workspace_write'
+    # 工作区内的绝对路径不升级：边界是「写到哪」，不是「写不写绝对路径」
+    inside = env.get_workdir() / 'b.txt'
+    assert hooks.evaluate_call(
+        'bash', {'command': f'cp a.txt {inside}'}).action == 'allow'
+    assert hooks.evaluate_call(
+        'bash', {'command': f'cat {tmp_path / "notes.md"}'}).action == 'allow'
+
+
 # ============================================================
 # 档位开关：/sandbox 与命令校验
 # ============================================================

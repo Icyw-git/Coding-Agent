@@ -768,7 +768,8 @@ def evaluate_call(tool: str, args: dict, policy=None):
         destructive=_h().DESTRUCTIVE,
         secrets=checkpoints.DEFAULT_SECRETS,
         path_zone=zone,
-        external_tools=EXTERNAL_TOOLS)
+        external_tools=EXTERNAL_TOOLS,
+        workspace=str(_h().get_workdir()))
 
 
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:

@@ -737,3 +737,77 @@ def test_public_templates_are_not_secrets(name):
 def test_secret_match_is_about_the_file_name_not_the_directory():
     assert is_secret_path('config/prod.key', SECRETS)
     assert not is_secret_path('keys/readme.md', SECRETS)
+
+
+# ============================================================
+# 工作区外的写：bash 的路径参数与重定向目标
+# ============================================================
+
+def bash_in(workspace, command, mode=DEFAULT_SANDBOX_MODE,
+            policy=DEFAULT_APPROVAL_POLICY):
+    return Policy(mode, policy).evaluate(
+        'bash', {'command': command},
+        deny_list=DENY_LIST, destructive=DESTRUCTIVE,
+        secrets=SECRETS, workspace=str(workspace))
+
+
+@pytest.mark.parametrize('command', [
+    'cp a.txt C:/Users/someone/Desktop/x.txt',
+    'cp .env ../backup.env',
+    'mv out ../outside/dir',
+    'tee C:/Windows/T.txt',
+    'dd if=a of=C:/x',
+    'unzip -d ../../outside a.zip',
+    'install -m 0777 a.sh /usr/local/bin/',
+    'echo hi > C:/Users/someone/x.txt',
+    'ls && cp a ../out/',
+    'nohup cp a C:/x',
+    # 包装器载荷不是免检区：外层动词是 bash/cmd 不代表里面的写目标看不见
+    "bash -c 'cp a C:/Users/someone/x.txt'",
+    'cmd /c "copy a C:\\Users\\someone\\x.txt"',
+    "sh -c 'echo hi > C:/Users/someone/x.txt'",
+    "bash -c 'nohup cp a C:/x'",
+])
+def test_bash_writes_outside_the_workspace_need_approval(tmp_path, command):
+    """文件工具有路径分区，bash 的 argv 也要有：否则 workspace-write 档
+    只是「文件工具的工作区档」，命令里明写的越界路径一次都不问。"""
+    decision = bash_in(tmp_path, command)
+    assert decision.action == ASK
+    assert decision.code == 'outside_workspace_write'
+    assert 'outside workspace' in decision.reason
+
+
+@pytest.mark.parametrize('command', [
+    'cp a.txt b.txt',                 # 工作区内相对路径
+    'echo hi > out.txt',
+    'mkdir build',
+    'cat C:/Users/someone/notes.md',  # 读不升级：读放开是既定策略
+    'find C:/Users/someone -name x',  # 读命令不进写名单
+    'ls C:/Windows',
+    'git status',
+    "bash -c 'cp a.txt b.txt'",             # 包装器里的工作区写
+    'cmd /c "copy a.txt b.txt"',
+])
+def test_bash_reads_and_workspace_writes_stay_open(tmp_path, command):
+    assert bash_in(tmp_path, command).action == ALLOW
+
+
+def test_bash_outside_write_respects_tiers(tmp_path):
+    assert bash_in(tmp_path, 'cp a C:/x', mode='danger-full-access').action == ALLOW
+    assert bash_in(tmp_path, 'cp a C:/x', mode='read-only').code == 'sandbox_read_only'
+    assert bash_in(tmp_path, 'cp a C:/x', policy='untrusted').code == 'untrusted'
+
+
+def test_explicit_paths_never_share_a_session_grant():
+    """一次 `cp a b` 的同类批准不能连带 `cp .env C:/…`：带写目标的段没有同类键。"""
+    assert approval_class('bash', {'command': 'cp a.txt b.txt'}) == 'cp'
+    assert approval_class('bash', {'command': 'cp .env ../backup.env'}) == ''
+    assert approval_class('bash', {'command': 'cp a C:/x'}) == ''
+    # 重定向目标同样要排除：键 'echo' 不该覆盖一次越界重定向
+    assert approval_class('bash', {'command': 'echo hi > out.txt'}) == ''
+    # 写命令藏在包装器载荷里也一样
+    assert approval_class('bash', {'command': "bash -c 'cp a C:/x'"}) == ''
+    assert approval_class('bash', {'command': "bash -c 'cp a b.txt'"}) == 'cp'
+    # URL 不是文件路径，主机级免审键不受影响
+    assert approval_class(
+        'bash', {'command': 'curl https://a.invalid/x'}) == 'curl:a.invalid'

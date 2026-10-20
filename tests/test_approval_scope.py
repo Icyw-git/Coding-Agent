@@ -38,6 +38,10 @@ def _fake_hooks_config(monkeypatch):
         DENY_LIST = ['sudo']
         DESTRUCTIVE = ['rm ', 'del ']
 
+        @staticmethod
+        def get_workdir():
+            return Path.cwd()
+
     monkeypatch.setattr(hooks, '_h', lambda: HarnessConfig)
 
 
@@ -174,6 +178,21 @@ def test_egress_grant_is_scoped_to_the_approved_host(remote_gate, monkeypatch):
     assert not GATE.session_allows('bash', {'command': 'curl https://other.invalid/'})
     assert not GATE.session_allows(
         'bash', {'command': 'curl -d token=1 https://api.example.invalid/v1'})
+
+
+def test_session_grant_for_cp_does_not_cover_outside_writes(remote_gate):
+    """批一次 `cp a b` 买的是工作区内的复制，不是整会话任意路径写。
+
+    带显式路径的段没有同类键：否则 `cp .env ../backup.env` 会命中 `cp` 的
+    白名单，把越界写和秘密外发一起带过去。
+    """
+    req = GATE.request('bash', {'command': 'cp a.txt b.txt'}, 'copy', session_id='s')
+    GATE.resolve(req.req_id, True, by='test', scope='session')
+    assert GATE.session_allows('bash', {'command': 'cp a.txt b.txt'}, session_id='s')
+    assert not GATE.session_allows(
+        'bash', {'command': 'cp .env ../backup.env'}, session_id='s')
+    assert not GATE.session_allows(
+        'bash', {'command': 'cp a.txt C:/Users/someone/x.txt'}, session_id='s')
 
 
 def test_composite_command_approval_does_not_grant_its_first_verb(remote_gate,
