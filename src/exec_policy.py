@@ -66,24 +66,53 @@ READ_ONLY_COMMANDS = frozenset({
 GIT_READONLY_SUBCOMMANDS = frozenset({
     'status', 'log', 'diff', 'show', 'blame', 'rev-parse', 'ls-files',
 })
+# git 的写子命令：既进不透明载荷（要审批），也不给「同类」免审。两处共用
+# 同一份名单——分开写两份，迟早一处放行一处拒绝。
+GIT_WRITE_SUBCOMMANDS = frozenset({
+    'clean', 'push', 'reset', 'checkout', 'switch', 'commit', 'rebase',
+    'merge', 'tag',
+})
 
 # 包装器：真实动作藏在后面的 token 里，需要解一层再看命令词。
 _WRAPPERS = frozenset({'cmd', 'sh', 'bash', 'zsh', 'powershell', 'pwsh'})
 _WRAP_FLAGS = frozenset({'-c', '/c', '-command'})
+# 前缀包装器：动作在后面的位置参数里（nohup rm … / xargs -n 1 rm …）。
+# 按外层名字判定，`nohup <任意命令>` 就整类放行；判定与同类键都要看内层。
+_PREFIX_WRAPPERS = frozenset({
+    'nohup', 'xargs', 'env', 'time', 'timeout', 'watch',
+})
+# 这些选项会把紧随其后的一个 token 当取值（`xargs -n 1`、`timeout -s KILL`），
+# 剥包装器时连取值一起跳过。
+_OPTION_WITH_VALUE = frozenset({
+    '-n', '-I', '-P', '-L', '-s', '-E', '-d', '-e', '-u', '-a',
+})
 # 不透明载荷：无法静态判断内容，一律询问（不是拒绝——本地跑一次性脚本是正常需求）。
 _OPAQUE_FLAGS = ('-enc', '-encodedcommand', '/enc', '/e', '-enc', '--encodedcommand')
 _INTERPRETERS = frozenset({'python', 'python2', 'python3', 'pypy', 'node', 'deno',
                            'ruby', 'perl', 'php', 'lua'})
 _OPAQUE_SCRIPT_FLAGS = frozenset({'-c', '-e', '--eval', '-command', '/command'})
-_NO_SESSION_GRANT = frozenset({
-    'ssh', 'scp', 'sftp', 'docker', 'podman', 'kubectl', 'terraform',
-    'npm', 'npx', 'pip', 'uv', 'git-lfs',
+# 外部操作：目标、副作用和出口都不在命令行里（云存储/远程执行/包管理器）。
+# 不是拒绝——读云文档、跑一次 pip 都是正常需求；但「安装即执行 postinstall」
+# 「cp 到对象存储」这类动作必须经过一次明确同意。只读子命令（docker ps）
+# 一并问：判定层不认子命令语义，宁可按最坏情况算（见 DEBUG_LOG 的记录）。
+EXTERNAL_OPERATIONS = frozenset({
+    'ssh', 'scp', 'sftp', 'rsync', 'docker', 'podman', 'kubectl', 'helm',
+    'terraform', 'aws', 'az', 'gcloud', 'gsutil', 's3cmd', 'rclone', 'ossutil',
+    'npm', 'npx', 'pnpm', 'yarn', 'pip', 'uv', 'poetry', 'conda',
 })
+# 进程启动器：参数里才是真正要跑的程序，判定层看不出来。
+_LAUNCHER_COMMANDS = frozenset({'start-process', 'start-job', 'invoke-command'})
+# 没有「同类」可记：批一次就等于把这一类命令整会话开放。
+_NO_SESSION_GRANT = (frozenset({'git-lfs'})
+                     | EXTERNAL_OPERATIONS | _LAUNCHER_COMMANDS)
 
 # 分号/管道/逻辑串联都是「一条命令里的多个动作」，逐段判定。
 # 换行在 POSIX shell 里同样分隔命令；Windows cmd 行为不同，但判定层按会执行的
 # 最坏情况处理，不能因为平台差异把第二行漏掉。
 _SEGMENT_SPLIT = re.compile(r'\||&&|;|&|[\r\n]+')
+# 带捕获组的分隔符：逐段剥包装器时要原样拼回去，否则 `curl … | sh` 的
+# 管道结构会被抹平，opaque 标签就落到别的分支上了。
+_SEGMENT_KEEP = re.compile(r'(\||&&|;|&|[\r\n]+)')
 _PATH_SPLIT = re.compile(r'[\\/]+')
 # bash 里 su""do 会被解析成 sudo，所以命令名要在「去引号」的副本上再取一次
 _STRIP_QUOTES = re.compile(r'["\'`]')
@@ -113,6 +142,10 @@ EGRESS_SEND_FLAGS = frozenset({
     '-body', '-infile', '--post-data', '--post-file',
     '-x', '--request',
 })
+# 查版本/帮助是只读用法，不该为它弹审批。刻意不含 `-v`：docker 的 -v 是
+# 卷挂载、不是版本，按工具区分版本开关不值得，少放行一个不会误事。
+QUERY_FLAGS = frozenset({'-V', '--version', '-h', '--help'})
+
 WORKTREE_TOOLS = {'create_worktree': 'create worktree',
                   'remove_worktree': 'remove worktree',
                   'keep_worktree': 'keep worktree'}
@@ -142,15 +175,17 @@ class Policy:
     approval_policy: str = DEFAULT_APPROVAL_POLICY
 
     def evaluate(self, tool: str, args: dict, *,
-                 deny_list=(), destructive=(),
+                 deny_list=(), destructive=(), secrets=(),
                  path_zone: str = PATH_OUTSIDE,
                  external_tools=()) -> Decision:
         """判定一次工具调用。
 
-        deny_list / destructive 由调用方注入（生产上来自 harness 模块全局，
-        测试里是自带的假列表）；path_zone 由调用方用 classify_path 解析后给出，
-        本模块不重复实现路径逻辑。省略 path_zone 时按 outside 处理：漏判分类的
-        文件写入走审批，而不是因为默认「在工作区内」被静默放行。
+        deny_list / destructive / secrets 由调用方注入（生产上分别来自 harness
+        模块全局与 checkpoints.DEFAULT_SECRETS，测试里是自带的假列表）——
+        本模块不反向依赖那些层。secrets 省略时 bash 不做秘密文件名检查，
+        生产入口 hooks.evaluate_call 必须传；path_zone 由调用方用 classify_path
+        解析后给出，本模块不重复实现路径逻辑。省略 path_zone 时按 outside 处理：
+        漏判分类的文件写入走审批，而不是因为默认「在工作区内」被静默放行。
 
         ASK 之后是问人还是直接拒，由调用方按自己是否处在可交互上下文里决定，
         本模块不关心。
@@ -162,7 +197,7 @@ class Policy:
         args = args if isinstance(args, dict) else {}
         if tool == 'bash':
             decision = self._evaluate_bash(str(args.get('command', '') or ''),
-                                           deny_list, destructive)
+                                           deny_list, destructive, secrets)
         elif tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
             decision = self._evaluate_file(tool, args, path_zone)
         elif tool in WORKTREE_TOOLS:
@@ -178,9 +213,19 @@ class Policy:
 
     # ---------- bash ----------
 
-    def _evaluate_bash(self, command: str, deny_list, destructive) -> Decision:
+    def _evaluate_bash(self, command: str, deny_list, destructive,
+                       secrets=()) -> Decision:
         if not command.strip():
             return Decision(ALLOW)
+        # 0) 前缀包装器：真正执行的是内层命令。按外层名字判定，等于
+        #    `nohup <任意命令>` 整类放行。每个命令段都要剥（复合命令的
+        #    后半段同样能藏一个包装器），剥完是空就按不可判定处理，不猜。
+        unwrapped = _strip_wrappers_in_segments(command)
+        if unwrapped is None:
+            return Decision(ASK, 'opaque_command',
+                            'wrapped command without a payload '
+                            '(cannot judge what will run)')
+        command = unwrapped
         normalized = command.casefold()
         # bash 会把 su""do 解析成 sudo：去引号后再取一次命令名，两种写法都覆盖
         verbs = _command_verbs(normalized) | _command_verbs(_STRIP_QUOTES.sub('', normalized))
@@ -203,6 +248,15 @@ class Policy:
         if any(flag in normalized for flag in _ROOT_DELETE_FLAGS):
             return Decision(DENY, 'deny_root_delete',
                             'denied filesystem-root deletion', '--no-preserve-root')
+
+        # 1.5) 秘密文件外发：文件工具的路径分区管不到 bash 的 argv。命令里点名
+        #      .env / 私钥，又同时出现出口或外部操作命令，就升级人工——不做路径
+        #      解析，也不硬拒：bash 是文本分析，`grep .env docs` 这类正常用法
+        #      误伤面比文件工具大，要不要拦由审批人看完整条命令决定。
+        refs = secret_references(command, secrets)
+        if refs and verbs & (EGRESS_COMMANDS | EXTERNAL_OPERATIONS):
+            return Decision(ASK, 'secret_egress',
+                            f'outbound command references protected file ({refs[0]})')
 
         # 2) 全量审批档（旧 HARNESS_APPROVAL_ALL=1 的等价语义）。排在档位短路之前，
         #    这样 danger-full-access + untrusted = 「不做启发式拦截，但每条都问我」。
@@ -412,6 +466,22 @@ def is_secret_path(path, secrets=()) -> bool:
                for pattern in secrets if str(pattern))
 
 
+def secret_references(command: str, secrets=()) -> list[str]:
+    """命令 token 里点名到的秘密文件（按文件名匹配，去重保序）。
+
+    只服务 bash 判定：不解析 argv 语义，`-T .env` 和 `cp .env` 一样看得见。
+    调用方决定升级还是硬拒；名单为空时不做任何工作。
+    """
+    if not secrets:
+        return []
+    found = []
+    for token in _STRIP_QUOTES.sub('', command).split():
+        token = token.strip('"\'')
+        if token and token not in found and is_secret_path(token, secrets):
+            found.append(token)
+    return found
+
+
 def system_roots() -> tuple[Path, ...]:
     """系统目录的写保护范围（读不受限）。
 
@@ -437,7 +507,7 @@ def system_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def classify_path(path: str, *, cwd=None, workspace, secrets=()) -> str:
+def classify_path(path: str, *, cwd=None, workspace, secrets) -> str:
     """返回 PATH_WORKSPACE / PATH_OUTSIDE / PATH_SECRET / PATH_SYSTEM / PATH_INVALID。
 
     秘密与系统目录的判定先于工作区判定：工作区内的 `.env`、把工作区设在
@@ -535,19 +605,106 @@ def _wrapped_tokens(tokens: list[str]) -> list[str]:
 
 
 def _wrapped_verbs(tokens: list[str]) -> set[str]:
-    """从 `cmd /c "del x"` 这类包装里取出所有被包的命令名，只解一层。"""
-    return {_basename(nested.split()[0])
-            for nested in _segments(' '.join(_wrapped_tokens(tokens)))
-            if nested.split()}
+    """从 `cmd /c "del x"` 这类包装里取出所有被包的命令名，只解一层。
+
+    载荷里还可能再包一层前缀包装器（`bash -c 'nohup aws …'`）：先按段剥掉，
+    否则 verbs 里只有 nohup，出口/外部操作检查都会漏。
+    """
+    nested = ' '.join(_wrapped_tokens(tokens))
+    nested = _strip_wrappers_in_segments(nested) if nested else nested
+    return {_basename(part.split()[0])
+            for part in _segments(nested or '')
+            if part.split()}
 
 
 def _wrapped_verb(tokens: list[str]) -> str:
     """包装器载荷里的第一个命令名：`cmd /c "del x"` → del。解不出来返回空串。"""
-    for nested in _segments(' '.join(_wrapped_tokens(tokens))):
-        words = nested.split()
+    nested = ' '.join(_wrapped_tokens(tokens))
+    nested = _strip_wrappers_in_segments(nested) if nested else nested
+    for part in _segments(nested or ''):
+        words = part.split()
         if words:
             return _basename(words[0])
     return ''
+
+
+def _skip_options(tokens: list[str]) -> list[str]:
+    """跳过开头的选项（含取值），返回第一个位置参数起的内容。"""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--':
+            return tokens[index + 1:]
+        if not token.startswith('-') or token == '-':
+            break
+        index += 1
+        if token in _OPTION_WITH_VALUE and index < len(tokens):
+            index += 1
+    return tokens[index:]
+
+
+def _skip_env_prefix(tokens: list[str]) -> list[str]:
+    """env 的选项与 VAR=1 赋值可以交替出现（`env -u FOO A=1 cmd`）。"""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--':
+            return tokens[index + 1:]
+        if token.startswith('-'):
+            index += 1
+            if token in _OPTION_WITH_VALUE and index < len(tokens):
+                index += 1
+            continue
+        if '=' in token:
+            index += 1
+            continue
+        break
+    return tokens[index:]
+
+
+def _strip_prefix_wrapper(command: str) -> str | None:
+    """剥掉一层前缀包装器，返回内层命令文本；不是前缀包装器返回 None。
+
+    只认形态固定的几个（nohup / xargs / env / time / timeout / watch）：
+    timeout 的第一个位置参数是时长，env 前面可能有 VAR=1 赋值，xargs 的
+    `-n 1` 之类要把取值一起跳过。剥完为空表示后面没有命令，调用方按
+    「不可判定」处理，不猜内层是什么。
+    """
+    tokens = command.strip().split()
+    if not tokens:
+        return None
+    verb = _basename(tokens[0])
+    if verb not in _PREFIX_WRAPPERS:
+        return None
+    rest = tokens[1:]
+    rest = _skip_env_prefix(rest) if verb == 'env' else _skip_options(rest)
+    if verb == 'timeout' and rest:
+        rest = rest[1:]            # timeout DURATION CMD
+    return ' '.join(rest)
+
+
+def _strip_wrappers_in_segments(command: str) -> str | None:
+    """剥掉每个命令段开头的前缀包装器；任一段剥完为空返回 None。
+
+    判定必须按段做：复合命令的每一段都可能包着 nohup/xargs，只剥整条命令
+    的开头，`echo x && nohup aws s3 cp .env …` 的后半段就会绕过外部操作与
+    秘密外发检查——而同类键本来就是按段算的，判定不能比它更松。
+    """
+    pieces = []
+    for index, piece in enumerate(_SEGMENT_KEEP.split(command)):
+        if index % 2:
+            pieces.append(piece)      # 分隔符原样保留
+            continue
+        segment = piece.strip()
+        while segment:
+            inner = _strip_prefix_wrapper(segment)
+            if inner is None:
+                break
+            if not inner.strip():
+                return None
+            segment = inner
+        pieces.append(segment)
+    return ' '.join(pieces)
 
 
 def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
@@ -561,7 +718,9 @@ def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
             return flag
     if 'invoke-expression' in normalized or 'iex(' in normalized:
         return 'invoke-expression'
-    for segment in _segments(normalized):
+    # 按原大小写分段：`-V` 与 `-v` 在外部操作里含义不同（pip -V 是版本，
+    # docker -v 是卷挂载），用 casefold 后的文本会把这个区别抹掉。
+    for segment in _segments(command):
         tokens = [token.strip('"\'') for token in segment.split()]
         if not tokens:
             continue
@@ -577,19 +736,30 @@ def _opaque_payload(command: str, normalized: str, verbs: set[str]) -> str:
             return f'{verb} command payload'
         if verb in ('curl', 'wget') and flags & EGRESS_SEND_FLAGS:
             return f'{verb} state-changing request'
-        if verb in ('ssh', 'scp', 'sftp', 'docker', 'podman', 'kubectl',
-                    'terraform', 'npm'):
+        if verb in EXTERNAL_OPERATIONS:
+            # 只认「命令 + 查询开关」这一种形态：参数里任意位置出现 --help 就
+            # 放行的话，`npm run build -- --help` 会跟着被当成只读查询。
+            # 先按原样比一次再按 casefold 比：`-V` 折叠成 `-v` 会落不到集合里，
+            # 而 `-v` 在 docker 里是卷挂载，不能无条件放行。
+            if len(tokens) == 2 and (tokens[1] in QUERY_FLAGS
+                                     or tokens[1].casefold() in QUERY_FLAGS):
+                continue
             return f'{verb} external operation'
+        if verb in _LAUNCHER_COMMANDS:
+            return f'{verb} launcher'
         if verb == 'git':
-            subcommand = _git_subcommand(segment)
-            if subcommand in ('clean', 'push', 'reset', 'checkout', 'switch',
-                              'commit', 'rebase', 'merge', 'tag'):
+            # 这一段按原大小写保留（-V/-v 要区分），git 子命令的匹配自己折叠
+            subcommand = _git_subcommand(segment.casefold())
+            if subcommand in GIT_WRITE_SUBCOMMANDS:
                 return f'git {subcommand} operation'
         if verb in _WRAPPERS:
             nested = ' '.join(_wrapped_tokens(tokens))
-            if nested and _opaque_payload(nested, nested.casefold(),
-                                          _command_verbs(nested)):
-                return 'wrapped command payload'
+            if nested:
+                nested = _strip_wrappers_in_segments(nested)
+                if nested is None:
+                    return 'wrapped command without a payload'
+                if _opaque_payload(nested, nested.casefold(), _command_verbs(nested)):
+                    return 'wrapped command payload'
     # curl ... | sh / wget ... | bash
     if ('curl' in verbs or 'wget' in verbs) and (
             normalized.count('|') and ('sh' in verbs or 'bash' in verbs or 'zsh' in verbs)):
@@ -656,6 +826,14 @@ def _bash_segment_class(segment: str) -> str | None:
     verb = _basename(words[0])
     if verb in ('pwsh', 'powershell'):
         return None
+    # 同类键必须落在真正执行的内层命令上：按 nohup/xargs 归类，批一次就把
+    # 「任意 nohup 命令」放进了本会话白名单。逐层剥，与判定路径同一份规则。
+    while verb in _PREFIX_WRAPPERS:
+        segment = _strip_prefix_wrapper(segment) or ''
+        words = segment.split()
+        if not words:
+            return None
+        verb = _basename(words[0])
     if verb in _WRAPPERS:
         verb = _wrapped_verb(words) or verb
     if verb in _NO_SESSION_GRANT or verb in _INTERPRETERS:
@@ -676,8 +854,7 @@ def _bash_segment_class(segment: str) -> str | None:
         return f'{verb}:{hosts.pop()}' if len(hosts) == 1 else None
     if verb == 'git':
         subcommand = _git_subcommand(segment.casefold()) or verb
-        if subcommand in {'clean', 'push', 'reset', 'checkout', 'switch',
-                          'commit', 'rebase', 'merge', 'tag'}:
+        if subcommand in GIT_WRITE_SUBCOMMANDS:
             return None
         return subcommand
     return verb

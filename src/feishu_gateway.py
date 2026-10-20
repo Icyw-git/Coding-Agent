@@ -85,6 +85,30 @@ def permission_result(record: dict) -> str:
     return f"{status} · {record.get('tool', '操作')}\n原因: {record.get('reason', '')}"
 
 
+def _chats_for(bindings: dict[str, str], session_id: str) -> list[str]:
+    """请求归属的聊天：有会话时只给绑定它的；后台任务（无会话）给全部。"""
+    if session_id:
+        return [chat_id for chat_id, bound in bindings.items() if bound == session_id]
+    return list(bindings)
+
+
+def format_judge_notice(req: dict) -> str:
+    """LLM 审查官自动放行的事后通知：不带按钮，只补「哪条被少问了」。
+
+    请求在登记的同一次调用里就已决议，审批卡片没有可点的东西；命令仍走
+    approval_view.detail，与审批卡片同一份转义规则。
+    """
+    tool = str(req.get('tool', '?'))
+    reason = str(req.get('reason', '')).removeprefix('LLM 审查放行 · ')
+    detail = approval_view.detail(tool, req.get('args') or {})
+    lines = [f'🤖 LLM 审查放行 · {tool}']
+    if reason:
+        lines.append(f'原因: {approval_view.safe_text(reason)}')
+    if detail:
+        lines.append(f'```\n{detail}\n```')
+    return '\n'.join(lines)
+
+
 def format_permission_prompt(req: dict, index: int | None = None) -> str:
     """审批提醒文案：点卡片按钮，或直接回复 y / n（多条时 y2、n2 按序号选）。
 
@@ -347,6 +371,11 @@ class FeishuGateway:
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._load_bindings()
         self._notified: set[str] = set()
+        # 审查官自动放行不进 pending（登记与决议在同一次调用里完成），只能从
+        # recent 事后补通知。集合必须独立：_notified 每轮按 pending 收敛，
+        # 混用会把刚记下的审查官请求立刻清掉、下一轮重复通知。
+        self._judge_notified: set[str] = set()
+        self._judge_since = time.time()   # 只补通知网关启动之后产生的请求
         self._poll_stop = threading.Event()
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
@@ -991,6 +1020,8 @@ class FeishuGateway:
 
         后台任务没有会话上下文（session_id 为空），仍推给所有聊天；有会话的
         请求一旦广播，任何绑定聊天都能替别的会话批操作——这是审批归属漏洞。
+        LLM 审查官放行的请求不会出现在 pending（同一次调用里就决议了），
+        事后通知由 _poll_judge_notices 从 recent 补。
         """
         try:
             pending = self.api.pending_permissions()
@@ -1003,9 +1034,7 @@ class FeishuGateway:
             if req_id in self._notified:
                 continue
             session_id = req.get('session_id') or ''
-            targets = ([chat_id for chat_id, bound in bindings.items()
-                        if bound == session_id] if session_id
-                       else list(bindings))
+            targets = _chats_for(bindings, session_id)
             if not targets:
                 # 会话还没绑定到任何聊天：先不标记，等绑定出现后的下一轮再推
                 continue
@@ -1023,6 +1052,41 @@ class FeishuGateway:
         self._notified &= pending_ids
         for fifo in self._chat_pending.values():
             fifo[:] = [req_id for req_id in fifo if req_id in pending_ids]
+        self._poll_judge_notices(bindings)
+
+    def _poll_judge_notices(self, bindings: dict[str, str]) -> None:
+        """从 recent 补「审查官自动放行」的事后通知。
+
+        只推网关启动之后产生的请求：重启不补历史，否则一上线就把最近几十条
+        旧放行全推一遍。集合按 recent 收敛，不随运行时长增长。
+        """
+        fetch = getattr(self.api, 'recent_permissions', None)
+        if not callable(fetch):
+            return
+        try:
+            recent = fetch(limit=50)
+        except Exception:
+            return
+        seen = set()
+        for req in recent:
+            req_id = req.get('req_id')
+            if not req_id:
+                continue
+            seen.add(req_id)
+            if (req.get('resolved_by') != 'llm-judge'
+                    or req_id in self._judge_notified
+                    or float(req.get('created_at') or 0) < self._judge_since):
+                continue
+            targets = _chats_for(bindings, req.get('session_id') or '')
+            if not targets:
+                continue          # 会话还没绑定，等绑定后的下一轮
+            self._judge_notified.add(req_id)
+            for chat_id in targets:
+                try:
+                    self._reply(chat_id, format_judge_notice(req))
+                except Exception as exc:
+                    print(f'[feishu] judge notice failed for chat {chat_id!r}: {exc}')
+        self._judge_notified &= seen
 
     def _push_approval(self, chat_id: str, req: dict, index: int) -> None:
         """推送审批请求：优先带按钮的卡片，发送失败回退纯文本提示。"""

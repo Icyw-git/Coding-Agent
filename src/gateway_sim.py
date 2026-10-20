@@ -261,6 +261,12 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['pending']
 
+    def recent_permissions(self, limit: int = 50) -> list[dict]:
+        """最近审批历史：审查官自动放行不进 pending，网关从这里补事后通知。"""
+        response = self.http.get('/v1/permissions', params={'limit': limit})
+        response.raise_for_status()
+        return response.json()['recent']
+
     def search_sessions(self, q: str, limit: int = 10) -> list[dict]:
         response = self.http.get('/v1/sessions/search',
                                  params={'q': q, 'limit': limit})
