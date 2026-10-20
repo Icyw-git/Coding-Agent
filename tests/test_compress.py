@@ -414,6 +414,8 @@ def test_per_call_usage_events(tmp_path, monkeypatch):
     events = [e for e in store.read_events() if e.get('type') == 'usage']
     assert [e['prompt'] for e in events] == [100, 200], "每次调用一条 usage 事件"
     assert [e['cached'] for e in events] == [80, 180]
+    # 归因字段：不开调试开关也能从日志判断缓存跌破是模型还是前缀内容变了
+    assert {'model', 'system_fp', 'tools_fp'} <= set(events[0])
     totals = store.usage_totals()
     assert totals['prompt'] == 300 and totals['total'] == 315 and totals['calls'] == 2
 

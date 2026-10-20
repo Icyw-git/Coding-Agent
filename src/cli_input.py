@@ -525,22 +525,172 @@ def choose_workspace(rows):
         return None
 
 
+def toggle_cleanup_selection(rows, selected):
+    """全选/全不选：作用于当前筛选结果，返回 (新集合, 是否刚全选)。
+
+    当前可见的会话已经全选中就取消它们，否则把它们全部加入；筛选之外的
+    已选项保持不动——先筛一批勾上、再清空筛选勾另一批，是正常用法。
+    """
+    ids = [row['id'] for row in rows]
+    if not ids:
+        return selected, False
+    if all(session_id in selected for session_id in ids):
+        return selected - set(ids), False
+    return selected | set(ids), True
+
+
+CLEANUP_HINT = ('↑↓ 移动 · 空格 勾选 · Ctrl+A / F2 全选/全不选 · '
+                'Enter 确认 · 输入关键词筛选 · Esc 返回')
+
+
+class CleanupPicker:
+    """归档/恢复/删除的多选界面：空格勾选、Ctrl+A 全选、Enter 确认。
+
+    不用 prompt_toolkit 的 checkboxlist_dialog：那里 Enter 和空格是同一个
+    「切换勾选」动作，回车不会确认，按完以为是确认、实际只是又勾了一条；
+    也没有全选，几十个会话只能一条条按空格。这里让回车只做确认，勾选交给
+    空格，并给 Ctrl+A / F2 全选/全不选（作用于当前筛选结果）。
+
+    注意 Ctrl+A 必须 eager：筛选框本身绑定了行首移动，不抢先处理就永远
+    轮不到应用层的全选。
+    """
+
+    def __init__(self, rows, *, restore=False, delete=False, **application_kwargs):
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import HSplit, Layout, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.styles import Style
+        from prompt_toolkit.widgets import TextArea
+
+        self.rows = list(rows)
+        self.action = '永久删除' if delete else '恢复' if restore else '归档'
+        self.delete = delete
+        self.selected = set()   # 按会话 id 记勾选：筛选变化不丢已选项
+        self.index = 0
+        self.notice = ''
+        self.search = TextArea(height=1, prompt='筛选：', multiline=False)
+        self.search.buffer.on_text_changed += self._reset_selection
+        self.content = FormattedTextControl(self._render)
+        self.list_window = Window(self.content, wrap_lines=False)
+        bindings = KeyBindings()
+
+        @bindings.add('up')
+        def previous(event):
+            self.index = max(0, self.index - 1)
+
+        @bindings.add('down')
+        def following(event):
+            self.index = min(max(0, len(self.visible()) - 1), self.index + 1)
+
+        @bindings.add('pageup')
+        @bindings.add('pagedown')
+        def move_page(event):
+            step = -8 if event.key_sequence[0].key == 'pageup' else 8
+            self.index = min(max(0, len(self.visible()) - 1), max(0, self.index + step))
+
+        @bindings.add(' ')
+        def toggle(event):
+            rows = self.visible()
+            if rows:
+                session_id = rows[min(self.index, len(rows) - 1)]['id']
+                if session_id in self.selected:
+                    self.selected.discard(session_id)
+                else:
+                    self.selected.add(session_id)
+                self.notice = ''
+
+        # eager：筛选框聚焦时，TextArea 自己绑定了 c-a（行首），不加 eager
+        # 这个键会被它吃掉——全选看起来就是“没反应”。
+        @bindings.add('c-a', eager=True)
+        @bindings.add('f2', eager=True)
+        def toggle_all(event):
+            rows = self.visible()
+            self.selected, selected_all = toggle_cleanup_selection(rows, self.selected)
+            if rows:
+                self.notice = (f'已勾选 {len(rows)} 个会话' if selected_all
+                               else f'已取消勾选 {len(rows)} 个会话')
+            event.app.invalidate()
+
+        @bindings.add('enter')
+        def accept(event):
+            chosen = [row['id'] for row in self.rows if row['id'] in self.selected]
+            if not chosen:
+                self.notice = '还没有勾选会话：空格勾选，Ctrl+A 全选，Esc 返回'
+                return
+            event.app.exit(result=chosen)
+
+        @bindings.add('escape')
+        @bindings.add('c-c')
+        @bindings.add('c-d')
+        def cancel(event):
+            event.app.exit(result=None)
+
+        root = HSplit([
+            self.list_window,
+            Window(height=1, char='─'),
+            self.search,
+            Window(FormattedTextControl(lambda: [('class:notice', f' {self.notice}')]
+                                                if self.notice else
+                                                [('class:muted', ' ' + CLEANUP_HINT)]),
+                   height=1),
+        ])
+        application_kwargs.setdefault('style', Style.from_dict({
+            'heading': 'bold', 'selected': 'bg:ansiblue ansiwhite bold', 'checked': 'bold',
+            'muted': 'ansibrightblack', 'notice': 'ansiyellow',
+        }))
+        self.application = Application(layout=Layout(root, focused_element=self.search),
+                                       key_bindings=bindings, full_screen=True,
+                                       **application_kwargs)
+
+    def _reset_selection(self, buffer):
+        self.index = 0
+
+    def visible(self):
+        query = self.search.text.strip().casefold()
+        rows = self.rows
+        if query:
+            rows = [row for row in rows if query in ' '.join(
+                str(row.get(key) or '') for key in ('title', 'preview', 'workspace', 'id')
+            ).casefold()]
+        self.index = min(self.index, max(0, len(rows) - 1))
+        return rows
+
+    def _render(self):
+        rows = self.visible()
+        marked = sum(row['id'] in self.selected for row in self.rows)
+        output = [('class:heading', f'{self.action} · 已勾选 {marked}/{len(self.rows)}\n')]
+        if self.delete:
+            output.append(('class:muted', '  记录及关联快照不可恢复；项目文件不受影响。\n'))
+        if not rows:
+            return output + [('class:muted', '\n  没有匹配的会话；清空筛选查看全部。')]
+        height = self.list_window.render_info.window_height if self.list_window.render_info else 18
+        width = self.list_window.render_info.window_width if self.list_window.render_info else 78
+        count = max(1, (height - 3) // 2)
+        start = max(0, min(self.index - count // 2, len(rows) - count))
+        for index in range(start, min(len(rows), start + count)):
+            row = rows[index]
+            style = 'class:selected' if index == self.index else ''
+            cursor = '› ' if index == self.index else '  '
+            box = '[×] ' if row['id'] in self.selected else '[ ] '
+            title = fit_cells(row.get('title') or '未命名任务', max(1, width - 6), pad=True)
+            meta = fit_cells(f"{row.get('workspace') or '工作目录未记录'} · "
+                             f"最近活跃 {relative_time(row.get('updated'))}",
+                             max(1, width - 6))
+            output.append((style, f'{cursor}{box}{title}\n'))
+            output.append((style or 'class:muted', f'      {meta}\n'))
+        return output
+
+
 def choose_cleanup_sessions(rows, *, restore=False, delete=False):
+    """返回勾选的会话 id；取消或非交互终端返回空列表（不做任何改动）。"""
     if not rows:
         print('  没有符合条件的会话。')
         return []
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print('  请在交互终端中选择会话；本次未执行任何改动。')
         return []
-    from prompt_toolkit.shortcuts import checkboxlist_dialog
-
     try:
-        return checkboxlist_dialog(
-            title=('永久删除归档（不可恢复）' if delete else
-                   '恢复归档' if restore else '归档旧会话（可恢复）'),
-            text='↑↓ 移动，空格多选，Tab 切换按钮，Enter 确认；不影响项目文件。',
-            values=[(row['id'], session_label(row)) for row in rows],
-            ok_text='选择完成', cancel_text='取消',
-        ).run() or []
+        return CleanupPicker(rows, restore=restore, delete=delete).application.run() or []
     except (EOFError, KeyboardInterrupt):
         return []

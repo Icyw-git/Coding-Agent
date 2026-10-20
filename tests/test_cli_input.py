@@ -2,7 +2,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
-from cli_input import SlashCompleter, create_reader
+from cli_input import SlashCompleter, create_reader, toggle_cleanup_selection
 
 
 def choices(completer, text):
@@ -69,6 +69,55 @@ def test_resume_completion_searches_human_context():
         assert [item.text for item in items] == ['abc123']
         assert to_plain_text(items[0].display) == label
         assert items[0].start_position == -len(query)
+
+
+def test_select_all_toggles_only_the_visible_rows():
+    rows = [{'id': 'a'}, {'id': 'b'}]
+    selected, added = toggle_cleanup_selection(rows, set())
+    assert selected == {'a', 'b'} and added
+
+    # 部分选中时再全选：补上缺的，已选的保持
+    selected, added = toggle_cleanup_selection(rows, {'a'})
+    assert selected == {'a', 'b'} and added
+
+    # 筛选之外的勾选不受影响：清空筛选后那些仍然保留
+    selected, added = toggle_cleanup_selection(rows, {'a', 'b', 'c'})
+    assert selected == {'c'} and not added
+
+
+def test_select_all_with_no_visible_rows_is_a_noop():
+    selected, added = toggle_cleanup_selection([], {'a'})
+    assert selected == {'a'} and not added
+
+
+def test_cleanup_hint_advertises_both_select_all_keys():
+    from cli_input import CLEANUP_HINT
+
+    # F2 是不依赖输入框焦点的备用键，和 Ctrl+A 一起写进提示
+    assert 'Ctrl+A' in CLEANUP_HINT and 'F2' in CLEANUP_HINT
+
+
+def test_cleanup_picker_ctrl_a_selects_all_even_with_search_focused():
+    """筛选框聚焦时 Ctrl+A 会被输入框的行首键吃掉；eager 绑定必须抢先处理。"""
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from cli_input import CleanupPicker
+
+    async def exercise():
+        with create_pipe_input() as pipe:
+            picker = CleanupPicker([{'id': 'a'}, {'id': 'b'}],
+                                   input=pipe, output=DummyOutput())
+            task = asyncio.create_task(picker.application.run_async())
+            await asyncio.sleep(0.1)
+            pipe.send_bytes(b'\x01')    # Ctrl+A
+            await asyncio.sleep(0.1)
+            pipe.send_bytes(b'\r')      # Enter 确认
+            return await asyncio.wait_for(task, timeout=3)
+
+    assert asyncio.run(exercise()) == ['a', 'b']
 
 
 def test_prompt_session_tab_and_eof(tmp_path):

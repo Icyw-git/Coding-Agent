@@ -695,10 +695,14 @@ class FeishuGateway:
                 return
             indices = argument.split()[1:]
             rows = listing[2]
-            if not indices or any(not n.isdigit() or not 1 <= int(n) <= len(rows) for n in indices):
-                self._reply(chat_id, '请输入列表中的序号，例如 select 1 3。')
+            if indices == ['all']:
+                selected = list(rows)
+            elif not indices or any(not n.isdigit() or not 1 <= int(n) <= len(rows)
+                                    for n in indices):
+                self._reply(chat_id, '请输入列表中的序号，例如 select 1 3；或 select all 全选。')
                 return
-            selected = [rows[i] for i in sorted({int(n) - 1 for n in indices})]
+            else:
+                selected = [rows[i] for i in sorted({int(n) - 1 for n in indices})]
             self._session_confirmation[chat_id] = (listing[1], selected, time.monotonic())
             confirmation = '/confirm 删除（不可恢复）' if listing[1] == 'delete' else '/confirm'
             self._reply(chat_id, '待处理会话：\n' + self._session_rows_text(selected)
@@ -707,7 +711,7 @@ class FeishuGateway:
         from session_cleanup import cleanup_candidates
         if command == '/delete':
             if argument:
-                self._reply(chat_id, '用法: /delete，或 /delete select <序号...>')
+                self._reply(chat_id, '用法: /delete，或 /delete select <序号...|all>')
                 return
             action, rows = 'delete', self.api.list_archives()
         elif argument == 'restore':
@@ -726,7 +730,8 @@ class FeishuGateway:
             self._archive_choices = {}
         self._archive_choices[chat_id] = (command, action, rows, time.monotonic())
         self._session_confirmation.pop(chat_id, None)
-        self._reply(chat_id, self._session_rows_text(rows) + f'\n\n{command} select <序号...> 多选。'
+        self._reply(chat_id, self._session_rows_text(rows)
+                    + f'\n\n{command} select <序号...> 多选，或 {command} select all 全选。'
                     if rows else '没有符合条件的会话。当前绑定的会话不可处理；/archive all 查看其他会话。')
 
     def _change_policy(self, chat_id: str, argument: str) -> None:
@@ -759,9 +764,9 @@ class FeishuGateway:
             '/sessions [页码]       会话卡片列表、详情与切换',
             '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
             '/archive [天数|empty|all|restore]  选择归档或恢复会话',
-            '/archive select <序号...>  多选后预览归档或恢复',
+            '/archive select <序号...|all>  多选后预览归档或恢复',
             '/delete                查看可永久删除的归档',
-            '/delete select <序号...>  多选后预览删除',
+            '/delete select <序号...|all>  多选后预览删除',
             '/confirm、/cancel      确认或取消待执行操作',
             '/cd [dir]              查看/切换当前会话工作区',
             '/pwd                   查看当前会话工作区',

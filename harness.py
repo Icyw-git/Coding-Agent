@@ -31,6 +31,7 @@ def enforce_trusted_policy_env() -> None:
 
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import subprocess
 import sys
@@ -109,12 +110,20 @@ from exec_policy import is_readonly_command, load_policy, set_tier
 from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
+from prompt_cache_debug import enabled as cache_debug_enabled
+from prompt_cache_debug import fingerprints as cache_fingerprints
+from prompt_cache_debug import first_divergence as first_cache_divergence
 from session_store import SessionEventStore, SessionReplayError
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from tools import TOOLS, run_bash, tool_registry
 from workspace_context import current_workspace, use_workspace
+
+# 请求前缀包含 system + tools + 历史：把 tools 指纹写进 usage 事件，事后
+# 不用开调试开关也能把缓存跌破归因到「模型 / system / 工具表」哪一项变了。
+TOOLS_FINGERPRINT = hashlib.sha1(
+    repr(TOOLS).encode('utf-8', 'replace')).hexdigest()[:12]
 
 load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
@@ -695,6 +704,63 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
     if os.getenv('HARNESS_DEBUG') == '1':
         print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return prompt
+
+_LAST_REQUESTS: dict[str, tuple[list[str], list]] = {}
+
+
+def _message_head(message, limit: int = 80) -> dict:
+    """调试记录里的一小段消息摘要：能认出是哪条，又不把长内容写进日志。"""
+    content = str((message or {}).get('content') or '')
+    return {'role': (message or {}).get('role', ''),
+            'chars': len(content),
+            'head': content[:limit]}
+
+
+def _report_cache_prefix(session_id: str, request_messages: list,
+                         model: str = '') -> None:
+    """HARNESS_DEBUG_CACHE=1：相邻请求的「system + 历史」前缀断了就记录。
+
+    只比较 system + 历史：`inject_memories` 把记忆块追加在请求末尾，它每轮的
+    位置都不同——把它算进来，每次工具结果追加都会被误报成前缀改写（实测每一轮
+    都会报一次）。真正的 `history_snipped` 会改动历史中部，仍然会被抓到。
+    只观测、不改请求；stderr 之外再写一份 `.cache/cache_debug.jsonl`。
+    """
+    if not cache_debug_enabled():
+        return
+    current = cache_fingerprints(request_messages)
+    previous = _LAST_REQUESTS.get(session_id)
+    _LAST_REQUESTS[session_id] = (current, request_messages)
+    if previous is None:
+        return
+    previous_fingerprints, previous_messages = previous
+    index = first_cache_divergence(previous_fingerprints, current)
+    if index >= len(previous_fingerprints):
+        return
+    system_chars = len(str((request_messages[0] or {}).get('content') or ''))
+    record = {
+        'ts': time.time(),
+        'session_id': session_id,
+        'index': index,
+        'previous_len': len(previous_fingerprints),
+        'current_len': len(current),
+        'system_chars': system_chars,
+        'system_fingerprint': current[0] if current else '',
+        'model': model,
+        'before': (_message_head(previous_messages[index])
+                   if index < len(previous_messages) else None),
+        'after': _message_head(request_messages[index]),
+    }
+    print(f'  \033[33m[cache] prefix changed at msg {index} '
+          f'({record["previous_len"]}→{record["current_len"]}, '
+          f'system={system_chars} chars) session {session_id[:8]}\033[0m',
+          file=sys.stderr)
+    try:
+        log_path = SESSIONS_DIR.parent / 'cache_debug.jsonl'
+        with open(log_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
 
 def update_context(context:dict,messages:list)->dict: # 更新上下文：工具、工作目录、技能
     # ⚠ 记忆不再进 system prompt：housekeeping 每轮更新 MEMORY_INDEX，若嵌在
@@ -1513,6 +1579,12 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
 
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         request_messages = inject_memories(messages, memories_content, system)
+        # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
+        probe_messages = ([{'role': 'system', 'content': system}] if system else [])
+        probe_messages.extend(messages)
+        _report_cache_prefix(
+            session_store.session_id, probe_messages,
+            recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '')
 
         def _create(): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
@@ -1541,6 +1613,12 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             reactive_retries=0
             detail=_parse_usage(getattr(response, 'usage', None))
             if detail:
+                # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
+                detail['model'] = (recovery_state.current_model
+                                   or os.getenv('LLM_MODEL_ID') or '')
+                detail['system_fp'] = hashlib.sha1(
+                    (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
+                detail['tools_fp'] = TOOLS_FINGERPRINT
                 turn_tokens += detail['total']
                 for _k in ('prompt','completion','cached','total'):
                     turn_usage[_k] += detail[_k]

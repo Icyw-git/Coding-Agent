@@ -67,6 +67,21 @@ def test_confirmation_rechecks_bindings_and_expiry(environment, monkeypatch):
     assert runtime.list_sessions()
 
 
+def test_select_all_selects_every_listed_session(environment):
+    """`select all` 选中当前列表全部候选，仍需 /confirm 才执行。"""
+    runtime, api, gw, transport = environment
+    gw.on_message('chat', '/archive all')
+    listed = len(gw._archive_choices['chat'][2])
+    assert listed >= 1
+
+    gw.on_message('chat', '/archive select all')
+    pending = gw._session_confirmation['chat'][1]
+    assert len(pending) == listed
+    assert '待处理会话' in transport.last()
+    gw.on_message('chat', '/cancel')
+    assert runtime.list_sessions(), '取消后不应归档任何会话'
+
+
 def test_archive_restore_and_delete_confirmation(environment):
     runtime, api, gw, transport = environment
     gw.on_message('chat', '/archive all')
