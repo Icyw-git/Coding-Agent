@@ -85,6 +85,26 @@ def test_start_new_session_refuses_an_existing_id(tmp_path, monkeypatch):
         harness.start_new_session(workspace=str(tmp_path), session_id='dup1')
 
 
+def test_start_new_session_restores_workspace_when_the_store_fails(
+        tmp_path, monkeypatch):
+    sessions = tmp_path / 'sessions'
+    sessions.mkdir()
+    project = tmp_path / 'project'
+    project.mkdir()
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions)
+    monkeypatch.setattr(harness, 'WORKDIR', tmp_path)
+
+    def broken(*args, **kwargs):
+        raise OSError('disk full')
+
+    monkeypatch.setattr(harness, 'SessionEventStore', broken)
+    with pytest.raises(OSError):
+        harness.start_new_session(workspace=str(project), session_id='fail1')
+
+    assert harness.WORKDIR == tmp_path
+    assert not (sessions / 'session_fail1.jsonl').exists()
+
+
 def test_browse_entries_navigate_folders_without_typing_paths(tmp_path):
     (tmp_path / 'alpha').mkdir()
     (tmp_path / 'beta').mkdir()

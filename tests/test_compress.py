@@ -420,6 +420,13 @@ def test_per_call_usage_events(tmp_path, monkeypatch):
     assert totals['prompt'] == 300 and totals['total'] == 315 and totals['calls'] == 2
 
 
+def test_tools_fingerprint_tracks_runtime_mcp_schemas(monkeypatch):
+    """MCP 工具在运行期才追加，指纹不能是 import 时算好的常量。"""
+    before = harness._tools_fingerprint()
+    monkeypatch.setattr(harness, 'TOOLS', [*harness.TOOLS, {'type': 'function'}])
+    assert harness._tools_fingerprint() != before
+
+
 def test_tail_within_budget(tmp_path, monkeypatch):
     """尾部保留：条数上限 + token 预算双约束（500KB 尾部不再原样保留）。"""
     monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 800_000)

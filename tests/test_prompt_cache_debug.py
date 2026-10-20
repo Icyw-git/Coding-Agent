@@ -84,4 +84,67 @@ def test_report_writes_a_jsonl_record_only_when_the_prefix_is_rewritten(
     assert record['session_id'] == 's1' and record['index'] == 1
     assert record['before']['head'] == 'b'
     assert record['after']['head'] == 'B'
+    assert record['truncated'] is False
     assert record['system_fingerprint']
+
+
+def test_shorter_request_records_truncation_instead_of_crashing(
+        monkeypatch, capsys, tmp_path):
+    import json
+
+    import harness
+
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE', '1')
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    harness._LAST_REQUESTS.clear()
+    previous = [{'role': 'user', 'content': 'a'},
+                {'role': 'assistant', 'content': 'b'},
+                {'role': 'user', 'content': 'c'},
+                {'role': 'assistant', 'content': 'd'}]
+    harness._report_cache_prefix('s1', previous)
+    harness._report_cache_prefix('s1', previous[:2])
+    assert 'prefix changed at msg 2' in capsys.readouterr().err
+
+    record = json.loads(
+        (tmp_path / 'cache_debug.jsonl').read_text(encoding='utf-8').splitlines()[-1])
+    assert record['index'] == 2 and record['truncated'] is True
+    assert record['after'] is None
+    assert record['before'] == {'role': 'user', 'chars': 1, 'head': 'c'}
+
+
+def test_system_text_is_fingerprinted_without_storing_the_whole_request(
+        monkeypatch, tmp_path):
+    import json
+
+    import harness
+
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE', '1')
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    harness._LAST_REQUESTS.clear()
+    messages = [{'role': 'user', 'content': 'a'}]
+    harness._report_cache_prefix('s1', messages, system='old prompt')
+    harness._report_cache_prefix('s1', messages, system='new prompt')
+
+    record = json.loads(
+        (tmp_path / 'cache_debug.jsonl').read_text(encoding='utf-8').splitlines()[-1])
+    assert record['index'] == 0
+    assert record['system_chars'] == len('new prompt')
+    assert record['before']['head'] == 'old prompt'
+    assert record['after']['head'] == 'new prompt'
+    assert harness._LAST_REQUESTS['s1'][1][0]['head'] == 'new prompt'
+
+
+def test_recent_requests_are_bounded(monkeypatch, tmp_path):
+    import harness
+
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE', '1')
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    harness._LAST_REQUESTS.clear()
+    total = harness._CACHE_DEBUG_SESSIONS + 5
+    for index in range(total):
+        harness._report_cache_prefix(
+            f's{index}', [{'role': 'user', 'content': str(index)}])
+
+    assert len(harness._LAST_REQUESTS) == harness._CACHE_DEBUG_SESSIONS
+    assert 's0' not in harness._LAST_REQUESTS
+    assert f's{total - 1}' in harness._LAST_REQUESTS

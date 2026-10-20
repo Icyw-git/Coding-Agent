@@ -32,7 +32,7 @@ from exec_policy import (
     system_roots,
 )
 
-DENY_LIST = ['rm -rf /', 'sudo', 'shutdown', 'reboot', '> /dev/']
+DENY_LIST = ['sudo', 'shutdown', 'reboot', '> /dev/']
 DESTRUCTIVE = ['rm ', 'del ', 'rmdir ', 'rd ', 'remove-item ', 'erase ',
                'clear-content ', '> /etc/', 'chmod 777']
 
@@ -105,6 +105,31 @@ def test_root_delete_flag_is_denied_even_without_the_blacklist_substring():
     decision = bash('rm -rf --no-preserve-root /')
     assert decision.action == DENY
     assert decision.code == 'deny_root_delete'
+
+
+@pytest.mark.parametrize('command', [
+    'rm -rf /',
+    'rm -fr /',
+    'rm -r -f /',
+    'rm --recursive --force /',
+    'rm -rf /*',
+    'rm -rf /tmp/../',
+    'echo $(rm -rf /)',
+    'bash -c "rm -rf /"',
+])
+def test_filesystem_root_deletion_is_denied(command):
+    decision = bash(command)
+    assert decision.action == DENY, command
+    assert decision.code == 'deny_root_delete'
+
+
+@pytest.mark.parametrize('command', [
+    'rm -rf /tmp/a',      # 旧子串 '-rf /' 曾把这句硬拒
+    'rm -rf build',
+    'rm -rf ./dist',
+])
+def test_rm_targeting_a_subdirectory_is_not_a_root_delete(command):
+    assert bash(command).code != 'deny_root_delete'
 
 
 def test_newline_separated_commands_are_judged_individually():

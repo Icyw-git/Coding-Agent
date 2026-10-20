@@ -120,10 +120,12 @@ from task_system import claim_task, complete_task, create_task, get_task, list_t
 from tools import TOOLS, run_bash, tool_registry
 from workspace_context import current_workspace, use_workspace
 
+
 # 请求前缀包含 system + tools + 历史：把 tools 指纹写进 usage 事件，事后
 # 不用开调试开关也能把缓存跌破归因到「模型 / system / 工具表」哪一项变了。
-TOOLS_FINGERPRINT = hashlib.sha1(
-    repr(TOOLS).encode('utf-8', 'replace')).hexdigest()[:12]
+# MCP 工具在运行期才追加到 TOOLS，所以指纹要在记 usage 时现算。
+def _tools_fingerprint() -> str:
+    return hashlib.sha1(repr(TOOLS).encode('utf-8', 'replace')).hexdigest()[:12]
 
 load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
@@ -253,11 +255,16 @@ def start_new_session(workspace=None, session_id=None):
     """
     if session_id and (SESSIONS_DIR / f'session_{session_id}.jsonl').exists():
         raise FileExistsError(f'already exists: {session_id}; use /r {session_id}')
+    previous = WORKDIR
     if workspace is not None:
         set_workspace(str(workspace))
-    store = SessionEventStore(SESSIONS_DIR, session_id=session_id)
-    store.append('session_created')
-    store.record_workspace(WORKDIR)
+    try:
+        store = SessionEventStore(SESSIONS_DIR, session_id=session_id)
+        store.append('session_created')
+        store.record_workspace(WORKDIR)
+    except Exception:
+        set_workspace(str(previous))
+        raise
     return store
 
 
@@ -636,7 +643,7 @@ MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
 CONSOLIDATE_THRESHOLD=10
 
 # ---------- 安全策略 ----------
-DENY_LIST=['rm -rf /','sudo','shutdown','reboot','> /dev/']
+DENY_LIST=['sudo','shutdown','reboot','> /dev/']
 DESTRUCTIVE=["rm ","del ","rmdir ","rd ","remove-item ","erase ",
              "clear-content ","> /etc/","chmod 777"]
 
@@ -705,7 +712,9 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
         print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return prompt
 
-_LAST_REQUESTS: dict[str, tuple[list[str], list]] = {}
+_CACHE_DEBUG_SESSIONS = 32
+# 只保留消息摘要而不是整份请求：开关开着跑长会话时，内存不随历史增长。
+_LAST_REQUESTS: dict[str, tuple[list[str], list[dict]]] = {}
 
 
 def _message_head(message, limit: int = 80) -> dict:
@@ -717,7 +726,7 @@ def _message_head(message, limit: int = 80) -> dict:
 
 
 def _report_cache_prefix(session_id: str, request_messages: list,
-                         model: str = '') -> None:
+                         model: str = '', *, system: str = '') -> None:
     """HARNESS_DEBUG_CACHE=1：相邻请求的「system + 历史」前缀断了就记录。
 
     只比较 system + 历史：`inject_memories` 把记忆块追加在请求末尾，它每轮的
@@ -727,32 +736,40 @@ def _report_cache_prefix(session_id: str, request_messages: list,
     """
     if not cache_debug_enabled():
         return
-    current = cache_fingerprints(request_messages)
-    previous = _LAST_REQUESTS.get(session_id)
-    _LAST_REQUESTS[session_id] = (current, request_messages)
+    probe = ([{'role': 'system', 'content': system}] if system else [])
+    probe.extend(request_messages)
+    current = cache_fingerprints(probe)
+    heads = [_message_head(message) for message in probe]
+    previous = _LAST_REQUESTS.pop(session_id, None)
+    _LAST_REQUESTS[session_id] = (current, heads)
+    if len(_LAST_REQUESTS) > _CACHE_DEBUG_SESSIONS:
+        _LAST_REQUESTS.pop(next(iter(_LAST_REQUESTS)))
     if previous is None:
         return
-    previous_fingerprints, previous_messages = previous
+    previous_fingerprints, previous_heads = previous
     index = first_cache_divergence(previous_fingerprints, current)
     if index >= len(previous_fingerprints):
         return
-    system_chars = len(str((request_messages[0] or {}).get('content') or ''))
+    # 当前请求更短（历史被压缩/截断）时，断裂点可能落在末尾之外。
+    truncated = index >= len(current)
     record = {
         'ts': time.time(),
         'session_id': session_id,
         'index': index,
         'previous_len': len(previous_fingerprints),
         'current_len': len(current),
-        'system_chars': system_chars,
-        'system_fingerprint': current[0] if current else '',
+        'truncated': truncated,
+        'system_chars': len(system),
+        'system_fingerprint': hashlib.sha1(
+            (system or '').encode('utf-8', 'replace')).hexdigest()[:12],
         'model': model,
-        'before': (_message_head(previous_messages[index])
-                   if index < len(previous_messages) else None),
-        'after': _message_head(request_messages[index]),
+        'before': (previous_heads[index]
+                   if index < len(previous_heads) else None),
+        'after': None if truncated else heads[index],
     }
     print(f'  \033[33m[cache] prefix changed at msg {index} '
           f'({record["previous_len"]}→{record["current_len"]}, '
-          f'system={system_chars} chars) session {session_id[:8]}\033[0m',
+          f'system={record["system_chars"]} chars) session {session_id[:8]}\033[0m',
           file=sys.stderr)
     try:
         log_path = SESSIONS_DIR.parent / 'cache_debug.jsonl'
@@ -1580,11 +1597,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         request_messages = inject_memories(messages, memories_content, system)
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
-        probe_messages = ([{'role': 'system', 'content': system}] if system else [])
-        probe_messages.extend(messages)
         _report_cache_prefix(
-            session_store.session_id, probe_messages,
-            recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '')
+            session_store.session_id, messages,
+            recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '',
+            system=system)
 
         def _create(): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
@@ -1618,7 +1634,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                                    or os.getenv('LLM_MODEL_ID') or '')
                 detail['system_fp'] = hashlib.sha1(
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
-                detail['tools_fp'] = TOOLS_FINGERPRINT
+                detail['tools_fp'] = _tools_fingerprint()
                 turn_tokens += detail['total']
                 for _k in ('prompt','completion','cached','total'):
                     turn_usage[_k] += detail[_k]

@@ -20,6 +20,7 @@
 """
 
 import os
+import posixpath
 import re
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -117,8 +118,6 @@ _SEGMENT_KEEP = re.compile(r'(\||&&|;|&|[\r\n]+)')
 _PATH_SPLIT = re.compile(r'[\\/]+')
 # bash 里 su""do 会被解析成 sudo，所以命令名要在「去引号」的副本上再取一次
 _STRIP_QUOTES = re.compile(r'["\'`]')
-# rm -rf --no-preserve-root / 这类「换写法绕过子串」的根删。
-_ROOT_DELETE_FLAGS = ('--no-preserve-root', '-rf /', '-fr /')
 
 READ_WRITE_TOOLS = ('write', 'edit')
 # 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
@@ -260,9 +259,13 @@ class Policy:
             elif text in normalized:
                 return Decision(DENY, 'deny_pattern',
                                 f'denied command {pattern}', pattern)
-        if any(flag in normalized for flag in _ROOT_DELETE_FLAGS):
+        if '--no-preserve-root' in normalized:
             return Decision(DENY, 'deny_root_delete',
-                            'denied filesystem-root deletion', '--no-preserve-root')
+                            'denied filesystem-root deletion',
+                            '--no-preserve-root')
+        if _deletes_filesystem_root(normalized):
+            return Decision(DENY, 'deny_root_delete',
+                            'denied filesystem-root deletion', 'rm -rf /')
 
         # 1.5) 秘密文件外发：文件工具的路径分区管不到 bash 的 argv。命令里点名
         #      .env / 私钥，又同时出现出口或外部操作命令，就升级人工——不做路径
@@ -598,6 +601,43 @@ def _command_verbs(command: str) -> set[str]:
         if verb in _WRAPPERS:
             verbs |= _wrapped_verbs(tokens)
     return {verb for verb in verbs if verb}
+
+
+def _rm_targets_root(words: list[str]) -> bool:
+    """`rm` 的参数是否带递归+强制开关，且目标就是文件系统根。"""
+    flags: set[str] = set()
+    targets = []
+    for word in words:
+        if word == '--':
+            continue
+        if word.startswith('--'):
+            flag = {'--recursive': 'r', '--force': 'f'}.get(word)
+            if flag:
+                flags.add(flag)
+            continue
+        if word.startswith('-') and word != '-':
+            flags.update(char for char in word[1:] if char in 'rf')
+            continue
+        targets.append(word)
+    return ({'r', 'f'} <= flags
+            and any(target.startswith('/')
+                    and not posixpath.normpath(target).strip('/*')
+                    for target in targets))
+
+
+def _deletes_filesystem_root(command: str) -> bool:
+    """命令里是否有目标为根的 `rm -rf`（含 `/*` 与命令替换）。
+
+    旧实现按子串 `-rf /` 判定，`rm -rf /tmp/a` 也被硬拒。这里按 rm 的 token
+    判定：开关可以合并或分开写，目标必须恰是 `/` 或 `/*`。
+    """
+    for segment in _segments(command):
+        for part in re.split(r'[()`]', segment):
+            words = _STRIP_QUOTES.sub(' ', part).split()
+            for start, word in enumerate(words):
+                if _basename(word) == 'rm' and _rm_targets_root(words[start + 1:]):
+                    return True
+    return False
 
 
 def egress_hosts(text: str) -> set[str]:
