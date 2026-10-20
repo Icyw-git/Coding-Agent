@@ -21,7 +21,7 @@ class Command:
 
 COMMANDS = (
     Command('/help', ('/?',), '[命令]', '显示帮助；如 /help rewind', '常用'),
-    Command('/new', ('/n',), '[会话ID]', '开始新会话，保留当前工作区', '会话'),
+    Command('/new', ('/n',), '[会话ID]', '选择工作区开始新会话；Enter 用当前目录', '会话'),
     Command('/resume', ('/r',), '[last|会话ID或前缀]', '选择并恢复会话及其工作目录；last 直达最近会话', '会话'),
     Command('/sessions', ('/s',), '', '打开会话管理；按工作区分组、预览和切换', '会话'),
     Command('/archive', (), '[天数|all|empty|restore]', '归档旧会话；默认 30 天，可查看全部或恢复归档', '会话'),
@@ -40,7 +40,7 @@ COMMANDS = (
     Command('/find', ('/search',), '<关键词>', '跨会话搜索历史内容', '会话'),
     Command('/rename', (), '<新主题>', '设置当前会话主题', '会话'),
     Command('/pwd', ('/p', '/w'), '', '查看当前工作区', '工作区'),
-    Command('/cd', (), '[路径]', '切换工作区；不带参数时查看路径', '工作区'),
+    Command('/cd', (), '[路径]', '切换当前会话工作区；换项目建议 /new', '工作区'),
     Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
     Command('/checkpoint', ('/cp',), '[标签]', '创建手动快照', '快照'),
     Command('/rewind', (), '[ID|last|head] [--force] [--session] [--yes]',

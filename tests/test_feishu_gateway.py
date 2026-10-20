@@ -96,6 +96,34 @@ def test_first_message_creates_session_and_binds(gateway, tmp_path):
     assert reloaded.bindings['chat-1'] == gw.bindings['chat-1']
 
 
+def test_new_lists_workspaces_and_selects_by_number(gateway, tmp_path):
+    """飞书 /new：先列候选、按序号选；带路径直接指定，不再要求用户记目录。"""
+    gw, fake = gateway
+    alpha = tmp_path / 'alpha'
+    beta = tmp_path / 'beta'
+    alpha.mkdir()
+    beta.mkdir()
+
+    gw.on_message('c1', '/cd "alpha"')
+    bound = gw.bindings['c1']
+
+    gw.on_message('c1', '/new')              # 只列候选，不创建会话
+    text = fake.last()
+    assert '选择工作区' in text and 'alpha' in text and '1.' in text
+    assert gw.bindings['c1'] == bound
+
+    gw.on_message('c1', f'/new "{beta}"')    # 显式路径
+    assert gw.api.get_workspace(gw.bindings['c1']) == str(beta)
+
+    gw.on_message('c1', '/new')              # 当前 beta + 最近 alpha
+    text = fake.last()
+    assert 'beta' in text and 'alpha' in text
+    previous = gw.bindings['c1']
+    gw.on_message('c1', '/new 2')            # 序号 2 = alpha
+    assert gw.bindings['c1'] != previous
+    assert gw.api.get_workspace(gw.bindings['c1']) == str(alpha)
+
+
 def test_commands_run_status_logs_stop(gateway):
     gw, fake = gateway
     gw.on_message('c1', '/run echo feishu-task')

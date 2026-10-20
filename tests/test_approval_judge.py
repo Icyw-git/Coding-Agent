@@ -274,7 +274,8 @@ def test_preflight_batch_merges_into_one_llm_call(monkeypatch):
              make_tool_call('c3', 'python -c "import shutil; shutil.rmtree(\'D:/x\')"')]
     assert hooks.preflight_judge(batch) == 2
     assert len(calls) == 1, "整批只打一次 LLM"
-    assert '[0] python run_tests.py' in calls[0]['messages'][-1]['content']
+    payload = calls[0]['messages'][-1]['content']
+    assert '[0]' in payload and 'python run_tests.py' in payload
 
     # 放行的两条：enforce 命中缓存，零 LLM、零人工
     assert hooks.enforce('bash', {'command': 'python run_tests.py'}, interactive=True) is None
@@ -296,6 +297,46 @@ def test_preflight_skips_clean_or_single_batches(monkeypatch):
     assert not calls
     assert hooks.preflight_judge([make_tool_call('c2', 'python a.py')]) == 0
     assert not calls, "单条候选走 enforce 的单条路径"
+
+
+def test_batch_payload_carries_the_same_defenses_as_single(monkeypatch):
+    """批量与单条同源：数据标注、事实段、触发原因、HARNESS_JUDGE_MODEL 一个不少。
+
+    批量曾只拼裸命令，事实段与模型开关都只在单条路径生效——同一条命令
+    单审有事实、批判没事实，审查官看到的前提都不一样。
+    """
+    client, calls = make_client([
+        '[{"index": 0, "decision": "approve"},'
+        ' {"index": 1, "decision": "approve"}]'])
+    monkeypatch.setattr(harness, 'client', client)
+    monkeypatch.setenv('HARNESS_JUDGE_MODEL', 'cheap-judge')
+
+    batch = [make_tool_call('c1', 'python run_tests.py'),
+             make_tool_call('c2', 'python build_docs.py')]
+    assert hooks.preflight_judge(batch) == 2
+    payload = calls[0]['messages'][-1]['content']
+    assert calls[0]['model'] == 'cheap-judge'
+    assert hooks.JUDGE_DATA_MARKER in payload, "数据标注不能只给单条路径"
+    assert 'OS 沙箱' in payload, "事实段（沙箱/档位）缺失"
+    assert '触发原因' in payload
+    assert 'python run_tests.py' in payload and 'python build_docs.py' in payload
+
+
+def test_batch_skips_over_budget_commands(monkeypatch):
+    """超预算命令不进批量：单条路径会直接升级人工，批量不能拿半条命令盲批。"""
+    client, calls = make_client([
+        '[{"index": 0, "decision": "approve"},'
+        ' {"index": 1, "decision": "approve"}]'])
+    monkeypatch.setattr(harness, 'client', client)
+    long_command = 'python -c "' + 'x' * (hooks.JUDGE_DETAIL_BUDGET + 100) + '"'
+
+    batch = [make_tool_call('c1', 'python run_tests.py'),
+             make_tool_call('c2', long_command),
+             make_tool_call('c3', 'python build_docs.py')]
+    assert hooks.preflight_judge(batch) == 2
+    payload = calls[0]['messages'][-1]['content']
+    assert long_command not in payload
+    assert 'python run_tests.py' in payload and 'python build_docs.py' in payload
 
 
 def test_preflight_failclosed_on_bad_output(monkeypatch):
@@ -388,6 +429,14 @@ def test_preflight_failure_visible_and_breaker(monkeypatch, capsys):
     assert '批量审查失败' in capsys.readouterr().out
     # 熔断后不再打 LLM（第 4 批零调用）
     assert hooks.preflight_judge(batch) == 0 and len(calls) == 3
+    # 单条路径同样受熔断约束：交互式 ASK 直接落人工，不再每条白等超时
+    decided = []
+    monkeypatch.setattr(hooks.GATE, 'decide',
+                        lambda *a, **kw: decided.append(a) or (True, ''))
+    assert hooks.enforce('bash', {'command': 'python -m pytest'},
+                         interactive=True) is None
+    assert len(calls) == 3, "熔断后单条路径不得再调用审查官"
+    assert len(decided) == 1
 
 
 def test_judge_model_env(monkeypatch):

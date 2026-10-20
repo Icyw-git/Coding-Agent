@@ -236,6 +236,38 @@ def set_workspace(path: str) -> Path:
     return WORKDIR
 
 
+def start_new_session(workspace=None, session_id=None):
+    """Create a session bound to ``workspace`` (default: the current one).
+
+    工作区先校验再落盘：目录不存在时不会留下一个半成品会话。选定目录会成为
+    本进程的当前工作区，并写进会话日志（/resume 恢复时据此切回）。
+    """
+    if session_id and (SESSIONS_DIR / f'session_{session_id}.jsonl').exists():
+        raise FileExistsError(f'already exists: {session_id}; use /r {session_id}')
+    if workspace is not None:
+        set_workspace(str(workspace))
+    store = SessionEventStore(SESSIONS_DIR, session_id=session_id)
+    store.append('session_created')
+    store.record_workspace(WORKDIR)
+    return store
+
+
+def _workspace_for_new_session():
+    """选择新会话的工作区；非交互返回当前目录，用户取消返回 None。"""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return WORKDIR
+    from cli_input import browse_for_workspace, choose_workspace
+    from workspace_choices import workspace_choices
+
+    rows = workspace_choices(session_rows(limit=None, include_empty=True), WORKDIR)
+    choice = choose_workspace(rows)
+    if choice is None:
+        return None
+    if choice.get('browse'):
+        return browse_for_workspace(WORKDIR)
+    return choice['path']
+
+
 def session_rows(limit: int | None = 100, *, include_empty: bool = False,
                  workspace: Path | None = None, query: str = '') -> list[dict]:
     rows = _session_catalog()
@@ -1863,14 +1895,19 @@ def run_repl(initial_messages:list, session_store=None):
                 if requested and not requested.replace('-', '').replace('_', '').isalnum():
                     print('  [session] invalid session id')
                     continue
-                if requested and (SESSIONS_DIR / f'session_{requested}.jsonl').exists():
-                    print(f'  [session] already exists: {requested}; use /r {requested}')
+                target = WORKDIR
+                if not requested:
+                    target = _workspace_for_new_session()
+                    if target is None:
+                        print('  [session] 已取消新建会话。')
+                        continue
+                try:
+                    session_store = start_new_session(workspace=target, session_id=requested)
+                except (ValueError, FileExistsError) as exc:
+                    print(f'  [session] {exc}')
                     continue
-                session_store = SessionEventStore(SESSIONS_DIR, session_id=requested)
-                session_store.append('session_created')
-                session_store.record_workspace(WORKDIR)
                 messages = []
-                print('  已开始新会话，工作区保持不变。')
+                print(f'  已开始新会话，工作区：{WORKDIR}')
                 continue
             if command == '/fork':
                 parts = line.split(maxsplit=1)

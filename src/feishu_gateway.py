@@ -23,7 +23,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 聊天命令（@机器人 发送）：
     /help             命令清单（未知命令也会自动附带）
-    /new [id] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
+    /new [序号|id|路径] /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
     /logs <id> /stop <id> /perms /approve [req_id] y|n /sandbox /quit(解绑)
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
@@ -54,6 +54,7 @@ from perf import record as perf_record
 from perf import reset as perf_reset
 from session_views import group_sessions, session_details
 from turn_progress import format_duration
+from workspace_choices import workspace_choices
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
@@ -351,6 +352,7 @@ class FeishuGateway:
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
         self._session_choices: dict[str, list[dict]] = {}
+        self._workspace_choices: dict[str, list[dict]] = {}
         self._session_views: dict[str, tuple] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
@@ -753,7 +755,7 @@ class FeishuGateway:
     def _help_text(self) -> str:
         return '\n'.join([
             '可用命令:',
-            '/new [id]              新建会话并绑定到本聊天',
+            '/new [序号|id|路径]     选择工作区新建会话并绑定到本聊天',
             '/sessions [页码]       会话卡片列表、详情与切换',
             '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
             '/archive [天数|empty|all|restore]  选择归档或恢复会话',
@@ -782,6 +784,50 @@ class FeishuGateway:
             '其余文本 → 作为消息发给当前绑定的 agent 会话',
         ])
 
+    def _handle_new(self, chat_id: str, argument: str) -> None:
+        """新建会话：先列工作区候选再按序号选，也接受显式路径与会话 ID。
+
+        不带参数只列候选、不建会话；候选来自会话摘要，和 CLI 的选择器同一套
+        去重与排序。序号只在最近一次列表内有效，避免旧按钮点到别的目录。
+        """
+        previous = self.bindings.get(chat_id)
+        current = self.api.get_workspace(previous) if previous else ''
+        if not argument:
+            rows = self.api.list_sessions(limit=1000)
+            if not current:
+                if not rows:
+                    self._reply(chat_id, '还没有会话；直接发消息即可在当前工作区创建。')
+                    return
+                # 未绑定时没有「当前目录」可查：用最近一条会话的工作区做列表基准。
+                current = rows[0]['workspace']
+            choices = workspace_choices(rows, current)
+            self._workspace_choices[chat_id] = choices
+            lines = ['新建会话 · 选择工作区']
+            for index, choice in enumerate(choices, 1):
+                mark = '（当前）' if choice['current'] else ''
+                lines.append(
+                    f"{index}. {choice['path']}{mark}（{choice['sessions']} 个会话）")
+            lines.append('回复 /new <序号> 选择；也可以用 /new <路径> 指定其他目录。')
+            self._reply(chat_id, '\n'.join(lines))
+            return
+        value = argument.strip().strip('"\'')
+        choices = self._workspace_choices.get(chat_id, [])
+        session_id = None
+        if value.isdigit() and 0 < int(value) <= len(choices):
+            workspace = choices[int(value) - 1]['path']
+        elif any(char in value for char in (':', '/', '\\')) or value.startswith('.'):
+            workspace = value
+        else:
+            workspace = current or None   # 兼容旧语义：/new <会话ID> 沿用当前工作区
+            session_id = value
+        created = self.api.create_session(session_id, workspace=workspace)
+        with self._bindings_lock:
+            self.bindings[chat_id] = created
+            self._save_bindings()
+        self._workspace_choices.pop(chat_id, None)
+        self._reply(chat_id,
+                    f'已创建新会话，工作区：{self.api.get_workspace(created)}')
+
     def _handle_command(self, chat_id: str, text: str, sender_id: str | None = None) -> None:
         parts = text.split(maxsplit=1)
         command = parts[0].lower()
@@ -792,13 +838,7 @@ class FeishuGateway:
             elif command in ('/help', '/?', '/'):
                 self._reply(chat_id, self._help_text())
             elif command == '/new':
-                previous = self.bindings.get(chat_id)
-                workspace = self.api.get_workspace(previous) if previous else None
-                session_id = self.api.create_session(argument or None, workspace=workspace)
-                with self._bindings_lock:
-                    self.bindings[chat_id] = session_id
-                    self._save_bindings()
-                self._reply(chat_id, '已创建新会话，工作区保持不变。')
+                self._handle_new(chat_id, argument)
             elif command == '/sessions':
                 if argument.isdigit() and int(argument) > 0:
                     view = self._session_views.get(chat_id)
