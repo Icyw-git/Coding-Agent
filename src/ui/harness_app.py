@@ -14,6 +14,7 @@ import time
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
+from rich.theme import Theme
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -49,11 +50,35 @@ FOLLOW_END = True
 SUGGESTION_LIMIT = 6
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
+# TUI 的 Rich Markdown 主题：避免默认的 “cyan on black” 代码块在深色终端上
+# 显得突兀，也让正文/标题/链接与 Textual dark 主题一致。
+MARKDOWN_THEME = Theme({
+    'markdown.paragraph': '#d7d7d7',
+    'markdown.h1': 'bold #ffffff',
+    'markdown.h2': 'bold #ffffff',
+    'markdown.h3': 'bold #eeeeee',
+    'markdown.h4': 'bold #eeeeee',
+    'markdown.h5': 'bold #dddddd',
+    'markdown.h6': 'bold #dddddd',
+    'markdown.strong': 'bold #ffffff',
+    'markdown.em': 'italic #d7d7d7',
+    'markdown.code': 'bold #87d7ff',
+    'markdown.code_block': '#d7d7d7 on #1c1c1c',
+    'markdown.block_quote': 'italic #a7a7a7',
+    'markdown.item.bullet': '#d7af5f',
+    'markdown.item.number': '#d7af5f',
+    'markdown.link': 'underline #5fafff',
+    'markdown.link_url': 'dim #5fafff',
+    'markdown.table.border': '#5f8787',
+    'markdown.hr': '#5f8787',
+})
+
+
 
 def _render_lines(renderable, width: int) -> list[Text]:
     """把 Rich renderable 渲染成固定宽度的 Text 行（虚拟视口用）。"""
     console = Console(width=width, force_terminal=True, color_system='truecolor',
-                      legacy_windows=False, safe_box=True)
+                      legacy_windows=False, safe_box=True, theme=MARKDOWN_THEME)
     options = console.options.update(max_width=width, min_width=width)
     lines = console.render_lines(renderable, options, pad=False)
     result = []
@@ -261,6 +286,7 @@ class HarnessApp(App):
         self._mention_root = None
         self._mention_at = 0.0
         self._turn_started = 0.0
+        self._last_stream_render = 0.0
 
     # ---------- 布局 ----------
 
@@ -297,9 +323,16 @@ class HarnessApp(App):
     def on_resize(self, event: events.Resize) -> None:
         self._place_popup()
 
-    def _flush_layout(self) -> None:
+    def _flush_layout(self, force: bool = False) -> None:
         if not self._dirty:
             return
+        if not force and self._busy:
+            streaming = any(block.kind == 'assistant'
+                            and block.payload.get('streaming')
+                            for block in reversed(self.model.snapshot()[-3:]))
+            if streaming and time.monotonic() - self._last_stream_render < 0.12:
+                return      # 流式 Markdown 很贵；保持 dirty，下个 tick 再整体重排
+        self._last_stream_render = time.monotonic()
         self._dirty = False
         self.view.refresh_layout()
 
@@ -640,8 +673,10 @@ class HarnessApp(App):
                                       style='bold #e0e0e0'), width)
         if kind == 'assistant':
             text = str(payload.get('text', ''))
-            if payload.get('streaming'):
-                return _render_lines(Text(text), width)
+            if not text:
+                return []
+            # 流式也用 Markdown 渲染，避免先看到 `**源码**` 再“变成”正文；
+            # Rich 能处理未闭合的标记，最后一块只是复用同一渲染路径。
             return _render_lines(RichMarkdown(text), width)
         if kind == 'tool':
             return _render_lines(tool_view(payload), width)
@@ -695,7 +730,7 @@ class HarnessApp(App):
                          else TOOL_MORE_LINES)
         self.model.update(block_id, preview_lines=new_limit)
         self._mark_dirty()
-        self._flush_layout()
+        self._flush_layout(force=True)
 
     def _notice(self, text: str, level: str = 'info') -> None:
         self.model.append('notice', {'text': text, 'level': level})
@@ -1190,7 +1225,7 @@ class HarnessApp(App):
     def _send_user(self, text: str) -> None:
         self.model.append('user', {'text': text})
         self._mark_dirty()
-        self._flush_layout()      # 先画出用户消息，不必等 50ms 定时器
+        self._flush_layout(force=True)      # 先画出用户消息，不必等 50ms 定时器
         self._pending.put(text)
         self._refresh_queue()
         if not self._busy:
@@ -1281,11 +1316,11 @@ class HarnessApp(App):
             elif text.startswith(current):
                 self.model.update(last.id, text=text, streaming=False)
                 self._mark_dirty()
-                self._flush_layout()
+                self._flush_layout(force=True)
                 return
         self.model.append('assistant', {'text': text, 'streaming': False})
         self._mark_dirty()
-        self._flush_layout()
+        self._flush_layout(force=True)
 
 
 def run(messages: list | None = None, session_id: str | None = None,

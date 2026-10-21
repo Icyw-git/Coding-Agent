@@ -43,6 +43,9 @@
 - P5k：footer 常驻 cwd/branch（隐藏“新会话”占位标题，每秒刷新）；token/成本
   对齐 Pi：`↑input ↓output RcacheRead WcacheWrite`、最近一次请求的 `cache%`，
   cost 按 fresh input/output/cacheRead/cacheWrite 分桶，reasoning 不再重复计费。
+- P5l：流式也用 Markdown 渲染，不再先显示 `**md 源码**`；Rich Markdown 增加
+  dark 主题（代码块不再默认 cyan-on-black）；工具输出剥离 ANSI；流式重排限频
+  120ms，最终回答强制刷新。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

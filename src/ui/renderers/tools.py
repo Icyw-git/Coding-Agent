@@ -1,7 +1,17 @@
 """工具块渲染：调用/结果两段 + diff 着色 + 预览行数（对齐 Pi tool-execution）。"""
 from __future__ import annotations
 
+import re
+
 from rich.text import Text
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def _strip_ansi(text: str) -> str:
+    """工具输出里的 ANSI 色码在 Textual 里会变成乱码/串色，展示前统一去掉。"""
+    return _ANSI_RE.sub('', text)
+
 
 TOOL_PREVIEW_LINES = 10
 TOOL_MORE_LINES = 40
@@ -62,7 +72,7 @@ def tool_view(payload: dict) -> Text:
     if diff:
         parts.append(_diff_text(diff))
 
-    output = str(payload.get('output') or '')
+    output = _strip_ansi(str(payload.get('output') or ''))
     lines = output.splitlines()
     hint = ''
     if not payload.get('expanded') and len(lines) > TOOL_PREVIEW_LINES:

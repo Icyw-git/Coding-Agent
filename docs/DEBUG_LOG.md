@@ -3047,3 +3047,19 @@ worker 调 `harness.agent_loop(self._messages)` 时**没有传 `session_store`**
 
 **测试**：pricing 的 reasoning 不重复计费、reasoning 溢价、cache_write 单价；
 footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed。
+## TUI 渲染：Markdown 流式、颜色与重排延迟
+
+- **先看到 md 源码**：`_render_block` 之前对 `streaming=True` 的 assistant 用纯
+  `Text(text)`，所以 `**bold**`、代码围栏会原样出现，回合结束才换成 Markdown。
+  现在流式/完成统一走 `RichMarkdown`；Rich 能解析未闭合围栏，最后一块复用同一路径。
+- **流式 Markdown 很贵**：10k 文本一次 Markdown 渲染约 50ms，20fps 会卡 UI。
+  `_flush_layout(force=False)` 在回合中检测 streaming assistant，限制为至少 120ms
+  重排一次；用户消息、最终回答、工具展开仍 `force=True` 立即刷新。
+- **颜色**：Rich 默认 `markdown.code` 是 `cyan on black`，在 Textual dark 背景上
+  突兀；新增 `MARKDOWN_THEME`，统一正文/标题/代码/链接/列表颜色，代码块用深灰底。
+  工具输出里残留的 ANSI 色码在 Textual 中会串色/显示乱码，展示前 `_strip_ansi`。
+- **footer 占位标题**：`新会话/新对话/New session/Untitled` 不再显示；第一段固定为
+  `目录 (分支)`，每秒刷新；token 指标与上一轮的 Pi 口径保持一致。
+
+**测试**：流式内容不含 `**`/反引号、Markdown 代码无 black 背景、footer 不含占位
+标题且以 cwd 开头、工具 ANSI 剥离；总回归 1163 passed / 1 skipped，旧 UI 64 passed。

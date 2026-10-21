@@ -917,3 +917,47 @@ def test_footer_shows_context_and_cache_hit_rate():
             assert 'cache 50%' in footer
 
     asyncio.run(scenario())
+
+
+def test_streaming_assistant_renders_markdown_immediately():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)):
+            app._apply(UIEvent('assistant_start', {'mid': 'md-1'}))
+            app._apply(UIEvent('assistant_delta', {
+                'mid': 'md-1', 'delta': '**bold** and `code`\n'}))
+            app._flush_layout()
+            lines = app.doc_layout.entries()[0].lines
+            text = '\n'.join(str(line) for line in lines)
+            assert '**' not in text and '`' not in text
+            assert 'bold' in text and 'code' in text
+
+    asyncio.run(scenario())
+
+
+def test_markdown_theme_has_no_black_code_background():
+    from rich.markdown import Markdown
+
+    from ui.harness_app import _render_lines
+
+    lines = _render_lines(Markdown('`inline`\n\n```python\nprint(1)\n```'), 60)
+    styles = [span.style for line in lines for span in line.spans]
+    assert not any(getattr(style, 'bgcolor', None) is not None
+                   and getattr(style.bgcolor, 'name', '') == 'black'
+                   for style in styles)
+
+
+def test_footer_starts_with_cwd_and_hides_placeholder_title(monkeypatch, tmp_path):
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'current_branch', lambda root: 'main')
+
+    async def scenario():
+        app = HarnessApp([], title='新会话')
+        async with app.run_test(size=(100, 20)) as pilot:
+            await pilot.pause()
+            footer = str(app._footer.render())
+            assert '新会话' not in footer
+            assert footer.startswith(tmp_path.name)
+            assert '(main)' in footer
+
+    asyncio.run(scenario())

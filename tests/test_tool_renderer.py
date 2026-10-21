@@ -30,3 +30,14 @@ def test_tool_view_collapses_output_until_expanded():
     assert 'line 9' in collapsed and 'line 10' not in collapsed
     assert 'more lines' in collapsed
     assert 'line 19' in expanded and 'more lines' not in expanded
+
+
+def test_tool_output_ansi_is_stripped():
+    from ui.renderers.tools import tool_view
+
+    rendered = str(tool_view({
+        'name': 'bash', 'args': {'command': 'x'},
+        'state': 'complete', 'output': '\x1b[31mred\x1b[0m done',
+    }))
+    assert 'red done' in rendered
+    assert '\x1b' not in rendered
