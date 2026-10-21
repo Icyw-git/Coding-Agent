@@ -2209,3 +2209,42 @@ TOCTOU 型 SSRF。重定向已有复检，但同一次请求内仍有这个窗�
 - 每轮固定开销优先砍「注定失败的子进程」：非 git 目录里的 `git status` 纯粹是浪费。
 - 用文件系统判断替代 `git rev-parse` 是几十毫秒级的收益，但必须覆盖 worktree 与
   GIT_DIR 这类边界。
+## feature/ui 合并 main（目录重构后）
+
+**背景**：`feature/ui` 基于 `src/` 重构之前的布局（根目录模块、根目录测试），而 main
+已经完成模块拆分、无头执行、排队输入、输出折叠与性能优化。两个分支的 24 条 UI 提交
+与 main 的 125 条提交没有共同的新基线，文本合并大面积冲突。
+
+**合并处理**：
+
+- 采用 main 的 `src/` 布局：删除根目录的 `MCPclient.py` / `background_task.py` /
+  `hooks.py` / `DEBUG_LOG.md` / `test_context_manage.py`（这些内容已在 `src/` 与
+  `docs/` 中演进）。
+- `harness.py` 取 main 版本；UI 分支独有的 `cc_ui.py` / `renderer.py` /
+  `ui_events.py` / `ui_textual.py` / `test_ui.py` / `test_mcp_ui_regression.py` /
+  `OPTIMIZATION.md` / `pyproject.toml` 保留。
+- `.gitignore` 取 main 版本（包含 `.cache/`、`.test-tmp*/` 等 UI 开发也需要忽略的项）。
+
+**为了分支可运行而补的接线（本轮）**：
+
+- harness 暴露 `permission_gate = ui_events.PermissionGate(bus)`：Textual 渲染层在
+  `on_mount` 订阅总线，审批弹窗用它应答；非 UI 模式仍走 stdin。
+- `CCApp.__init__` 初始化 `_round_metrics` / `_background_tasks`：早到的事件不再依赖
+  `on_mount` 顺序。
+- `test_ui.py` 改读 `#status-main`（状态栏已拆分为主状态与上下文两块）。
+- `test_mcp_ui_regression.py` 重写为当前契约：session 跑在一条长生命周期任务里，
+  `connect()` 保存任务句柄、`close()` 取消并等待；旧的「不要创建子任务」断言对应的是
+  已被替换的旧实现。
+- 顺带清理 UI 文件的 lint（16 项：import 排序、两处超长行、未使用变量、`os.path`）。
+
+**仍未完成（后续提交）**：
+
+- harness 主循环尚未 emit UI 事件（`assistant_start/delta/end`、`tool_start/end`、
+  `status`、`round_end`、`session_end`）：Textual/ANSI 渲染层目前只在测试注入的事件下
+  工作，真实会话还看不到流式输出。
+- `update_panel_status` 的指标聚合（token/成本/上下文来源）仍只在旧分支实现。
+- `ui_textual` 引用的 `export_session` / `list_transcripts` / `load_transcript`
+  在新 harness 中不存在（旧分支也缺失），需要按 session_store 重新实现。
+
+**验证**：`pytest tests/` 1079 passed / 1 skipped（main 回归）；`pytest test_ui.py
+test_mcp_ui_regression.py` 49 passed；`ruff check` 对根 UI 文件通过。

@@ -20,14 +20,14 @@ import logging
 import queue
 import time
 
+from rich.markup import escape as markup_escape
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Collapsible, Input, Markdown, Static
 
-from rich.markup import escape as markup_escape
-from rich.text import Text
-from ui_events import bus, UIEvent
+from ui_events import UIEvent, bus
 
 logger = logging.getLogger('harness.ui')
 
@@ -180,7 +180,10 @@ class CommandModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id='command-box'):
             yield Static('Command', classes='modal-title')
-            yield Static('clear  export  sessions  resume <n>  search <text>  failures  all  help', classes='modal-hint')
+            yield Static(
+                'clear  export  sessions  resume <n>  search <text>  '
+                'failures  all  help',
+                classes='modal-hint')
             yield Input(placeholder='Type a command', id='command-input')
 
     def on_mount(self) -> None:
@@ -241,6 +244,8 @@ class CCApp(App):
         self._user_input_q: queue.Queue = queue.Queue()   # 用户输入 → agent 线程（多轮）
         self._exiting = False
         self._busy = False
+        self._round_metrics = []      # 早到事件可能先于 on_mount
+        self._background_tasks = {}
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
@@ -257,6 +262,7 @@ class CCApp(App):
 
     def on_mount(self) -> None:
         import os
+
         import harness as h
         from ui_events import clear_cancel
         clear_cancel()
@@ -391,7 +397,9 @@ class CCApp(App):
         verb = verb.lower()
         argument = argument.strip()
         if verb in ('help', '?'):
-            await self._show_notice('Commands: clear | export | sessions | resume <n> | allow <tool> | deny <tool> | ask <tool> | search <text> | failures | all | help')
+            await self._show_notice(
+                'Commands: clear | export | sessions | resume <n> | allow <tool> '
+                '| deny <tool> | ask <tool> | search <text> | failures | all | help')
         elif verb == 'clear':
             await self._clear_conversation()
         elif verb == 'export':
@@ -581,6 +589,7 @@ class CCApp(App):
 
     def _run_agent(self) -> None:
         import time
+
         import harness
         try:
             # 多轮对话：空闲时不占 agent_lock，让 cron 队列能主动执行。
@@ -749,9 +758,6 @@ class CCApp(App):
             metric = e.payload
             self._round_metrics.append(dict(metric))
             self._round_metrics = self._round_metrics[-10:]
-            source = metric.get('source', 'estimated')
-            marker = '' if source in ('confirmed', 'provider_reported') else '~'
-            compressed = ' · compressed' if metric.get('compressed') else ''
             logger.info(
                 "round=%s duration_ms=%s input=%s output=%s cost=%s compressed=%s",
                 metric.get('round', 0), metric.get('duration_ms', 0),

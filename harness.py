@@ -214,6 +214,12 @@ class _LazyLLMClient:
 
 client = _LazyLLMClient()
 
+# UI 事件总线与权限门：Textual / ANSI 渲染层订阅 bus，并在弹窗里应答审批。
+# 非 UI 模式下 PermissionGate 仍走 stdin，行为与原 console 审批一致。
+from ui_events import PermissionGate, bus  # noqa: E402  UI 依赖放在配置区之后
+
+permission_gate = PermissionGate(bus)
+
 
 def __getattr__(name):
     """模块级懒加载（PEP 562）：mcp_bridge 的 import 约 1s，只延迟到真正

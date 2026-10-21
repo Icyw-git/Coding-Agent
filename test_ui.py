@@ -6,11 +6,12 @@ import io
 import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cc_ui as ui
-import ui_events
 import renderer
+import ui_events
 
 _RESET = '\x1b[0m'
 
@@ -403,10 +404,10 @@ def test_textual_streaming_flow():
     except ImportError:
         return   # 未安装 textual 的环境跳过该用例
     import threading
-    import time as _time
+
+    import harness
     import ui_events as ev
     import ui_textual
-    import harness
 
     async def _scenario():
         orig_loop = harness.agent_loop
@@ -451,7 +452,7 @@ def test_textual_streaming_flow():
                     if not app.is_running:
                         break
                     try:
-                        line = str(app.query_one('#status-line').render())
+                        line = str(app.query_one('#status-main').render())
                         if 'generating' in line.lower():   # 状态栏渲染为 Generating（首字母大写）
                             saw_generating = True
                         t = _render_map(app).get('Static', '')
@@ -500,6 +501,7 @@ def test_textual_streaming_flow():
 def test_permission_gate_cancel_pending():
     """退出时取消权限请求必须立即唤醒业务线程，不能等待 300 秒超时。"""
     import threading
+
     from ui_events import PermissionGate, UIEventBus
 
     local_bus = UIEventBus()
@@ -626,7 +628,6 @@ def test_textual_search_and_clear_commands():
         import textual  # noqa: F401
     except ImportError:
         return
-    import ui_events
     import ui_textual
 
     async def _scenario():

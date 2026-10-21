@@ -4,10 +4,11 @@
 无 UI 版本的显示效果一致（普通打印 + hooks 现有输出）；未来可加
 TextualRenderer 而业务代码零改动。import 本模块即触发默认后端 attach。
 """
-from ui_events import UIEvent, bus
-import cc_ui
 import logging
 import time
+
+import cc_ui
+from ui_events import UIEvent, bus
 
 logger = logging.getLogger('harness.ui')
 
