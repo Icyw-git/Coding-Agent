@@ -195,6 +195,16 @@ class PermissionRequest:
                 if not key.startswith('_')}
 
 
+def _ui_gate():
+    """Textual 模式的审批门（harness.permission_gate）；不可用时返回 None。"""
+    return getattr(_h(), 'permission_gate', None)
+
+
+def _ui_mode() -> bool:
+    """渲染层接管终端时，审批走弹窗、控制台提示一律不打印（否则会刷坏 TUI）。"""
+    return bool(getattr(_ui_gate(), 'use_ui', False))
+
+
 class PermissionGate:
     """登记请求并等待决议；双后端 + 超时熔断 + 审批历史（有界）。
 
@@ -375,6 +385,12 @@ class PermissionGate:
     def decide(self, tool: str, args: dict, reason: str) -> tuple[bool, str]:
         """登记请求并等待决议，返回 (allowed, message)。阻塞调用方线程。"""
         req = self.request(tool, args, reason)
+        if _ui_mode():
+            # Textual 正占用终端：input() 读不到，打印会刷坏屏幕；
+            # 交给渲染层弹窗应答（弹窗自带超时与取消）。
+            allowed = _ui_gate().request(tool, args, title=reason)
+            self.resolve(req.req_id, allowed, by='ui-modal')
+            return self._conclude(req, quiet=True)
         if self.backend == 'remote':
             self._await_remote(req)
         else:
@@ -388,6 +404,10 @@ class PermissionGate:
         一次询问。所以只登记进队列等远程决议（/approvals、审批卡片、HTTP），
         超时同样拒绝。阻塞的是这个工作线程，主循环不受影响。"""
         req = self.request(tool, args, reason)
+        if _ui_mode():
+            allowed = _ui_gate().request(tool, args, title=reason)
+            self.resolve(req.req_id, allowed, by='ui-modal')
+            return self._conclude(req, quiet=True)
         print(f'  \033[33m[permission] {approval_view.safe_text(tool)} 等待审批：'
               f'{approval_view.safe_text(reason)}'
               f'（/approvals 或审批卡片处理，{int(self.timeout)}s 未决议则拒绝）\033[0m')
@@ -401,13 +421,15 @@ class PermissionGate:
                 if req.status == 'pending':
                     req.status, req.resolved_by = 'timeout', 'gate'
 
-    def _conclude(self, req: PermissionRequest) -> tuple[bool, str]:
+    def _conclude(self, req: PermissionRequest, *,
+                  quiet: bool = False) -> tuple[bool, str]:
         allowed = req.status == 'approved'
         message = f'{req.status} [{req.req_id}] {req.tool}: {req.reason}'
         status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}[req.status]
-        shown = approval_view.safe_text(f'{req.tool}: {req.reason}')
-        print(f'  \033[{"32" if allowed else "31"}m[permission] {status} · '
-              f'{shown}\033[0m')
+        if not quiet:   # Textual 由弹窗展示结果
+            shown = approval_view.safe_text(f'{req.tool}: {req.reason}')
+            print(f'  \033[{"32" if allowed else "31"}m[permission] {status} · '
+                  f'{shown}\033[0m')
         return allowed, message
 
     def _decide_console(self, req: PermissionRequest) -> bool:

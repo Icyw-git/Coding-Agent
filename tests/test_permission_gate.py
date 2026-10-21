@@ -149,3 +149,42 @@ def test_to_dict_hides_event_and_history_orders_newest_first():
     assert history[0].created_at >= history[1].created_at
     dumped = history[0].to_dict()
     assert 'req_id' in dumped and '_event' not in dumped
+
+
+class _FakeUIGate:
+    use_ui = True
+
+    def __init__(self, allow):
+        self.allow = allow
+        self.calls = []
+
+    def request(self, tool, args, title=''):
+        self.calls.append((tool, args, title))
+        return self.allow
+
+
+def test_ui_mode_routes_approval_to_modal_without_stdin(monkeypatch, capsys):
+    import harness
+
+    fake = _FakeUIGate(allow=True)
+    monkeypatch.setattr(harness, 'permission_gate', fake)
+    monkeypatch.setattr('builtins.input', lambda prompt='': (_ for _ in ()).throw(
+        AssertionError('UI mode must not read stdin')))
+    gate = PermissionGate()
+
+    allowed, message = gate.decide('bash', {'command': 'rm x'}, 'destructive')
+
+    assert allowed and message.startswith('approved')
+    assert fake.calls == [('bash', {'command': 'rm x'}, 'destructive')]
+    assert capsys.readouterr().out == ''   # 不向 TUI 的控制台打印
+
+
+def test_ui_mode_denies_when_modal_says_no(monkeypatch):
+    import harness
+
+    monkeypatch.setattr(harness, 'permission_gate', _FakeUIGate(allow=False))
+    gate = PermissionGate()
+
+    allowed, message = gate.decide('bash', {'command': 'rm x'}, 'destructive')
+
+    assert not allowed and message.startswith('denied')

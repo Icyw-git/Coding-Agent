@@ -2349,3 +2349,27 @@ Textual 可见），以及 teammate 的工具事件会混进主会话聊天区�
 
 **测试**：新增 `tests/test_subagent_loop.py`（统一路径与消息布局、事件归属、
 入口截断生效）；`pytest tests/` 1087 passed / 1 skipped。
+## Textual 模式的审批接线
+
+**问题**：`ui_textual` 把 `harness.permission_gate.use_ui` 置 True，但真正拦截工具的
+是 `hooks.GATE`。后者在 console 后端里 `input()`：Textual 已接管终端，读不到输入，
+打印的审批提示还会刷坏全屏界面——TUI 下的审批实际上是坏的。
+
+**做法**：
+
+- `hooks._ui_mode()`：以 `harness.permission_gate.use_ui` 为准判断渲染层是否接管终端。
+- `decide()`：UI 模式把请求交给 `permission_gate.request(tool, args, title=reason)`，
+  由渲染层弹窗应答；`resolve()` 记入审批历史，`_conclude(quiet=True)` 不再打印。
+- `decide_queued()`（teammate / 后台 worker）：同样走弹窗，工作线程阻塞等 UI 决议；
+  没有 UI 时保持原来的「排队等远程/超时拒绝」。
+- `_conclude(quiet=...)`：UI 模式不打印状态行，结果交给弹窗与事件流。
+
+**取舍**：
+
+- 弹窗超时沿用 `ui_events.PermissionGate` 的 300s；`hooks.GATE.timeout` 仍只作用于
+  远程后端，两套超时语义没有合并（合并会让 CLI 与 TUI 行为不一致）。
+- teammate 的并发审批会同时弹多个窗口，目前按请求顺序排队由用户逐个处理；
+  批量授权仍走「同类」或远程审批接口。
+
+**测试**：`tests/test_permission_gate.py` 新增两条：UI 模式走弹窗且不读 stdin、
+不向控制台打印；弹窗拒绝时正确返回 denied。总回归 1089 passed / 1 skipped。
