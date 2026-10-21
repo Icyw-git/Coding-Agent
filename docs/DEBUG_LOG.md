@@ -2815,3 +2815,30 @@ Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。
 
 **测试**：新增 `tests/test_ui_commands.py`（模糊评分/排序、别名、建议、帮助/快捷键）
 与未知命令/`/hotkeys` 用例；总回归 1133 passed / 1 skipped，旧 UI 64 passed。
+## TUI 重构 P5c：命令参数补全与帮助细化
+
+**调研 Pi**：`BUILTIN_SLASH_COMMANDS` 只有元数据；真正的补全在
+`pi-tui/autocomplete.ts` 的 `CombinedAutocompleteProvider`：
+- 命令对象可带 `getArgumentCompletions(prefix)`，输入 `/cmd arg` 后由命令自己给出候选；
+- 命令名补全后自动补一个空格，再进入参数补全；
+- 动态来源（prompt 模板、扩展命令、`skill:name`）与内建命令合并，冲突时改名；
+- 分发仍是 `interactive-mode` 里的前缀 if-chain，与我们的 switch 等价。
+
+**复用/实现**：
+
+- `CommandSpec.argument_completions`（对应 Pi 的 `getArgumentCompletions`）：
+  - `/resume` → 会话 id/标题（`harness.session_rows`）；
+  - `/model` → `MODEL_WINDOWS` + 当前模型；
+  - `/allow|/deny|/ask` → `tool_registry` 工具名；
+  - `/help` → TUI 可用命令名。
+- Composer 补全区分「命令名」与「参数」：
+  - `/he` 补 `/help `（带参数提示的命令自动补空格）；
+  - `/resume 12` 只替换参数部分，不覆盖命令名；
+  - 参数补全失败时静默返回空，不影响输入。
+- `/help <命令>` 显示用法、描述与「仅行式 REPL」标记。
+
+**未搬的 Pi 能力**（记录为后续）：动态命令（prompt 模板、扩展命令、`skill:name`）
+与命令名冲突改名；命令面板的分类展示。
+
+**测试**：`test_harness_app.py` 补参数替换、`/resume` 会话候选、`/help model`、
+仅行式命令提示；总回归 1135 passed / 1 skipped，旧 UI 64 passed。

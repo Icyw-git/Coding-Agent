@@ -588,7 +588,14 @@ class HarnessApp(App):
         if verb == 'quit':
             self.exit()
         elif verb == 'help':
-            self._notice(commands.help_text())
+            spec = commands.find(argument) if argument else None
+            if spec is None:
+                self._notice(commands.help_text())
+            else:
+                availability = ('' if spec.ported
+                                else f'{chr(10)}仅行式 REPL 提供（--ui ansi）')
+                self._notice(f'{spec.usage}{chr(10)}{spec.description}'
+                             f'{availability}')
         elif verb == 'hotkeys':
             self._notice(commands.hotkeys_text())
         elif verb == 'clear':

@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from ui.fuzzy import fuzzy_filter
+
+ArgumentCompleter = Callable[[str], list[tuple[str, str]]]
 
 
 @dataclass(frozen=True)
@@ -17,24 +20,80 @@ class CommandSpec:
     argument_hint: str = ''
     aliases: tuple[str, ...] = ()
     ported: bool = True          # False = 仅行式 REPL 提供
+    argument_completions: ArgumentCompleter | None = None
 
     @property
     def usage(self) -> str:
         return f'/{self.name}' + (f' {self.argument_hint}' if self.argument_hint else '')
 
 
+def _help_arguments(prefix: str) -> list[tuple[str, str]]:
+    specs = fuzzy_filter([spec for spec in COMMANDS if spec.ported],
+                         prefix, lambda spec: spec.name)
+    return [(spec.name, spec.usage) for spec in specs]
+
+
+def _resume_arguments(prefix: str) -> list[tuple[str, str]]:
+    try:
+        import harness
+        rows = harness.session_rows(limit=None, include_empty=False)
+    except Exception:
+        return []
+    items = [(row['id'], f"{row['title']} · {row['id'][:8]}")
+             for row in rows]
+    if prefix:
+        needle = prefix.casefold()
+        items = [item for item in items
+                 if needle in item[0].casefold() or needle in item[1].casefold()]
+    return items
+
+
+def _model_arguments(prefix: str) -> list[tuple[str, str]]:
+    try:
+        import harness
+        names = set(harness.MODEL_WINDOWS)
+        current = harness.os.getenv('LLM_MODEL_ID', '')
+        if current:
+            names.add(current)
+    except Exception:
+        return []
+    items = [(name, name) for name in sorted(names)]
+    if prefix:
+        needle = prefix.casefold()
+        items = [item for item in items if needle in item[0].casefold()]
+    return items
+
+
+def _tool_arguments(prefix: str) -> list[tuple[str, str]]:
+    try:
+        import harness
+        names = sorted(harness.tool_registry)
+    except Exception:
+        return []
+    if prefix:
+        needle = prefix.casefold()
+        names = [name for name in names if needle in name.casefold()]
+    return [(name, name) for name in names]
+
+
 COMMANDS: tuple[CommandSpec, ...] = (
-    CommandSpec('help', '显示帮助', '[命令]', ('?',)),
+    CommandSpec('help', '显示帮助', '[命令]', ('?',),
+                argument_completions=_help_arguments),
     CommandSpec('status', '查看当前会话与运行状态'),
-    CommandSpec('model', '查看当前模型'),
+    CommandSpec('model', '查看当前模型',
+                argument_completions=_model_arguments),
     CommandSpec('pwd', '查看当前工作区'),
     CommandSpec('sessions', '打开会话选择器', aliases=('transcripts',)),
-    CommandSpec('resume', '恢复会话', '<序号|ID前缀|标题>'),
+    CommandSpec('resume', '恢复会话', '<序号|ID前缀|标题>',
+                argument_completions=_resume_arguments),
     CommandSpec('export', '导出 transcript'),
     CommandSpec('clear', '清空当前对话视图'),
-    CommandSpec('allow', '本会话允许某个工具', '<工具>'),
-    CommandSpec('deny', '本会话拒绝某个工具', '<工具>'),
-    CommandSpec('ask', '恢复某个工具的逐次审批', '<工具>'),
+    CommandSpec('allow', '本会话允许某个工具', '<工具>',
+                argument_completions=_tool_arguments),
+    CommandSpec('deny', '本会话拒绝某个工具', '<工具>',
+                argument_completions=_tool_arguments),
+    CommandSpec('ask', '恢复某个工具的逐次审批', '<工具>',
+                argument_completions=_tool_arguments),
     CommandSpec('hotkeys', '显示快捷键'),
     CommandSpec('quit', '退出', aliases=('exit', 'q')),
     CommandSpec('diff', '查看未提交改动', ported=False),
@@ -77,6 +136,17 @@ def matches(query: str) -> list[CommandSpec]:
         return [spec for spec in COMMANDS if spec.ported][:8]
     return fuzzy_filter(COMMANDS, query,
                         lambda spec: f'{spec.name} {spec.description}')[:8]
+
+
+def argument_suggestions(spec: CommandSpec,
+                         prefix: str) -> list[tuple[str, str]]:
+    """命令参数补全（对应 Pi 的 `getArgumentCompletions`）；失败时返回空。"""
+    if spec.argument_completions is None:
+        return []
+    try:
+        return spec.argument_completions(prefix or '')
+    except Exception:
+        return []
 
 
 def did_you_mean(name: str) -> str | None:

@@ -102,7 +102,7 @@ def test_completion_overlay_and_accept():
 
     assert apply_suggestion('/he', '/help') == '/help'
     assert apply_suggestion('see @src/ap', '@src/app.py') == 'see @src/app.py'
-    assert suggestions('/he', [])[0][0] == '/help'
+    assert suggestions('/he', [])[0][0] == '/help '
 
     async def scenario():
         app = HarnessApp([])
@@ -114,7 +114,7 @@ def test_completion_overlay_and_accept():
 
             app.accept_suggestion()
             await pilot.pause()
-            assert app._composer.text == '/help'
+            assert app._composer.text == '/help '
             assert not app.has_suggestions()
 
             app._composer.text = '/st'
@@ -367,5 +367,43 @@ def test_unknown_command_suggests_and_hotkeys(monkeypatch):
             await pilot.pause()
             hotkeys = app.model.snapshot()[-1].payload['text']
             assert 'Ctrl+O' in hotkeys and 'Esc' in hotkeys
+
+    asyncio.run(scenario())
+
+
+def test_argument_completion_replaces_only_argument(monkeypatch):
+    from ui.composer.completions import apply_suggestion, suggestions
+
+    assert apply_suggestion('/resume 12', '1234') == '/resume 1234'
+    assert apply_suggestion('/he', '/help') == '/help'
+
+    monkeypatch.setattr(harness, 'session_rows', lambda **kwargs: [
+        {'id': 'abc123', 'title': 'first task', 'workspace': 'ws',
+         'updated': 0, 'preview': ''},
+    ])
+    items = suggestions('/resume ab', [])
+    assert items and items[0][0] == 'abc123'
+
+    help_items = suggestions('/help mo', [])
+    assert any(value == 'model' for value, _label in help_items)
+
+
+def test_help_with_argument_shows_command_details(monkeypatch):
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('command must not reach model')))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/help resume')
+            await pilot.pause()
+            text = app.model.snapshot()[-1].payload['text']
+            assert '/resume' in text and '恢复会话' in text
+
+            app.submit_text('/help review')
+            await pilot.pause()
+            text = app.model.snapshot()[-1].payload['text']
+            assert '仅行式 REPL' in text
 
     asyncio.run(scenario())

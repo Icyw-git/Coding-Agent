@@ -19,6 +19,8 @@
   新 TUI 支持 `/` 命令路由、`/sessions` 选择恢复、`permission_request` 弹窗。
 - P5b：命令注册表 + 移植 Pi 的 fuzzy 匹配；补全/帮助/未知命令建议共用一份
   元数据，`/hotkeys` 与快捷键表同源；`!` shell、Esc 取消、Ctrl+O 展开。
+- P5c：对齐 Pi `getArgumentCompletions`：`/resume` 会话、`/model` 模型、
+  `/allow|deny|ask` 工具、`/help` 命令名；`/help <cmd>` 显示用法/可用性。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

@@ -10,11 +10,23 @@ def suggestions(text: str, files: list[str],
     value = text or ''
     if value.startswith('/'):
         from ui import commands
-        query = value[1:].strip()
-        return [(f'/{spec.name}',
-                 f'/{spec.name}  {spec.description}')
-                for spec in commands.matches(query)
-                if spec.ported][:limit]
+        body = value[1:]
+        if ' ' in body:
+            name, argument = body.split(' ', 1)
+            spec = commands.find(name)
+            if spec is None:
+                return []
+            return commands.argument_suggestions(spec, argument)[:limit]
+        items = []
+        for spec in commands.matches(body):
+            if not spec.ported:
+                continue
+            suffix = ' ' if spec.argument_hint else ''
+            label = f'/{spec.name}  {spec.description}'
+            if spec.argument_hint:
+                label += f'  {spec.argument_hint}'
+            items.append((f'/{spec.name}{suffix}', label))
+        return items[:limit]
     mention = mention_token(value)
     if mention is None:
         return []
@@ -25,7 +37,10 @@ def suggestions(text: str, files: list[str],
 def apply_suggestion(text: str, value: str) -> str:
     """把当前候选替换进输入文本（命令名整体替换，@ 只替换 token）。"""
     if (text or '').startswith('/'):
-        return value
+        space = (text or '').find(' ')
+        if space == -1:
+            return value
+        return f'{text[:space + 1]}{value}'
     mention = mention_token(text or '')
     if mention is None:
         return value
