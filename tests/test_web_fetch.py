@@ -1,4 +1,9 @@
 """web_fetch：URL/SSRF 校验、正文提取与审批接入。"""
+import http.client
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 
 import hooks
@@ -149,3 +154,81 @@ def test_policy_denies_invalid_url():
     decision = hooks.evaluate_call('web_fetch', {'url': 'ftp://example.com/x'})
     assert decision.denied
     assert decision.code == 'invalid_url'
+
+
+def _no_proxy(monkeypatch):
+    """本机可能有系统代理；固定地址的用例必须走直连分支。"""
+    monkeypatch.setattr(urllib.request, 'getproxies', lambda: {})
+
+
+def test_pinned_connection_uses_validated_address(monkeypatch):
+    _no_proxy(monkeypatch)
+    monkeypatch.setattr(web_access, 'public_addresses',
+                        lambda host, port: ['93.184.216.34'])
+    request = urllib.request.Request('http://example.com/x')
+    connection = web_access._pinned_connection(
+        http.client.HTTPConnection, request)('example.com')
+    calls = []
+    monkeypatch.setattr(web_access.socket, 'create_connection',
+                        lambda address, timeout=None, source_address=None:
+                        calls.append(address) or object())
+
+    connection._create_connection(('example.com', 80))
+
+    # 关键：连接用的是校验过的字面 IP，不再二次解析主机名。
+    assert calls == [('93.184.216.34', 80)]
+
+
+def test_proxied_request_skips_pinning(monkeypatch):
+    monkeypatch.setattr(web_access, 'public_addresses',
+                        lambda host, port: pytest.fail('proxy must not resolve target'))
+    request = urllib.request.Request('http://example.com/x')
+    request.set_proxy('127.0.0.1:8080', 'http')
+
+    assert web_access._pinned_connection(
+        http.client.HTTPConnection, request) is http.client.HTTPConnection
+
+
+def test_open_url_connects_to_pinned_address(monkeypatch):
+    _no_proxy(monkeypatch)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'pinned-ok'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        monkeypatch.setattr(web_access, 'public_addresses',
+                            lambda host, port: ['127.0.0.1'])
+        # 主机名不可解析；只有「连接固定到校验过的地址」才能成功。
+        response = web_access._open_url(
+            f'http://pinned.invalid:{port}/x', timeout=5)
+        with response:
+            assert response.read() == b'pinned-ok'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_fetch_propagates_connect_time_rejection(monkeypatch):
+    def refuse(host, port):
+        raise web_access.WebAccessError(f'rebinding blocked for {host}')
+
+    _no_proxy(monkeypatch)
+    monkeypatch.setattr(web_access, 'check_url', lambda url: None)
+    monkeypatch.setattr(web_access, 'public_addresses', refuse)
+
+    with pytest.raises(web_access.WebAccessError, match='rebinding blocked'):
+        web_access.fetch('http://example.com/')

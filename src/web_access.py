@@ -5,6 +5,7 @@
 """
 import codecs
 import html
+import http.client
 import ipaddress
 import re
 import socket
@@ -60,8 +61,12 @@ def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_global
 
 
-def resolve_public_host(host: str, port: int) -> None:
-    """解析主机并拒绝任何非公网地址；混合解析（公网+私网）整批拒绝。"""
+def public_addresses(host: str, port: int) -> list[str]:
+    """解析主机并返回全部公网地址；混合解析（公网+私网）整批拒绝。
+
+    校验与连接必须共用这一份结果：只校验不固定地址时，两次解析之间的
+    DNS 重绑定可以让连接落到 127.0.0.1。
+    """
     name = host.casefold().rstrip('.')
     if name in _BLOCKED_HOSTS or name.endswith(_BLOCKED_SUFFIXES):
         raise WebAccessError(f'refusing to access private host {host!r}')
@@ -76,14 +81,22 @@ def resolve_public_host(host: str, port: int) -> None:
     addresses = []
     for info in infos:
         try:
-            addresses.append(ipaddress.ip_address(info[4][0]))
+            address = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
+        if address not in addresses:
+            addresses.append(address)
     if not addresses:
         raise WebAccessError(f'cannot resolve host {host!r}')
     if not all(_is_public_ip(address) for address in addresses):
         raise WebAccessError(
             f'refusing to access non-public address for host {host!r}')
+    return [str(address) for address in addresses]
+
+
+def resolve_public_host(host: str, port: int) -> None:
+    """解析并校验主机；保留旧入口供调用方复用。"""
+    public_addresses(host, port)
 
 
 def check_url(url: str) -> urllib.parse.SplitResult:
@@ -102,8 +115,47 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _pinned_connection(base, request):
+    """为一次请求创建固定在已校验地址上的连接类。
+
+    代理请求（`req.host` 已被 ProxyHandler 改写成代理主机）不做固定：DNS 由代理
+    负责，本地代理本身可能就是私网地址，按目标地址校验反而会误杀。
+    """
+    parsed = urllib.parse.urlsplit(request.full_url)
+    target = (parsed.hostname or '').casefold()
+    # 直接连接时 req.host 可能是 `host:port`；代理时它已被改写成代理主机。
+    connected = urllib.parse.urlsplit('//' + request.host)
+    if (connected.hostname or '').casefold() != target:
+        return base
+    port = connected.port or (443 if parsed.scheme.casefold() == 'https' else 80)
+    pinned = public_addresses(target, port)[0]
+
+    class _Pinned(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = (
+                lambda address, timeout=None, source_address=None:
+                socket.create_connection((pinned, port), timeout,
+                                         source_address))
+
+    return _Pinned
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(
+            _pinned_connection(http.client.HTTPConnection, req), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _pinned_connection(http.client.HTTPSConnection, req), req)
+
+
 def _open_url(url: str, timeout: float):
-    opener = urllib.request.build_opener(_SafeRedirectHandler)
+    opener = urllib.request.build_opener(
+        _SafeRedirectHandler(), _PinnedHTTPHandler(), _PinnedHTTPSHandler())
     request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     return opener.open(request, timeout=timeout)
 
@@ -187,6 +239,8 @@ def fetch(url: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         response = _open_url(url, timeout)
     except urllib.error.HTTPError as exc:
         raise WebAccessError(f'HTTP {exc.code} from {url}') from None
+    except WebAccessError:
+        raise
     except urllib.error.URLError as exc:
         raise WebAccessError(f'cannot fetch {url}: {exc.reason}') from None
     except (TimeoutError, socket.timeout):

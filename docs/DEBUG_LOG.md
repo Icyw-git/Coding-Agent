@@ -1907,3 +1907,41 @@ MCP 运行期 `append` 污染规范列表（进而让下次启动多出重复工
   没有行为回归。
 - 兼容性再导出最容易留下死名字；每次拆分后跑一次 `rg` 确认调用方，
   比等 lint 发现更早。
+## 联网连接期地址固定（DNS 重绑定）
+
+**问题**：`web_fetch` 先 `getaddrinfo` 校验，再由 `urllib` 自己解析一次并连接。
+两次解析之间如果 DNS 从公网翻到 `127.0.0.1`，校验通过、连接落到私网——典型的
+TOCTOU 型 SSRF。重定向已有复检，但同一次请求内仍有这个窗口。
+
+**做法**：
+
+- `public_addresses()` 返回「全部公网」的地址列表（混合解析整批拒绝），
+  `resolve_public_host()` 保留为兼容入口。
+- 直连时给本次请求生成一个连接子类，把 `_create_connection` 固定到校验过的字面
+  IP 和端口：`http.client` 仍用原主机名写 Host、做 TLS SNI 与证书校验，
+  但 socket 不再二次 DNS。
+- 用 `_PinnedHTTPHandler` / `_PinnedHTTPSHandler` 替换默认 handler，重定向回到
+  `opener.open` 时按新 URL 重新固定；`fetch` 让连接期的 `WebAccessError` 原样透出。
+- 代理请求不做固定：`ProxyHandler` 已把 `req.host` 改写成代理主机，DNS 由代理
+  完成；本地代理本身常是私网地址，按目标地址校验反而会误杀合法代理。
+
+**踩过的坑**：
+
+- `Request` 没有 `.port` 属性；直接连接时端口并进 `req.host`（`host:port`），
+  必须用 `urlsplit('//' + req.host)` 统一解析。否则带端口的 URL 会被误判成代理，
+  静默跳过固定。
+- 判断「是否走代理」不能靠环境变量：本机注册表里就配了 `127.0.0.1:10090` 代理，
+  `getproxies()` 非空。用 `req.host` 与 URL 主机是否一致来判定，跨平台且精确。
+- 本机存在系统代理时，直连分支的测试必须先把 `getproxies` 置空，否则用例测到的是
+  代理路径；反过来，这也暴露了真实边界：代理场景的 DNS 校验只能依赖代理。
+- 固定地址后仍要保留证书校验：连接类只替换 `_create_connection`，`HTTPSConnection`
+  继续用 `self.host` 做 `server_hostname`，不能改成 IP。
+
+**测试**：`tests/test_web_fetch.py` 新增 4 条——连接使用校验后的字面 IP、代理请求
+跳过固定、本地 HTTP 服务验证「主机名不可解析但固定地址可连通」、连接期拒绝原样
+抛 `WebAccessError`；总回归 1045 passed / 1 skipped。
+
+**收获**：
+
+- 防 SSRF 的校验和连接必须绑在同一次解析结果上，否则校验只是一次采样。
+- 代理是安全边界的黑洞：代码能做的只有明确降级并写进边界文档，而不是假装覆盖。
