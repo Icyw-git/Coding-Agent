@@ -1333,12 +1333,17 @@ class HarnessApp(App):
         self._send_user(text, mode=mode)
 
     def _send_user(self, text: str, mode: str = 'steer') -> None:
+        if self._busy and mode != 'followup':
+            # steer 先只进队列；等 agent_loop 真正注入时再由 user_message 事件落块。
+            self._steering.put(text)
+            self._refresh_queue()
+            return
         self.model.append('user', {'text': text})
         self._mark_dirty()
         self._flush_layout(force=True)      # 先画出用户消息，不必等 50ms 定时器
         if self._busy:
-            # Pi 语义：运行中 Enter=steer（下一轮请求前注入），Alt+Enter=follow-up。
-            (self._pending if mode == 'followup' else self._steering).put(text)
+            # Alt+Enter：本回合结束后再处理，不打断正在进行的回答。
+            self._pending.put(text)
             self._refresh_queue()
             return
         self._pending.put(text)

@@ -3099,7 +3099,7 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
   最后一条），队列条分别标 `steer:` / `next:`；
 - **Esc 取消**：设置 cancel 后调用 `dequeue_all()`，未消费的消息回到输入框，
   不会在取消后自动继续执行；
-- UI 对 steer 消息先显示 user 块，agent loop 注入时不重复发 user 事件；
+- steer 先只进队列，agent loop 注入时发 user_message 事件落块；取消/刖除不会留下幽影消息；
 - `active` 计数、footer 和 composer 的 `N queued` 都合并两个队列。
 
 限制：steer 不能中断已经在传输中的 HTTP 流，只能在下一轮请求/工具批次前注入；

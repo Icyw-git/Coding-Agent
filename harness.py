@@ -1735,6 +1735,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             message = {'role': 'user', 'content': str(text)}
             messages.append(message)
             session_store.append_message(message)
+            ui_emit('user_message', text=str(text))
             injected = True
         return injected
 

@@ -1092,3 +1092,19 @@ def test_cancel_restores_queued_messages(monkeypatch):
             app._pending.put(None)
 
     asyncio.run(scenario())
+
+
+def test_steering_does_not_render_until_agent_consumes_it():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app._busy = True
+            app.submit_text('steer now')
+            await pilot.pause()
+            assert app._steering.snapshot() == ['steer now']
+            assert not any(block.kind == 'user' for block in app.model.snapshot())
+            app._apply(UIEvent('user_message', {'text': 'steer now'}))
+            await pilot.pause()
+            assert any(block.kind == 'user' for block in app.model.snapshot())
+            app._busy = False
+    asyncio.run(scenario())
