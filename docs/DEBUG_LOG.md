@@ -1809,3 +1809,31 @@ fetch 拒绝时不联网、截断与响应头、后台 id 校验）；更新 `te
 - 迁移会「顺带」破坏基于模块属性的补丁点，测试通过与否取决于是否 import 过某模块；
   补丁应指向真正执行副作用的模块。
 - 可调常量保持「入口持有、实现接收」，是兼容测试补丁的低成本做法。
+## 拆分团队协作工具
+
+**问题**：派生 teammate、消息收发与 lead 协议共 6 个 handler 约 60 行，混在 tools
+里；它们只依赖 `agent_teams.BUS` / `team_protocols`，与注册表无关。
+
+**做法**：
+
+- 新增 `src/tool_teams.py`：`run_spawn_teammate` / `run_send_message` /
+  `run_check_inbox` / `run_request_shutdown` / `run_request_plan` /
+  `run_review_plan`，直接复用两个子系统的公开对象。
+- tools 改为导入并再导出，`tool_registry` 与 schema 不变；协议状态仍由
+  `team_protocols.pending_requests` 持有，没有复制。
+
+**踩过的坑**：
+
+- 这组没有入口状态依赖，不需要注入层；但 `pending_requests` 是模块级字典，
+  测试必须在 fixture 里清空，否则用例之间会互相看到上一条请求。
+- `BUS.send` 的参数顺序是 `(sender, target, content, type, payload)`；断言时
+  按位置取字段容易错位，最好按语义取 `sent[0][1]` / `sent[0][2]`。
+
+**测试**：新增 `tests/test_tool_teams.py`（发送通道、收件箱空/非空、shutdown 请求落表、
+plan 请求、审批通过/已处理/不存在、派生透传）；总回归 1037 passed / 1 skipped；
+`tools.py` 1167 → 1119 行。
+
+**收获**：
+
+- 纯委托型 handler 最适合直接搬迁：没有状态、没有注入，测试用假 BUS 即可。
+- 共享可变状态（pending_requests）的测试隔离必须显式写，不能靠用例顺序。
