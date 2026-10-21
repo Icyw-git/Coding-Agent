@@ -4,17 +4,12 @@
 import ast
 import hashlib
 import json
-import os
-import re
-import shutil
 import subprocess
 import tempfile
 import threading
-from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import List, Optional
 
-import checkpoints
 import document_render
 import documents
 import sandbox
@@ -22,7 +17,7 @@ import web_access
 from agent_core import estimate_image_tokens
 from agent_teams import BUS, spawn_teammate_thread
 from cron_scheduler import cancel_job, cron_lock, schedule_job, scheduled_jobs
-from exec_policy import is_secret_path, resolve_tool_path
+from exec_policy import resolve_tool_path
 from process_utils import close_process, kill_process_tree
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
@@ -31,9 +26,9 @@ from tool_files import edit_file, read_file, write_file
 # hooks / 策略层从这里取补丁解析入口，保持 tools 作为统一工具面。
 from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
 from tool_patch import apply_patch as _apply_patch
+from tool_search import _grep_with_ripgrep, _rg_binary, glob_files, grep_files, ls_dir
 from tool_text import (
     BinaryFileError,
-    decode_text,
 )
 from worktree import create_worktree, keep_worktree, remove_worktree
 
@@ -1030,269 +1025,26 @@ def run_apply_patch(patch: str, cwd: str = None) -> str:
     )
 
 
-MAX_SEARCH_BYTES = 2 * 1024 * 1024
-_SEARCH_IGNORE = frozenset(checkpoints.DEFAULT_IGNORE) | {
-    'node_modules', '.venv', 'venv', '.tox', '.mypy_cache'}
-
-
-def _search_root(path: str, cwd: str | None) -> tuple[Path | None, str | None]:
-    """只读搜索工具的根路径：显式秘密路径先拒，其余与 read 共用同一解析。"""
-    denied = _gate_file('read', path, cwd)
-    if denied:
-        return None, denied
-    try:
-        return safe_path(path, cwd), None
-    except Exception as exc:
-        return None, f'Error: {exc}'
-
-
-def _secret_file(path: Path) -> bool:
-    """按最终目标判断：名为 notes.txt 的链接指向 .env 时，同样不能搜内容。"""
-    if is_secret_path(path, checkpoints.DEFAULT_SECRETS):
-        return True
-    if path.is_symlink():
-        try:
-            return is_secret_path(path.resolve(), checkpoints.DEFAULT_SECRETS)
-        except OSError:
-            return True
-    return False
-
-
-def _search_files(root: Path):
-    """遍历搜索根；跳过忽略目录、指向目录的链接与秘密文件。"""
-    if root.is_file():
-        if not _secret_file(root):
-            yield root
-        return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = sorted(
-            name for name in dirnames
-            if name not in _SEARCH_IGNORE
-            and not (Path(dirpath) / name).is_symlink())
-        for name in sorted(filenames):
-            candidate = Path(dirpath) / name
-            if candidate.is_file() and not _secret_file(candidate):
-                yield candidate
-
-
-def _match_search_glob(path: Path, root: Path, pattern: str | None) -> bool:
-    if not pattern:
-        return True
-    if '/' in pattern or '\\' in pattern:
-        try:
-            rel = path.relative_to(root).as_posix()
-        except ValueError:
-            rel = path.as_posix()
-        return fnmatchcase(rel, pattern.replace('\\', '/'))
-    return fnmatchcase(path.name, pattern)
-
-
 def run_glob(pattern: str, path: str = None, cwd: str = None) -> str:
-    root, error = _search_root(path or '.', cwd)
-    if error:
-        return error
-    try:
-        if not root.exists():
-            return f'Error: path not found: {path}'
-        matches = [p for p in root.glob(pattern) if p.is_file()]
-        results = sorted(str(p.relative_to(root)) for p in matches)
-        return "\n".join(results) if results else "(no matches)"
-    except Exception as e:
-        return f"Error: {e}"
+    return glob_files(pattern, path, cwd, gate=_gate_file, resolve=safe_path)
 
 
-RG_TIMEOUT = 30.0
-_RG_GLOB_IGNORES = tuple(sorted(_SEARCH_IGNORE))
-
-
-def _rg_binary() -> str | None:
-    return shutil.which('rg')
-
-
-def _grep_with_ripgrep(pattern: str, root: Path, glob: str | None,
-                       case_insensitive: bool, limit: int) -> str | None:
-    """用 ripgrep 搜目录；不可用时返回 None，交给 Python 回退。
-
-    Python 正则与 rust-regex 语义不同、GBK 需要逐文件探测编码，所以
-    非 ASCII 模式直接走回退；rg 输出出现替换符也视为编码不适配。
-    """
-    if not pattern.isascii():
-        return None
-    binary = _rg_binary()
-    if not binary:
-        return None
-    command = [
-        binary, '--no-heading', '--line-number', '--color', 'never',
-        '-H', '--hidden', '--no-ignore', '--no-messages',
-        '--max-columns', '1000', '--max-columns-preview',
-        '--regexp', pattern,
-    ]
-    if case_insensitive:
-        command.append('-i')
-    for name in _RG_GLOB_IGNORES:
-        command += ['--glob', f'!{name}/**']
-    for secret in checkpoints.DEFAULT_SECRETS:
-        command += ['--glob', f'!{secret}']
-    command += ['--', '.']
-    timed_out = []
-
-    def stop():
-        timed_out.append(True)
-        try:
-            proc.kill()
-        except OSError:
-            pass
-
-    try:
-        proc = subprocess.Popen(
-            command, cwd=str(root), stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
-            errors='replace')
-    except OSError:
-        return None
-    timer = threading.Timer(RG_TIMEOUT, stop)
-    timer.start()
-    hits = []
-    fallback = False
-    truncated = False
-    try:
-        for raw in proc.stdout:
-            line = raw.rstrip('\r\n')
-            if not line:
-                continue
-            rel, _, rest = line.partition(':')
-            lineno, _, text = rest.partition(':')
-            rel = rel.replace('\\', '/')
-            if rel.startswith('./'):
-                rel = rel[2:]
-            candidate = root / rel
-            if not lineno.isdigit():
-                fallback = True
-                break
-            try:
-                if candidate.stat().st_size > MAX_SEARCH_BYTES:
-                    continue
-            except OSError:
-                continue
-            if _secret_file(candidate):
-                continue
-            if not _match_search_glob(candidate, root, glob):
-                continue
-            if '\ufffd' in text:
-                fallback = True
-                break
-            if len(text) > 400:
-                text = text[:400] + '…'
-            hits.append(f'{rel}:{lineno}: {text}')
-            if len(hits) >= limit:
-                truncated = True
-                break
-    finally:
-        timer.cancel()
-        if proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-    if fallback:
-        return None
-    if timed_out:
-        note = f'\n(search timed out after {RG_TIMEOUT:g}s)'
-        return ('\n'.join(hits) + note) if hits else '(no matches)' + note
-    if truncated:
-        return '\n'.join(hits) + f'\n(truncated at {limit} matches)'
-    if proc.returncode not in (0, 1) and not hits:
-        return None
-    return '\n'.join(hits) if hits else "(no matches)"
+def _grep_backend(pattern, root, glob, case_insensitive, limit):
+    return _grep_with_ripgrep(pattern, root, glob, case_insensitive, limit,
+                              rg_binary=_rg_binary)
 
 
 def run_grep(pattern: str, path: str = '.', glob: str = None,
              case_insensitive: bool = False, max_results: int = 100,
              cwd: str = None) -> str:
-    """按正则搜索文件内容，返回 `path:line: text`。
-
-    只读工具：根路径走 read 的分区判定；目录遍历跳过秘密文件与常见忽略目录。
-    二进制与超过 MAX_SEARCH_BYTES 的文件不搜，避免把一次检索变成整盘扫描。
-    目录搜索优先走 ripgrep；不可用或模式含非 ASCII 时回退到 Python 逐文件解码。
-    """
-    try:
-        regex = re.compile(pattern, re.IGNORECASE if case_insensitive else 0)
-    except re.error as exc:
-        return f'Error: invalid pattern: {exc}'
-    root, error = _search_root(path, cwd)
-    if error:
-        return error
-    if not root.exists():
-        return f'Error: path not found: {path}'
-    limit = max(1, min(int(max_results), 1000))
-    if root.is_dir():
-        fast = _grep_with_ripgrep(pattern, root, glob, case_insensitive, limit)
-        if fast is not None:
-            return fast
-    hits: list[str] = []
-    try:
-        for candidate in _search_files(root):
-            if not _match_search_glob(candidate, root, glob):
-                continue
-            try:
-                if candidate.stat().st_size > MAX_SEARCH_BYTES:
-                    continue
-                data = candidate.read_bytes()
-            except OSError:
-                continue
-            try:
-                text, _encoding = decode_text(data)
-            except BinaryFileError:
-                continue
-            try:
-                display = str(candidate.relative_to(root)) \
-                    if root.is_dir() else str(root)
-            except ValueError:
-                display = str(candidate)
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if not regex.search(line):
-                    continue
-                if len(line) > 400:
-                    line = line[:400] + '…'
-                hits.append(f'{display}:{lineno}: {line}')
-                if len(hits) >= limit:
-                    return '\n'.join(hits) + f'\n(truncated at {limit} matches)'
-    except Exception as e:
-        return f'Error: {e}'
-    return '\n'.join(hits) if hits else "(no matches)"
+    return grep_files(pattern, path, glob, case_insensitive=case_insensitive,
+                      max_results=max_results, cwd=cwd, gate=_gate_file,
+                      resolve=safe_path, backend=_grep_backend)
 
 
 def run_ls(path: str = '.', all: bool = False, cwd: str = None) -> str:
-    """列目录（只读）。隐藏项需要 all=True；路径可以在工作区外。"""
-    root, error = _search_root(path, cwd)
-    if error:
-        return error
-    try:
-        if not root.exists():
-            return f'Error: path not found: {path}'
-        if root.is_file():
-            return f'f  {root.name}  {root.stat().st_size} B'
-        if not root.is_dir():
-            return f'Error: not a file or directory: {path}'
-        rows = []
-        for item in sorted(root.iterdir(),
-                           key=lambda p: (not p.is_dir(), p.name.lower())):
-            if not all and item.name.startswith('.'):
-                continue
-            try:
-                if item.is_dir():
-                    rows.append(f'd  {item.name}/')
-                else:
-                    rows.append(f'f  {item.name}  {item.stat().st_size} B')
-            except OSError:
-                rows.append(f'?  {item.name}')
-        return "\n".join(rows) if rows else "(empty)"
-    except Exception as e:
-        return f"Error: {e}"
+    return ls_dir(path, all, cwd, gate=_gate_file, resolve=safe_path)
+
 
 _TODO_MAX_ITEMS = 100
 _TODO_MAX_CHARS = 500

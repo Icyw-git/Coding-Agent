@@ -1646,3 +1646,35 @@ tools 里而无法搬走；直接 `import tools` 会形成循环依赖。
 - 切分代码要用精确的起止标记并先 `rg` 确认范围内到底有哪些定义，不能凭行号印象。
 - 迁移后被 lint 删掉的导入是「隐式破坏」，恢复块后要跑一次全量 lint + 相关回归。
 - 同名薄包装是让 monkeypatch 继续生效的关键：调用方不用改，测试也不用改。
+## 拆分只读搜索工具
+
+**问题**：`glob` / `grep` / `ls` 与 ripgrep 快路径共约 300 行，混在 tools 里。
+它们只依赖 `resolve` / `gate`、`checkpoints.DEFAULT_SECRETS` 与文本解码，和注册表无关。
+
+**做法**：
+
+- 新增 `src/tool_search.py`：`search_root` / `glob_files` / `grep_files` / `ls_dir`，
+  以及 `_secret_file`、`_search_files`、`_match_search_glob` 与 ripgrep 封装。
+  路径解析和边界门由 tools 注入。
+- `tools.py` 的 `run_glob` / `run_grep` / `run_ls` 改为薄包装；`_grep_with_ripgrep`、
+  `_rg_binary` 继续从 tools 再导出。
+- 增加 `_grep_backend` 适配器：把「查找 rg」注入 ripgrep 实现的调用点，
+  保持后端函数仍是 5 参数签名，测试里的 spy 与自定义 lambda 都不用改。
+
+**踩过的坑**：
+
+- 一开始让 `grep_files` 直接给 backend 传 `rg_binary=` 关键字，自定义后端（只接受
+  `*args`）立刻 TypeError。改成适配器后，后端契约保持 5 参数，注入点留在 tools。
+- tools 再导出的 `_grep_with_ripgrep` 必须仍被 `run_grep` 引用，否则 Ruff 会把它当
+  未使用删掉，测试的 monkeypatch 目标就消失了。
+- 移动后 `shutil` / `fnmatchcase` / `is_secret_path` 在 tools 里变成未使用，交给
+  `ruff --fix` 清理，再用全量回归确认没有连带删除。
+
+**测试**：新增 `tests/test_tool_search.py`（拒绝时不解析、隐藏项、缺失根目录、
+秘密文件过滤）；`tests/test_grep_backend.py` 的 spy 与 rg 回退用例继续通过；
+总回归 1011 passed / 1 skipped；`tools.py` 1819 → 1571 行。
+
+**收获**：
+
+- 注入点要选在「替换实现」和「替换查找函数」之间：后端签名越简单，测试越稳。
+- 迁移前后都要确认再导出名字仍被引用，否则 lint 会静默删掉兼容层。
