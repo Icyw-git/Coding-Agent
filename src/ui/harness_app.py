@@ -102,8 +102,8 @@ class Composer(TextArea):
     ]
 
     def action_submit(self) -> None:
-        self.app.submit_text(self.text)
-        self.text = ''
+        # 有候选时 Enter 先采用候选：命令候选采用后直接执行，路径/@ 候选只回填。
+        self.app.submit_composer()
 
     def action_newline(self) -> None:
         self.insert(chr(10))
@@ -1056,6 +1056,23 @@ class HarnessApp(App):
                           state='failed' if failed else 'complete',
                           output=str(output), duration_ms=duration_ms)
         self._mark_dirty()
+
+    def submit_composer(self) -> None:
+        """Enter 的统一入口：候选优先采用，命令候选随后执行。"""
+        if self._composer is None:
+            return
+        if self.has_suggestions():
+            self.accept_suggestion()
+            text = self._composer.text
+            if text.lstrip().startswith('/'):
+                self._programmatic_text = ''
+                self._composer.text = ''
+                self.submit_text(text)
+            return
+        text = self._composer.text
+        self._programmatic_text = ''
+        self._composer.text = ''
+        self.submit_text(text)
 
     def submit_text(self, text: str) -> None:
         text = (text or '').strip()

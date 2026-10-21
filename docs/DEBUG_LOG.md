@@ -2949,3 +2949,24 @@ args`
 
 **测试**：新增 Ctrl-C（主界面+模态）、选择器键盘/鼠标、补全 ↑↓/鼠标、会话搜索 Enter
 用例；总回归 1149 passed / 1 skipped，旧 UI 64 passed。
+## 补全候选 Enter 无效：选中态与确认语义
+
+用户反馈“上下键后 Enter 没效果”。复现后确认两件事：
+
+- 选中行其实已经变化（`_suggestion_index` 在变），但浮层只有 `▸` 标记，视觉不明显；
+- Enter 仍走 `Composer.action_submit -> submit_text`，把**原始半截文本**发了出去，
+  候选选中结果完全没被采用，所以看起来“Enter 没反应”。
+
+按 Pi `editor.ts` 的 autocomplete 分支对齐：
+
+1. 有候选时 Enter 先 `applyCompletion`；
+2. 若补全的是 slash command（`autocompletePrefix.startsWith("/")`），采用后
+   **继续提交**，直接执行命令；
+3. 路径/`@` 文件补全只回填，不提交，留给用户继续编辑；
+4. 浮层选中行加粗，保留 `▸`，Tab 仍然只采用不执行。
+
+实现落在 `HarnessApp.submit_composer()`：Composer 的 Enter 全部委托给它；
+`CompletionPopup.show()` 把选中行渲染成粗体。测试覆盖 `/he` + Enter 执行 `/help`、
+`@src/ap` + Enter 只回填不发消息。
+
+**测试**：1151 passed / 1 skipped，旧 UI 64 passed。

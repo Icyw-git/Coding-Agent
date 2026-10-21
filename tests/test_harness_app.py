@@ -747,3 +747,42 @@ def test_completion_up_down_and_mouse(monkeypatch):
             assert not app.has_suggestions()
 
     asyncio.run(scenario())
+
+
+def test_enter_accepts_selected_command_before_submitting(monkeypatch):
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._composer.focus()
+            app._composer.text = '/he'
+            await pilot.pause()
+            assert app.has_suggestions()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert not app.has_suggestions()
+            assert app._composer.text == ''
+            assert 'TUI commands' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+
+
+def test_enter_accepts_path_completion_without_submitting(monkeypatch):
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._composer.focus()
+            app._composer.text = '@src/ap'
+            app._suggestions = [('@src/app.py', 'src/app.py')]
+            app._suggestion_index = 0
+            app._popup.show(app._suggestions, 0)
+            app._place_popup()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._composer.text == '@src/app.py'
+            assert not app.model.snapshot()   # 仅回填，不发送
+
+    asyncio.run(scenario())
