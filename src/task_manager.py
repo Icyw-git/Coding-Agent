@@ -127,8 +127,11 @@ class TaskManager:
 
     def list(self, limit: int = 50) -> list[TaskRecord]:
         with self._lock:
-            records = sorted(self._tasks.values(),
-                             key=lambda r: r.created_at, reverse=True)
+            # created_at 在 Windows 上可能同刻（time.time 分辨率不足），
+            # 用插入序号兜底，保证后创建的任务仍排在前面。
+            records = [record for _index, record in sorted(
+                enumerate(self._tasks.values()),
+                key=lambda item: (item[1].created_at, item[0]), reverse=True)]
         return records[:max(1, limit)]
 
     def stop(self, task_id: str) -> TaskRecord:

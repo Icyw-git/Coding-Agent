@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
+import project_context
 import recovery
 import sandbox
 import web_access
@@ -137,14 +138,22 @@ def _tools_fingerprint() -> str:
 load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
 WORKDIR = Path.cwd().resolve()
+APP_DIR = Path(__file__).resolve().parent
 
 
 def get_workdir() -> Path:
     return current_workspace(WORKDIR)
 
 
-SKILLS_DIR=WORKDIR/"skills"
-scan_skills()   # 扫描技能目录 → SKILL_REGISTRY（skill_system 内）
+def project_prompt_section(workspace=None) -> str:
+    instructions = project_context.load_project_instructions(
+        workspace or get_workdir())
+    return project_context.format_project_instructions(instructions)
+
+
+SKILLS_DIR=WORKDIR/"skills"                 # 当前工作区的项目技能
+BUILTIN_SKILLS_DIR=APP_DIR/"skills"         # 随 harness 分发的内建技能
+scan_skills()   # 扫描内建 + 项目技能目录 → SKILL_REGISTRY（skill_system 内）
 
 
 
@@ -251,6 +260,7 @@ def set_workspace(path: str) -> Path:
         raise ValueError(f'Workspace does not exist: {candidate}')
     WORKDIR = candidate
     SKILLS_DIR = WORKDIR / 'skills'
+    scan_skills()   # 项目技能随工作区切换；签名未变时是空操作
     return WORKDIR
 
 
@@ -706,6 +716,9 @@ def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身�
     if skills:
         sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
     sections.append(PROMPT_SECTIONS['rules_main'])
+    project=context.get('project_instructions','')
+    if project:
+        sections.append(project)
     return '\n\n'.join(sections)
 
 _prompt_cache = ContextVar('prompt_cache', default=None)
@@ -786,6 +799,8 @@ def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没�
     loaded=['identity','tools','workspace','rules']
     if context.get('skills'):
         loaded.append('skills')
+    if context.get('project_instructions'):
+        loaded.append('project')
     if os.getenv('HARNESS_DEBUG') == '1':
         print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return prompt
@@ -865,6 +880,7 @@ def update_context(context:dict,messages:list)->dict: # 更新上下文：工具
         'enabled_tools':list(tool_registry.keys()),
         'workspace':str(get_workdir()),
         'skills':list_skills(),
+        'project_instructions':project_prompt_section(),
     }
 
 
@@ -873,13 +889,16 @@ def build_system()->str: #暴露给外部调用，返回系统提示
 
 
 def build_sub_system()->str:
-    return (
-        PROMPT_SECTIONS['identity_sub'].format(workdir=get_workdir()) +
-        '\n\n' +
-        PROMPT_SECTIONS['rules_sub'].format(workdir=get_workdir()) +
-        '\n\n' +
-        PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills())
-    )
+    sections = [
+        PROMPT_SECTIONS['identity_sub'].format(workdir=get_workdir()),
+        PROMPT_SECTIONS['rules_sub'].format(workdir=get_workdir()),
+    ]
+    project = project_prompt_section()
+    if project:
+        sections.append(project)
+    sections.append(
+        PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills()))
+    return '\n\n'.join(sections)
 
 
 # ── 记忆 / 压缩 / hooks 逻辑已提取到 agent_core.py ──
@@ -1009,20 +1028,34 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
     return messages, skip_micro_rounds
 
 
-def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
+def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
+                   on_event=None):
     """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
     返回 (name, args, tool 消息 dict, images)。images 是 view_image 的附件引用，
     由调用方作为独立 user 消息追加（tool 角色里放图片各家支持不一致）。
     主循环与 teammate 共用同一条安全/兜底路径。
-    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。"""
+    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。
+    on_event：无头 JSONL 的事件出口，按 ``(类型, 载荷)`` 回调。"""
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments)
         if not isinstance(args, dict):
             raise ValueError('tool arguments must be a JSON object')
     except (TypeError, ValueError) as exc:
+        # 无头 JSONL 的消费方按 started/completed 配对跟踪工具调用；参数解析失败
+        # 也要配对上报，否则这次调用在事件流里是静默丢失的。
+        message = f'Error: invalid tool arguments: {exc}'
+        if on_event:
+            on_event('tool.started', {'name': name, 'call_id': tool_call.id,
+                                      'arguments': {}})
+            on_event('tool.completed', {'name': name, 'call_id': tool_call.id,
+                                        'status': 'error', 'output': message,
+                                        'images': []})
         return name, {}, {'role': 'tool', 'tool_call_id': tool_call.id,
-                          'content': f'Error: invalid tool arguments: {exc}'}, []
+                          'content': message}, []
+    if on_event:
+        on_event('tool.started', {'name': name, 'call_id': tool_call.id,
+                                  'arguments': args})
     if registry is None:
         registry = tool_registry
     if hooks:
@@ -1053,8 +1086,18 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
         trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
     # 形态，前缀天然稳定；全量已落盘可恢复）。hooks 拿到的仍是全量输出。
+    content = _bound_tool_output(tool_call.id, output)
+    if on_event:
+        text = str(content)
+        status = ('blocked' if blocked else
+                  'error' if text.startswith(('Error:', 'Permission denied')) else 'ok')
+        on_event('tool.completed', {
+            'name': name, 'call_id': tool_call.id, 'status': status,
+            'output': text,
+            'images': [str(image.get('name') or 'image') for image in images],
+        })
     return name, args, {"role": "tool", "tool_call_id": tool_call.id,
-                        "content": _bound_tool_output(tool_call.id, output)}, images
+                        "content": content}, images
 
 
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
@@ -1083,7 +1126,7 @@ def _batch_bash_commands(tool_calls):
     return commands
 
 
-def _run_tool_batch(tool_calls, session_store, tool_messages):
+def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
     """执行一批 tool_call：全部无副作用时并行，任一可变则整批串行兜底。
 
     无副作用 = 只读白名单工具，或整批 bash 且每条命令都落在只读命令白名单
@@ -1105,13 +1148,14 @@ def _run_tool_batch(tool_calls, session_store, tool_messages):
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
             executed = list(pool.map(
-                lambda tc: contextvars.copy_context().run(exec_tool_call, tc),
+                lambda tc: contextvars.copy_context().run(
+                    exec_tool_call, tc, on_event=on_event),
                 tool_calls))
     else:
         executed = []
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)
-            executed.append(exec_tool_call(tool_call))
+            executed.append(exec_tool_call(tool_call, on_event=on_event))
     for _, _, tool_message, _images in executed:   # 原序写回结果
         tool_messages.append(tool_message)
         session_store.append_message(tool_message)
@@ -1304,6 +1348,13 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/diff':
         print(format_workspace_diff(color=sys.stdout.isatty()))
+
+    elif command == '/review':
+        from review import run_review
+        try:
+            print(run_review(progress=lambda text: print(text, flush=True)))
+        except Exception as exc:
+            print(f'  [review] 审阅失败：{exc}')
 
     elif command == '/model':
         print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
@@ -1617,8 +1668,14 @@ def _stream_completion(create_kwargs, on_delta):
 
 
 @_isolated_checkpoint_context()
-def agent_loop(messages:list, session_store=None, on_delta=None):
-    """Run one OpenAI session, recording an append-only event stream for recovery."""
+def agent_loop(messages:list, session_store=None, on_delta=None, *,
+               on_event=None, housekeeping=True):
+    """Run one OpenAI session, recording an append-only event stream for recovery.
+
+    ``on_event`` mirrors tool execution for one-shot transports; ``housekeeping``
+    can be disabled by short-lived processes that would otherwise start title /
+    memory LLM calls in daemon threads and die before they finish.
+    """
     perf_reset()   # 分段计时清零（HARNESS_PERF=1 时生效）
     if session_store is None:
         session_store = SessionEventStore(SESSIONS_DIR)
@@ -1837,19 +1894,22 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
             session_store.append('turn_completed')
             # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
             # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
-            turn_no += 1
-            housekeeping = threading.Thread(
-                target=_post_turn_housekeeping,
-                args=(pre_compress, list(messages), session_store, turn_no),
-                daemon=True,
-            )
-            with _housekeeping_lock:
-                # 只清理「已启动且已死」的旧线程——is_alive() 对未 start 的线程
-                # 也返回 False，必须先清理再注册，否则会把本线程误删
-                _housekeeping_threads[:] = [th for th in _housekeeping_threads
-                                            if th.is_alive()]
-                _housekeeping_threads.append(housekeeping)
-            housekeeping.start()
+            # 无头一次性进程没有「下一次启动」可等，跑这些线程只会被退出截断，
+            # 所以由调用方显式关闭。
+            if housekeeping:
+                turn_no += 1
+                housekeeping_thread = threading.Thread(
+                    target=_post_turn_housekeeping,
+                    args=(pre_compress, list(messages), session_store, turn_no),
+                    daemon=True,
+                )
+                with _housekeeping_lock:
+                    # 只清理「已启动且已死」的旧线程——is_alive() 对未 start 的线程
+                    # 也返回 False，必须先清理再注册，否则会把本线程误删
+                    _housekeeping_threads[:] = [th for th in _housekeeping_threads
+                                                if th.is_alive()]
+                    _housekeeping_threads.append(housekeeping_thread)
+                housekeeping_thread.start()
             return message.content or "No output"
 
 
@@ -1868,7 +1928,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                 # 批级合并审查：批内多条会 ASK 的 bash 打包成一次 LLM 审查，
                 # 放行结果进缓存（enforce 单条路径零开销命中）；升级的照旧问人
                 hooks.preflight_judge(batch)  # noqa: B023
-                _run_tool_batch(batch, session_store, tool_messages)  # noqa: B023
+                _run_tool_batch(batch, session_store, tool_messages,  # noqa: B023
+                                on_event=on_event)
             batch.clear()  # noqa: B023
 
         for tool_call in message.tool_calls:

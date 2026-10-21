@@ -1362,3 +1362,53 @@ TTL 过期、未授权目录与失效时机；`test_session_workspace.py` 覆盖
 - **provider 的图片规则要按官方口径取保守值**：DeepSeek 只公布每图上限 1024、没有瓦片
   公式，就按 1024 计；固定 1000 既不是它的账单值，也不该被当成精确值。图片只放 user
   消息这一点与现有附件布局一致，不需要为 DeepSeek 单开一条消息通道。
+## 无头执行、项目说明与只读审阅
+
+**问题**：Harness 只有交互式入口，脚本、CI 和编辑器插件没法复用同一条回合循环；模型也不知道
+仓库自己的约定（测试命令、代码风格），每次都要用户重复贴一遍；提交前的检查仍靠人眼，而「把 diff
+交给模型看」很容易顺手把写权限一起给了它。
+
+**做法**：
+
+- `entrypoint.py` 增加 `-p/--print`、`--json`、`--session`、`--workspace`、`-i/--image`，
+  `src/headless.py` 复用 `AgentRuntime.send()` 而不另写一套回合循环。stdout 只留最终回答（或
+  JSONL），其余诊断统一重定向到 stderr。`exec_tool_call` 增加 `on_event` 出口，工具事件与结果
+  从同一条截断后的内容派生，所以 JSONL 里的 `output` 就是历史里的形态。无头进程不启动 cron/
+  队列线程、不做标题生成与记忆提炼（`housekeeping=False`），否则 daemon 线程会被进程退出直接截断。
+- `src/project_context.py` 读取工作区根目录的 `AGENTS.override.md` / `AGENTS.md` / `CLAUDE.md`，
+  32 KiB 截断，缓存键是 `(解析后路径, mtime_ns, size)`，作为 system prompt 的 `project` 段
+  注入主循环与子代理；`HARNESS_PROJECT_CONTEXT=off` 可关闭整条通道。
+- `skill_system` 改为内建 `APP_DIR/skills` + 工作区 `SKILLS_DIR` 合并扫描，工作区同名技能覆盖
+  内建；manifest 的 mtime/size 作为签名，`list_skills()` / `load_skill()` 前自动重扫，CLI 切换
+  工作区也会重扫，编辑 skill.md 不用重启。
+- `src/review.py` 的 `/review` 用只读子代理审阅未提交 diff：工具面收窄到 `read/glob/grep/ls`，
+  `exec_policy.classify_path` 在调用工具前拒绝工作区外路径，敏感文件在进入 prompt 前就被剔除；
+  轮次、diff 长度和上下文长度都有上限。
+
+**踩过的坑**：
+
+- stdout 一混进工具日志，`--json` 就不再是 JSONL。`contextlib.redirect_stdout` 必须在 `_run`
+  之前生效，而最终回答要写回调用方捕获的原始流。
+- 无头进程里跑 housekeeping 不是「多做一点」：标题和记忆提炼会再发两次 LLM 请求，进程退出时
+  它们还在排队，事件流里留下半截状态。要么等 `wait_for_housekeeping()`，要么显式关掉；一次性
+  执行选后者。
+- 图片附件不能只在 `--image` 上传路径：历史里必须存缓存引用，下一轮请求前再由
+  `expand_image_parts` 展开成 data URI。越界图片没有交互审批可等，只能在发送前快速失败。
+- 项目说明是仓库可控内容：跟着符号链接读到工作区外、把它当可信指令源、或让它覆盖审批规则，
+  都会把「仓库里的一个文件」变成提权面。路径边界与优先级必须写进实现，而不只是写进文档。
+- `/review` 不能复用主工具面：有 `bash` 就能改工作区，「只读审阅」就成了口头承诺。它也不能留下
+  同类预授权——审查过程中的一次工具批准，不该变成后续会话里的免审通行证。
+
+**测试**：`test_headless.py` 钉住 stdout 纯净、JSONL 事件、退出码、图片边界、恢复会话、
+housekeeping 关闭与「参数解析失败也要配对上报 started/completed」；`test_project_context.py` 覆盖
+优先级、截断、符号链接逃逸、缓存失效、技能合并与重扫；`test_review.py` 覆盖干净/非 Git 工作区、
+工具面收窄、越界路径拒绝、敏感文件过滤与轮次预算；`test_entrypoint.py` 覆盖无头标志解析、
+派发与 `--resume` 误用。全量 `pytest` 976 passed / 1 skipped，
+`ruff check harness.py src tests` 通过。
+
+**收获**：
+
+- 传输层只决定「谁看得到什么」，回合逻辑仍然只有 `agent_loop` 一份；加一个入口不等于复制一套循环。
+- 一次性进程必须显式声明生命周期：后台线程、housekeeping、MCP 连接都要有明确的收尾点。
+- 把 diff 交给模型时，权限要按「这次审阅」收窄，而不是按「这个工具平时能做什么」。
+- 仓库内的说明文件是输入，不是配置：它只影响提示，不影响授权；这条边界要在代码里写死。

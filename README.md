@@ -11,6 +11,8 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 - 上下文压缩、输出截断和模型错误恢复
 - 后台任务与 cron 定时任务
 - Subagent、Teammate、任务板和 Git Worktree 隔离
+- 工作区项目说明（`AGENTS.md` / `CLAUDE.md`）与内建/项目技能合并
+- 一次性无头执行（`-p` / `--json`）与只读代码审阅（`/review`）
 - Textual 终端 UI 与 React/Vite 可视化面板
 
 ## 环境要求
@@ -38,6 +40,9 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 - `/sessions`（`/s`）：打开会话管理，与不带参数的 `/resume` 使用同一界面。
 - `/cd "D:\My Project"`：切换当前会话的工作区，支持带空格的路径；`/pwd` 查看路径。
   换项目建议用 `/new` 开新会话——工作区随会话记录，`/cd` 只作兼容与迁移。
+- `/diff`：只读查看当前工作区未提交改动（文件状态 + 逐行 diff）。
+- `/review`：只读子代理审阅未提交改动并输出 P0–P3 分级问题。工具面只有
+  `read`/`glob`/`grep`/`ls` 且限制在工作区内，敏感文件既不进 diff 也读不到。
 - `/checkpoint [标签]`、`/checkpoints`、`/rewind`：创建、查看和回溯快照。
 - `/sandbox`：查看并切换执行档位与审批档位，见「执行安全与审批」。
 - `/status` 查看状态，`/quit`（`/exit`）退出。
@@ -126,6 +131,20 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 并向 Agent 返回超时结果。`cwd` 让单条命令在指定目录执行；显式 `run_in_background` 或命中
 安装/构建/测试等慢命令关键词时转入后台（后台默认上限 3600 秒），用 `background_output`
 等待或读取输出、`kill_background` 终止。
+
+## 项目说明与技能
+
+工作区根目录的说明文件会作为 `project` 段落注入主 system prompt 与子代理 system prompt，
+按 `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md` 取第一个命中的文件（文件名大小写不敏感）：
+
+- 只读工作区根目录，不向上查找；指向工作区外的符号链接会被忽略。
+- 超过 32 KiB 时截断到最近的换行并附一行说明；`HARNESS_PROJECT_CONTEXT=off` 可整体关闭。
+- 按 mtime/size 失效重读；切换工作区后下一轮重新组装，`/review` 也会带上它。
+- 它属于 system prompt 的一部分，不进入 canonical history；其中的指令不能覆盖安全与审批规则。
+
+技能目录合并两处扫描：随发行版分发的 `skills/`（`APP_DIR/skills`）与当前工作区的
+`skills/`（`SKILLS_DIR`）。同名技能以工作区版本为准；system prompt 只放名称与描述，正文通过
+`load_skill` 按需加载。`skill.md` 的 mtime/size 变化或工作区切换（CLI `/cd`、`/new`）后会重新扫描。
 
 ## 内建工具
 
@@ -345,6 +364,9 @@ HARNESS_UI=ansi
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
 
+# 可选：工作区 AGENTS.md / CLAUDE.md 注入（on 默认 / off 关闭）
+HARNESS_PROJECT_CONTEXT=on
+
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
 
@@ -381,7 +403,7 @@ HARNESS_PERF=1
 改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
 事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
 飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke` 和 `/sandbox`；
-文件查看与上下文压缩仍建议在 CLI 中执行。
+文件查看、代码审阅（`/review`）与上下文压缩仍建议在 CLI 中执行。
 
 请勿提交 `.env` 或任何真实 API 密钥；`.gitignore` 已默认忽略该文件。
 
@@ -452,6 +474,26 @@ python entrypoint.py --resume <session_id>
 
 交互过程中可使用 `/status` 查看当前运行状态，使用 `/sessions` 查看已保存会话，使用 `/resume <session_id>` 切换到已有会话。
 
+一次性（无头）执行：
+
+```bash
+python entrypoint.py -p "总结这个仓库的架构"
+python entrypoint.py --json "找出未通过的测试" > events.jsonl
+cat prompt.txt | python entrypoint.py -p --session daily-review
+python entrypoint.py --workspace D:\work\project -i screenshot.png "复现这个报错"
+```
+
+- 触发方式：`-p/--print`、`--json`、`--session`、`--workspace`、`--image`，或直接给出位置参数 prompt。
+  未提供 prompt 且 stdin 不是终端时，从 stdin 读取；`-` 也显式表示读取 stdin。
+- stdout 只输出最终回答（普通模式）或 JSONL（`--json`）；工具日志、Hook 输出和 token 统计写入 stderr。
+- `--session` 在会话已存在时恢复，不存在时按该 ID 新建；`--workspace` 为本次会话选择或切换工作区。
+  `--resume` 只用于交互模式，无头执行恢复会话请用 `--session`。
+- `-i/--image` 可重复，图片必须位于会话工作区内，并复用 `view_image` 的边界与敏感文件策略。
+- `--json` 事件类型：`session`、`turn.started`、`tool.started`、`tool.completed`、`delta`、`message`、
+  `turn.completed`（含 `usage` 与 `files_changed`）、`error`。
+- 无头进程不启动 cron/队列线程，也不执行标题生成和记忆提炼；退出码 `0` 成功、`2` 用法/配置错误、
+  `1` 运行错误、`130` 中断。
+
 启动 HTTP API（可选）：
 
   ```bash
@@ -513,6 +555,9 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
+| `src/headless.py` | 一次性执行与 JSONL 事件流：stdout 纯净输出、工具事件、退出码 |
+| `src/project_context.py` | 工作区 AGENTS.md / CLAUDE.md 注入：路径边界、32 KiB 截断与缓存 |
+| `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |
 | `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
 | `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |

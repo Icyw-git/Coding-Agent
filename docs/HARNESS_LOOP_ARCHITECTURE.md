@@ -38,7 +38,7 @@
 
 1. 如果没有传入 `SessionEventStore`，创建新的 session 日志对象。
 2. 将初始消息写入 `.cache/sessions/session_<id>.jsonl`。
-3. 调用 `update_context()` 收集工作目录、工具、记忆索引和 skills。
+3. 调用 `update_context()` 收集工作目录、工具、记忆索引、skills 和项目说明（`AGENTS.md`）。
 4. 创建 `RecoveryState`。
 5. 触发 `UserPromptSubmit` hook。
 6. 调用 `get_system_prompt()` 组装或读取缓存的 system prompt。
@@ -537,13 +537,31 @@ wt_ctx['path'] = WORKTREES_DIR / task.worktree
 
 ## 18. Skills 生命周期
 
-启动时 `scan_skills()` 扫描 `skills/*/skill.md`，解析 frontmatter，构建 `SKILL_REGISTRY`。
+`scan_skills()` 扫描两处 `skills/*/skill.md` 并解析 frontmatter，合并成 `SKILL_REGISTRY`：
+`APP_DIR/skills`（随发行版分发的内建技能）与 `SKILLS_DIR`（当前工作区的项目技能）。
+同名技能由工作区版本覆盖；两目录解析到同一路径时只扫一次。
+
+扫描按 manifest 的 mtime/size 做签名，签名不变时是空操作；`list_skills()` / `load_skill()`
+调用前以及 CLI 切换工作区（`set_workspace`）后都会重扫，因此编辑 skill.md 无需重启。
 
 system prompt 通过 `list_skills()` 展示技能目录；模型需要具体规则时调用 `load_skill(name)` 获取 skill body。
 
-代码位置：[`skill_system.py:13-40`](skill_system.py:13)。
+代码位置：[`skill_system.py:13-100`](skill_system.py:13)。
 
 这是一种“目录预加载 + 内容按需加载”模式：技能索引进入 system prompt，完整技能内容不默认塞入上下文。
+
+## 18.1 项目说明（AGENTS.md）
+
+`update_context()` 额外调用 `project_prompt_section()`，把工作区根目录的说明文件交给
+`project_context.load_project_instructions()`。优先级为 `AGENTS.override.md` → `AGENTS.md` →
+`CLAUDE.md`（大小写不敏感），只读工作区根目录、不向上查找，逃出工作区的符号链接忽略。
+
+读取上限 32 KiB（截断到最近换行并标记 `truncated`），缓存键是 `(解析后路径, mtime_ns, size)`，
+所以编辑文件后下一轮自动生效；`HARNESS_PROJECT_CONTEXT=off` 关闭整条通道。
+
+组装结果作为 `project` 段落追加在 `rules_main` 之后（子代理追加在 skills 段之前），
+提示词里明确它不能覆盖安全与审批规则——工作区文件是仓库可控内容，不是可信指令源。
+它属于 system prompt，不写入 canonical history，也不产生事件。
 
 ## 19. Hooks 生命周期
 

@@ -155,6 +155,11 @@ def changed_since(workspace: Path, baseline: dict[str, tuple],
     return changes
 
 
+def pending_changes(workspace: Path, ignore=DEFAULT_IGNORE) -> list[dict] | None:
+    """未提交条目；不是 Git 仓库时返回 None（供 /review 等调用方判定）。"""
+    return _status(workspace, ignore)
+
+
 def _colorize(text: str) -> str:
     lines = []
     for line in text.splitlines():
@@ -198,24 +203,16 @@ def _file_diff(workspace: Path, entry: dict, budget: int) -> str:
     return text
 
 
-def format_diff(workspace: Path, path: str = '',
-                *, max_chars: int = MAX_DIFF_CHARS, color: bool = False,
-                ignore=DEFAULT_IGNORE) -> str:
-    """IDE 风格的逐行比较：文件状态 + 每个文件的统一 diff。"""
-    workspace = Path(workspace)
-    entries = _status(workspace, ignore)
-    if entries is None:
-        return '  当前工作区不是 Git 仓库，无法显示 diff。'
-    scope = (path or '').strip().replace('\\', '/').rstrip('/')
-    if scope and scope != '.':
-        entries = [entry for entry in entries
-                   if entry['path'] == scope
-                   or entry['path'].startswith(scope + '/')]
-    if not entries:
-        if scope and scope != '.':
-            return f'  工作区干净，{scope} 没有未提交改动。'
-        return '  工作区干净，没有未提交改动。'
+def format_entries(workspace: Path, entries: list[dict],
+                   *, max_chars: int = MAX_DIFF_CHARS,
+                   color: bool = False) -> str:
+    """渲染给定条目（状态 + 逐行 diff）；空列表返回空串。
 
+    /review 需要先剔除敏感文件，再复用同一份渲染逻辑，避免两处格式漂移。
+    """
+    if not entries:
+        return ''
+    workspace = Path(workspace)
     status_lines = ['  文件状态：']
     for entry in entries:
         rename = f"{entry['old']} → {entry['path']}" if entry.get('old') else entry['path']
@@ -238,9 +235,30 @@ def format_diff(workspace: Path, path: str = '',
         chunks.append(f'  （diff 过长，已截断；共 {len(entries)} 个文件）')
 
     if not chunks:
-        return '\n'.join(status_lines) + '\n  已跟踪文件没有可显示的行级差异。'
-    body = '\n\n'.join(status_lines + ['', '  逐行改动：'] + chunks)
+        body = '\n'.join(status_lines) + '\n  已跟踪文件没有可显示的行级差异。'
+    else:
+        body = '\n\n'.join(status_lines + ['', '  逐行改动：'] + chunks)
     return _colorize(body) if color else body
+
+
+def format_diff(workspace: Path, path: str = '',
+                *, max_chars: int = MAX_DIFF_CHARS, color: bool = False,
+                ignore=DEFAULT_IGNORE) -> str:
+    """IDE 风格的逐行比较：文件状态 + 每个文件的统一 diff。"""
+    workspace = Path(workspace)
+    entries = pending_changes(workspace, ignore)
+    if entries is None:
+        return '  当前工作区不是 Git 仓库，无法显示 diff。'
+    scope = (path or '').strip().replace('\\', '/').rstrip('/')
+    if scope and scope != '.':
+        entries = [entry for entry in entries
+                   if entry['path'] == scope
+                   or entry['path'].startswith(scope + '/')]
+    if not entries:
+        if scope and scope != '.':
+            return f'  工作区干净，{scope} 没有未提交改动。'
+        return '  工作区干净，没有未提交改动。'
+    return format_entries(workspace, entries, max_chars=max_chars, color=color)
 
 
 def turn_changes(workspace: Path, baseline: dict | None,

@@ -95,6 +95,42 @@ def test_runtime_forwards_stream_delta_callback(tmp_path):
     assert received == ['hello']
 
 
+def test_runtime_persists_attachments_and_forwards_turn_options(tmp_path):
+    seen = {}
+    events = []
+
+    def run_turn(messages, session_store, on_delta=None, on_event=None,
+                 housekeeping=True):
+        seen['messages'] = list(messages)
+        seen['housekeeping'] = housekeeping
+        on_event('tool.started', {'name': 'view_image'})
+        assistant = {'role': 'assistant', 'content': 'looked'}
+        messages.append(assistant)
+        session_store.append_message(assistant)
+        return 'looked'
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('attach')
+    attachment = {'type': 'harness_image', 'path': 'cached.png',
+                  'mime': 'image/png', 'name': 'pixel.png'}
+
+    result = runtime.send(session_id, 'what is this?',
+                          attachments=[attachment],
+                          on_event=lambda kind, payload: events.append((kind, payload)),
+                          housekeeping=False)
+
+    assert result.content == 'looked'
+    assert seen['housekeeping'] is False
+    assert events == [('tool.started', {'name': 'view_image'})]
+    attached = seen['messages'][-1]
+    assert attached['role'] == 'user'
+    assert attached['content'][0]['type'] == 'text'
+    assert attached['content'][1] == attachment
+    history = runtime.history(session_id)
+    assert history[-2]['content'][1]['type'] == 'harness_image'
+    assert history[-1] == {'role': 'assistant', 'content': 'looked'}
+
+
 def _workspace_runtime(tmp_path, run_turn=lambda *_a, **_kw: 'unused'):
     return AgentRuntime(
         run_turn=run_turn,

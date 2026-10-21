@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Type
 
 import workspaces
+from agent_core import image_attachment_message
 from workspace_choices import RECENT_LIMIT, workspace_choices
 from workspace_context import resolve_workspace, use_workspace
 
@@ -181,8 +182,16 @@ class AgentRuntime:
     def remove_workspace(self, workspace_id: str) -> dict:
         return workspaces.remove_workspace(workspace_id, file=self.workspace_file)
 
-    def send(self, session_id: str, content: str, on_delta=None) -> AgentResult:
-        """Append a user message, run one turn, and return the assistant content."""
+    def send(self, session_id: str, content: str, on_delta=None, *,
+             attachments: list[dict] | None = None, on_event=None,
+             housekeeping: bool = True) -> AgentResult:
+        """Append a user message, run one turn, and return the assistant content.
+
+        ``attachments`` are ``harness_image`` references (already cached by the
+        caller); they travel as a separate user message right after the prompt,
+        matching how view_image results are replayed. ``on_event`` receives
+        ``(event_type, payload)`` for one-shot transports such as JSONL.
+        """
         if not isinstance(content, str) or not content.strip():
             raise ValueError("message content must be a non-empty string")
         with self._session_lock(session_id):
@@ -193,11 +202,19 @@ class AgentRuntime:
             message = {"role": "user", "content": content}
             messages.append(message)
             store.append_message(message)
+            if attachments:
+                attachment = image_attachment_message(attachments)
+                messages.append(attachment)
+                store.append_message(attachment)
+            turn_kwargs = {}
+            if on_delta is not None:
+                turn_kwargs["on_delta"] = on_delta
+            if on_event is not None:
+                turn_kwargs["on_event"] = on_event
+            if not housekeeping:
+                turn_kwargs["housekeeping"] = False
             with use_workspace(workspace):
-                if on_delta is None:
-                    result = self._run_turn(messages, session_store=store)
-                else:
-                    result = self._run_turn(messages, session_store=store, on_delta=on_delta)
+                result = self._run_turn(messages, session_store=store, **turn_kwargs)
             return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:
