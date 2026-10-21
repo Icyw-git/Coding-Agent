@@ -3,6 +3,7 @@ import pytest
 
 import harness
 import project_context
+import prompt_assembly
 import skill_system
 
 
@@ -14,9 +15,9 @@ def _write(path, text):
 
 @pytest.fixture(autouse=True)
 def _restore_prompt_cache():
-    harness._prompt_cache.set(None)
+    prompt_assembly._prompt_cache.set(None)
     yield
-    harness._prompt_cache.set(None)
+    prompt_assembly._prompt_cache.set(None)
 
 
 @pytest.fixture(autouse=True)

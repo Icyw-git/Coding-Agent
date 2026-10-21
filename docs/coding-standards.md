@@ -16,7 +16,10 @@
 （`_LazyLLMClient` 透明代理 + PEP 562 模块 `__getattr__`），预热只挂 CLI 启动与
 API lifespan 的后台线程。
 
-CLI 只适配输入输出，runtime 与工具不反向依赖入口和网关。路径一律 `Path`；
+CLI 只适配输入输出，runtime 与工具不反向依赖入口和网关。`src/` 模块不 import
+harness：工作区、工具表、技能目录与 model client 由入口采集后注入（如
+`prompt_assembly.collect_context()`、`session_title.generate_session_title(messages, client)`），
+保证每个 `src` 模块都能脱离 CLI 单独导入与测试。路径一律 `Path`；
 环境变量用 `HARNESS_` 前缀（`HARNESS_PROGRESS_INTERVAL`、`HARNESS_APPROVAL_TIMEOUT`），
 模型上下文窗口查 `MODEL_WINDOWS` 表再允许 `LLM_CONTEXT_WINDOW` 覆盖，未知模型
 打印告警并保守回落，不静默降级。

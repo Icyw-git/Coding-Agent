@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -242,6 +244,19 @@ def test_format_session_list_never_calls_model_or_mutates_legacy_session(tmp_pat
     assert 'x' in listing
     assert '未记录' in listing
     assert store.path.read_bytes() == before
+
+
+def test_session_title_module_does_not_import_entrypoint():
+    """标题副通道由 client 注入：网关/SDK 调用时不应连带加载 CLI 入口。"""
+    result = subprocess.run(
+        [sys.executable, '-c',
+         'import sys; sys.path.insert(0, "src"); import session_title; '
+         'print("harness" in sys.modules)'],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'False'
 
 
 def test_generate_session_title_does_not_call_model_for_empty_session(monkeypatch):

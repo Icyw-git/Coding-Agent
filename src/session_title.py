@@ -2,7 +2,7 @@
 
 标题是副通道（housekeeping）的一次独立 LLM 调用，不属于主循环：失败时静默
 退回本地兜底，绝不阻塞回复。放在 src 是因为 CLI、网关和 SDK 共用同一份逻辑；
-client 通过 ``_h()`` 回读 harness，测试里 monkeypatch ``harness.client`` 仍然生效。
+client 由调用方注入，本模块不读取入口全局状态。
 """
 from __future__ import annotations
 
@@ -11,12 +11,7 @@ import os
 from session_store import is_injected_user_content
 
 
-def _h():
-    import harness
-    return harness
-
-
-def generate_session_title(messages: list[dict]) -> str:
+def generate_session_title(messages: list[dict], client) -> str:
     """Ask the configured model for a compact session topic, with a local fallback.
 
     取材是「会话在做什么」而非「最后说了什么」：首条有效 user（原始目标）+
@@ -66,7 +61,7 @@ def generate_session_title(messages: list[dict]) -> str:
     if not exchanges:
         return '(untitled session)'
     try:
-        response = _h().client.chat.completions.create(
+        response = client.chat.completions.create(
             model=os.getenv('LLM_MODEL_ID'),
             messages=[
                 {'role': 'system', 'content': (

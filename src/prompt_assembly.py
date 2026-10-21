@@ -1,9 +1,11 @@
 """系统提示组装与上下文采集。
 
 提示词分段（身份 / 工具 / 工作区 / 技能 / 规则 / 项目说明）属于请求前缀：
-只在内容变化时重建，由 `_prompt_cache` 按 context 指纹缓存。
-模块持有当前执行上下文的提示缓存；工具表、技能与工作区通过 `_h()` 回读 harness，
-以兼容现有入口与测试补丁。后续应由调用方显式传入这些运行时依赖。
+只在内容变化时重建，由 ``_prompt_cache`` 按 context 指纹缓存。
+
+本模块不读取入口的全局状态：工作区、工具名、技能目录与项目说明都由调用方
+注入，harness / 网关 / SDK 各自负责采集。这样它可以独立导入和测试，也不会
+把 CLI 的全局变量带进其他入口；`_prompt_cache` 是模块自身的执行上下文缓存。
 """
 from __future__ import annotations
 
@@ -15,15 +17,9 @@ from contextvars import ContextVar
 import project_context
 
 
-def _h():
-    import harness
-    return harness
-
-
-def project_prompt_section(workspace=None) -> str:
+def project_prompt_section(workspace) -> str:
     """读取工作区的 AGENTS.md/CLAUDE.md 并渲染成 system prompt 段落。"""
-    instructions = project_context.load_project_instructions(
-        workspace or _h().get_workdir())
+    instructions = project_context.load_project_instructions(workspace)
     return project_context.format_project_instructions(instructions)
 
 
@@ -77,7 +73,7 @@ PROMPT_SECTIONS={
 
 def assemble_system_prompt(context: dict) -> str:
     """组装 system prompt：身份、工具、工作区、技能、规则、项目说明。"""
-    workspace = context.get('workspace', _h().get_workdir())
+    workspace = context['workspace']
     sections = [PROMPT_SECTIONS['identity_main'].format(workdir=workspace)]
     tools = ','.join(context.get('enabled_tools', []))
     if tools:
@@ -118,33 +114,34 @@ def get_system_prompt(context: dict) -> str:
     return prompt
 
 
-def update_context(context: dict, messages: list) -> dict:
-    """收集随回合变化的前缀内容：工具表、工作区、技能目录与项目说明。"""
+def collect_context(*, workdir, tool_names, skills) -> dict:
+    """收集随回合变化的前缀内容；运行时依赖由入口层注入，不在这里读取全局。"""
     # ⚠ 记忆不再进 system prompt：housekeeping 每轮更新 MEMORY_INDEX，若嵌在
     # system 里，请求前缀每轮逐字变化，供应商前缀缓存（KV 复用）全失效。
     # 记忆由 inject_memories 作为请求末尾的独立 system 消息注入。
     return {
-        'enabled_tools': list(_h().tool_registry.keys()),
-        'workspace': str(_h().get_workdir()),
-        'skills': _h().list_skills(),
-        'project_instructions': project_prompt_section(),
+        'enabled_tools': list(tool_names),
+        'workspace': str(workdir),
+        'skills': skills,
+        'project_instructions': project_prompt_section(workdir),
     }
 
 
-def build_system() -> str:
+def build_system(*, workdir, tool_names, skills) -> str:
     """返回完整的 system prompt（外部调用 / 调试用）。"""
-    return assemble_system_prompt(update_context({}, []))
+    return assemble_system_prompt(
+        collect_context(workdir=workdir, tool_names=tool_names, skills=skills))
 
 
-def build_sub_system() -> str:
+def build_sub_system(*, workdir, skills) -> str:
     """子代理的 system prompt：身份 + 规则 + 项目说明 + 技能目录。"""
     sections = [
-        PROMPT_SECTIONS['identity_sub'].format(workdir=_h().get_workdir()),
-        PROMPT_SECTIONS['rules_sub'].format(workdir=_h().get_workdir()),
+        PROMPT_SECTIONS['identity_sub'].format(workdir=workdir),
+        PROMPT_SECTIONS['rules_sub'].format(workdir=workdir),
     ]
-    project = project_prompt_section()
+    project = project_prompt_section(workdir)
     if project:
         sections.append(project)
     sections.append(
-        PROMPT_SECTIONS['skills_usage'].format(catalog=_h().list_skills()))
+        PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
     return '\n\n'.join(sections)

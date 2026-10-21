@@ -1469,7 +1469,7 @@ Office 文本抽取走标准库，PDF 文本抽取与页面渲染需要可选包
 
 - 清理 `harness.py` 中拆分遗留的空标题及连续空行，保留主循环阶段顺序。
 - 修正提示组装模块的状态说明：它持有 ContextVar 缓存，且仍通过 `_h()` 依赖入口；
-  这只是拆分的过渡状态，后续应显式传入运行时依赖。
+  当时以 `_h()` 过渡，后续已改为显式注入（见下一节）。
 - 提示组装与缓存命中诊断改写 stderr，并增加输出通道回归，避免污染调用方 stdout。
 - 文档测试改为按能力跳过：缺 pypdf 仅跳过 3 项 PDF 文本抽取测试，缺渲染包仅跳过
   3 项实际渲染测试，Office 解析、转换命令及工具边界测试继续执行。
@@ -1477,3 +1477,45 @@ Office 文本抽取走标准库，PDF 文本抽取与页面渲染需要可选包
 
 验证：相关回归 71 passed / 1 skipped（主机不支持符号链接）；屏蔽 pypdf、pypdfium2、PIL
 后的文档回归 16 passed / 6 skipped；增量 Ruff 检查通过。
+## 解除新模块对入口的反向依赖
+
+**问题**：上一批把提示组装、标题生成下沉到 `src/`，但两者仍通过 `_h()` 回读 harness。
+文件变短了，依赖方向没变：任何入口（API / 网关 / SDK）想复用它们，都会把 CLI 入口的
+全局状态（`WORKDIR`、`SKILLS_DIR`、`client`、`tool_registry`）一起拖进来；测试也只能
+靠 monkeypatch harness 属性间接验证。
+
+**做法**：
+
+- `prompt_assembly` 只保留纯函数：`project_prompt_section(workspace)`、
+  `assemble_system_prompt(context)`、`collect_context(workdir, tool_names, skills)`、
+  `build_system(...)`、`build_sub_system(...)`；不再 import harness。
+- `session_title.generate_session_title(messages, client)`：client 显式传入。
+- harness 保留同名薄包装（`project_prompt_section` / `update_context` / `build_system` /
+  `build_sub_system` / `generate_session_title`），在这里采集 `get_workdir()`、
+  `tool_registry`、`list_skills()` 与 `client`。调用点、subagent 的 `_h()`、review 的调用
+  和既有 monkeypatch 目标都不变。
+- `_prompt_cache` 只属于 `prompt_assembly`；harness 不再 re-export，测试 fixture 直接
+  重置模块自己的 ContextVar。
+- 新增 `tests/test_prompt_assembly.py`（注入式采集、子代理提示、包装器接线），并在两个
+  测试里加子进程隔离断言：单独 import `prompt_assembly` / `session_title` 时
+  `sys.modules` 不含 `harness`。
+
+**踩过的坑**：
+
+- 依赖注入要注入「值」而不是「取数函数」：传 callable 看似更省事，但 callable 仍会捕获
+  harness；传值后测试可以直接构造上下文，模块也不需要知道入口如何取数。
+- 包装层必须留在 harness：subagent、review 和测试的补丁目标都是 harness 上的名字；直接
+  把调用点改成 `src` 函数会绕过所有既有 monkeypatch。
+- 子进程断言要手动把 `src` 加进 `sys.path`：开发时是 harness 插入的，不能假设独立进程
+  也能 import。
+- `_prompt_cache` 若继续从 harness 再导出，测试重置的虽是同一个对象，却掩盖了归属；
+  归属清晰后 harness 不再暴露模块内部状态。
+
+**测试**：`pytest` 982 passed / 1 skipped；`ruff check harness.py src tests` 通过；
+`harness.py` 2028 → 1984 行。
+
+**收获**：
+
+- 「拆文件」不等于「解耦」：判断标准是模块能否在没有入口的情况下被 import 并测试。
+- 依赖方向要单向：入口采集 → src 纯逻辑。反向回读会把入口差异带进共享模块。
+- 薄包装层是保留兼容补丁点的低成本方案，代价只是入口多二十来行接线。

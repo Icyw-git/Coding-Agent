@@ -117,19 +117,18 @@ from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
 from prompt_assembly import (
-    _prompt_cache,
     assemble_system_prompt,
-    build_sub_system,
-    build_system,
+    collect_context,
     get_system_prompt,
-    project_prompt_section,
-    update_context,
 )
+from prompt_assembly import build_sub_system as _build_sub_system
+from prompt_assembly import build_system as _build_system
+from prompt_assembly import project_prompt_section as _project_prompt_section
 from prompt_cache_debug import enabled as cache_debug_enabled
 from prompt_cache_debug import fingerprints as cache_fingerprints
 from prompt_cache_debug import first_divergence as first_cache_divergence
 from session_store import SessionEventStore, SessionReplayError
-from session_title import generate_session_title
+from session_title import generate_session_title as _generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
@@ -157,6 +156,32 @@ def get_workdir() -> Path:
 SKILLS_DIR=WORKDIR/"skills"                 # 当前工作区的项目技能
 BUILTIN_SKILLS_DIR=APP_DIR/"skills"         # 随 harness 分发的内建技能
 scan_skills()   # 扫描内建 + 项目技能目录 → SKILL_REGISTRY（skill_system 内）
+
+
+# ── 提示与标题的依赖注入 ──
+# src 中的原语不感知入口；这里把工作区、实时工具表、技能目录与 client 传进去。
+def project_prompt_section(workspace=None) -> str:
+    return _project_prompt_section(workspace or get_workdir())
+
+
+def update_context(context: dict, messages: list) -> dict:
+    return collect_context(workdir=get_workdir(),
+                           tool_names=tool_registry.keys(),
+                           skills=list_skills())
+
+
+def build_system() -> str:
+    return _build_system(workdir=get_workdir(),
+                         tool_names=tool_registry.keys(),
+                         skills=list_skills())
+
+
+def build_sub_system() -> str:
+    return _build_sub_system(workdir=get_workdir(), skills=list_skills())
+
+
+def generate_session_title(messages: list[dict]) -> str:
+    return _generate_session_title(messages, client)
 
 
 class _LazyLLMClient:
