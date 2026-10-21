@@ -1030,3 +1030,21 @@ def test_tui_initial_history_is_batched_and_capped():
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_tui_header_shows_session_title():
+    import asyncio
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    async def scenario():
+        app = ui_textual.CCApp([], title='修复登录超时')
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            header = str(app.query_one('#header-line').render())
+            assert '修复登录超时' in header
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())

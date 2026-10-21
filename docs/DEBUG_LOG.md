@@ -2643,3 +2643,20 @@ UI 测试 61 passed。
 
 **测试**：新增「500 条初始历史 → 控件数受限、末尾消息可见、折叠提示存在」；
 总回归 1097 passed / 1 skipped，UI 测试 62 passed。
+## TUI 头部与退出体验
+
+**对照 Codex / Pi**：它们的顶部同时给出「在哪个会话、用的什么模型、工作目录」，
+退出是即时的；我们的 TUI 头部只有模型与目录，且关闭窗口/`Ctrl+C` 可能停 10 秒。
+
+**做法**：
+
+- `ui_textual.run(..., title=...)` / `CCApp(title=...)`：头部显示
+  `harness · <会话标题> · <模型> · <工作目录>`；`run_repl` 传入
+  `session_store.session_summary()['title']`，恢复/新建会话后标题正确。
+- `_run_agent` 退出等待从固定 10s 改为「最多 2s 且 `_exiting` 时直接跳过」：
+  消费者已经停下时不再为 `unfinished_tasks` 空等。UI 测试套件从 42s 降到 12s，
+  真实关窗也不会再假死。
+
+**取舍**：标题超长截到 40 字符，避免挤掉模型与目录；完整标题仍可用 `/status` 查看。
+
+**测试**：新增头部标题断言；UI 测试 63 passed，总回归 1097 passed / 1 skipped。

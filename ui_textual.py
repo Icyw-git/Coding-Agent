@@ -372,10 +372,12 @@ class CCApp(App):
         ("escape", "jump_bottom", "Cancel / jump to latest"),
     ]
 
-    def __init__(self, msgs: list, session_id: str | None = None):
+    def __init__(self, msgs: list, session_id: str | None = None,
+                 title: str = ''):
         super().__init__()
         self._msgs = msgs
         self._session_id = session_id or ''   # 空 = 不过滤（测试可直接注入事件）
+        self._session_title = title
         self._event_queue: queue.Queue = queue.Queue()
         self._chat = None
         self._user_input_q: queue.Queue = queue.Queue()   # 用户输入 → agent 线程（多轮）
@@ -413,7 +415,9 @@ class CCApp(App):
         clear_cancel()
         bus.subscribe(self._on_event)
         header = self.query_one('#header-line', Static)
-        header.update(f"[{PALETTE['accent']}]harness[/] [{PALETTE['muted']}]{os.getenv('LLM_MODEL_ID', '')}[/]"
+        title = f" · {markup_escape(self._session_title[:40])}" if self._session_title else ''
+        header.update(f"[{PALETTE['accent']}]harness[/]{title}"
+                      f" [{PALETTE['muted']}]{os.getenv('LLM_MODEL_ID', '')}[/]"
                       f" [dim]{markup_escape(str(h.WORKDIR))}[/]")
         self._chat = self.query_one('#chat', VerticalScroll)
         self._side_panel = self.query_one('#side-panel', Vertical)
@@ -990,9 +994,12 @@ class CCApp(App):
             harness.permission_gate.use_ui = False
             self._event_queue.put(None)   # 通知消费者退出
             # 等剩余事件渲染完再退出（带超时兜底，避免消费者异常时永久挂起）
-            deadline = time.monotonic() + 10
-            while self._event_queue.unfinished_tasks > 0 and time.monotonic() < deadline:
-                time.sleep(0.05)
+            # 退出时消费者通常已经停下：只为尚未渲染完的事件等一小会儿，
+            # 不要把关闭窗口拖成 10s 的假死。
+            deadline = time.monotonic() + 2
+            while (not self._exiting and self._event_queue.unfinished_tasks > 0
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
             self.call_from_thread(self.exit)
 
     # ---------- 事件流：bus 回调（任意线程）→ 队列 → UI 线程顺序应用 ----------
@@ -1619,13 +1626,14 @@ class CCApp(App):
         return f'[{color}]{bar}[/] [dim]{label}%[/]'
 
 
-def run(msgs: list, session_id: str | None = None) -> None:
+def run(msgs: list, session_id: str | None = None,
+        title: str = '') -> None:
     """以 Textual 模式启动会话（阻塞直到 agent_loop 结束）。
 
     调用方（harness __main__）已保证 stdout 为 TTY；此处只负责切换渲染后端。"""
     from renderer import default_renderer
     bus.unsubscribe(default_renderer.on_event)   # 避免 ANSI 后端双份渲染
     try:
-        CCApp(msgs, session_id=session_id).run()
+        CCApp(msgs, session_id=session_id, title=title).run()
     finally:
         bus.subscribe(default_renderer.on_event)
