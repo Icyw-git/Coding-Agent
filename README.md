@@ -548,7 +548,8 @@ python -m pytest
 （`test_exec_policy.py` 测判定矩阵，`test_execution_paths.py` 测四条执行入口的接线，
 `test_sandbox.py` 测 OS 沙箱的启动、拒绝写与失败降级；Windows 集成用例在无法打标签时跳过）等模块。
 全量回归还需要可选的文档依赖（`test_documents.py` / `test_document_render.py`）：
-`python -m pip install -r requirements-docs.txt`；未安装时这两组用例整体跳过，不会收集失败。
+`python -m pip install -r requirements-docs.txt`；未安装时仅跳过 PDF 文本抽取与实际页面渲染用例，
+Office 文本解析、转换命令及工具边界测试仍照常运行。
 测试默认将 `HARNESS_OS_SANDBOX` 固定为 `off`，避免把 `tmp_path` 目录标记为 Low。
 在受限环境中，可为 pytest 指定一个可写的临时目录：
 

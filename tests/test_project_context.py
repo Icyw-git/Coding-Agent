@@ -125,6 +125,20 @@ def test_system_prompt_cache_invalidates_when_file_changes(tmp_path, monkeypatch
     assert 'version one' not in second
 
 
+def test_prompt_debug_output_uses_stderr(monkeypatch, capsys):
+    monkeypatch.setenv('HARNESS_DEBUG', '1')
+    context = {'workspace': 'example', 'enabled_tools': []}
+
+    first = harness.get_system_prompt(context)
+    second = harness.get_system_prompt(context)
+
+    captured = capsys.readouterr()
+    assert first == second
+    assert captured.out == ''
+    assert '[assembled]' in captured.err
+    assert '[cache hit]' in captured.err
+
+
 def test_builtin_and_project_skills_merge_with_project_override(tmp_path, monkeypatch):
     builtin = tmp_path / 'builtin'
     project = tmp_path / 'project'

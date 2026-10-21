@@ -1,14 +1,15 @@
 """系统提示组装与上下文采集。
 
 提示词分段（身份 / 工具 / 工作区 / 技能 / 规则 / 项目说明）属于请求前缀：
-只在内容变化时重建，由 `_prompt_cache` 按 context 指纹缓存。本模块不持有状态，
-client、工具表、技能与工作区都通过 `_h()` 回读 harness，测试里 monkeypatch
-harness 上的入口仍然生效。
+只在内容变化时重建，由 `_prompt_cache` 按 context 指纹缓存。
+模块持有当前执行上下文的提示缓存；工具表、技能与工作区通过 `_h()` 回读 harness，
+以兼容现有入口与测试补丁。后续应由调用方显式传入这些运行时依赖。
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 from contextvars import ContextVar
 
 import project_context
@@ -101,7 +102,8 @@ def get_system_prompt(context: dict) -> str:
     cached = _prompt_cache.get()
     if cached is not None and cached[0] == key:
         if os.getenv('HARNESS_DEBUG') == '1':
-            print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+            print("  \033[90m[cache hit] system prompt unchanged\033[0m",
+                  file=sys.stderr)
         return cached[1]
     prompt = assemble_system_prompt(context)
     _prompt_cache.set((key, prompt))
@@ -111,7 +113,8 @@ def get_system_prompt(context: dict) -> str:
     if context.get('project_instructions'):
         loaded.append('project')
     if os.getenv('HARNESS_DEBUG') == '1':
-        print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+        print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m",
+              file=sys.stderr)
     return prompt
 
 

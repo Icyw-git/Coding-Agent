@@ -159,7 +159,6 @@ BUILTIN_SKILLS_DIR=APP_DIR/"skills"         # 随 harness 分发的内建技能
 scan_skills()   # 扫描内建 + 项目技能目录 → SKILL_REGISTRY（skill_system 内）
 
 
-
 class _LazyLLMClient:
     """延迟构造 OpenAI 客户端：openai SDK 的 import 约 1.5s，CLI/测试进程
     启动时不该为它买单。属性访问透明委托，首次真正调用 LLM 时才加载。"""
@@ -681,71 +680,8 @@ def _report_cache_prefix(session_id: str, request_messages: list,
         pass
 
 
-# ── 记忆 / 压缩 / hooks 逻辑已提取到 agent_core.py ──
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Task tools
-
-
-
-
-
-
-
-
-
-
-
-# ── Cron Tools ──
-
-
-
-
-
-
-
-# ── Team Tools ──
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# 子代理与技能工具在这里接入统一注册表。
 tool_registry['task']=spawn_subagent
-
-
-
 tool_registry['load_skill']=load_skill
 
 # compact 工具：让模型在上下文过长时主动触发历史摘要
@@ -1525,11 +1461,6 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             messages.append(cron_message)
             session_store.append_message(cron_message)
             print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
-
-
-
-
-
 
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，

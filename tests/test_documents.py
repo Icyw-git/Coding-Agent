@@ -11,8 +11,8 @@ import exec_policy
 import harness
 import tools
 
-# PDF 文本层是可选依赖（requirements-docs.txt）：没装时跳过整组，而不是收集失败。
-pytestmark = pytest.mark.skipif(
+# 仅 PDF 文本抽取依赖 pypdf；Office 解析和工具边界在基础环境中也要验证。
+requires_pdf = pytest.mark.skipif(
     importlib.util.find_spec('pypdf') is None,
     reason='pypdf is not installed (requirements-docs.txt)')
 
@@ -179,6 +179,7 @@ def test_detect_kind_and_unsupported():
         documents.extract_document(b'plain text', 'x.txt')
 
 
+@requires_pdf
 def test_pdf_extracts_text_and_page_selection(tmp_path):
     data = _pdf(['First page', 'Second page'])
     output = documents.extract_document(data, 'demo.pdf')
@@ -188,6 +189,7 @@ def test_pdf_extracts_text_and_page_selection(tmp_path):
     assert 'Second page' in selected and 'First page' not in selected
 
 
+@requires_pdf
 def test_pdf_default_page_limit_and_scan_hint():
     many = _pdf([f'Page {index}' for index in range(1, 22)])
     output = documents.extract_document(many, 'many.pdf')
@@ -200,6 +202,7 @@ def test_pdf_default_page_limit_and_scan_hint():
     assert 'no text layer' in output and 'scanned PDF' in output
 
 
+@requires_pdf
 def test_pdf_rejects_bad_page_selection():
     data = _pdf(['one'])
     with pytest.raises(documents.DocumentError, match='1-based'):

@@ -13,8 +13,8 @@ import harness
 import tools
 from test_documents import _docx, _pdf, _pptx, _xlsx
 
-# 渲染依赖（pypdfium2 / Pillow）是可选的（requirements-docs.txt）。
-pytestmark = pytest.mark.skipif(
+# 仅实际渲染依赖可选包；转换命令和权限边界在基础环境中也要验证。
+requires_render = pytest.mark.skipif(
     importlib.util.find_spec('pypdfium2') is None
     or importlib.util.find_spec('PIL') is None,
     reason='document extras are not installed (requirements-docs.txt)')
@@ -31,6 +31,7 @@ def _workspace(tmp_path, monkeypatch):
     return tmp_path
 
 
+@requires_render
 def test_render_pdf_pages_as_png():
     rendered = document_render.render_document(
         _pdf(['First', 'Second', 'Third']), 'demo.pdf', pages='1-2', dpi=72)
@@ -41,6 +42,7 @@ def test_render_pdf_pages_as_png():
         assert image.width > 0 and image.height > 0
 
 
+@requires_render
 def test_render_defaults_to_first_three_and_caps_eight():
     pages = document_render.render_document(
         _pdf([str(number) for number in range(1, 6)]), 'demo.pdf', dpi=72)
@@ -92,6 +94,7 @@ def test_office_conversion_invokes_soffice(monkeypatch):
     assert any('source.docx' in part for part in command)
 
 
+@requires_render
 def test_render_document_returns_cached_image_refs(tmp_path):
     (tmp_path / 'demo.pdf').write_bytes(_pdf(['layout', 'second']))
     result = tools.run_render_document('demo.pdf', pages='1-2', dpi=72)
