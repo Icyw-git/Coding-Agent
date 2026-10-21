@@ -83,6 +83,10 @@ def test_interactive_lock_is_skipped_for_textual(monkeypatch):
     ctx = entrypoint._interactive_lock()
     assert isinstance(ctx, contextlib.nullcontext)
 
+    monkeypatch.setenv('HARNESS_UI', 'textual-next')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
     monkeypatch.setenv('HARNESS_UI', 'ansi')
     assert entrypoint._interactive_lock() is entrypoint.harness.agent_lock
 

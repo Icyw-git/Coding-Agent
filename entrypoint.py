@@ -12,7 +12,7 @@ import harness
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Harness Agent')
     parser.add_argument('--doctor', action='store_true', help='check local configuration and exit')
-    parser.add_argument('--ui', choices=('ansi', 'textual'),
+    parser.add_argument('--ui', choices=('ansi', 'textual', 'textual-next'),
                         help='override HARNESS_UI for this run (ansi keeps native scrollback)')
     parser.add_argument('--resume', metavar='SESSION_ID', help='resume a saved session')
     parser.add_argument('prompt', nargs='?', help='one-shot prompt (enables headless mode)')
@@ -42,7 +42,7 @@ def _interactive_lock():
     让 cron 有机会执行）；entrypoint 再包一层会让 worker 永远拿不到锁——
     表现就是输入后一直停在「正在处理」。
     """
-    if os.getenv('HARNESS_UI', 'ansi') == 'textual':
+    if os.getenv('HARNESS_UI', 'ansi') in ('textual', 'textual-next'):
         return contextlib.nullcontext()
     return harness.agent_lock
 
