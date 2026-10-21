@@ -44,6 +44,8 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 - `/review`：只读子代理审阅未提交改动并输出 P0–P3 分级问题。工具面只有
   `read`/`glob`/`grep`/`ls` 且限制在工作区内，敏感文件既不进 diff 也读不到。
 - `/checkpoint [标签]`、`/checkpoints`、`/rewind`：创建、查看和回溯快照。
+- `/cache [gc [天数] [--apply]]`：查看 `.cache/tool_results` 占用；`/cache gc 7` 预览、
+  加 `--apply` 才会删除「超过保留期且未被任何会话引用」的文件。
 - `/sandbox`：查看并切换执行档位与审批档位，见「执行安全与审批」。
 - `/status` 查看状态，`/quit`（`/exit`）退出。
 
@@ -402,7 +404,9 @@ HARNESS_PERF=1
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
 展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一次快照）、`/revoke`
-（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。每个回合正常结束时，若本轮
+（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。`/cache gc` 默认只预览，
+按文件名匹配会话事件里的引用，宁可少删也不误删；被清理的图片在恢复旧会话时降级为文本。
+每个回合正常结束时，若本轮
 改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
 事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
 飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke` 和 `/sandbox`；

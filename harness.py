@@ -52,6 +52,7 @@ import approval_view  # 审批面的参数渲染（/approvals 列表要显示完
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
 import sandbox
+import tool_cache
 import web_access
 import workspace_diff
 import workspaces
@@ -573,6 +574,9 @@ def run_doctor() -> int:
     print(f'[os-sandbox] {sandbox.ENV}={sandbox.configured_mode()}'
           f'（Windows 低完整性，仅约束 shell 子进程）')
     print(f'[optional] documents: {_document_extras_status()}')
+    cache = tool_cache.scan(TOOL_RESULTS_DIR)
+    print(f"[cache] tool_results: {cache['files']} files, "
+          f"{tool_cache.human_size(cache['bytes'])} (use /cache gc)")
     return 0 if all(passed for _, passed in checks) else 1
 
 
@@ -1105,6 +1109,10 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/diff':
         print(format_workspace_diff(color=sys.stdout.isatty()))
+
+    elif command == '/cache':
+        print(tool_cache.handle_cache_command(
+            TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
 
     elif command == '/review':
         from review import run_review

@@ -13,6 +13,7 @@ def test_commands_include_descriptions_and_resolve_alias(tmp_path):
     completer = SlashCompleter(lambda: tmp_path, lambda: [])
     items = choices(completer, '/')
     assert '/resume' in [item.text for item in items]
+    assert '/cache' in [item.text for item in items]
     assert all(item.display_meta for item in items)
     assert [item.text for item in choices(completer, '/r')] == [
         '/resume', '/review', '/revoke', '/rename', '/rewind']
