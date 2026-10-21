@@ -8,9 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from rich.text import Text
+
 from ui.transcript.model import Block, ConversationModel
 
-Line = str
+Line = str | Text
 RenderBlock = Callable[[Block, int], Sequence[Line]]
 
 
@@ -159,6 +161,19 @@ class TranscriptLayout:
             else:
                 return entry.block_id
         return None
+
+    def line_at(self, line_index: int) -> Line | None:
+        """单行读取（视口按需渲染用）；越界返回 None。"""
+        if line_index < 0 or line_index >= self._total:
+            return None
+        result = self.block_at(line_index)
+        if result is None:
+            return None
+        index = self._index.get(result)
+        if index is None:
+            return None
+        entry = self._entries[index]
+        return entry.lines[line_index - entry.start]
 
     def max_scroll(self, viewport_height: int) -> int:
         return max(0, self._total - max(0, int(viewport_height)))

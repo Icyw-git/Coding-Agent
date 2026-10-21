@@ -2731,3 +2731,15 @@ UI 测试 61 passed。
 
 **测试**：新增 `tests/test_transcript_layout.py`（缓存复用、宽度变化、切片、
 命中测试）；总回归 1109 passed / 1 skipped，UI 66 passed。
+## TUI 重构 P2 起步：虚拟对话视口
+
+- 新增 `VirtualTranscript(ScrollView)`：`virtual_size` 设为总行数，
+  `render_line(y)` 用 `scroll_y + y` 从 `TranscriptLayout` 取单行；
+  行缓存按 `(line, width, model.revision)` 失效，上限 4000 行。
+- 滚动/翻页不触发布局重算（测试里 `render_calls` 保持不变），也不会为视口外
+  的消息创建任何 widget。
+- `follow_end`：布局刷新时若原本贴底则保持贴底；宽度变化触发重排。
+- 测试：200 条消息的 demo App 挂载后 `virtual_size=200`、首行/滚动后首行正确、
+  滚动不重算布局。
+
+**测试**：总回归 1110 passed / 1 skipped；UI 64 passed（另 bridge/integration 11 条）。

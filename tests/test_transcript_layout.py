@@ -85,3 +85,50 @@ def test_block_at_maps_lines_to_blocks():
     assert layout.block_at(2) == 'second'
     assert layout.block_at(3) is None
     assert layout.block_at(-1) is None
+
+
+def test_virtual_transcript_renders_only_viewport():
+    import asyncio
+
+    from textual.app import App, ComposeResult
+
+    from ui.transcript import ConversationModel, TranscriptLayout
+    from ui.transcript.view import VirtualTranscript
+
+    class Demo(App):
+        def __init__(self):
+            super().__init__()
+            self.model = ConversationModel()
+            for index in range(200):
+                self.model.append('user', {'text': f'row-{index}'},
+                                  block_id=f'b{index}')
+            self.doc_layout = TranscriptLayout(
+                lambda block, width: [block.payload['text']])
+            self.view = VirtualTranscript(self.model, self.doc_layout,
+                                          follow_end=False)
+
+        def compose(self) -> ComposeResult:
+            yield self.view
+
+    async def scenario():
+        app = Demo()
+        async with app.run_test(size=(40, 10)) as pilot:
+            await pilot.pause()
+            view = app.view
+            assert view.content_line_count == 200
+            assert view.virtual_size.height == 200
+
+            calls = app.doc_layout.render_calls
+            line = view.render_line(0)
+            assert 'row-0' in str(line.text)
+
+            view.scroll_end(animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert app.doc_layout.render_calls == calls   # 滚动不重算布局
+            assert view.scroll_offset.y > 0
+            top = view.scroll_offset.y
+            assert f'row-{top}' in str(view.render_line(0).text)
+            app._exiting = True
+
+    asyncio.run(scenario())

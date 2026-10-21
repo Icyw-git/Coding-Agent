@@ -7,6 +7,8 @@
   滚动 1.4ms/帧、流式增量 3.2ms。
 - P0 浮层：Textual 8.2 `position:absolute + overlay:screen + offset` 验证通过，
   补全浮层可按 editor 坐标定位且不抢焦点。
+- P2 起步：`VirtualTranscript(ScrollView)` 用 `virtual_size + render_line`
+  只画可见行；滚动不重算布局，视口外不创建 widget。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21
