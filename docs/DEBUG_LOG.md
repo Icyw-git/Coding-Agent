@@ -2533,3 +2533,28 @@ Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI �
 **测试**：`test_ui.py` 新增真实会话的列目录 + 按序号恢复（tmp 会话、
 断言 session_id 与消息历史切回）；总回归 1096 passed / 1 skipped，
 UI 测试 56 passed。
+## TUI 多行输入
+
+**问题**：Textual 的 `Input` 是单行控件，贴一段代码或写多段需求时无法换行；
+行式 REPL 至少还能 `Ctrl-J` 换行。Codex/Pi 的输入区都可以多行编辑。
+
+**做法**：
+
+- 底部输入从 `Input` 换成 `TextArea`（`PromptArea`）：
+  `Enter` 发送、`Ctrl-J` 换行；`Tab` 仍补全 `/` 命令或 `@` 文件；`↑/↓` 在单行时翻历史，
+  多行时保持光标上下移动。
+- 高度随内容增长，CSS `max-height: 8`；粘贴多行内容不再被截成一行。
+- 提交逻辑从 `Input.Submitted` 事件改为 `PromptArea.action_submit → app.submit_text(text)`，
+  测试可以直接调用 `submit_text` 而不依赖控件事件。
+- 忙碌提示从 `placeholder` 改到输入框下方的提示行（`TextArea` 没有 placeholder）：
+  `正在处理当前消息…（已排队 N 条）`，空闲时显示
+  `Enter 发送 · Ctrl-J 换行 · / 命令 · @ 文件 · ↑↓ 历史 · Ctrl+P 面板`。
+
+**取舍**：
+
+- `Shift+Enter` 在部分终端与 `Enter` 不可区分，换行统一用 `Ctrl-J`（与行式 REPL 一致）。
+- `Tab` 仍只补全、不切焦点；多行内容的光标移动交给 `↑/↓/←/→` 原生命令。
+
+**测试**：`test_ui.py` 用 `run_test` 模拟输入 `abc` + `Ctrl-J` + `def` + `Enter`，
+断言输入框保留换行、提交后进入历史且输入清空；其余输入相关测试改用 `.text` /
+`submit_text`。总回归 1096 passed / 1 skipped，UI 测试 57 passed。

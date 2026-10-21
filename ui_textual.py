@@ -25,7 +25,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Collapsible, Input, Markdown, Static
+from textual.widgets import Collapsible, Input, Markdown, Static, TextArea
 
 from file_mentions import format_mention, match_mentions, mention_token, workspace_files
 from ui_events import UIEvent, bus
@@ -87,8 +87,8 @@ Collapsible:focus { border-left: thick $info; }
 .diff-title { margin: 1 2 0 2; color: $muted; }
 
 /* ---- 底部输入框 + 状态栏（dock 固定：输入在上，状态在下） ---- */
-#bottom-bar { dock: bottom; height: 3; background: $surface; }
-#input-line { height: 1; padding: 0 2; background: $surface; color: $text; border: none; }
+#bottom-bar { dock: bottom; height: auto; background: $surface; }
+#input-line { height: auto; max-height: 8; padding: 0 2; background: $surface; color: $text; border: none; }
 #input-line:focus { border: none; }
 #command-hint { height: 1; padding: 0 2; color: $muted; background: $surface; }
 #status-line { height: 1; background: $surface; color: $muted; padding: 0 2; }
@@ -282,22 +282,37 @@ def complete_mention_text(text: str, files: list[str]) -> str | None:
     return f'{text[:start]}{format_mention(matches[0])}'
 
 
-class PromptInput(Input):
-    """输入框按键：Tab 补全 @ 文件/命令，↑↓ 翻历史。"""
+class PromptArea(TextArea):
+    """多行输入：Enter 发送，Ctrl-J 换行，Tab 补全，↑↓ 历史/光标移动。"""
 
     BINDINGS = [
+        Binding('enter', 'submit', 'Send', show=False, priority=True),
+        Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
         Binding('tab', 'complete', 'Complete', show=False),
         Binding('up', 'history_prev', 'History', show=False),
         Binding('down', 'history_next', 'History', show=False),
     ]
 
+    def action_submit(self) -> None:
+        self.app.submit_text(self.text)
+        self.text = ''
+
+    def action_newline(self) -> None:
+        self.insert(chr(10))
+
     def action_complete(self) -> None:
         self.app.complete_input()
 
     def action_history_prev(self) -> None:
+        if chr(10) in self.text:      # 多行时保留光标移动
+            self.move_cursor_relative(rows=-1)
+            return
         self.app.history_prev()
 
     def action_history_next(self) -> None:
+        if chr(10) in self.text:
+            self.move_cursor_relative(rows=1)
+            return
         self.app.history_next()
 
 
@@ -341,8 +356,7 @@ class CCApp(App):
                 yield Static('', id='session-summary')
                 yield Static('', id='recent-tools')
         with Vertical(id="bottom-bar"):
-            yield PromptInput(placeholder="输入消息，Enter 发送 · / 命令 · @ 文件 · Ctrl+P 面板",
-                              id="input-line")
+            yield PromptArea(id="input-line", soft_wrap=True)
             yield Static('', id="command-hint")
             with Horizontal(id="status-line"):
                 yield Static('', id="status-main")
@@ -362,8 +376,9 @@ class CCApp(App):
         self._side_panel = self.query_one('#side-panel', Vertical)
         self._session_summary = self.query_one('#session-summary', Static)
         self._recent_tools_widget = self.query_one('#recent-tools', Static)
-        self._input = self.query_one('#input-line', Input)
+        self._input = self.query_one('#input-line', PromptArea)
         self._command_hint = self.query_one('#command-hint', Static)
+        self._set_hint(self.DEFAULT_HINT)
         self._active_tools: list = []   # 执行中的工具块（FIFO 匹配 tool_end）
         self._last_status: dict = {}    # 最后已知状态指标（thinking/idle 时状态栏常驻显示）
         self._active_widgets: dict = {}   # mid -> 流式中的 assistant Static（增量追加）
@@ -424,19 +439,31 @@ class CCApp(App):
 
     # ---------- 底部输入框：多轮对话 ----------
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if getattr(event.input, 'id', '') != 'input-line':
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if getattr(event.text_area, 'id', '') != 'input-line':
             return
-        self._update_command_hint(event.value)
+        self._update_command_hint(event.text_area.text)
+
+    DEFAULT_HINT = ('Enter 发送 · Ctrl-J 换行 · / 命令 · @ 文件 · '
+                    '↑↓ 历史 · Ctrl+P 面板')
+
+    def _set_hint(self, text: str) -> None:
+        hint = getattr(self, '_command_hint', None)
+        if hint is not None:
+            hint.update(text)
+
+    def _busy_hint(self) -> str:
+        if not self._busy:
+            return self.DEFAULT_HINT
+        queued = self._user_input_q.qsize()
+        return '正在处理当前消息…' + (f'（已排队 {queued} 条）' if queued else '')
 
     def _update_command_hint(self, value: str) -> None:
-        hint = getattr(self, '_command_hint', None)
-        if hint is None:
-            return
         if (value or '').startswith('/'):
-            hint.update(command_hint_text(value))
+            self._set_hint(command_hint_text(value))
             return
-        hint.update(mention_hint_text(value, self._workspace_mention_files()))
+        mention = mention_hint_text(value, self._workspace_mention_files())
+        self._set_hint(mention or self._busy_hint())
 
     def _workspace_mention_files(self) -> list[str]:
         """@ 文件索引：按工作区缓存 5s，避免逐键遍历仓库。"""
@@ -450,50 +477,54 @@ class CCApp(App):
             self._mention_at = now
         return self._mention_files
 
+    def _cursor_to_end(self) -> None:
+        text = self._input.text
+        lines = text.split(chr(10))
+        self._input.cursor_location = (len(lines) - 1, len(lines[-1]))
+
     def complete_input(self) -> None:
         """Tab：优先补全 / 命令，其次 @ 文件。"""
         if not hasattr(self, '_input'):
             return
-        value = self._input.value
+        value = self._input.text
         if value.startswith('/'):
             from cli_commands import COMMANDS
             typed = value.strip().lower()
             for command in COMMANDS:
                 names = (command.name, *command.aliases)
                 if any(name.startswith(typed) for name in names):
-                    self._input.value = command.name
+                    self._input.text = command.name
                     break
         else:
             completed = complete_mention_text(value, self._workspace_mention_files())
             if completed is not None:
-                self._input.value = completed
-        self._input.cursor_position = len(self._input.value)
+                self._input.text = completed
+        self._cursor_to_end()
 
     def history_prev(self) -> None:
         if not self._history or not hasattr(self, '_input'):
             return
         self._history_index = max(0, self._history_index - 1)
-        self._input.value = self._history[self._history_index]
-        self._input.cursor_position = len(self._input.value)
+        self._input.text = self._history[self._history_index]
+        self._cursor_to_end()
 
     def history_next(self) -> None:
         if not self._history or not hasattr(self, '_input'):
             return
         self._history_index = min(len(self._history), self._history_index + 1)
-        self._input.value = ('' if self._history_index >= len(self._history)
-                             else self._history[self._history_index])
-        self._input.cursor_position = len(self._input.value)
+        self._input.text = ('' if self._history_index >= len(self._history)
+                            else self._history[self._history_index])
+        self._cursor_to_end()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter 提交：文本进队列交给 agent 线程，同时渲染为 user 消息。"""
+    def submit_text(self, text: str) -> None:
+        """Enter 发送：命令走命令通道，普通消息进队列（忙时排队）。"""
         if self._exiting:
             return
-        text = (event.value or '').strip()
-        self._input.value = ''
+        text = (text or '').strip()
         if not text:
             return
         command = slash_command(text)
-        if command is not None:      # / 命令不进入对话，交给命令通道
+        if command is not None:      # / 命令不进入对话
             self._update_command_hint('')
             self.execute_command(command)
             return
@@ -501,7 +532,6 @@ class CCApp(App):
         self._history_index = len(self._history)
         self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
         self._user_input_q.put(text)
-        # 回合中继续输入 → 排队，当前回合结束后按顺序执行（与行式 REPL 一致）
         self._set_input_busy(True)
 
     def action_quit(self) -> None:
@@ -542,7 +572,7 @@ class CCApp(App):
             import turn_control
             turn_control.request_cancel()
             if hasattr(self, '_input'):
-                self._input.placeholder = '正在取消当前请求…'
+                self._set_hint('正在取消当前请求…')
             return
         if self._chat is not None:
             self._chat.scroll_end(animate=False)
@@ -784,17 +814,10 @@ class CCApp(App):
         queued = self._user_input_q.qsize()
         busy = busy or bool(queued)
         self._busy = busy
-        if not hasattr(self, '_input'):
-            return
-        self._input.disabled = False
-        if busy:
-            hint = f'（已排队 {queued} 条）' if queued else ''
-            self._input.placeholder = f'正在处理当前消息…{hint}'
-        else:
-            self._input.placeholder = (
-                '输入消息，Enter 发送 · / 命令 · @ 文件 · Ctrl+P 面板')
-        if not busy and not self._exiting:
-            self._input.focus()
+        if hasattr(self, '_input'):
+            self._set_hint(self._busy_hint())
+            if not busy and not self._exiting:
+                self._input.focus()
         self._refresh_status_line()
 
     async def _consume_events(self) -> None:

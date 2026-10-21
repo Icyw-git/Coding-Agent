@@ -501,6 +501,7 @@ python entrypoint.py
 `python harness.py --ui ansi`。TUI 与行式 REPL 行为对齐：回合进行中可以继续输入
 （消息排队，按顺序执行，状态行显示 `N queued`）；`@` 列出并补全工作区文件（Tab）；
 `↑`/`↓` 翻输入历史；状态栏显示模型、git 分支、执行档位与上下文占用；
+输入框支持多行：`Enter` 发送、`Ctrl-J` 换行（高度随内容增长，最多 8 行）。
 回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。TUI 的 `/sessions` 与
 `/resume <序号|ID前缀|标题>` 直接使用会话事件流（与行式 `/resume` 同一份数据），
 不再列 transcript 快照。

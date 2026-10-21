@@ -703,7 +703,6 @@ def test_slash_command_and_hint_text():
 
 def test_textual_input_shows_slash_hints_and_routes_commands():
     import asyncio
-    from types import SimpleNamespace
 
     pytest.importorskip('textual')
     import ui_textual
@@ -722,12 +721,12 @@ def test_textual_input_shows_slash_hints_and_routes_commands():
     async def scenario():
         app = ui_textual.CCApp([])
         async with app.run_test() as pilot:
-            app._input.value = '/he'
+            app._input.text = '/he'
             await pilot.pause()
             await asyncio.sleep(0.02)
             assert '/help' in str(app.query_one('#command-hint').render())
 
-            app.on_input_submitted(SimpleNamespace(value='/help'))
+            app.submit_text('/help')
             await pilot.pause()
             await asyncio.sleep(0.05)
             assert 'Commands:' in chat_text(app)
@@ -757,18 +756,17 @@ def test_textual_queues_input_while_busy():
     pytest.importorskip('textual')
     import ui_textual
 
+    hints = []
     app = ui_textual.CCApp([])
-    app._input = SimpleNamespace(value='', disabled=False, placeholder='',
-                                 cursor_position=0, focus=lambda: None)
-    app._command_hint = SimpleNamespace(update=lambda text: None)
+    app._input = SimpleNamespace(text='', focus=lambda: None)
+    app._command_hint = SimpleNamespace(update=hints.append)
     app._refresh_status_line = lambda: None   # 无挂载：状态行由 run_test 用例覆盖
     app._set_input_busy(True)
 
-    app.on_input_submitted(SimpleNamespace(value='second'))
+    app.submit_text('second')
 
     assert app._user_input_q.qsize() == 1     # 回合中提交 → 排队
-    assert app._input.disabled is False       # 仍可继续输入
-    assert '已排队' in app._input.placeholder
+    assert any('已排队' in text for text in hints)
     assert 'queued' in app._queue_suffix()
 
 
@@ -784,13 +782,13 @@ def test_textual_input_history_navigation():
             app._history = ['first', 'second']
             app._history_index = len(app._history)
             app.history_prev()
-            assert app._input.value == 'second'
+            assert app._input.text == 'second'
             app.history_prev()
-            assert app._input.value == 'first'
+            assert app._input.text == 'first'
             app.history_next()
-            assert app._input.value == 'second'
+            assert app._input.text == 'second'
             app.history_next()
-            assert app._input.value == ''
+            assert app._input.text == ''
             app._exiting = True
             app._user_input_q.put(None)
 
@@ -805,17 +803,18 @@ def test_escape_cancels_a_running_turn(monkeypatch):
     import ui_textual
 
     calls = []
+    hints = []
     monkeypatch.setattr(turn_control, 'request_cancel',
                         lambda: calls.append(True))
     app = ui_textual.CCApp([])
-    app._input = SimpleNamespace(value='', disabled=False, placeholder='',
-                                 cursor_position=0, focus=lambda: None)
+    app._input = SimpleNamespace(text='', focus=lambda: None)
     app._busy = True
+    app._set_hint = lambda text: hints.append(text)
 
     app.action_jump_bottom()
 
     assert calls == [True]
-    assert '取消' in app._input.placeholder
+    assert any('取消' in text for text in hints)
 
 
 def test_tui_sessions_list_and_resume_real_session(tmp_path, monkeypatch):
@@ -852,6 +851,35 @@ def test_tui_sessions_list_and_resume_real_session(tmp_path, monkeypatch):
             await pilot.pause()
             assert app._session_id == 'tui-resume'
             assert any(m.get('content') == '旧会话的目标' for m in app._msgs)
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())
+
+
+def test_multiline_input_ctrl_j_newline_enter_submit(monkeypatch):
+    import asyncio
+
+    pytest.importorskip('textual')
+    import harness
+    import ui_textual
+
+    monkeypatch.setattr(harness, 'agent_loop', lambda *args, **kwargs: 'ok')
+
+    async def scenario():
+        app = ui_textual.CCApp([])
+        async with app.run_test() as pilot:
+            app._input.focus()
+            await pilot.press('a', 'b', 'c')
+            await pilot.press('ctrl+j')
+            await pilot.press('d', 'e', 'f')
+            assert app._input.text == 'abc' + chr(10) + 'def'
+
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._history[-1] == 'abc' + chr(10) + 'def'
+            assert app._input.text == ''
+
             app._exiting = True
             app._user_input_q.put(None)
 
