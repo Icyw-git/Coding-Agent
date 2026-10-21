@@ -579,6 +579,9 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/project_context.py` | 工作区 AGENTS.md / CLAUDE.md 注入：路径边界、32 KiB 截断与缓存 |
 | `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |
 | `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
+| `src/tool_patch.py` | `apply_patch` 解析、规划与原子回滚；路径解析/审批/checkpoint 由 tools 注入 |
+| `src/tool_text.py` | 文件文本 BOM/编码探测、二进制拒绝与换行符保留 |
+| `src/tool_cache.py` | `/cache`：`.cache/tool_results` 统计与引用保护回收 |
 | `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
 | `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |

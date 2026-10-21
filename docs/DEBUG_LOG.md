@@ -1576,3 +1576,40 @@ Office 文本抽取走标准库，PDF 文本抽取与页面渲染需要可选包
 
 - 无界增长点的第一步不是「自动清理」，而是把「什么是可删的」写成可测试的规则。
 - 生命周期命令要和已有破坏性命令一致：先预览、再执行，输出里给出保留原因计数。
+## 拆分 apply_patch 与文件文本原语
+
+**问题**：`tools.py` 2235 行，补丁解析/规划/回滚和文件编码判定都埋在同一个文件里。
+这两块都不依赖工具注册表，却因为 `safe_path`、`_capture_checkpoint`、`_gate()` 都在
+tools 里而无法搬走；直接 `import tools` 会形成循环依赖。
+
+**做法**：
+
+- `src/tool_text.py`：`decode_text` / `encode_text` / `read_text_file` / `detect_newline`
+  与 `BinaryFileError`。只处理字节，不碰路径和工作区，read/edit/patch/grep 共用。
+- `src/tool_patch.py`：`parse_patch` / `patch_paths` / `_apply_hunks` / `_plan_patch` /
+  `_apply_plans`，对外 `apply_patch(patch, cwd, resolve=, capture=, gate=)`。路径解析、
+  checkpoint 捕获与无头审批门由调用方注入，模块本身不 import harness 或 tools。
+- `tools.py` 保留 `run_apply_patch` 薄包装，把 `safe_path`、`_capture_checkpoint` 和
+  `_gate().enforce_headless` 传进去；`PatchError` / `parse_patch` / `patch_paths`
+  继续从 tools 再导出给 `hooks.py` 和策略层。
+- 新增 `tests/test_tool_patch.py`（注入顺序、审批拒绝不落盘、回滚）和
+  `tests/test_tool_text.py`（BOM/GB18030/二进制/换行）。
+
+**踩过的坑**：
+
+- 循环依赖不能靠 `import tools` 或 `_h()` 绕过：`tools` 要导入提取后的模块，提取后的
+  模块又需要 tools 的 `safe_path`。把三个协作者做成参数注入，依赖方向立刻变单向。
+- 再导出的名字会被 Ruff 当未使用删掉：`hooks.py` 从 tools 取 `PatchError`，提取后必须
+  显式 `# noqa: F401` 保留再导出行，并注明这是统一工具面。
+- 换行符与编码必须随补丁一起保留：`encode_text` 用原文件的 encoding/newline 回写，
+  否则一次 apply_patch 会把 CRLF/UTF-16 文件整体改写。
+- 回滚测试不要依赖真实权限失败：用「父路径是文件」制造 `mkdir` 失败，稳定且跨平台。
+
+**测试**：`tests/` 1001 passed / 1 skipped；`ruff check` 通过；
+`tools.py` 2235 → 1893 行，新增模块 380 行。
+
+**收获**：
+
+- 拆大文件的顺序：先找「不依赖注册表」的纯逻辑，再把它的外部依赖做成参数。
+- 纯逻辑下沉后，每个模块都能用临时目录 + 假注入独立测试，不必启动整个工具面。
+- 兼容层（薄包装 + 再导出）比改所有调用点便宜，但再导出必须显式声明用途。

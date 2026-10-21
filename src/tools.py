@@ -2,7 +2,6 @@
 可变全局（WORKDIR 等）由 harness 持有，通过 _h() 在运行时读取（便于测试 patch）。
 """
 import ast
-import codecs
 import hashlib
 import json
 import os
@@ -27,6 +26,16 @@ from exec_policy import is_secret_path, resolve_tool_path
 from process_utils import close_process, kill_process_tree
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
+
+# hooks / 策略层从这里取补丁解析入口，保持 tools 作为统一工具面。
+from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
+from tool_patch import apply_patch as _apply_patch
+from tool_text import (
+    BinaryFileError,
+    decode_text,
+    encode_text,
+    read_text_file,
+)
 from worktree import create_worktree, keep_worktree, remove_worktree
 
 
@@ -851,79 +860,6 @@ def safe_path(p: str, cwd: str = None) -> Path:
     return resolve_tool_path(p, cwd=cwd, workspace=_h().get_workdir())
 
 
-class _BinaryFileError(ValueError):
-    pass
-
-
-_TEXT_BOMS = (
-    (codecs.BOM_UTF32_LE, 'utf-32'),
-    (codecs.BOM_UTF32_BE, 'utf-32'),
-    (codecs.BOM_UTF8, 'utf-8-sig'),
-    (codecs.BOM_UTF16_LE, 'utf-16'),
-    (codecs.BOM_UTF16_BE, 'utf-16'),
-)
-
-_BINARY_MAGIC = (
-    b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'GIF87a', b'GIF89a',
-    b'%PDF-', b'PK\x03\x04', b'\x7fELF', b'MZ',
-)
-
-
-def _looks_binary_text(text: str) -> bool:
-    sample = text[:4096]
-    if not sample:
-        return False
-    controls = sum(1 for ch in sample if ord(ch) < 32 and ch not in '\n\r\t')
-    return controls > max(8, len(sample) // 100)
-
-
-def _decode_text(data: bytes) -> tuple[str, str]:
-    """按 BOM → UTF-8 → GB18030 解码；二进制内容抛 _BinaryFileError。
-
-    文件工具对编码的判断必须一致：read 看到的中文、edit 回写的编码和 grep
-    搜索的内容都走这里，否则 Windows 上 GBK/UTF-16 文件会在不同工具间表现分裂。
-    """
-    for bom, encoding in _TEXT_BOMS:
-        if data.startswith(bom):
-            return data.decode(encoding), encoding
-    if data.startswith(_BINARY_MAGIC):
-        raise _BinaryFileError('binary file (not text)')
-    if b'\x00' in data:
-        raise _BinaryFileError('binary file (contains NUL bytes)')
-    try:
-        return data.decode('utf-8'), 'utf-8'
-    except UnicodeDecodeError:
-        pass
-    try:
-        text = data.decode('gb18030')
-    except UnicodeDecodeError:
-        return data.decode('utf-8', errors='replace'), 'utf-8'
-    if _looks_binary_text(text):
-        raise _BinaryFileError('binary file (not text)')
-    return text, 'gb18030'
-
-
-def _detect_newline(text: str) -> str:
-    if '\r\n' in text:
-        return '\r\n'
-    if '\r' in text:
-        return '\r'
-    return '\n'
-
-
-def _read_text_file(path: Path) -> tuple[str, str, str]:
-    """返回 (统一为 \\n 的文本, 编码, 原换行符)。"""
-    text, encoding = _decode_text(path.read_bytes())
-    newline = _detect_newline(text)
-    return text.replace('\r\n', '\n').replace('\r', '\n'), encoding, newline
-
-
-def _encode_text(text: str, encoding: str, newline: str) -> bytes:
-    if newline != '\n':
-        text = text.replace('\r\n', '\n').replace('\n', newline)
-    return text.encode(encoding)
-
-
 def _capture_checkpoint(path: Path) -> None:
     """把「写入前」的内容交给当前活跃 checkpoint 节点；无活跃 manager 时静默跳过。"""
     manager = _h().active_checkpoint_manager()
@@ -1005,7 +941,7 @@ def run_view_image(path: str, cwd: str = None) -> ImageResult | str:
             'bytes': len(data),
             'tokens': estimate_image_tokens(data),
         }])
-    except _BinaryFileError as exc:
+    except BinaryFileError as exc:
         return f'Error: {exc}'
     except Exception as exc:
         return f'Error: {exc}'
@@ -1090,7 +1026,7 @@ def run_read(path: str, limit: Optional[int] = None,
         if file_path.suffix.lower() in _DOCUMENT_SUFFIXES:
             return (f'Error: {file_path.suffix} is a document; use read_document '
                     'to extract its text')
-        text, _encoding, _newline = _read_text_file(file_path)
+        text, _encoding, _newline = read_text_file(file_path)
         lines = text.splitlines()
         total = len(lines)
         if offset >= total:
@@ -1103,7 +1039,7 @@ def run_read(path: str, limit: Optional[int] = None,
         if end < total:
             chunk += f'\n... ({total - end} more lines; use offset={end})'
         return chunk if chunk else '(empty file)'
-    except _BinaryFileError as exc:
+    except BinaryFileError as exc:
         return f'Error: {exc}'
     except Exception as e:
         return f"Error: {e}"
@@ -1120,12 +1056,12 @@ def run_write(path: str, content: str, cwd: str = None) -> str:
         encoding, newline = 'utf-8', '\n'
         if file_path.is_file():
             try:
-                _text, encoding, newline = _read_text_file(file_path)
-            except _BinaryFileError:
+                _text, encoding, newline = read_text_file(file_path)
+            except BinaryFileError:
                 return f'Error: refusing to overwrite binary file: {path}'
         _capture_checkpoint(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(_encode_text(content, encoding, newline))
+        file_path.write_bytes(encode_text(content, encoding, newline))
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -1140,7 +1076,7 @@ def run_edit(path: str, old_text: str, new_text: str,
         if not old_text:
             return 'Error: old_text must not be empty'
         file_path = safe_path(path, cwd)
-        text, encoding, newline = _read_text_file(file_path)
+        text, encoding, newline = read_text_file(file_path)
         count = text.count(old_text)
         if count == 0:
             return f"Error: text not found in {path}"
@@ -1150,300 +1086,22 @@ def run_edit(path: str, old_text: str, new_text: str,
         updated = text.replace(old_text, new_text) if replace_all \
             else text.replace(old_text, new_text, 1)
         _capture_checkpoint(file_path)   # 确认能改再抓 pre-image，避免记下无意义的快照
-        file_path.write_bytes(_encode_text(updated, encoding, newline))
+        file_path.write_bytes(encode_text(updated, encoding, newline))
         return f"Edited {path}"
-    except _BinaryFileError as exc:
+    except BinaryFileError as exc:
         return f'Error: {exc}'
     except Exception as e:
         return f"Error: {e}"
 
 
-PATCH_BEGIN = '*** Begin Patch'
-PATCH_END = '*** End Patch'
-_PATCH_FILE_HEADER = re.compile(
-    r'^\*\*\* (Add File|Update File|Delete File):\s*(.+?)\s*$')
-_PATCH_MOVE_HEADER = re.compile(r'^\*\*\* Move to:\s*(.+?)\s*$')
-
-
-class PatchError(ValueError):
-    pass
-
-
-def _parse_hunk(raw: dict, path: str, number: int) -> dict:
-    old, new = [], []
-    for line in raw['lines']:
-        if line == '':
-            old.append('')
-            new.append('')
-        elif line[0] == ' ':
-            old.append(line[1:])
-            new.append(line[1:])
-        elif line[0] == '-':
-            old.append(line[1:])
-        elif line[0] == '+':
-            new.append(line[1:])
-    if not old and raw['hint'] is None:
-        raise PatchError(
-            f'{path}: hunk {number} needs context lines or a @@ anchor')
-    return {'hint': raw['hint'], 'old': old, 'new': new}
-
-
-def parse_patch(patch: str) -> list[dict]:
-    """解析 Codex 风格的 *** Begin Patch 文本，返回文件操作列表。
-
-    只做语法解析，不读盘、不判定路径；策略层用 patch_paths 取路径，
-    handler 用本函数的结果做两阶段（先规划、后写盘）应用。
-    """
-    if not isinstance(patch, str) or not patch.strip():
-        raise PatchError('empty patch')
-    lines = patch.splitlines()
-    index = 0
-    while index < len(lines) and not lines[index].strip():
-        index += 1
-    if index >= len(lines) or lines[index].strip() != PATCH_BEGIN:
-        raise PatchError(f"patch must start with '{PATCH_BEGIN}'")
-    index += 1
-    ops = []
-    seen_end = False
-    while index < len(lines):
-        raw = lines[index]
-        if raw.strip() == PATCH_END:
-            seen_end = True
-            index += 1
-            break
-        if not raw.strip():
-            index += 1
-            continue
-        match = _PATCH_FILE_HEADER.match(raw)
-        if not match:
-            raise PatchError(
-                f'line {index + 1}: expected file header, got {raw[:60]!r}')
-        kind = match.group(1).lower().split()[0]
-        path = match.group(2)
-        index += 1
-        move_to = None
-        if kind == 'update':
-            while index < len(lines) and not lines[index].strip():
-                index += 1
-            if index < len(lines) and lines[index].startswith('*** Move to:'):
-                move_match = _PATCH_MOVE_HEADER.match(lines[index])
-                if not move_match:
-                    raise PatchError(f'line {index + 1}: invalid move header')
-                move_to = move_match.group(1)
-                index += 1
-        if kind == 'delete':
-            ops.append({'kind': 'delete', 'path': path})
-            continue
-        if kind == 'add':
-            content = []
-            while index < len(lines) and not lines[index].startswith('*** '):
-                line = lines[index]
-                if line.startswith('\\'):
-                    index += 1
-                    continue
-                if line.startswith('+'):
-                    content.append(line[1:])
-                elif line == '':
-                    content.append('')
-                else:
-                    raise PatchError(
-                        f'line {index + 1}: added lines must start with "+"')
-                index += 1
-            if not content:
-                raise PatchError(f'add file {path!r} has no content')
-            text = '\n'.join(content)
-            ops.append({'kind': 'add', 'path': path,
-                        'content': text if text.endswith('\n') else text + '\n'})
-            continue
-        hunks = []
-        current = {'hint': None, 'lines': []}
-        while index < len(lines) and not lines[index].startswith('*** '):
-            line = lines[index]
-            if line.startswith('@@'):
-                if current['hint'] is not None or current['lines']:
-                    hunks.append(current)
-                current = {'hint': line[2:].strip() or None, 'lines': []}
-            elif line.startswith('\\'):
-                pass
-            elif line.startswith((' ', '+', '-')) or line == '':
-                current['lines'].append(line)
-            else:
-                raise PatchError(
-                    f'line {index + 1}: hunk lines must start with '
-                    '" ", "+" or "-"')
-            index += 1
-        if current['hint'] is not None or current['lines']:
-            hunks.append(current)
-        if not hunks and move_to is None:
-            raise PatchError(f'update file {path!r} has no hunks')
-        ops.append({'kind': 'update', 'path': path, 'move_to': move_to,
-                    'hunks': [_parse_hunk(hunk, path, number)
-                              for number, hunk in enumerate(hunks, 1)]})
-    if not seen_end:
-        raise PatchError(f"missing '{PATCH_END}'")
-    if any(line.strip() for line in lines[index:]):
-        raise PatchError(f'content after {PATCH_END}')
-    if not ops:
-        raise PatchError('patch affects no files')
-    return ops
-
-
-def patch_paths(patch: str) -> list[str]:
-    """补丁涉及的全部路径（含 move 目标），供策略层做整批路径判定。"""
-    paths = []
-    for op in parse_patch(patch):
-        paths.append(op['path'])
-        if op.get('move_to'):
-            paths.append(op['move_to'])
-    return paths
-
-
-def _apply_hunks(text: str, hunks: list[dict], path: str) -> str:
-    trailing_newline = text.endswith('\n')
-    lines = text.splitlines()
-    cursor = 0
-    for number, hunk in enumerate(hunks, 1):
-        old, new, hint = hunk['old'], hunk['new'], hunk['hint']
-        if hint is not None:
-            anchors = [i + 1 for i in range(cursor, len(lines))
-                       if lines[i] == hint or hint in lines[i]]
-            if not anchors:
-                raise PatchError(
-                    f'{path}: hunk {number}: anchor not found: {hint!r}')
-            if old:
-                matches = [anchor for anchor in anchors
-                           if lines[anchor:anchor + len(old)] == old]
-                if not matches:
-                    raise PatchError(
-                        f'{path}: hunk {number}: context not found after anchor')
-                if len(matches) > 1:
-                    raise PatchError(
-                        f'{path}: hunk {number}: context is ambiguous; '
-                        'add more context lines')
-                index = matches[0]
-            else:
-                if len(anchors) > 1:
-                    raise PatchError(
-                        f'{path}: hunk {number}: anchor is ambiguous')
-                index = anchors[0]
-        else:
-            matches = [i for i in range(cursor, len(lines) - len(old) + 1)
-                       if lines[i:i + len(old)] == old]
-            if not matches:
-                raise PatchError(f'{path}: hunk {number}: context not found')
-            if len(matches) > 1:
-                raise PatchError(
-                    f'{path}: hunk {number}: context is ambiguous; '
-                    'add more context lines')
-            index = matches[0]
-        lines[index:index + len(old)] = new
-        cursor = index + len(new)
-    result = '\n'.join(lines)
-    return result + '\n' if trailing_newline else result
-
-
-def _plan_patch(ops: list[dict], cwd: str | None) -> list[dict]:
-    plans = []
-    touched = set()
-
-    def reserve(path: Path, what: str) -> None:
-        key = os.path.normcase(str(path))
-        if key in touched:
-            raise PatchError(f'{what} touches the same file twice: {path}')
-        touched.add(key)
-
-    for op in ops:
-        source = safe_path(op['path'], cwd)
-        if op['kind'] == 'add':
-            reserve(source, 'add')
-            if source.exists():
-                raise PatchError(f'add file already exists: {source}')
-            plans.append({'kind': 'write', 'path': source,
-                          'data': _encode_text(op['content'], 'utf-8', '\n')})
-            continue
-        if not source.is_file():
-            raise PatchError(f'{op["kind"]} file not found: {source}')
-        text, encoding, newline = _read_text_file(source)
-        if op['kind'] == 'delete':
-            reserve(source, 'delete')
-            plans.append({'kind': 'delete', 'path': source})
-            continue
-        reserve(source, 'update')
-        updated = _apply_hunks(text, op['hunks'], str(source))
-        data = _encode_text(updated, encoding, newline)
-        move_to = op.get('move_to')
-        if not move_to:
-            plans.append({'kind': 'write', 'path': source, 'data': data})
-            continue
-        dest = safe_path(move_to, cwd)
-        reserve(dest, 'move target')
-        if dest.exists():
-            raise PatchError(f'move target already exists: {dest}')
-        plans.append({'kind': 'move', 'path': source, 'dest': dest, 'data': data})
-    return plans
-
-
-def _apply_plans(plans: list[dict]) -> None:
-    """写盘并保留回滚副本：任何一个文件失败，已改文件恢复原样。"""
-    backups = []
-    seen = set()
-    for plan in plans:
-        paths = ([plan['path'], plan['dest']]
-                 if plan['kind'] == 'move' else [plan['path']])
-        for path in paths:
-            key = os.path.normcase(str(path))
-            if key in seen:
-                continue
-            seen.add(key)
-            _capture_checkpoint(path)
-            backups.append((path, path.read_bytes() if path.is_file() else None))
-    try:
-        for plan in plans:
-            if plan['kind'] == 'delete':
-                plan['path'].unlink()
-            elif plan['kind'] == 'write':
-                plan['path'].parent.mkdir(parents=True, exist_ok=True)
-                plan['path'].write_bytes(plan['data'])
-            else:
-                plan['dest'].parent.mkdir(parents=True, exist_ok=True)
-                plan['dest'].write_bytes(plan['data'])
-                plan['path'].unlink()
-    except Exception:
-        for path, old in reversed(backups):
-            try:
-                if old is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    path.write_bytes(old)
-            except OSError:
-                pass
-        raise
-
-
 def run_apply_patch(patch: str, cwd: str = None) -> str:
-    try:
-        ops = parse_patch(patch)
-    except PatchError as exc:
-        return f'Error: invalid patch: {exc}'
-    gate_args = {'patch': patch}
-    if cwd:
-        gate_args['cwd'] = cwd
-    denied = _gate().enforce_headless('apply_patch', gate_args)
-    if denied:
-        return denied
-    try:
-        plans = _plan_patch(ops, cwd)
-        _apply_plans(plans)
-    except PatchError as exc:
-        return f'Error: patch not applied: {exc}'
-    except Exception as exc:
-        return f'Error: patch not applied: {exc}'
-    updates = sum(1 for plan in plans if plan['kind'] == 'write')
-    adds = sum(1 for op in ops if op['kind'] == 'add')
-    deletes = sum(1 for op in ops if op['kind'] == 'delete')
-    moves = sum(1 for plan in plans if plan['kind'] == 'move')
-    return (f'Applied patch: {updates} updated, {adds} added, '
-            f'{deletes} deleted, {moves} moved')
+    """审批门、路径解析与 checkpoint 捕获由 tools 注入，实现见 tool_patch。"""
+    return _apply_patch(
+        patch, cwd,
+        resolve=safe_path,
+        capture=_capture_checkpoint,
+        gate=lambda name, args: _gate().enforce_headless(name, args),
+    )
 
 
 MAX_SEARCH_BYTES = 2 * 1024 * 1024
@@ -1661,8 +1319,8 @@ def run_grep(pattern: str, path: str = '.', glob: str = None,
             except OSError:
                 continue
             try:
-                text, _encoding = _decode_text(data)
-            except _BinaryFileError:
+                text, _encoding = decode_text(data)
+            except BinaryFileError:
                 continue
             try:
                 display = str(candidate.relative_to(root)) \
