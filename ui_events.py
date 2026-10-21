@@ -61,6 +61,10 @@ class UIEventBus:
                 except Exception:
                     pass    # 渲染异常不拖垮业务
 
+    def has_subscribers(self) -> bool:
+        with self._lock:
+            return bool(self._subs)
+
     def subscribe(self, cb: Callable[[UIEvent], None]) -> None:
         with self._lock:
             self._subs.append(cb)

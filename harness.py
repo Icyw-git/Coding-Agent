@@ -219,6 +219,8 @@ client = _LazyLLMClient()
 from ui_events import PermissionGate, bus  # noqa: E402  UI 依赖放在配置区之后
 
 permission_gate = PermissionGate(bus)
+from ui_bridge import METRICS, status_payload, streaming_enabled  # noqa: E402
+from ui_bridge import emit as ui_emit
 
 
 def __getattr__(name):
@@ -445,6 +447,40 @@ def format_session_list(limit: int = 20) -> str:
     return '\n\n'.join(session_label(row) for row in rows)
 
 
+# ---------- 转录导出（Textual / 命令面板共用）----------
+
+def export_session(messages) -> Path:
+    """把当前会话写出一份 transcript，返回路径（复用 agent_core 的唯一写入实现）。"""
+    return write_transcript(messages)
+
+
+def list_transcripts() -> list[Path]:
+    """最近优先的 transcript 列表；目录不存在时返回空列表。"""
+    try:
+        return sorted(TRANSCRIPT_DIR.glob('transcript_*.jsonl'),
+                      key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def load_transcript(path) -> list[dict]:
+    """读回一份 transcript；坏行跳过，不因一行损坏丢掉整场会话。"""
+    records = []
+    try:
+        with open(path, encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return records
+
+
 # ---------- 执行档位（/sandbox）----------
 # 档位只描述「策略层怎么判」，不代表内核强制：见 exec_policy 模块头的边界说明。
 SANDBOX_MODE_HELP = (
@@ -643,6 +679,24 @@ def _default_context_limit()->int:
     return max(4000,int((int(window)-OUTPUT_RESERVE)*CTX_SAFETY))
 
 CONTEXT_LIMIT=_default_context_limit()
+
+
+def _context_window(model: str) -> int:
+    """状态行显示用的真实窗口（不是压缩阈值 CONTEXT_LIMIT）。"""
+    window = os.getenv('LLM_CONTEXT_WINDOW') or MODEL_WINDOWS.get(model)
+    return int(window) if window else CONTEXT_LIMIT
+
+
+def update_panel_status(messages=None, *, model=None, ctx_tokens=None,
+                        ctx_source=None) -> None:
+    """把当前用量/上下文占用发给 UI 状态行；无订阅者时是空操作。"""
+    model = model or os.getenv('LLM_MODEL_ID', '')
+    if ctx_tokens is None:
+        ctx_tokens = estimate_size(messages) if messages else 0
+        ctx_source = ctx_source or 'estimated'
+    ui_emit('status', **status_payload(
+        model=model, workdir=get_workdir(), ctx_tokens=int(ctx_tokens),
+        ctx_source=ctx_source or 'confirmed', window=_context_window(model)))
 KEEP_RECENT=6
 PERSIST_THERSHOLD=10000
 TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）
@@ -835,6 +889,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     images = []
     background_started = False
     started = time.perf_counter()
+    ui_emit('tool_start', name=name, args=args)
     if blocked:
         output = blocked
     elif name not in registry:
@@ -856,6 +911,17 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
             # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
             output = f"Error: {e}"
     elapsed = time.perf_counter() - started
+    text_output = str(output)
+    failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
+    ui_emit('tool_end', name=name, args=args,
+            output_preview=text_output[:2000], output_len=len(text_output),
+            ok=not (blocked or failed),
+            outcome=('denied' if blocked else
+                     'queued' if background_started else
+                     'failed' if failed else 'completed'),
+            background=background_started,
+            duration_ms=round(elapsed * 1000))
+    METRICS.record_tool()
     if on_activity is not None:
         from tool_activity import is_failure, result_hint
         on_activity(name, args, elapsed, is_failure(output),
@@ -1609,6 +1675,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '',
             system=system)
 
+        request_started = time.monotonic()
+        stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
+        ui_emit('activity', state='thinking', detail='Requesting model response')
+
         def _create(): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
@@ -1620,12 +1690,17 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
-            if on_delta is None:
+            if on_delta is None and not streaming_enabled():
                 return client.chat.completions.create(**kwargs)
 
-            def _delta_hook(part):
+            def _delta_hook(part, probe=stream_probe, hook=on_delta):  # noqa: B023
+                if not probe['started']:
+                    probe['started'] = True
+                    ui_emit('assistant_start', mid=probe['mid'])
+                ui_emit('assistant_delta', mid=probe['mid'], delta=part)
                 streamed_parts.append(part)
-                on_delta(part)
+                if hook is not None:
+                    hook(part)
 
             streamed_parts.clear()   # 标记只反映最近一次调用
             return _stream_completion(kwargs, _delta_hook)
@@ -1650,6 +1725,18 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 # 聚合口径由 usage_totals() 求和保持不变）
                 session_store.append('usage', **detail)
                 ctx_tokens = detail['prompt']   # 压缩判据锚点：本请求真实大小
+                METRICS.record_usage(detail)
+                ui_emit('round_end', round=turn_no,
+                        prompt_tokens=detail['prompt'],
+                        completion_tokens=detail['completion'],
+                        total_tokens=detail['total'],
+                        cached_tokens=detail['cached'],
+                        duration_ms=round(
+                            (time.monotonic() - request_started) * 1000),
+                        compressed=False)
+                update_panel_status(messages, model=detail['model'],
+                                    ctx_tokens=detail['prompt'],
+                                    ctx_source='confirmed')
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
@@ -1683,6 +1770,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             }
         messages.append(assistant_message) #添加模型回复到上下文
         session_store.append_message(assistant_message)
+        if stream_probe['started']:
+            ui_emit('assistant_end', mid=stream_probe['mid'])
+        elif assistant_message.get('content'):
+            ui_emit('assistant_text', text=str(assistant_message['content']))
         if ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
             ctx_tokens += estimate_size([assistant_message])
 
@@ -1759,6 +1850,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                                                 if th.is_alive()]
                     _housekeeping_threads.append(housekeeping_thread)
                 housekeeping_thread.start()
+            ui_emit('session_end', summary=METRICS.snapshot())
+            ui_emit('activity', state='complete', detail='Response complete')
             return message.content or "No output"
 
 
@@ -1784,6 +1877,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 hooks.preflight_judge(batch)  # noqa: B023
                 _run_tool_batch(batch, session_store, tool_messages,  # noqa: B023
                                 on_event=on_event)
+                ui_emit('activity', state='thinking',
+                        detail='Reviewing tool result')
+                if ctx_tokens is not None:   # noqa: B023  只复用已知用量
+                    update_panel_status(messages, ctx_tokens=ctx_tokens,  # noqa: B023
+                                        ctx_source='confirmed')
             batch.clear()  # noqa: B023
 
         for tool_call in message.tool_calls:
@@ -1944,6 +2042,8 @@ def run_repl(initial_messages:list, session_store=None):
     agent_loop 每轮结束就返回，canonical history 由 session_store 维护，
     因此每轮结束后用 rebuild_openai_history() 刷新本地 messages —— 这样 /rewind 与多轮对话共用同一份历史。
     """
+    METRICS.reset()
+    ui_emit('session_start', prompt='')
     messages=[dict(m) for m in initial_messages]
     if session_store is None:
         session_store=SessionEventStore(SESSIONS_DIR)
@@ -1954,6 +2054,15 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
+    if os.getenv('HARNESS_UI', 'ansi') == 'textual' and sys.stdin.isatty():
+        try:
+            import ui_textual
+        except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
+            print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
+        else:
+            ui_textual.run(messages)
+            return
+
     policy = load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "
           f"{session_store.session_summary()['title']}")
@@ -2119,6 +2228,7 @@ def run_repl(initial_messages:list, session_store=None):
             messages[:] = session_store.rebuild_openai_history(recover_pending=True)
             messages.append({'role':'user','content':line})
             session_store.append_message(messages[-1])
+            ui_emit('user_message', text=line)
             global ACTIVE_TICKER
             turn_control.begin_turn()
             ticker = None
@@ -2145,7 +2255,11 @@ def run_repl(initial_messages:list, session_store=None):
                 # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
                 agent_loop(messages, session_store=session_store, on_delta=on_delta)
             except KeyboardInterrupt:
+                ui_emit('activity', state='cancelled', detail='Request cancelled')
                 print('\n[会话已中断]')
+            except Exception as exc:   # 让 UI 看到失败，同时保留终端可读性
+                ui_emit('error', msg=f'{type(exc).__name__}: {exc}')
+                print(f'\n[error] {type(exc).__name__}: {exc}')
             finally:
                 turn_control.end_turn()
                 if ticker is not None:

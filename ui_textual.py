@@ -554,9 +554,12 @@ class CCApp(App):
             cost = float(summary.get('cost', 0))
         except (TypeError, ValueError):
             cost = 0.0
-        text = (f"Session complete  ·  {summary.get('rounds', 0)} rounds  ·  "
+        cost_text = ''
+        if source != 'unavailable':   # 没有可靠价格表时不显示 0.0000 假装知道成本
+            cost_text = f"  ·  {prefix}¥{cost:.4f}"
+        text = (f"Turn complete  ·  {summary.get('rounds', 0)} rounds  ·  "
                 f"{summary.get('tools', 0)} tools ({failed} failed/denied)  ·  "
-                f"{summary.get('tokens', 0)} tokens  ·  {prefix}¥{cost:.4f}")
+                f"{summary.get('tokens', 0)} tokens{cost_text}")
         await self._chat.mount(Static(Text(text), classes='session-summary-line'))
 
     def _set_input_busy(self, busy: bool) -> None:

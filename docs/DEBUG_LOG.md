@@ -2248,3 +2248,50 @@ TOCTOU 型 SSRF。重定向已有复检，但同一次请求内仍有这个窗�
 
 **验证**：`pytest tests/` 1079 passed / 1 skipped（main 回归）；`pytest test_ui.py
 test_mcp_ui_regression.py` 49 passed；`ruff check` 对根 UI 文件通过。
+## feature/ui：把 main 的功能接进 UI 事件桥
+
+**背景**：合并只完成了目录层面的统一；新 harness 不 emit 任何 UI 事件，Textual/ANSI
+渲染层拿到的是空流，真实会话里看不到流式输出与工具块。本轮把 main 的流式、工具执行、
+用量与转录能力接入 `ui_events`。
+
+**做法**：
+
+- 新增 `src/ui_bridge.py`：事件转发（无订阅者时空操作）、`SessionMetrics`
+  （工具次数 / prompt / completion / cached / 最近调用）、`status_payload()`
+  （在桥里算 ctx 百分比，渲染层只负责画）。
+- `agent_loop`：
+  - 有 UI 订阅者时即使调用方没传 `on_delta` 也走流式（`streaming_enabled()`），
+    首个 delta 发 `assistant_start`，逐段 `assistant_delta`，收尾 `assistant_end`；
+    非流式回复发 `assistant_text`。
+  - 每轮模型调用发 `activity(thinking)`，usage 解析后发 `round_end` + `status`
+    （ctx 用供应商返回的 prompt_tokens，标 `confirmed`），工具批次后刷新状态。
+  - 回合结束发 `session_end`（summary 来自 METRICS）与 `activity(complete)`。
+- `exec_tool_call` 发 `tool_start` / `tool_end`（预览 2KB、长度、耗时、outcome、
+  后台标记），并累计工具次数；teammate/子代理的工具也会出现在同一条事件流里。
+- `run_repl`：`/new` 与会话启动时重置指标并发 `session_start`；提交消息发
+  `user_message`；中断与异常分别发 `activity(cancelled)` / `error`。
+- `HARNESS_UI=textual` + TTY 时把 REPL 交给 `ui_textual.run(messages)`；textual
+  或终端不可用时打印原因回退行式 REPL。
+- 新增 `export_session` / `list_transcripts` / `load_transcript`（复用
+  `agent_core.write_transcript`），补齐 `ui_textual` 的命令面板调用。
+- UI 侧：回合结束摘要改称 “Turn complete”；价格来源为 `unavailable` 时不再显示
+  `¥0.0000`；`session_end` 仍用于每回合收尾（main 的 `agent_loop` 一次处理一条用户消息）。
+
+**取舍**：
+
+- 不做成本估算：main 没有可靠价格表，显示 `~¥0.0000` 等于谎报；宁可不显示。
+  后续要显示成本，需要先确定价格来源与币种。
+- 状态行的 ctx 百分比用「真实窗口」而不是压缩阈值 `CONTEXT_LIMIT`：否则 80%
+  安全线会被画成 100%。
+- 只在有订阅者时开流式：SDK/无头/测试保持非流式行为，避免额外协议字段。
+
+**测试**：新增 `tests/test_ui_bridge.py`（流式/状态/回合事件、工具事件、
+transcript 往返）；`pytest tests/` 1082 passed / 1 skipped；
+根目录 UI 测试 47 + MCP UI 回归 2 条通过。
+
+**仍需后续处理**：
+
+- 成本显示与价格表（需要产品决策）；
+- ANSI 渲染后端（`renderer.py`）尚未接到新 REPL 的 print 路径：目前默认仍是行式
+  输出，Textual 走事件流；两条渲染路径没有统一；
+- teammate/后台任务的工具事件会混入主会话事件流，需要按 session/agent 标记区分。

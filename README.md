@@ -384,7 +384,7 @@ LLM_MODEL_ID=your-model-id
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 
-# 可选：textual 或 ansi
+# 可选：ansi（默认，保留原生滚动区）或 textual（全屏 TUI）
 HARNESS_UI=ansi
 
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
@@ -493,7 +493,9 @@ python -m pip install -r requirements.txt
 python entrypoint.py
 ```
 
-首次启动时，程序会进入交互式 Agent 会话。使用 `HARNESS_UI=ansi` 可在不支持全屏终端的环境中运行。
+首次启动时，程序会进入交互式 Agent 会话。默认是 ANSI 行式界面；设置
+`HARNESS_UI=textual` 可启用 Textual 全屏 TUI（需要 `pip install textual`，
+依赖见 `pyproject.toml` 的 `ui` extra）。
 
 启动前检查本地配置和目录：
 
