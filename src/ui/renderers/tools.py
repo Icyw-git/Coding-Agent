@@ -4,6 +4,7 @@ from __future__ import annotations
 from rich.text import Text
 
 TOOL_PREVIEW_LINES = 10
+TOOL_MORE_LINES = 40
 DIFF_MAX_LINES = 80
 
 _STATE_COLORS = {
@@ -63,11 +64,25 @@ def tool_view(payload: dict) -> Text:
 
     output = str(payload.get('output') or '')
     lines = output.splitlines()
+    hint = ''
     if not payload.get('expanded') and len(lines) > TOOL_PREVIEW_LINES:
-        hidden = len(lines) - TOOL_PREVIEW_LINES
-        lines = lines[:TOOL_PREVIEW_LINES] + [f'… {hidden} more lines']
-    if lines:
-        parts.append(Text('\n'.join(lines), style='#bcbcbc'))
+        limit = int(payload.get('preview_lines') or TOOL_PREVIEW_LINES)
+        limit = max(TOOL_PREVIEW_LINES, min(limit, TOOL_MORE_LINES))
+        hidden = len(lines) - limit
+        if hidden > 0:
+            action = 'show less' if limit > TOOL_PREVIEW_LINES else 'show more'
+            lines = lines[:limit]
+            hint = f'… {hidden} more lines · 点击 {action}'
+        elif limit > TOOL_PREVIEW_LINES:
+            lines = lines[:limit]
+            hint = '… 点击 show less'
+    if lines or hint:
+        body = Text(chr(10).join(lines), style='#bcbcbc')
+        if hint:
+            if lines:
+                body.append(chr(10))
+            body.append(hint, style='bold #5fafff')
+        parts.append(body)
 
     result = Text()
     for index, part in enumerate(parts):

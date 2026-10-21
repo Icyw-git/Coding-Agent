@@ -34,6 +34,9 @@
   （复制当前叶），保留 `/fork <seq>` 作为 inclusive 兼容入口。
 - P5h：交互自检修复：Ctrl-C 退出、补全候选 ↑↓/鼠标点击、会话选择器搜索框
   ↑↓/Enter、模态焦点延后到 screen 激活后。
+- P5i：响应体验：提交后立即刷出用户消息；屏蔽 agent_loop 对 Textual 屏幕的
+  print；回合结束用 agent_loop 返回值兜底最后一答（先 drain 事件防重复）；
+  工具块点击在 10/40 行预览间切换（show more/show less），Ctrl+O 仍展开全文。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

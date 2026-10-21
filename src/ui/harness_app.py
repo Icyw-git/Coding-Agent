@@ -5,6 +5,8 @@ feature flag：`HARNESS_UI=textual-next`。旧 `ui/app.py` 仍是默认实现。
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import queue
 import threading
 import time
@@ -25,7 +27,7 @@ from ui.modals.approval import PermissionModal
 from ui.modals.forks import ForkPickerModal
 from ui.modals.models import ModelPickerModal
 from ui.modals.sessions import SessionPickerModal
-from ui.renderers.tools import tool_view
+from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
 
@@ -601,7 +603,28 @@ class HarnessApp(App):
     def on_transcript_click(self, line_index: int) -> None:
         block_id = self.doc_layout.block_at(line_index)
         if block_id:
-            self.toggle_tool(block_id)
+            block = self.model.get(block_id)
+            if block is not None and block.kind == 'tool':
+                self.toggle_tool_preview(block_id)
+            elif block is not None:
+                self.toggle_tool(block_id)
+
+    def toggle_tool_preview(self, block_id: str) -> None:
+        """点击工具块：10 行 ↔ 40 行；Ctrl+O 仍可展开全文。"""
+        block = self.model.get(block_id)
+        if block is None or block.kind != 'tool':
+            return
+        if block.expanded:
+            # Ctrl+O 展开过全文，再点一次回到默认折叠。
+            self.model.set_expanded(block_id, False)
+            new_limit = TOOL_PREVIEW_LINES
+        else:
+            limit = int(block.payload.get('preview_lines') or TOOL_PREVIEW_LINES)
+            new_limit = (TOOL_PREVIEW_LINES if limit > TOOL_PREVIEW_LINES
+                         else TOOL_MORE_LINES)
+        self.model.update(block_id, preview_lines=new_limit)
+        self._mark_dirty()
+        self._flush_layout()
 
     def _notice(self, text: str, level: str = 'info') -> None:
         self.model.append('notice', {'text': text, 'level': level})
@@ -932,8 +955,9 @@ class HarnessApp(App):
     def _run_compact(self, block_id: str, messages: list) -> None:
         import harness
         try:
-            compacted = harness.compact_history(list(messages))
-            harness._record_compaction(self._store, compacted, 'manual')
+            with contextlib.redirect_stdout(io.StringIO()):
+                compacted = harness.compact_history(list(messages))
+                harness._record_compaction(self._store, compacted, 'manual')
         except Exception as exc:
             self.call_from_thread(self._compact_done, block_id, None,
                                   f'Compact failed: {exc}')
@@ -1090,6 +1114,7 @@ class HarnessApp(App):
     def _send_user(self, text: str) -> None:
         self.model.append('user', {'text': text})
         self._mark_dirty()
+        self._flush_layout()      # 先画出用户消息，不必等 50ms 定时器
         self._pending.put(text)
         self._refresh_queue()
         if not self._busy:
@@ -1111,6 +1136,7 @@ class HarnessApp(App):
         self._busy = True
         self._turn_started = time.monotonic()
         self._refresh_footer()
+        self._tick_border_status()   # 立即显示 Working，不等 0.2s 定时器
         threading.Thread(target=self._run_agent, daemon=True).start()
 
     def _run_agent(self) -> None:
@@ -1123,16 +1149,24 @@ class HarnessApp(App):
                     break
                 self._messages.append({'role': 'user', 'content': text})
                 self.call_from_thread(self._refresh_queue)
+                answer = None
                 turn_control.begin_turn()
                 try:
                     with harness.agent_lock:
                         harness.permission_gate.use_ui = True
-                        harness.agent_loop(self._messages)
+                        # agent_loop 仍会 print tokens/结果；Textual 已接管屏幕，
+                        # 这些写入会盖住 UI 并拖慢重绘，全部收进内存。
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            answer = harness.agent_loop(self._messages)
                 except KeyboardInterrupt:
                     pass
                 finally:
                     turn_control.end_turn()
                     harness.permission_gate.use_ui = False
+                try:
+                    self.call_from_thread(self._sync_final_answer, answer)
+                except Exception:
+                    pass
                 self.call_from_thread(self._refresh_queue)
                 self.call_from_thread(self._refresh_footer)
                 if len(self._pending) == 0:
@@ -1140,6 +1174,38 @@ class HarnessApp(App):
                     break
         finally:
             self._busy = False
+
+    def _sync_final_answer(self, answer) -> None:
+        """兜底：事件流丢失 assistant_end/text 时，用 agent_loop 返回值补最后一答。"""
+        self._drain_events()   # 先吃掉 queued 的 delta/end，避免把同一段文本追加两遍
+        text = str(answer or '').strip()
+        if not text or text == 'No output':
+            for message in reversed(self._messages):
+                if message.get('role') != 'assistant':
+                    continue
+                content = message.get('content')
+                if isinstance(content, str) and content.strip():
+                    text = content.strip()
+                    break
+        if not text:
+            return
+        assistants = [block for block in self.model.snapshot()
+                      if block.kind == 'assistant']
+        last = assistants[-1] if assistants else None
+        if last is not None:
+            current = str(last.payload.get('text', '')).strip()
+            if not last.payload.get('streaming'):
+                # 已有完整 assistant 块：事件流已渲染，不再追加，避免重复。
+                if current:
+                    return
+            elif text.startswith(current):
+                self.model.update(last.id, text=text, streaming=False)
+                self._mark_dirty()
+                self._flush_layout()
+                return
+        self.model.append('assistant', {'text': text, 'streaming': False})
+        self._mark_dirty()
+        self._flush_layout()
 
 
 def run(messages: list | None = None, session_id: str | None = None,

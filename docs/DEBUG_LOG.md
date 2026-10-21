@@ -2970,3 +2970,29 @@ args`
 `@src/ap` + Enter 只回填不发消息。
 
 **测试**：1151 passed / 1 skipped，旧 UI 64 passed。
+## TUI 响应体验：首屏、最后一答、工具预览
+
+三个问题分别处理：
+
+1. **提交后迟迟不显示**
+   - `_send_user()` 追加用户块后立即 `_flush_layout()`，不再等 50ms 定时器；
+   - `agent_loop` 仍会 `print()` 最终回答、tokens、diff 等；Textual 已接管屏幕，
+     这些写 terminal 的操作会和 UI 重绘抢输出。worker 内用
+     `redirect_stdout(StringIO())` 收走，UI 只走事件总线；
+   - 回合开始立即刷新 composer 的 `Working Ns` 状态。
+
+2. **最后没有回答**
+   - `_run_agent` 保存 `agent_loop()` 返回值（最终 `message.content`）；
+   - `_sync_final_answer()` 在回合结束兜底：先 `_drain_events()` 吃掉排队的
+     delta/end，再比较最后一个 assistant 块；缺失或仍 streaming 就补全，
+     已有完整块则不动，避免重复；
+   - 事件流正常时仍以事件为准，兜底只处理丢失/异常路径。
+
+3. **工具 more lines 不可点**
+   - 工具块预览从固定 10 行改为两级：10 行 ↔ 40 行，提示行显示
+     `… N more lines · 点击 show more/show less` 并高亮；
+   - 点击工具块任意行调用 `toggle_tool_preview()`；`Ctrl+O` / `/expand` 仍切换全文；
+   - 已用 `Ctrl+O` 展开全文时，点击会回到 10 行折叠。
+
+**测试**：工具 50 行点击 10↔40、最终回答兜底（无事件）、兜底不与正常
+流式重复；总回归 1154 passed / 1 skipped，旧 UI 64 passed。

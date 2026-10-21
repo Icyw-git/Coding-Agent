@@ -91,8 +91,8 @@ def test_submit_queues_and_calls_agent(monkeypatch):
                 if calls:
                     break
             assert calls and calls[0] == ['hello agent']
-            assert len(app.model) == 1
             assert app.model.snapshot()[0].kind == 'user'
+            assert any(block.kind == 'assistant' for block in app.model.snapshot())
 
     asyncio.run(scenario())
 
@@ -436,7 +436,7 @@ def test_skill_command_expands_into_user_message(monkeypatch):
             assert '<skill name="demo">' in content
             assert 'BODY of demo' in content
             assert 'extra args' in content
-            assert app.model.snapshot()[-1].kind == 'user'
+            assert any(block.kind == 'user' for block in app.model.snapshot())
 
     asyncio.run(scenario())
 
@@ -784,5 +784,90 @@ def test_enter_accepts_path_completion_without_submitting(monkeypatch):
             await pilot.pause()
             assert app._composer.text == '@src/app.py'
             assert not app.model.snapshot()   # 仅回填，不发送
+
+    asyncio.run(scenario())
+
+
+def test_tool_click_cycles_preview_lines(monkeypatch):
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._apply(UIEvent('tool_start', {
+                'name': 'bash', 'args': {'command': 'seq 60'}, 'call_id': 'c1'}))
+            app._apply(UIEvent('tool_end', {
+                'name': 'bash', 'call_id': 'c1', 'outcome': 'completed',
+                'ok': True, 'output_preview': '\n'.join(str(i) for i in range(60)),
+                'duration_ms': 5}))
+            await pilot.pause()
+            app._flush_layout()
+            block = app.model.get('tool-c1')
+            assert block.payload.get('preview_lines') is None
+
+            entry = next(item for item in app.doc_layout.entries()
+                         if item.block_id == 'tool-c1')
+            offset = next(i for i, rendered in enumerate(entry.lines)
+                          if 'show more' in str(rendered))
+            line = entry.start + offset
+            app.on_transcript_click(line)
+            await pilot.pause()
+            assert block.payload['preview_lines'] == 40
+            entry = next(item for item in app.doc_layout.entries()
+                         if item.block_id == 'tool-c1')
+            assert any('show less' in str(rendered) for rendered in entry.lines)
+
+            app.on_transcript_click(line)
+            await pilot.pause()
+            assert block.payload['preview_lines'] == 10
+
+    asyncio.run(scenario())
+
+
+def test_final_answer_fallback_when_events_missing(monkeypatch):
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: 'fallback answer')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('question')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if any(b.kind == 'assistant' for b in app.model.snapshot()):
+                    break
+            assistants = [b for b in app.model.snapshot()
+                          if b.kind == 'assistant']
+            assert assistants and assistants[-1].payload['text'] == 'fallback answer'
+            assert 'fallback answer' in '\n'.join(
+                str(app.view.render_line(i).text)
+                for i in range(app.view.size.height))
+
+    asyncio.run(scenario())
+
+
+def test_final_answer_fallback_does_not_duplicate_stream(monkeypatch):
+    def fake_loop(messages, **kwargs):
+        ui_events.bus.emit('assistant_start', mid='stream-1')
+        ui_events.bus.emit('assistant_delta', mid='stream-1', delta='hello ')
+        ui_events.bus.emit('assistant_delta', mid='stream-1', delta='world')
+        ui_events.bus.emit('assistant_end', mid='stream-1')
+        return 'hello world'
+
+    monkeypatch.setattr(harness, 'agent_loop', fake_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('question')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                assistants = [b for b in app.model.snapshot()
+                              if b.kind == 'assistant']
+                if assistants and not assistants[-1].payload.get('streaming'):
+                    break
+            assistants = [b for b in app.model.snapshot()
+                          if b.kind == 'assistant']
+            assert [b.payload['text'] for b in assistants] == ['hello world']
 
     asyncio.run(scenario())
