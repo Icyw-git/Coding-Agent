@@ -1530,8 +1530,14 @@ def _parse_usage(usage) -> dict | None:
     cached = getattr(details, 'cached_tokens', None) if details is not None else None
     if cached is None:
         cached = getattr(usage, 'prompt_cache_hit_tokens', None)
+    completion_details = getattr(usage, 'completion_tokens_details', None)
+    reasoning = (getattr(completion_details, 'reasoning_tokens', None)
+                 if completion_details is not None else None)
+    if reasoning is None:
+        reasoning = getattr(usage, 'reasoning_tokens', None)
     return {'prompt': prompt, 'completion': completion, 'total': total,
-            'cached': int(cached or 0), 'cached_seen': cached is not None}
+            'cached': int(cached or 0), 'cached_seen': cached is not None,
+            'reasoning': int(reasoning or 0)}
 
 
 def _cache_hit_rate_line(bucket: dict) -> str:
@@ -1616,6 +1622,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
     session_store.record_workspace(get_workdir())
+    wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
     set_session(session_store.session_id)
     set_agent('lead')   # 子代理会临时覆盖，退出后恢复
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
@@ -1629,7 +1636,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
     turn_started=time.monotonic() #本回合起始（tokens 行显示总用时）
     turn_tokens=0 #本回合累计 tokens（含工具轮次）
-    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末打印）
+    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,
+                'reasoning':0,'cached_seen':False} #本回合明细（回合末打印）
     ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
     snip_state={} #snip 触发迟滞：触发后基线+阈值/4 才允许再次触发（无迟滞则越线后每回合滑动断前缀）
     turn_no=0 #已完成回合数（每 8 回合异步重生成一次会话标题）
@@ -1742,7 +1750,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
                 detail['tools_fp'] = _tools_fingerprint()
                 turn_tokens += detail['total']
-                for _k in ('prompt','completion','cached','total'):
+                for _k in ('prompt','completion','cached','total','reasoning'):
                     turn_usage[_k] += detail[_k]
                 turn_usage['cached_seen'] = turn_usage['cached_seen'] or detail['cached_seen']
                 # 埋点：逐调用 usage 事件（供应商权威值；命中率可逐调用分析，
@@ -1755,6 +1763,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                         completion_tokens=detail['completion'],
                         total_tokens=detail['total'],
                         cached_tokens=detail['cached'],
+                        reasoning_tokens=detail.get('reasoning', 0),
+                        cost=str(METRICS.cost),
+                        cost_source=METRICS.cost_source,
                         duration_ms=round(
                             (time.monotonic() - request_started) * 1000),
                         compressed=False)
@@ -1997,13 +2008,18 @@ def resume_agent_loop(session_path: Path):
 
 _mcp_init_lock = threading.Lock()
 _mcp_initialized = False
+_mcp_ready = threading.Event()     # 连接/注册完成（成功或失败都置位：不让首条消息永久等待）
+_mcp_async_started = threading.Event()
 
 
 def initialize_mcp_tools() -> None:
     """Register configured MCP tools once for all adapters in this process."""
     global _mcp_initialized
     with _mcp_init_lock:
-        if not _mcp_initialized:
+        if _mcp_initialized:
+            _mcp_ready.set()
+            return
+        try:
             # 优先取模块命名空间里的 register_mcp_tools（测试可打补丁）；
             # 未注入时才懒加载 mcp_bridge（import 约 1s，见模块级 __getattr__）
             register = globals().get('register_mcp_tools')
@@ -2016,6 +2032,27 @@ def initialize_mcp_tools() -> None:
             hooks.register_external_tools(
                 schema['function']['name'] for schema in schemas)
             _mcp_initialized = True
+        finally:
+            # 失败也放行：首条消息最多等 wait_for_mcp_tools 的超时，不会卡死。
+            _mcp_ready.set()
+
+
+def start_mcp_initialization_async() -> None:
+    """交互模式下把 MCP 连接放到后台：先把界面交给用户，首条消息前再等它。"""
+    if _mcp_async_started.is_set():
+        return
+    _mcp_async_started.set()
+    threading.Thread(target=initialize_mcp_tools,
+                     name='mcp-init', daemon=True).start()
+
+
+def wait_for_mcp_tools(timeout: float = 10.0) -> bool:
+    """等待后台 MCP 初始化；仅当显式用异步启动过才可能阻塞。"""
+    if _mcp_initialized:
+        return True
+    if not _mcp_async_started.is_set():
+        return _mcp_initialized
+    return _mcp_ready.wait(timeout)
 
 
 def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:

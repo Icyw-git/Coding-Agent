@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextvars
 import threading
+from decimal import Decimal
 
 try:
     from ui_events import bus
@@ -34,6 +35,10 @@ class SessionMetrics:
             self.recent: list[dict] = []
             self.ctx_tokens = 0
             self.ctx_source = 'estimated'
+            self.cost = Decimal('0')
+            self.cost_source = 'unavailable'
+            self.currency = ''
+
 
     def record_tool(self) -> None:
         with self._lock:
@@ -51,6 +56,17 @@ class SessionMetrics:
             self.recent = (self.recent + [dict(detail)])[-5:]
             self.ctx_tokens = int(detail.get('prompt', self.ctx_tokens))
             self.ctx_source = 'confirmed'
+            from pricing import estimate_cost
+            estimate = estimate_cost(
+                detail.get('model', ''), prompt=detail.get('prompt', 0),
+                completion=detail.get('completion', 0),
+                cached=detail.get('cached', 0),
+                reasoning=detail.get('reasoning', 0))
+            if estimate:
+                self.cost += estimate['cost']
+                self.cost_source = estimate['source']
+                self.currency = estimate['currency']
+
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -66,8 +82,9 @@ class SessionMetrics:
                 'recent_calls': list(self.recent),
                 'rounds': self.calls,
                 'tool_outcomes': {},
-                'cost': '0',
-                'cost_source': 'unavailable',
+                'cost': str(self.cost.quantize(Decimal('0.0001'))),
+                'cost_source': self.cost_source,
+                'currency': self.currency,
             }
 
 

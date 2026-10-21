@@ -1048,3 +1048,54 @@ def test_tui_header_shows_session_title():
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_more_loads_older_history():
+    import asyncio
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    messages = [{'role': 'user' if i % 2 == 0 else 'assistant',
+                 'content': f'msg {i}'} for i in range(500)]
+
+    async def scenario():
+        app = ui_textual.CCApp(messages)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await asyncio.sleep(0.2)
+            initial = len(app.query_one('#chat').children)
+
+            await app._load_older_history()
+            await pilot.pause()
+            assert len(app.query_one('#chat').children) > initial
+            assert app._history_limit == len(messages)   # 全部加载
+
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())
+
+
+def test_escape_closes_suggestions_first(monkeypatch):
+    from types import SimpleNamespace
+
+    pytest.importorskip('textual')
+    import turn_control
+    import ui_textual
+
+    calls = []
+    monkeypatch.setattr(turn_control, 'request_cancel',
+                        lambda: calls.append(True))
+    app = ui_textual.CCApp([])
+    app._input = SimpleNamespace(text='', focus=lambda: None)
+    hints = []
+    app._set_hint = hints.append
+    app._suggestions = [('/help', '/help')]
+    app._busy = True
+    app._user_input_q = SimpleNamespace(qsize=lambda: 0)
+
+    app.action_jump_bottom()
+
+    assert app._suggestions == []
+    assert calls == []          # 只关列表，不取消回合

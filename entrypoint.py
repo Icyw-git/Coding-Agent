@@ -78,7 +78,7 @@ def main(argv=None) -> int:
         daemon=True,
     ).start()
 
-    harness.initialize_mcp_tools()
+    harness.start_mcp_initialization_async()
     with _interactive_lock():
         try:
             if args.resume:
@@ -102,6 +102,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print('\n[会话已中断]')
     finally:
+        harness.wait_for_mcp_tools(10)
         harness.shutdown_mcp()
     return 0
 

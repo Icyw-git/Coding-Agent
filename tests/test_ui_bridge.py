@@ -177,3 +177,30 @@ def test_agent_loop_honours_cancel_request(tmp_path, monkeypatch):
             raise AssertionError('cancelled turn should raise KeyboardInterrupt')
     finally:
         turn_control.end_turn()
+
+
+def test_status_reports_estimated_cost_for_known_model(tmp_path, monkeypatch,
+                                                      capsys):
+    events = _collect()
+    monkeypatch.setenv('LLM_MODEL_ID', 'deepseek-v4-flash')
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(role='assistant', content='hi',
+                                    tool_calls=None),
+            finish_reason='stop')],
+        usage=_usage(prompt=1000, completion=100))
+    monkeypatch.setattr(harness, '_stream_completion',
+                        lambda kwargs, hook: response)
+    store = harness.SessionEventStore(tmp_path, session_id='ui-cost')
+    try:
+        harness.agent_loop([{'role': 'user', 'content': 'hello'}],
+                           session_store=store, housekeeping=False)
+    finally:
+        ui_events.bus.unsubscribe(events.append)
+
+    status = next(e for e in events if e.type == 'status')
+    assert status.payload['cost_source'] == 'estimated'
+    assert status.payload['currency'] == 'CNY'
+    assert float(status.payload['cost']) > 0

@@ -393,6 +393,9 @@ HARNESS_MEMORY_RECALL=local
 # 可选：工作区 AGENTS.md / CLAUDE.md 注入（on 默认 / off 关闭）
 HARNESS_PROJECT_CONTEXT=on
 
+# 可选：覆盖模型价格表（每 1M tokens，JSON）
+# LLM_PRICING_JSON={"my-model":{"input":"2","output":"4","currency":"USD"}}
+
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
 
@@ -509,7 +512,10 @@ workspace-write 之间切换执行档位。
 回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。TUI 的 `/sessions` 与
 `/resume <序号|ID前缀|标题>` 直接使用会话事件流（与行式 `/resume` 同一份数据），
 不再列 transcript 快照。恢复大历史时只渲染最近 400 条并批量挂载，更早的消息
-折叠成一行提示（完整内容用 `/export` 导出）；状态栏与工具块保持实时。
+折叠成一行提示：`/more` 继续加载，`/export` 导出全文；状态栏与工具块保持实时。
+交互模式启动时 MCP 在后台连接，界面先可用，首条消息前完成工具注册。
+状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
+可用 `LLM_PRICING_JSON` 覆盖价格。
 
 启动前检查本地配置和目录：
 

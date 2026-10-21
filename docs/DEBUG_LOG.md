@@ -2660,3 +2660,33 @@ UI 测试 61 passed。
 **取舍**：标题超长截到 40 字符，避免挤掉模型与目录；完整标题仍可用 `/status` 查看。
 
 **测试**：新增头部标题断言；UI 测试 63 passed，总回归 1097 passed / 1 skipped。
+## 启动、成本、分页与候选面板
+
+**对照 Codex / Pi 的四项遗留**：
+
+1. **启动耗时**：交互模式把 MCP 初始化从「阻塞入口」改为后台线程
+   （`start_mcp_initialization_async`）；`agent_loop` 在首轮请求前
+   `wait_for_mcp_tools()`，界面先可用、首条消息前工具面齐全。失败也会置位
+   `_mcp_ready`，不会让首条消息永久等待；退出前 `wait_for_mcp_tools(10)` 再关闭。
+2. **成本显示**：新增 `src/pricing.py`（内置 CNY 价格表 + `LLM_PRICING_JSON` 覆盖）；
+   `SessionMetrics` 按 prompt/completion/cached/reasoning 累计成本，
+   `status`/`round_end` 带 `cost` / `cost_source` / `currency`；未知模型不猜价格，
+   UI 继续隐藏成本而不是显示 0。
+3. **历史分页**：`/more`（或 `older`）每次多加载 400 条，折叠提示里同时给出
+   `/more to load older, /export for the full log`；`/clear` 重置分页状态。
+4. **候选面板**：保留提示行内的下拉列表（Textual 无内建浮层），补上 `Esc` 优先
+   关闭候选、再取消/回底的优先级；键盘路径仍是 Tab 采用、Alt+↑/↓ 选择。
+
+**取舍**：
+
+- MCP 异步初始化意味着“第一轮请求可能多等几百毫秒”，但 TUI/REPL 的出现时间不再被
+  2.7s 的连接阻塞；headless/API 仍同步初始化，保证首轮工具面完整。
+- 成本是估算值，UI 用 `~` 前缀；要“精确成本”需要供应商回传计费字段，当前没有。
+- `/more` 重新挂载已加载部分（不保留滚动位置），换取实现简单与顺序正确；400 条
+  重挂约 0.4-0.5s。
+- 候选面板不是悬浮层：真正 overlay 需要焦点管理与分层渲染，收益有限，暂缓。
+
+**测试**：新增 `tests/test_pricing.py`（默认价、缓存价、环境覆盖、未知模型）、
+`test_ui_bridge` 成本字段、`test_ui.py` 的 `/more` 分页与 Esc 关闭候选、
+`test_entrypoint` 的「MCP 未完成时 REPL 已启动」。总回归 1097 passed / 1 skipped，
+UI 测试 66 passed。

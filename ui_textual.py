@@ -233,7 +233,7 @@ def slash_command(text: str) -> str | None:
 # TUI 支持的命令（其余命令仍只在行式 REPL 提供，提示里不再列出死路）
 _TUI_COMMANDS = frozenset({
     'help', '?', 'status', 'model', 'pwd', 'quit', 'exit', 'q',
-    'clear', 'export', 'sessions', 'transcripts', 'resume',
+    'clear', 'export', 'sessions', 'transcripts', 'resume', 'more', 'older',
     'allow', 'deny', 'ask', 'search', 'failures', 'failed', 'all',
     'show-all',
 })
@@ -386,6 +386,8 @@ class CCApp(App):
         self._round_metrics = []      # 早到事件可能先于 on_mount
         self._background_tasks = {}
         self._history: list[str] = []
+        self._history_all: list[dict] = []
+        self._history_limit = HISTORY_RENDER_LIMIT
         self._history_index = 0
         self._mention_files: list[str] = []
         self._mention_root = None
@@ -690,7 +692,11 @@ class CCApp(App):
         asyncio.create_task(self._show_notice(message))
 
     def action_jump_bottom(self) -> None:
-        """回合中 = 取消当前请求；空闲 = 回到最新一条消息。"""
+        """Esc：先关候选列表；回合中取消；空闲回到最新消息。"""
+        if self._suggestions:
+            self._suggestions = []
+            self._set_hint(self._busy_hint())
+            return
         if self._busy:
             import turn_control
             turn_control.request_cancel()
@@ -746,6 +752,8 @@ class CCApp(App):
             await self._list_sessions()
         elif verb == 'resume':
             await self._resume_session(argument)
+        elif verb in ('more', 'older'):
+            await self._load_older_history()
         elif verb in ('allow', 'deny', 'ask'):
             await self._set_permission_policy(verb, argument)
         elif verb == 'search':
@@ -763,6 +771,8 @@ class CCApp(App):
             await self._show_notice('Cannot clear while a request is running.')
             return
         self._msgs.clear()
+        self._history_all.clear()
+        self._history_limit = HISTORY_RENDER_LIMIT
         self._active_tools.clear()
         self._active_widgets.clear()
         self._assistant_buffers.clear()
@@ -852,7 +862,6 @@ class CCApp(App):
             harness.set_workspace(summary['workspace'])
         self._msgs[:] = messages
         self._session_id = store.session_id
-        await self._clear_rendered_conversation()
         await self._render_history(messages)
         hidden = max(0, len(messages) - HISTORY_RENDER_LIMIT)
         suffix = f'（已折叠更早的 {hidden} 条）' if hidden else ''
@@ -1186,20 +1195,39 @@ class CCApp(App):
 
     async def _render_history(self, messages: list[dict]) -> None:
         """批量恢复历史：限量 + 分块 mount_all + 老消息不走 Markdown。"""
-        shown = messages[-HISTORY_RENDER_LIMIT:]
+        self._history_all = list(messages)
+        self._history_limit = HISTORY_RENDER_LIMIT
+        await self._mount_history()
+
+    async def _mount_history(self) -> None:
+        messages = self._history_all
+        shown = messages[-self._history_limit:] if self._history_limit else []
         hidden = len(messages) - len(shown)
         widgets = []
         if hidden:
             widgets.append(Static(
-                Text(f'… {hidden} earlier messages hidden; use /export for the full log'),
-                classes='muted'))
+                Text(f'… {hidden} earlier messages hidden; /more to load older, '
+                     '/export for the full log'), classes='muted'))
         tail_start = max(0, len(shown) - HISTORY_MARKDOWN_TAIL)
         for index, message in enumerate(shown):
             widget = self._history_widget(message, rich=index >= tail_start)
             if widget is not None:
                 widgets.append(widget)
+        await self._clear_rendered_conversation()
         for start in range(0, len(widgets), HISTORY_BATCH):
             await self._chat.mount_all(widgets[start:start + HISTORY_BATCH])
+
+    async def _load_older_history(self) -> None:
+        """/more：多加载一批更早的历史（重新挂载，保证顺序与折叠提示正确）。"""
+        if self._history_limit >= len(self._history_all):
+            await self._show_notice('No older messages.')
+            return
+        self._history_limit = min(len(self._history_all),
+                                  self._history_limit + HISTORY_RENDER_LIMIT)
+        await self._mount_history()
+        remaining = max(0, len(self._history_all) - self._history_limit)
+        suffix = f'（仍有 {remaining} 条更早）' if remaining else ''
+        await self._show_notice(f'Loaded older history{suffix}.')
 
     async def _stream_typing(self, md: Markdown, text: str) -> None:
         """打字机效果：分块增量渲染 Markdown（约 80 步完成，模拟流式）。"""
@@ -1580,7 +1608,10 @@ class CCApp(App):
             parts.append(f"[dim]{payload['tokens']} tok[/]")
         cost = payload.get('cost')
         if cost and width >= 96:
-            parts.append(f"[dim]{self._format_cost(cost, payload.get('cost_source', 'estimated'))}[/]")
+            cost_text = self._format_cost(
+                cost, payload.get('cost_source', 'estimated'),
+                payload.get('currency', 'CNY'))
+            parts.append(f'[dim]{cost_text}[/]')
         if payload.get('workdir') and width >= 72:
             parts.append(f"[dim]{markup_escape(str(payload['workdir']))}[/]")
         return '  '.join(parts)

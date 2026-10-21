@@ -116,3 +116,43 @@ def test_textual_failure_falls_back_to_line_repl(tmp_path, monkeypatch, capsys):
 
     output = capsys.readouterr().out
     assert '回退行式 REPL' in output and 'no driver' in output
+
+
+def test_interactive_starts_before_mcp_finishes(monkeypatch):
+    import threading
+    import time
+
+    import harness
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_init():
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(harness, 'initialize_mcp_tools', slow_init)
+    monkeypatch.setattr(harness, '_mcp_async_started', threading.Event())
+    monkeypatch.setattr(harness, '_mcp_ready', threading.Event())
+    monkeypatch.setattr(harness, 'validate_runtime_config', lambda: None)
+    monkeypatch.setattr(harness, 'load_durable_jobs', lambda: None)
+    monkeypatch.setattr(harness, 'cron_scheduler_loop', lambda: None)
+    monkeypatch.setattr(harness, 'queue_processor_loop', lambda *a, **k: None)
+    monkeypatch.setattr(harness, 'wait_for_cron_idle', lambda: None)
+    monkeypatch.setattr(harness, 'wait_for_mcp_tools', lambda timeout=10: True)
+    monkeypatch.setattr(harness, 'shutdown_mcp', lambda: None)
+    monkeypatch.setattr(harness.client, 'warmup', lambda: None)
+
+    seen = []
+    start = time.monotonic()
+
+    def fake_repl(*args, **kwargs):
+        seen.append(time.monotonic() - start)
+
+    monkeypatch.setattr(harness, 'run_repl', fake_repl)
+
+    entrypoint.main([])
+
+    assert started.is_set()          # MCP 初始化已经开始
+    assert seen and seen[0] < 0.5    # 但 REPL 没有等它（后台线程）
+    release.set()
