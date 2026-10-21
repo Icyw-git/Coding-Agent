@@ -74,3 +74,45 @@ def test_doctor_reports_optional_document_extras(monkeypatch):
 
     monkeypatch.setattr('importlib.util.find_spec', lambda name: object())
     assert entrypoint.harness._document_extras_status() == 'installed'
+
+
+def test_interactive_lock_is_skipped_for_textual(monkeypatch):
+    import contextlib
+
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
+    monkeypatch.setenv('HARNESS_UI', 'ansi')
+    assert entrypoint._interactive_lock() is entrypoint.harness.agent_lock
+
+
+def test_ui_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    called = []
+    monkeypatch.setattr(entrypoint.harness, 'run_doctor',
+                        lambda: called.append(True) or 0)
+
+    assert entrypoint.main(['--ui', 'ansi', '--doctor']) == 0
+    assert entrypoint.os.environ['HARNESS_UI'] == 'ansi'
+    assert called
+
+
+def test_textual_failure_falls_back_to_line_repl(tmp_path, monkeypatch, capsys):
+    import sys
+
+    import cli_input
+    import harness
+    import ui_textual
+
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(ui_textual, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError('no driver')))
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
+    store = harness.SessionEventStore(tmp_path, session_id='ui-fallback')
+
+    harness.run_repl([], store)
+
+    output = capsys.readouterr().out
+    assert '回退行式 REPL' in output and 'no driver' in output

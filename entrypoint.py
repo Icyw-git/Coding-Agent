@@ -1,6 +1,8 @@
 """Command-line entrypoint for Harness Agent."""
 
 import argparse
+import contextlib
+import os
 import sys
 import threading
 
@@ -10,6 +12,8 @@ import harness
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Harness Agent')
     parser.add_argument('--doctor', action='store_true', help='check local configuration and exit')
+    parser.add_argument('--ui', choices=('ansi', 'textual'),
+                        help='override HARNESS_UI for this run (ansi keeps native scrollback)')
     parser.add_argument('--resume', metavar='SESSION_ID', help='resume a saved session')
     parser.add_argument('prompt', nargs='?', help='one-shot prompt (enables headless mode)')
     parser.add_argument('-p', '--print', dest='print_mode', action='store_true',
@@ -31,8 +35,22 @@ def _headless_requested(args) -> bool:
                 or args.prompt is not None)
 
 
+def _interactive_lock():
+    """行式 REPL 全程持 agent_lock，阻止 cron 队列插话。
+
+    Textual 模式下锁由 UI 的 agent worker 按「每个回合」持有（空闲时释放，
+    让 cron 有机会执行）；entrypoint 再包一层会让 worker 永远拿不到锁——
+    表现就是输入后一直停在「正在处理」。
+    """
+    if os.getenv('HARNESS_UI', 'ansi') == 'textual':
+        return contextlib.nullcontext()
+    return harness.agent_lock
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.ui:   # 显式参数优先于 .env：TUI 卡住时可以直接 --ui ansi 救场
+        os.environ['HARNESS_UI'] = args.ui
 
     if args.doctor:
         return harness.run_doctor()
@@ -61,7 +79,7 @@ def main(argv=None) -> int:
     ).start()
 
     harness.initialize_mcp_tools()
-    with harness.agent_lock:
+    with _interactive_lock():
         try:
             if args.resume:
                 store = harness.SessionEventStore.open(

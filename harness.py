@@ -2100,8 +2100,12 @@ def run_repl(initial_messages:list, session_store=None):
         except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
             print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
         else:
-            ui_textual.run(messages, session_id=session_store.session_id)
-            return
+            try:
+                ui_textual.run(messages, session_id=session_store.session_id)
+                return
+            except Exception as exc:   # 渲染驱动/终端不兼容：回退行式，不吞掉会话
+                print(f'[ui] Textual 运行失败，回退行式 REPL：'
+                      f'{type(exc).__name__}: {exc}')
 
     _attach_repl_renderer()
     policy = load_policy()

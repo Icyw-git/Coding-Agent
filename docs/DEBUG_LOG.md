@@ -2394,3 +2394,40 @@ Textual 可见），以及 teammate 的工具事件会混进主会话聊天区�
 它依赖 textual，缺包时 skip。
 
 **测试**：`pytest tests/` 1091 passed / 1 skipped；根 UI 测试 49 passed；`ruff` 通过。
+## 启动「卡住」的根因：agent_lock 死锁
+
+**现象**：`python harness.py`（`.env` 里 `HARNESS_UI=textual`）启动后停在 TUI，
+输入消息后一直显示「正在处理当前消息…」，进程不退出、CPU 空闲。
+
+**定位**（`py-spy dump --pid`）：
+
+```
+MainThread  → textual.app.run → ui_textual.run → harness.run_repl
+asyncio_0   → ui_textual._run_agent → with harness.agent_lock   ← 阻塞
+```
+
+根因是合并后两套加锁职责重叠：
+
+- `entrypoint.main` 在行式 REPL 外层 `with harness.agent_lock:` 全程持锁，
+  目的是不让 cron 队列在用户对话间插话；
+- Textual 分支的 `_run_agent` 也在每个回合 `with harness.agent_lock:`。
+- `agent_lock` 是 `threading.Lock`（非重入），且持有者与等待者不是同一线程
+  （Textual 事件循环在主线程，agent 跑在 worker 线程）→ 永久等待。
+
+UI 测试直接构造 `CCApp`（绕过 entrypoint），所以没有覆盖到这条路径。
+
+**修复**：
+
+- `entrypoint._interactive_lock()`：`HARNESS_UI=textual` 时返回 `nullcontext`，
+  锁交给 UI 的 agent worker 按回合持有（空闲释放，cron 才有机会运行）；
+  行式 REPL 保持全程持锁的原行为。
+- 兜底一：新增 `--ui ansi|textual`，显式参数覆盖 `.env`，TUI 卡住时
+  `python harness.py --ui ansi` 直接救场。
+- 兜底二：`ui_textual.run` 抛异常（终端/驱动不兼容）时回退行式 REPL 并打印原因，
+  不再带着异常退出。
+
+**测试**：`_interactive_lock` 在两种 UI 下的行为、`--ui` 覆盖 `.env`、
+Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI 测试 49 passed。
+
+**教训**：跨分支合并时，「锁由谁持有」和「锁在哪一层加」必须重新核对一遍；
+直接构造 UI 组件的测试覆盖不到入口层的锁顺序，端到端要至少有一条经过 `main()`。
