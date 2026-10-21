@@ -202,7 +202,8 @@ def test_slash_help_is_handled_locally(monkeypatch):
             await pilot.pause()
             assert len(app.model) == 1
             assert app.model.snapshot()[0].kind == 'notice'
-            assert 'Commands:' in str(app.model.snapshot()[0].payload['text'])
+            assert 'commands:' in str(
+                app.model.snapshot()[0].payload['text']).lower()
             assert len(app._pending) == 0
 
     asyncio.run(scenario())
@@ -262,3 +263,109 @@ def test_permission_request_opens_modal_and_resolves():
         asyncio.run(scenario())
     finally:
         ui_events.bus.unsubscribe(record)
+
+
+def test_bang_shell_runs_without_agent(monkeypatch):
+    def fail_loop(messages, **kwargs):
+        raise AssertionError('shell must not reach the model')
+
+    monkeypatch.setattr(harness, 'agent_loop', fail_loop)
+    monkeypatch.setattr(harness, 'run_bash', lambda command: f'shell:{command}')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('!echo hi')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                block = app.model.get('tool-1') or next(
+                    (b for b in app.model.snapshot() if b.kind == 'tool'), None)
+                if block and block.payload.get('state') != 'running':
+                    break
+            block = next(b for b in app.model.snapshot() if b.kind == 'tool')
+            assert 'shell:echo hi' in block.payload['output']
+            assert block.payload['state'] == 'complete'
+            assert len(app._pending) == 0
+
+    asyncio.run(scenario())
+
+
+def test_escape_cancels_only_when_busy(monkeypatch):
+    import turn_control
+
+    calls = []
+    monkeypatch.setattr(turn_control, 'request_cancel',
+                        lambda: calls.append(True))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)):
+            app._composer.action_escape()      # 空闲：不取消
+            assert calls == []
+
+            app._busy = True
+            app._composer.action_escape()
+            assert calls == [True]
+
+            app._suggestions = [('/help', '/help')]
+            app._composer.action_escape()      # 有候选：只关列表
+            assert app._suggestions == []
+            assert calls == [True]
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_o_expands_last_tool(monkeypatch):
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app._apply(UIEvent('tool_start', {
+                'name': 'bash', 'args': {'command': 'pytest'}, 'call_id': 'c1'}))
+            await pilot.pause()
+            app._apply(UIEvent('tool_end', {
+                'name': 'bash', 'call_id': 'c1', 'outcome': 'completed',
+                'ok': True, 'output_preview': 'done', 'duration_ms': 5}))
+            await pilot.pause()
+            app._composer.action_expand_tool()
+            block = app.model.get('tool-c1')
+            assert block.expanded is True
+
+    asyncio.run(scenario())
+
+
+def test_approval_preview_prefers_patch_or_content():
+    from ui.modals.approval import PermissionModal
+
+    patch_modal = PermissionModal('r1', 'apply_patch',
+                                  {'patch': '*** Begin Patch\n' + 'line\n' * 30})
+    assert 'Patch (preview)' in patch_modal._detail_text()
+    assert 'more lines' in patch_modal._detail_text()
+
+    content_modal = PermissionModal('r2', 'write',
+                                    {'path': 'a.txt', 'content': 'hello\n'})
+    assert 'Content (preview)' in content_modal._detail_text()
+
+    command_modal = PermissionModal('r3', 'bash', {'command': 'rm x'})
+    assert 'Target: rm x' in command_modal._detail_text()
+
+
+def test_unknown_command_suggests_and_hotkeys(monkeypatch):
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('command must not reach model')))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/modl')
+            await pilot.pause()
+            notice = app.model.snapshot()[-1].payload['text']
+            assert '/model' in notice
+
+            app.submit_text('/hotkeys')
+            await pilot.pause()
+            hotkeys = app.model.snapshot()[-1].payload['text']
+            assert 'Ctrl+O' in hotkeys and 'Esc' in hotkeys
+
+    asyncio.run(scenario())

@@ -44,10 +44,30 @@ class PermissionModal(ModalScreen):
             yield Static(f"[{title_color}][bold]{label}[/]  {markup_escape(self.title)}[/]",
                          id="perm-title")
             yield Static(Text("Tool: ", style="dim") + Text(self.tool))
-            yield Static(Text("Target: ", style="dim") + Text(self._target_text()))
+            yield Static(Text(self._detail_text()))
             yield Static("")
             yield Static("[yellow]y[/] = Allow    [yellow]n[/]/[yellow]Esc[/] = Deny    "
                          f"([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])")
+
+    def _detail_text(self) -> str:
+        """审批前给出可判断的上下文：补丁/内容预览优先于原始参数。"""
+        patch = str(self.args.get('patch') or '')
+        if patch:
+            return 'Patch (preview):' + chr(10) + self._clip(patch)
+        content = str(self.args.get('content') or '')
+        if content and self.tool in ('write', 'edit'):
+            return 'Content (preview):' + chr(10) + self._clip(content)
+        return 'Target: ' + self._target_text()
+
+    @staticmethod
+    def _clip(text: str, lines: int = 20, chars: int = 1600) -> str:
+        rows = text.splitlines()
+        shown = chr(10).join(rows[:lines])
+        if len(rows) > lines:
+            shown += chr(10) + f'… {len(rows) - lines} more lines'
+        if len(shown) > chars:
+            shown = shown[:chars] + '…'
+        return shown
 
     def _target_text(self) -> str:
         """Prefer the actionable command/path over a noisy raw argument dict."""

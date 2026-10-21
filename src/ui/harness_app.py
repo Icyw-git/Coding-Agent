@@ -19,6 +19,7 @@ from textual.containers import Vertical
 from textual.widgets import Static, TextArea
 
 from file_mentions import workspace_files
+from ui import commands
 from ui.composer.completions import apply_suggestion, suggestions
 from ui.modals.approval import PermissionModal
 from ui.modals.sessions import SessionPickerModal
@@ -91,6 +92,8 @@ class Composer(TextArea):
         Binding('tab', 'complete', 'Complete', show=False),
         Binding('alt+up', 'suggest_prev', 'Prev', show=False),
         Binding('alt+down', 'suggest_next', 'Next', show=False),
+        Binding('ctrl+o', 'expand_tool', 'Expand tool', show=False,
+                priority=True),
         Binding('escape', 'escape', 'Close', show=False, priority=True),
     ]
 
@@ -115,7 +118,13 @@ class Composer(TextArea):
             self.app.cycle_suggestion(1)
 
     def action_escape(self) -> None:
-        self.app.close_suggestions()
+        if self.app.has_suggestions():
+            self.app.close_suggestions()
+        else:
+            self.app.cancel_turn()
+
+    def action_expand_tool(self) -> None:
+        self.app.toggle_last_tool()
 
 
 class CompletionPopup(Static):
@@ -145,6 +154,9 @@ class Transcript(VirtualTranscript):
 
 class HarnessApp(App):
     """行模型驱动的 TUI：聊天区只有一个自绘视口。"""
+
+    BINDINGS = [Binding('ctrl+q', 'quit_app', 'Quit', show=False,
+                        priority=True)]
 
     CSS = """
     Screen { background: $background; }
@@ -219,6 +231,9 @@ class HarnessApp(App):
         self.set_interval(0.03, self._drain_events)
         self.set_interval(0.05, self._flush_layout)
         self.set_interval(0.2, self._tick_border_status)
+
+    def action_quit_app(self) -> None:
+        self.exit()
 
     def on_unmount(self) -> None:
         self._exiting = True
@@ -557,12 +572,25 @@ class HarnessApp(App):
         verb, _, argument = raw.partition(' ')
         verb = verb.lower()
         argument = argument.strip()
+
+        spec = commands.find(verb)
+        if spec is None:
+            hint = commands.did_you_mean(verb)
+            suffix = f'；是否想输入 {hint}？' if hint else ''
+            self._notice(f'Unknown command: /{verb}{suffix}', level='error')
+            return True
+        verb = spec.name
+        if not spec.ported:
+            self._notice(f'/{verb} 暂未迁移到 textual-next；请用 --ui ansi。')
+            return True
+
         import harness
-        if verb in ('quit', 'exit', 'q'):
+        if verb == 'quit':
             self.exit()
-        elif verb in ('help', '?'):
-            self._notice('Commands: /help /status /model /pwd /sessions /resume <n> '
-                         '/export /clear /allow|/deny|/ask <tool> /quit')
+        elif verb == 'help':
+            self._notice(commands.help_text())
+        elif verb == 'hotkeys':
+            self._notice(commands.hotkeys_text())
         elif verb == 'clear':
             self.model.clear()
             self._mark_dirty()
@@ -575,7 +603,7 @@ class HarnessApp(App):
             if state.get('tokens'):
                 lines.append(f"tokens: {state['tokens']}")
             self._notice(chr(10).join(lines))
-        elif verb in ('sessions', 'transcripts'):
+        elif verb == 'sessions':
             self.open_session_picker()
         elif verb == 'resume':
             if argument:
@@ -594,14 +622,6 @@ class HarnessApp(App):
             else:
                 harness.permission_gate.set_policy(argument, verb)
                 self._notice(f'Permission policy for {argument}: {verb}')
-        elif verb in ('more', 'older', 'find', 'search', 'diff', 'review',
-                      'cache', 'sandbox', 'checkpoint', 'rewind', 'undo',
-                      'fork', 'archive', 'delete', 'watch', 'expand',
-                      'approvals', 'revoke', 'workspaces', 'workspace', 'cd',
-                      'new', 'compact', 'rename'):
-            self._notice(f'/{verb} 暂未迁移到 textual-next；请用 --ui ansi。')
-        else:
-            self._notice(f'Unknown command: /{verb}', level='error')
         return True
 
     def _display_status(self) -> dict:
@@ -663,12 +683,60 @@ class HarnessApp(App):
         self._refresh_footer()
         self._notice(f"Resumed {summary['title']}.")
 
+    def cancel_turn(self) -> None:
+        """Esc：仅当回合进行中才发取消，避免空闲时误触。"""
+        if not self._busy:
+            return
+        import turn_control
+        turn_control.request_cancel()
+        if self._composer is not None:
+            self._composer.border_title = 'cancelling…'
+
+    def submit_shell(self, command: str) -> None:
+        """`!cmd`：直接执行 shell，输出按工具块展示，不进入模型上下文。"""
+        block = self.model.append('tool', {
+            'name': 'bash', 'args': {'command': command},
+            'state': 'running', 'output': '', 'expanded': False})
+        self._mark_dirty()
+        threading.Thread(target=self._run_shell,
+                         args=(block.id, command), daemon=True).start()
+
+    def _run_shell(self, block_id: str, command: str) -> None:
+        import harness
+        import turn_control
+        started = time.monotonic()
+        output = ''
+        try:
+            harness.permission_gate.use_ui = True
+            turn_control.begin_turn()
+            output = harness.run_bash(command)
+        except Exception as exc:
+            output = f'Error: {exc}'
+        finally:
+            turn_control.end_turn()
+            harness.permission_gate.use_ui = False
+        duration = int((time.monotonic() - started) * 1000)
+        try:
+            self.call_from_thread(self._finish_shell, block_id, output, duration)
+        except Exception:
+            pass
+
+    def _finish_shell(self, block_id: str, output: str, duration_ms: int) -> None:
+        failed = str(output).lstrip().startswith(('Error', 'Permission denied'))
+        self.model.update(block_id,
+                          state='failed' if failed else 'complete',
+                          output=str(output), duration_ms=duration_ms)
+        self._mark_dirty()
+
     def submit_text(self, text: str) -> None:
         text = (text or '').strip()
         if not text or self._exiting:
             return
         self.close_suggestions()
         self._programmatic_text = ''    # Composer 提交后会清空文本
+        if text.startswith('!') and text[1:].strip():
+            self.submit_shell(text[1:].strip())
+            return
         if self._handle_command(text):
             return
         self.model.append('user', {'text': text})

@@ -2799,3 +2799,19 @@ Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。
 
 **测试**：`tests/test_harness_app.py` 新增命令本地处理、选择器恢复真实会话、
 审批弹窗应答；总回归 1124 passed / 1 skipped，旧 UI 66 passed。
+## TUI 重构 P5b：命令注册表与 Pi 式模糊匹配
+
+- `src/ui/fuzzy.py`：移植 Pi `fuzzy.ts`（MIT）的评分（连续命中/词边界加分、
+  间隔扣分、`abc123`/`123abc` 互换），`fuzzy_filter` 支持多 token。
+- `src/ui/commands.py`：`CommandSpec` 统一 name/description/argumentHint/aliases/
+  ported；`find`/`matches`/`did_you_mean`/`help_text`/`hotkeys_text`。
+  - 补全、`/help`、未知命令建议共用同一份元数据；
+  - 未迁移命令标记 `ported=False`，帮助里单列「Only in line REPL」；
+  - `/hotkeys` 与真实绑定同源，避免文档漂移。
+- 新 TUI：命令分发改为注册表驱动（别名 `?`/`exit`/`transcripts` 生效），
+  未知命令给模糊建议；补全只列 TUI 可用命令。
+- 快捷键复查：`Ctrl+O` priority 展开工具、`Esc` 关候选→取消、`Ctrl+Q` 退出，
+  避开 TextArea 的 `Ctrl+C` 复制与 `Ctrl+D` 删除。
+
+**测试**：新增 `tests/test_ui_commands.py`（模糊评分/排序、别名、建议、帮助/快捷键）
+与未知命令/`/hotkeys` 用例；总回归 1133 passed / 1 skipped，旧 UI 64 passed。

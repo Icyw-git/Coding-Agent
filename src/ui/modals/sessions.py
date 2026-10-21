@@ -36,12 +36,14 @@ class SessionSearchInput(Input):
 class SessionPickerModal(ModalScreen):
     """会话选择器：搜索过滤 + ↑↓ 选择 + Enter 恢复（对齐 Codex /resume）。"""
 
-    BINDINGS = [('escape', 'dismiss', 'Close')]
+    BINDINGS = [('escape', 'dismiss', 'Close'),
+                ('s', 'cycle_sort', 'Sort')]
 
     def __init__(self, rows: list[dict]):
         super().__init__()
         self.rows = list(rows)
         self._by_id = {row['id']: row for row in self.rows}
+        self._sort = 'updated'    # updated | title
 
     def compose(self) -> ComposeResult:
         with Vertical(id='session-box'):
@@ -49,7 +51,8 @@ class SessionPickerModal(ModalScreen):
             yield SessionSearchInput(placeholder='搜索标题 / 工作区 / 会话 ID',
                                      id='session-search')
             yield OptionList(id='session-list')
-            yield Static('↑↓ 选择 · Enter 恢复 · Esc 取消', classes='modal-hint')
+            yield Static('↑↓ 选择 · s 切换排序 · Enter 恢复 · Esc 取消',
+                         classes='modal-hint')
 
     def on_mount(self) -> None:
         self._filter('')
@@ -60,7 +63,12 @@ class SessionPickerModal(ModalScreen):
         needle = (query or '').strip().casefold()
         options = self.query_one('#session-list', OptionList)
         options.clear_options()
-        for row in self.rows:
+        rows = sorted(self.rows,
+                      key=(lambda row: (row.get('title') or '').casefold())
+                      if self._sort == 'title'
+                      else (lambda row: row.get('updated') or 0),
+                      reverse=self._sort != 'title')
+        for row in rows:
             haystack = ' '.join(str(row.get(key, '')) for key in
                                 ('title', 'workspace', 'id')).casefold()
             if needle and needle not in haystack:
@@ -72,6 +80,11 @@ class SessionPickerModal(ModalScreen):
             options.add_option(Option(label, id=row['id']))
         if options.option_count:
             options.highlighted = 0   # 首项高亮：聚焦后 Enter 即可恢复
+
+    def action_cycle_sort(self) -> None:
+        self._sort = 'title' if self._sort == 'updated' else 'updated'
+        search = self.query_one('#session-search', Input)
+        self._filter(search.value)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if getattr(event.input, 'id', '') == 'session-search':

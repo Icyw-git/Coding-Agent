@@ -17,6 +17,8 @@
   write/edit/apply_patch 生成 unified diff（跳过秘密/二进制、20k 上限）。
 - P5：审批弹窗与会话选择器抽到 `src/ui/modals/`（旧/新 TUI 共用）；
   新 TUI 支持 `/` 命令路由、`/sessions` 选择恢复、`permission_request` 弹窗。
+- P5b：命令注册表 + 移植 Pi 的 fuzzy 匹配；补全/帮助/未知命令建议共用一份
+  元数据，`/hotkeys` 与快捷键表同源；`!` shell、Esc 取消、Ctrl+O 展开。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

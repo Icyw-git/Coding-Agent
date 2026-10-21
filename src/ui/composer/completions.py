@@ -3,31 +3,18 @@ from __future__ import annotations
 
 from file_mentions import format_mention, match_mentions, mention_token
 
-TUI_COMMANDS = frozenset({
-    'help', '?', 'status', 'model', 'pwd', 'quit', 'exit', 'q',
-    'clear', 'export', 'sessions', 'transcripts', 'resume', 'more', 'older',
-    'allow', 'deny', 'ask', 'search', 'failures', 'failed', 'all',
-    'show-all',
-})
-
 
 def suggestions(text: str, files: list[str],
                 limit: int = 6) -> list[tuple[str, str]]:
     """返回 (插入值, 展示文本)；`/` 给命令，`@` 给文件，其它输入为空。"""
     value = text or ''
     if value.startswith('/'):
-        from cli_commands import COMMANDS
-        typed = value.strip().lower()
-        items = []
-        for command in COMMANDS:
-            names = (command.name, *command.aliases)
-            supported = any(name.lstrip('/') in TUI_COMMANDS for name in names)
-            if supported and any(name.startswith(typed) for name in names):
-                items.append((command.name,
-                              f'{command.name}  {command.description}'))
-            if len(items) >= limit:
-                break
-        return items
+        from ui import commands
+        query = value[1:].strip()
+        return [(f'/{spec.name}',
+                 f'/{spec.name}  {spec.description}')
+                for spec in commands.matches(query)
+                if spec.ported][:limit]
     mention = mention_token(value)
     if mention is None:
         return []
