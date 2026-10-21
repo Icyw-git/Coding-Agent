@@ -28,7 +28,8 @@ DEFAULT_PRICING = {
     },
 }
 
-_FIELDS = ('input', 'output', 'cached_input', 'reasoning_output')
+_FIELDS = ('input', 'output', 'cached_input', 'cache_write',
+           'reasoning_output')
 
 
 def _decimal(value):
@@ -66,9 +67,14 @@ def load_pricing() -> dict:
 
 
 def estimate_cost(model: str, *, prompt: int, completion: int,
-                  cached: int = 0, reasoning: int = 0,
+                  cached: int = 0, reasoning: int = 0, cache_write: int = 0,
                   pricing: dict | None = None) -> dict | None:
-    """按 token 用量估算成本；未知模型返回 None。"""
+    """按 token 用量估算成本；未知模型返回 None。
+
+    对齐 Pi `calculateCost`：fresh input、output、cacheRead、cacheWrite 分开计价，
+    单位都是 $/1M（这里沿用配置的 currency）。reasoning 通常是 output 的子集，
+    只作为 output 的单价覆盖，**不能**再额外加一遍，否则会重复计费。
+    """
     pricing = pricing if pricing is not None else load_pricing()
     spec = pricing.get((model or '').casefold())
     if not spec:
@@ -80,6 +86,9 @@ def estimate_cost(model: str, *, prompt: int, completion: int,
     cached_rate = _decimal(spec.get('cached_input'))
     if cached_rate is None:
         cached_rate = input_rate
+    write_rate = _decimal(spec.get('cache_write'))
+    if write_rate is None:
+        write_rate = input_rate
     reasoning_rate = _decimal(spec.get('reasoning_output'))
     if reasoning_rate is None:
         reasoning_rate = output_rate
@@ -87,11 +96,14 @@ def estimate_cost(model: str, *, prompt: int, completion: int,
     prompt = max(0, int(prompt))
     completion = max(0, int(completion))
     cached = min(max(0, int(cached)), prompt)
-    reasoning = max(0, int(reasoning))
-    fresh = prompt - cached
+    cache_write = min(max(0, int(cache_write)), prompt)
+    reasoning = min(max(0, int(reasoning)), completion)
+    fresh = max(0, prompt - cached - cache_write)
+    normal_output = max(0, completion - reasoning)
     cost = ((Decimal(fresh) * input_rate
              + Decimal(cached) * cached_rate
-             + Decimal(completion) * output_rate
+             + Decimal(cache_write) * write_rate
+             + Decimal(normal_output) * output_rate
              + Decimal(reasoning) * reasoning_rate) / Decimal(1_000_000))
     return {
         'cost': cost.quantize(Decimal('0.0001')),

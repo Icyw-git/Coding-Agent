@@ -3018,3 +3018,32 @@ worker 调 `harness.agent_loop(self._messages)` 时**没有传 `session_store`**
 
 **测试**：worker 传入的 store 与 App 一致、事件能落块；footer 的 ctx/cache 文案；
 总回归 1156 passed / 1 skipped，旧 UI 64 passed。
+## Pi 调研：token 计数、成本与缓存命中率
+
+阅读 Pi `components/footer.ts`、`usage-totals.ts`、`cache-stats.ts` 和 bundle 里的
+`calculateCost`：
+
+- **usage 分桶**：`input`、`output`、`cacheRead`、`cacheWrite`、`totalTokens`；
+  `cost` 也按四桶拆开。`totalTokens` 是四者之和。
+- **成本**：`cost.input = input_rate/1e6*input`，output/cacheRead/cacheWrite 同理；
+  `cacheWrite1h` 用 input 的 2 倍；模型可配置按输入规模的 `cost.tiers`。
+  `reasoning` 是 `output` 的子集，不单独加价，否则会重复计费。
+- **缓存命中率**：取**最近一条 assistant message** 的
+  `cacheRead / (input + cacheRead + cacheWrite)`；没有缓存活动不显示。
+- **footer**：左边是 `cwd (branch) • session name`，右边是累计
+  `↑input ↓output RcacheRead WcacheWrite CHxx.x%`、成本和
+  `contextPercent/contextWindow`；上下文超过 70%/90% 用警示色。
+- **缓存浪费**：跨回合比较 `cacheRead`，miss 低于 1024 tokens 视为噪声；这是诊断，
+  不是基础计数。
+
+我们的实现：
+
+- `_parse_usage` 增加 `cache_write`；`SessionMetrics` 记录累计 fresh input/output/
+  cacheRead/cacheWrite 和最近一次 prompt/cached/rate；
+- `pricing.estimate_cost` 改为分桶公式，reasoning 只覆盖 output 单价；
+- footer 常驻 cwd(branch)，显示 `ctx`、`↑/↓/R/W`、`cache%` 和成本；
+  “新会话/新对话”占位标题不再占据第一段，footer 每秒刷新目录/分支。
+- 未知缓存价回退 input 价，未知模型仍不猜成本。
+
+**测试**：pricing 的 reasoning 不重复计费、reasoning 溢价、cache_write 单价；
+footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed。

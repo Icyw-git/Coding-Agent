@@ -394,7 +394,8 @@ HARNESS_MEMORY_RECALL=local
 HARNESS_PROJECT_CONTEXT=on
 
 # 可选：覆盖模型价格表（每 1M tokens，JSON）
-# LLM_PRICING_JSON={"my-model":{"input":"2","output":"4","currency":"USD"}}
+# LLM_PRICING_JSON={"my-model":{"input":"2","output":"4",
+#                   "cached_input":"0.2","cache_write":"2.5","currency":"USD"}}
 
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
@@ -516,7 +517,11 @@ workspace-write 之间切换执行档位。
 折叠成一行提示：`/more` 继续加载，`/export` 导出全文；状态栏与工具块保持实时。
 交互模式启动时 MCP 在后台连接，界面先可用，首条消息前完成工具注册。
 状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
-可用 `LLM_PRICING_JSON` 覆盖价格。
+可用 `LLM_PRICING_JSON` 覆盖价格（input/output/cached_input/cache_write，
+单位均为每 1M tokens；reasoning 视为 output 的子集，不会再重复计费）。
+textual-next 的 footer 常驻 `目录 (分支)`，并显示 `ctx 25% 50k/200k`、
+`↑输入 ↓输出 R缓存读 W缓存写`、`cache 50%`（最近一次请求的缓存命中率）和成本；
+未知缓存字段不显示，避免把“未知”当成 0。
 
 启动前检查本地配置和目录：
 

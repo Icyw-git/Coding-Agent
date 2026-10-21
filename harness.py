@@ -1590,6 +1590,10 @@ def _parse_usage(usage) -> dict | None:
     cached = getattr(details, 'cached_tokens', None) if details is not None else None
     if cached is None:
         cached = getattr(usage, 'prompt_cache_hit_tokens', None)
+    cache_write = getattr(usage, 'cache_creation_input_tokens', None)
+    if cache_write is None and details is not None:
+        cache_write = (getattr(details, 'cache_creation_tokens', None)
+                       or getattr(details, 'cache_write_tokens', None))
     completion_details = getattr(usage, 'completion_tokens_details', None)
     reasoning = (getattr(completion_details, 'reasoning_tokens', None)
                  if completion_details is not None else None)
@@ -1597,6 +1601,7 @@ def _parse_usage(usage) -> dict | None:
         reasoning = getattr(usage, 'reasoning_tokens', None)
     return {'prompt': prompt, 'completion': completion, 'total': total,
             'cached': int(cached or 0), 'cached_seen': cached is not None,
+            'cache_write': int(cache_write or 0),
             'reasoning': int(reasoning or 0)}
 
 

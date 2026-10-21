@@ -40,6 +40,9 @@
 - P5j：修复 worker 未把 `session_store` 传给 `agent_loop` 导致事件 session_id
   对不上（UI 不显示本轮结果，重开才从会话文件刷出）；footer 增加上下文
   `ctx N% 50k/200k` 与 `cache N%`，并处理 `round_end` 的 usage。
+- P5k：footer 常驻 cwd/branch（隐藏“新会话”占位标题，每秒刷新）；token/成本
+  对齐 Pi：`↑input ↓output RcacheRead WcacheWrite`、最近一次请求的 `cache%`，
+  cost 按 fresh input/output/cacheRead/cacheWrite 分桶，reasoning 不再重复计费。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

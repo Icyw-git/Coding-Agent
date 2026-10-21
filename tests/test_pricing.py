@@ -42,3 +42,30 @@ def test_invalid_override_falls_back_to_defaults(monkeypatch):
     result = pricing.estimate_cost('deepseek-chat', prompt=1_000_000, completion=0)
 
     assert result['cost'] == Decimal('1.0100')
+
+
+def test_reasoning_is_not_double_charged(monkeypatch):
+    monkeypatch.setenv('LLM_PRICING_JSON',
+                       '{"r-model":{"input":"1","output":"2",'
+                       '"reasoning_output":"2","currency":"USD"}}')
+    result = pricing.estimate_cost('r-model', prompt=0, completion=1_000_000,
+                                   reasoning=500_000)
+    assert result['cost'] == Decimal('2.0000')   # 500k*2 + 500k*2
+
+
+def test_reasoning_can_have_premium_rate(monkeypatch):
+    monkeypatch.setenv('LLM_PRICING_JSON',
+                       '{"r-model":{"input":"1","output":"2",'
+                       '"reasoning_output":"3","currency":"USD"}}')
+    result = pricing.estimate_cost('r-model', prompt=0, completion=1_000_000,
+                                   reasoning=500_000)
+    assert result['cost'] == Decimal('2.5000')   # 500k*2 + 500k*3
+
+
+def test_cache_write_uses_configured_rate(monkeypatch):
+    monkeypatch.setenv('LLM_PRICING_JSON',
+                       '{"w-model":{"input":"1","output":"2",'
+                       '"cache_write":"1.25","currency":"USD"}}')
+    result = pricing.estimate_cost('w-model', prompt=1_000_000, completion=0,
+                                   cached=0, cache_write=1_000_000)
+    assert result['cost'] == Decimal('1.2500')

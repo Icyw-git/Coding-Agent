@@ -284,6 +284,7 @@ class HarnessApp(App):
         self.set_interval(0.03, self._drain_events)
         self.set_interval(0.05, self._flush_layout)
         self.set_interval(0.2, self._tick_border_status)
+        self.set_interval(1.0, self._refresh_footer)
 
     def action_quit_app(self) -> None:
         self.exit()
@@ -306,8 +307,17 @@ class HarnessApp(App):
         if self._footer is None:
             return
         parts = []
-        if self._title:
-            parts.append(self._title[:40])
+        # 目录/分支常驻，不会被会话标题挤掉（标题只在有实际内容时显示）。
+        try:
+            import harness
+            workspace = harness.get_workdir()
+            branch = harness.current_branch(workspace)
+            label = f'{workspace.name} ({branch})' if branch else workspace.name
+            parts.append(str(label))
+        except Exception:
+            pass
+        if self._title and self._title not in ('新会话', '新对话', 'New session', 'Untitled'):
+            parts.append(self._title[:28])
         try:
             import harness
             parts.append(harness.os.getenv('LLM_MODEL_ID', '') or '(model unset)')
@@ -321,24 +331,33 @@ class HarnessApp(App):
             if ctx_tokens and ctx_window:
                 detail += f' {_short_count(ctx_tokens)}/{_short_count(ctx_window)}'
             parts.append(detail)
-        tokens = self._status.get('tokens')
-        if tokens:
-            parts.append(f'tok {_short_count(tokens)}')
+        input_tokens = self._status.get('input_tokens')
+        output_tokens = self._status.get('output_tokens')
         prompt_tokens = self._status.get('prompt_tokens')
         cached_tokens = self._status.get('cached_tokens')
-        if prompt_tokens and cached_tokens is not None:
-            parts.append(f'cache {100 * min(1.0, cached_tokens / prompt_tokens):.0f}%')
+        cache_write = self._status.get('cache_write_tokens') or 0
+        if input_tokens is None and prompt_tokens is not None:
+            input_tokens = max(0, prompt_tokens - (cached_tokens or 0)
+                               - cache_write)
+        if input_tokens:
+            parts.append(f'↑{_short_count(input_tokens)}')
+        if output_tokens:
+            parts.append(f'↓{_short_count(output_tokens)}')
+        if cached_tokens:
+            parts.append(f'R{_short_count(cached_tokens)}')
+        if cache_write:
+            parts.append(f'W{_short_count(cache_write)}')
+        rate = self._status.get('latest_cache_hit_rate')
+        if rate is None and prompt_tokens:
+            rate = min(1.0, (cached_tokens or 0) / prompt_tokens)
+        if rate is not None and (cached_tokens or self._status.get('cache_seen')):
+            parts.append(f'cache {100 * float(rate):.0f}%')
+        total = self._status.get('tokens')
+        if total and not (input_tokens or output_tokens):
+            parts.append(f'tok {_short_count(total)}')
         if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
             symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
             parts.append(f"~{symbol}{self._status['cost']}")
-        try:
-            import harness
-            workspace = harness.get_workdir()
-            branch = harness.current_branch(workspace)
-            label = f'{workspace.name} ({branch})' if branch else workspace.name
-            parts.append(str(label))
-        except Exception:
-            pass
         queued = len(self._pending)
         if queued:
             parts.append(f'{queued} queued')
@@ -564,15 +583,24 @@ class HarnessApp(App):
                 str(payload.get('title', 'Permission needed')),
                 str(payload.get('risk', 'warning'))))
         elif kind == 'round_end':
+            prompt_tokens = int(payload.get('prompt_tokens') or 0)
+            cached_tokens = int(payload.get('cached_tokens') or 0)
+            completion_tokens = int(payload.get('completion_tokens') or 0)
             self._status.update({
-                'prompt_tokens': payload.get('prompt_tokens'),
-                'cached_tokens': payload.get('cached_tokens'),
+                'prompt_tokens': prompt_tokens,
+                'cached_tokens': cached_tokens,
+                'input_tokens': max(0, prompt_tokens - cached_tokens),
+                'output_tokens': completion_tokens,
                 'tokens': payload.get('total_tokens'),
+                'latest_prompt_tokens': prompt_tokens,
+                'latest_cached_tokens': cached_tokens,
+                'latest_cache_hit_rate': (
+                    cached_tokens / prompt_tokens if prompt_tokens else None),
+                'cache_seen': True,
                 'cost': payload.get('cost'),
                 'cost_source': payload.get('cost_source'),
             })
             window = self._status.get('ctx_window')
-            prompt_tokens = payload.get('prompt_tokens')
             if window and prompt_tokens:
                 self._status['ctx_tokens'] = prompt_tokens
                 self._status['ctx_pct'] = min(

@@ -32,6 +32,13 @@ class SessionMetrics:
             self.prompt_tokens = 0
             self.completion_tokens = 0
             self.cached_tokens = 0
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.cache_write_tokens = 0
+            self.latest_prompt_tokens = 0
+            self.latest_cached_tokens = 0
+            self.latest_cache_hit_rate = None
+            self.cache_seen = False
             self.recent: list[dict] = []
             self.ctx_tokens = 0
             self.ctx_source = 'estimated'
@@ -49,10 +56,24 @@ class SessionMetrics:
             return
         with self._lock:
             self.calls += 1
+            prompt = int(detail.get('prompt', 0))
+            completion = int(detail.get('completion', 0))
+            cached = int(detail.get('cached', 0))
+            write = int(detail.get('cache_write', 0))
             self.tokens += int(detail.get('total', 0))
-            self.prompt_tokens += int(detail.get('prompt', 0))
-            self.completion_tokens += int(detail.get('completion', 0))
-            self.cached_tokens += int(detail.get('cached', 0))
+            self.prompt_tokens += prompt
+            self.completion_tokens += completion
+            self.cached_tokens += cached
+            self.input_tokens += max(0, prompt - cached - write)
+            self.output_tokens += completion
+            self.cache_write_tokens += write
+            self.latest_prompt_tokens = prompt
+            self.latest_cached_tokens = cached
+            self.latest_cache_hit_rate = (
+                cached / (max(0, prompt - cached - write) + cached + write)
+                if prompt > 0 else None)
+            self.cache_seen = self.cache_seen or bool(
+                detail.get('cached_seen', True))
             self.recent = (self.recent + [dict(detail)])[-5:]
             self.ctx_tokens = int(detail.get('prompt', self.ctx_tokens))
             self.ctx_source = 'confirmed'
@@ -77,6 +98,13 @@ class SessionMetrics:
                 'prompt_tokens': self.prompt_tokens,
                 'completion_tokens': self.completion_tokens,
                 'cached_tokens': self.cached_tokens,
+                'input_tokens': self.input_tokens,
+                'output_tokens': self.output_tokens,
+                'cache_write_tokens': self.cache_write_tokens,
+                'latest_prompt_tokens': self.latest_prompt_tokens,
+                'latest_cached_tokens': self.latest_cached_tokens,
+                'latest_cache_hit_rate': self.latest_cache_hit_rate,
+                'cache_seen': self.cache_seen,
                 'ctx_tokens': self.ctx_tokens,
                 'ctx_source': self.ctx_source,
                 'recent_calls': list(self.recent),
