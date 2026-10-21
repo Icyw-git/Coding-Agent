@@ -1,4 +1,3 @@
-import argparse
 import os
 
 # 执行/审批档位只认「启动进程时的真实环境」：项目根的 .env 就在工作区里，
@@ -53,7 +52,7 @@ import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/�
 import recovery
 import sandbox
 import tool_cache
-import web_access
+import turn_control
 import workspace_diff
 import workspaces
 from agent_core import (
@@ -854,7 +853,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     if on_activity is not None:
         from tool_activity import is_failure, result_hint
         on_activity(name, args, elapsed, is_failure(output),
-                    background_started, result_hint(output))
+                    background_started, result_hint(output), str(output))
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
@@ -884,20 +883,54 @@ PARALLEL_MAX_WORKERS = 4
 
 
 ACTIVE_TICKER = None   # 交互回合进行中的进度行；工具活动行借它原子换行
+TOOL_OUTPUTS = {}      # 折叠输出的环形缓存：编号 -> (工具名, 全文)
+TOOL_OUTPUT_LIMIT = 20
+_tool_output_seq = 0
+
+
+def _remember_tool_output(name, output) -> int:
+    """保存被折叠的输出，返回 /expand 用的编号；只保留最近 20 条。"""
+    global _tool_output_seq
+    _tool_output_seq += 1
+    while len(TOOL_OUTPUTS) >= TOOL_OUTPUT_LIMIT:
+        TOOL_OUTPUTS.pop(next(iter(TOOL_OUTPUTS)))
+    TOOL_OUTPUTS[_tool_output_seq] = (name, str(output))
+    return _tool_output_seq
+
+
+def format_tool_output(argument: str) -> str:
+    """/expand <编号>：打印被折叠的工具全文。"""
+    try:
+        number = int(argument.strip())
+    except (TypeError, ValueError):
+        return '  用法：/expand <编号>（编号见工具行末尾的折叠提示）'
+    entry = TOOL_OUTPUTS.get(number)
+    if entry is None:
+        return f'  没有编号为 {number} 的工具输出（只保留最近 {TOOL_OUTPUT_LIMIT} 条）。'
+    return entry[1]
 
 
 def _print_tool_activity(name, args, elapsed, failed, background=False,
-                         hint=''):
-    """交互终端的工具活动行；管道、测试与无头模式保持 stdout 干净。"""
+                         hint='', output=''):
+    """交互终端的工具活动行；长输出折叠为头尾 + /expand 提示。"""
     if not sys.stdout.isatty():
         return
-    from tool_activity import format_line
+    from tool_activity import format_line, preview_lines
     line = format_line(name, args, elapsed, failed=failed,
                        background=background, hint=hint)
+    lines, hidden = preview_lines(output)
+    if hidden:
+        number = _remember_tool_output(name, output)
+        block = '\n'.join(
+            [line]
+            + [f'    │ {text}' for text in lines]
+            + [f'    └ … {hidden} 行已折叠 · /expand {number}'])
+    else:
+        block = line
     if ACTIVE_TICKER is not None:
-        ACTIVE_TICKER.emit_line(line)
+        ACTIVE_TICKER.emit_line(block)
         return
-    print(line, flush=True)
+    print(block, flush=True)
 
 
 def _batch_bash_commands(tool_calls):
@@ -1145,6 +1178,9 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/status':
         print(format_status(session_store))
+
+    elif command == '/expand':
+        print(format_tool_output(argument))
 
     elif command == '/watch':
         print(watch_command(argument))
@@ -1514,7 +1550,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
     restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
     turn_workspace = get_workdir()
-    turn_baseline = workspace_diff.snapshot(turn_workspace, CHECKPOINT_IGNORE)
+    # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
+    turn_baseline = None
+    baseline_taken = False
     turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
 
     while True:
@@ -1684,7 +1722,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             fallback = _safe_checkpoint(
                 checkpoint_manager.changed_files_since, turn_cp_start) or {}
             try:
-                changes = workspace_diff.turn_changes(
+                changes = [] if not baseline_taken else workspace_diff.turn_changes(
                     turn_workspace, turn_baseline, fallback, CHECKPOINT_IGNORE)
             except Exception as exc:   # 汇总失败不影响本轮结果
                 print(f'  [diff] 无法汇总本轮改动：{exc}')
@@ -1729,7 +1767,12 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
 
         def _flush_batch():
             # 本函数每轮重新定义，且只在本轮内同步调用：batch/tool_messages 不跨轮存活
+            nonlocal baseline_taken, turn_baseline
             if batch:  # noqa: B023
+                if not baseline_taken:   # 首个工具执行前记录工作区基线
+                    turn_baseline = workspace_diff.snapshot(
+                        turn_workspace, CHECKPOINT_IGNORE)
+                    baseline_taken = True
                 # 批级合并审查：批内多条会 ASK 的 bash 打包成一次 LLM 审查，
                 # 放行结果进缓存（enforce 单条路径零开销命中）；升级的照旧问人
                 hooks.preflight_judge(batch)  # noqa: B023
@@ -1923,175 +1966,186 @@ def run_repl(initial_messages:list, session_store=None):
 
     read_line = create_reader(lambda: WORKDIR, session_choices)
 
-    interrupted = 0
-    while True:
-        try:
-            line=read_line(prompt_text()).strip()
-            interrupted = 0
-        except EOFError:
-            print('\n[会话已结束]')
-            break
-        except KeyboardInterrupt:
-            # Codex 习惯：第一次 Ctrl-C 只提示，第二次才退出，避免误触丢会话。
-            if interrupted:
+    from contextlib import nullcontext
+
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    # TTY 下输入线程持有提示符：回合内与命令输出都打印到提示符上方。
+    stdout_guard = patch_stdout(raw=True) if sys.stdout.isatty() else nullcontext()
+    with stdout_guard:
+        interrupted = 0
+        while True:
+            try:
+                line=read_line(prompt_text()).strip()
+                interrupted = 0
+            except EOFError:
                 print('\n[会话已结束]')
                 break
-            interrupted += 1
-            print('\n  再按一次 Ctrl-C 退出（Ctrl-D 也可退出）。')
-            continue
-        if not line:
-            continue
-        if line.startswith('/') or line == 'cd' or line.startswith('cd '):
-            if line == 'cd' or line.startswith('cd '):
-                line = '/' + line
-            command, argument = parse_command(line)
-            error = command_error(command, argument)
-            if error:
-                print(f'  {error}')
+            except KeyboardInterrupt:
+                # Codex 习惯：第一次 Ctrl-C 只提示，第二次才退出，避免误触丢会话。
+                if interrupted:
+                    print('\n[会话已结束]')
+                    break
+                interrupted += 1
+                print('\n  再按一次 Ctrl-C 退出（Ctrl-D 也可退出）。')
                 continue
-            line = f'{command} {argument}'.rstrip()
-            if command in ('/exit','/quit'):
-                break
-            if command in ('/r', '/resume', '/sessions'):
-                parts = line.split(maxsplit=1)
-                argument = parts[1].strip() if len(parts) > 1 else ''
-                try:
-                    if argument == 'last':
-                        rows = session_rows(limit=1, include_empty=False)
-                        if not rows:
-                            print('  [session] 没有可恢复的会话。')
-                            continue
-                        if rows[0]['id'] == session_store.session_id:
-                            print(f"  [session] 最近会话就是当前会话：{rows[0]['title']}")
-                            continue
-                        path = resolve_session_path(rows[0]['id'])
-                    elif not argument:
-                        identifier = choose_session(session_rows(limit=None, include_empty=True),
-                                                    session_store.session_id, WORKDIR)
-                        if identifier is None:
-                            continue
-                        path = resolve_session_path(identifier)
-                    else:
-                        rows = session_rows(include_empty=False, query=argument)
-                        matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
-                        if len(matches) == 1:
-                            path = matches[0]
-                        elif len(matches) > 1:
-                            selected = choose_session(rows, session_store.session_id)
-                            if selected is None:
-                                continue
-                            path = resolve_session_path(selected)
-                        else:
-                            path = resolve_session_path(argument)
-                    candidate = SessionEventStore.open(path)
-                    history = candidate.rebuild_openai_history(recover_pending=True)
-                    summary = candidate.session_summary()
-                    if summary['workspace']:
-                        set_workspace(summary['workspace'])
-                    else:
-                        print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
-                    session_store = candidate
-                    messages = history
-                    print(f"  已恢复：{summary['title']}\n  工作区：{WORKDIR}")
-                except (FileNotFoundError, ValueError, SessionReplayError) as exc:
-                    print(f'  [session] {exc}')
+            if not line:
                 continue
-            if command in ('/n', '/new'):
-                parts = line.split(maxsplit=1)
-                requested = parts[1].strip() if len(parts) > 1 else None
-                target = WORKDIR
-                session_id = None
-                lowered = requested.lower() if requested else ''
-                if lowered.startswith('--'):
-                    if lowered != '--ws' and not lowered.startswith('--ws '):
-                        print('  [workspace] 未知参数；用法：'
-                              '/new [--ws <序号|名称|路径>|会话ID]')
-                        continue
-                    selector = requested[4:].strip()
-                    if not selector:
-                        print('  [workspace] 用法：/new --ws <序号|名称|路径>')
-                        continue
+            if line.startswith('/') or line == 'cd' or line.startswith('cd '):
+                if line == 'cd' or line.startswith('cd '):
+                    line = '/' + line
+                command, argument = parse_command(line)
+                error = command_error(command, argument)
+                if error:
+                    print(f'  {error}')
+                    continue
+                line = f'{command} {argument}'.rstrip()
+                if command in ('/exit','/quit'):
+                    break
+                if command in ('/r', '/resume', '/sessions'):
+                    parts = line.split(maxsplit=1)
+                    argument = parts[1].strip() if len(parts) > 1 else ''
                     try:
-                        target = find_workspace(registered_workspaces(), selector)['path']
-                    except ValueError as exc:
-                        # 直接给路径也允许（未登记时不必先 /workspace add）
-                        candidate = Path(selector).expanduser()
-                        if not candidate.is_absolute():
-                            candidate = WORKDIR / candidate
-                        if candidate.is_dir():
-                            target = str(candidate.resolve())
+                        if argument == 'last':
+                            rows = session_rows(limit=1, include_empty=False)
+                            if not rows:
+                                print('  [session] 没有可恢复的会话。')
+                                continue
+                            if rows[0]['id'] == session_store.session_id:
+                                print(f"  [session] 最近会话就是当前会话：{rows[0]['title']}")
+                                continue
+                            path = resolve_session_path(rows[0]['id'])
+                        elif not argument:
+                            identifier = choose_session(session_rows(limit=None, include_empty=True),
+                                                        session_store.session_id, WORKDIR)
+                            if identifier is None:
+                                continue
+                            path = resolve_session_path(identifier)
                         else:
-                            print(f'  [workspace] {exc}')
+                            rows = session_rows(include_empty=False, query=argument)
+                            matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
+                            if len(matches) == 1:
+                                path = matches[0]
+                            elif len(matches) > 1:
+                                selected = choose_session(rows, session_store.session_id)
+                                if selected is None:
+                                    continue
+                                path = resolve_session_path(selected)
+                            else:
+                                path = resolve_session_path(argument)
+                        candidate = SessionEventStore.open(path)
+                        history = candidate.rebuild_openai_history(recover_pending=True)
+                        summary = candidate.session_summary()
+                        if summary['workspace']:
+                            set_workspace(summary['workspace'])
+                        else:
+                            print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
+                        session_store = candidate
+                        messages = history
+                        print(f"  已恢复：{summary['title']}\n  工作区：{WORKDIR}")
+                    except (FileNotFoundError, ValueError, SessionReplayError) as exc:
+                        print(f'  [session] {exc}')
+                    continue
+                if command in ('/n', '/new'):
+                    parts = line.split(maxsplit=1)
+                    requested = parts[1].strip() if len(parts) > 1 else None
+                    target = WORKDIR
+                    session_id = None
+                    lowered = requested.lower() if requested else ''
+                    if lowered.startswith('--'):
+                        if lowered != '--ws' and not lowered.startswith('--ws '):
+                            print('  [workspace] 未知参数；用法：'
+                                  '/new [--ws <序号|名称|路径>|会话ID]')
                             continue
-                elif requested:
-                    if not requested.replace('-', '').replace('_', '').isalnum():
-                        print('  [session] invalid session id')
+                        selector = requested[4:].strip()
+                        if not selector:
+                            print('  [workspace] 用法：/new --ws <序号|名称|路径>')
+                            continue
+                        try:
+                            target = find_workspace(registered_workspaces(), selector)['path']
+                        except ValueError as exc:
+                            # 直接给路径也允许（未登记时不必先 /workspace add）
+                            candidate = Path(selector).expanduser()
+                            if not candidate.is_absolute():
+                                candidate = WORKDIR / candidate
+                            if candidate.is_dir():
+                                target = str(candidate.resolve())
+                            else:
+                                print(f'  [workspace] {exc}')
+                                continue
+                    elif requested:
+                        if not requested.replace('-', '').replace('_', '').isalnum():
+                            print('  [session] invalid session id')
+                            continue
+                        session_id = requested
+                    else:
+                        target = _workspace_for_new_session()
+                        if target is None:
+                            print('  [session] 已取消新建会话。')
+                            continue
+                    try:
+                        session_store = start_new_session(workspace=target, session_id=session_id)
+                    except (ValueError, FileExistsError) as exc:
+                        print(f'  [session] {exc}')
                         continue
-                    session_id = requested
-                else:
-                    target = _workspace_for_new_session()
-                    if target is None:
-                        print('  [session] 已取消新建会话。')
-                        continue
-                try:
-                    session_store = start_new_session(workspace=target, session_id=session_id)
-                except (ValueError, FileExistsError) as exc:
-                    print(f'  [session] {exc}')
+                    messages = []
+                    print(f'  已开始新会话，工作区：{WORKDIR}')
                     continue
-                messages = []
-                print(f'  已开始新会话，工作区：{WORKDIR}')
-                continue
-            if command == '/fork':
-                parts = line.split(maxsplit=1)
-                upto = None
-                if len(parts) > 1:
-                    if not parts[1].strip().isdigit():
-                        print('  [fork] 用法：/fork [事件序号]，缺省复制全部历史。')
+                if command == '/fork':
+                    parts = line.split(maxsplit=1)
+                    upto = None
+                    if len(parts) > 1:
+                        if not parts[1].strip().isdigit():
+                            print('  [fork] 用法：/fork [事件序号]，缺省复制全部历史。')
+                            continue
+                        upto = int(parts[1].strip())
+                    try:
+                        forked = SessionEventStore.fork(session_store, upto_seq=upto)
+                    except (FileExistsError, OSError, SessionReplayError) as exc:
+                        print(f'  [fork] 分叉失败：{exc}')
                         continue
-                    upto = int(parts[1].strip())
-                try:
-                    forked = SessionEventStore.fork(session_store, upto_seq=upto)
-                except (FileExistsError, OSError, SessionReplayError) as exc:
-                    print(f'  [fork] 分叉失败：{exc}')
+                    session_store = forked
+                    messages = session_store.rebuild_openai_history()
+                    print(f'  已分叉出新会话 {forked.session_id}（原会话保留），后续对话在新会话进行。')
                     continue
-                session_store = forked
-                messages = session_store.rebuild_openai_history()
-                print(f'  已分叉出新会话 {forked.session_id}（原会话保留），后续对话在新会话进行。')
+                handle_command(line,messages,session_store)
                 continue
-            handle_command(line,messages,session_store)
-            continue
-        messages[:] = session_store.rebuild_openai_history(recover_pending=True)
-        messages.append({'role':'user','content':line})
-        session_store.append_message(messages[-1])
-        global ACTIVE_TICKER
-        ticker = None
-        if sys.stdout.isatty():
-            from turn_progress import ProgressTicker, TurnProgress
-            progress = TurnProgress()
+            messages[:] = session_store.rebuild_openai_history(recover_pending=True)
+            messages.append({'role':'user','content':line})
+            session_store.append_message(messages[-1])
+            global ACTIVE_TICKER
+            turn_control.begin_turn()
+            ticker = None
+            if sys.stdout.isatty():
+                from turn_progress import ProgressTicker, TurnProgress
+                progress = TurnProgress()
+                try:
+                    progress.follow(session_store, session_store.path.stat().st_size)
+                except OSError:
+                    progress.follow(session_store, 0)
+                ticker = ProgressTicker(progress).start()
+                ACTIVE_TICKER = ticker
+
+            def on_delta(part):
+                nonlocal ticker
+                if turn_control.cancel_requested():
+                    raise KeyboardInterrupt
+                if ticker is not None:
+                    ticker.stop()   # 正文开始上屏前清掉进度行
+                    ticker = None
+                print(part, end='', flush=True)
+
             try:
-                progress.follow(session_store, session_store.path.stat().st_size)
-            except OSError:
-                progress.follow(session_store, 0)
-            ticker = ProgressTicker(progress).start()
-            ACTIVE_TICKER = ticker
-
-        def on_delta(part):
-            nonlocal ticker
-            if ticker is not None:
-                ticker.stop()   # 正文开始上屏前清掉进度行
-                ticker = None
-            print(part, end='', flush=True)
-
-        try:
-            # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
-            agent_loop(messages, session_store=session_store, on_delta=on_delta)
-        except KeyboardInterrupt:
-            print('\n[会话已中断]')
-        finally:
-            if ticker is not None:
-                ticker.stop()
-                ACTIVE_TICKER = None
-        messages[:]=session_store.rebuild_openai_history(recover_pending=True)
+                # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
+                agent_loop(messages, session_store=session_store, on_delta=on_delta)
+            except KeyboardInterrupt:
+                print('\n[会话已中断]')
+            finally:
+                turn_control.end_turn()
+                if ticker is not None:
+                    ticker.stop()
+                    ACTIVE_TICKER = None
+            messages[:]=session_store.rebuild_openai_history(recover_pending=True)
 
 
 if __name__ == '__main__':

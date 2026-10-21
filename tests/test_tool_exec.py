@@ -1,5 +1,6 @@
 """tool_exec：超时校验、审批门与联网抓取边界。"""
 import tool_exec
+import web_access
 
 
 def _gate(denied=None, log=None):
@@ -57,8 +58,8 @@ def test_bash_rejects_bad_timeout_before_spawn(tmp_path, monkeypatch):
 
 
 def test_fetch_url_denial_skips_network(tmp_path, monkeypatch):
-    monkeypatch.setattr(tool_exec.web_access, 'check_url', lambda url: None)
-    monkeypatch.setattr(tool_exec.web_access, 'fetch',
+    monkeypatch.setattr(web_access, 'check_url', lambda url: None)
+    monkeypatch.setattr(web_access, 'fetch',
                         lambda url: (_ for _ in ()).throw(
                             AssertionError('must not fetch')))
     gate, _ = _gate(denied='Error: denied')
@@ -67,8 +68,8 @@ def test_fetch_url_denial_skips_network(tmp_path, monkeypatch):
 
 
 def test_fetch_url_truncates_and_reports_headers(tmp_path, monkeypatch):
-    monkeypatch.setattr(tool_exec.web_access, 'check_url', lambda url: None)
-    monkeypatch.setattr(tool_exec.web_access, 'fetch', lambda url: {
+    monkeypatch.setattr(web_access, 'check_url', lambda url: None)
+    monkeypatch.setattr(web_access, 'fetch', lambda url: {
         'text': 'x' * 50, 'final_url': 'https://example.com/',
         'content_type': 'text/plain', 'truncated': True})
     gate, log = _gate()

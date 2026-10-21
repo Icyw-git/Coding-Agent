@@ -1,13 +1,16 @@
 """Interactive input adapter; command execution stays in the REPL."""
 
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
+import turn_control
 from cli_commands import COMMANDS, parse_command
 from file_mentions import format_mention, match_mentions, mention_token, workspace_files
 from session_views import display_text, group_sessions, relative_time, session_details, session_status
@@ -346,30 +349,71 @@ def _history_path():
         return None
 
 
+class QueuedPrompt:
+    """TTY 输入由后台线程读、主线程消费：回合进行中也能继续输入。
+
+    队列里的每条输入会在当前回合结束后按顺序处理；Ctrl-C 在回合进行中只置取消位，
+    空闲时才作为「中断提示 / 退出」事件交给主循环。
+    """
+
+    def __init__(self, workspace, sessions):
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.key_binding import KeyBindings
+
+        bindings = KeyBindings()
+
+        @bindings.add('c-j')
+        def _insert_newline(event):
+            # Enter 提交、Ctrl-J 换行：多行消息不用先学 /paste。
+            event.current_buffer.insert_text('\n')
+
+        path = _history_path()
+        self.session = PromptSession(
+            completer=SlashCompleter(workspace, sessions),
+            complete_while_typing=True,
+            key_bindings=bindings,
+            history=FileHistory(str(path)) if path is not None else None,
+            enable_history_search=True,
+        )
+        self.prompt = '> '
+        self.events = queue.Queue()
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+
+    def _read_loop(self):
+        while True:
+            try:
+                line = self.session.prompt(lambda: self.prompt)
+            except EOFError:
+                self.events.put(('eof', None))
+                return
+            except KeyboardInterrupt:
+                if turn_control.active():
+                    turn_control.request_cancel()
+                else:
+                    self.events.put(('interrupt', None))
+                continue
+            except BaseException:   # 终端被关闭等：按 EOF 结束，不留死线程
+                self.events.put(('eof', None))
+                return
+            self.events.put(('line', line or ''))
+
+    def __call__(self, prompt):
+        if prompt:
+            self.prompt = prompt
+        kind, value = self.events.get()
+        if kind == 'eof':
+            raise EOFError
+        if kind == 'interrupt':
+            raise KeyboardInterrupt
+        return value
+
+
 def create_reader(workspace, sessions):
     """Use plain input for pipes and test runners, never force a terminal UI."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.key_binding import KeyBindings
-
-    bindings = KeyBindings()
-
-    @bindings.add('c-j')
-    def _insert_newline(event):
-        # Enter 提交、Ctrl-J 换行：多行消息不用先学 /paste。
-        event.current_buffer.insert_text('\n')
-
-    path = _history_path()
-    session = PromptSession(
-        completer=SlashCompleter(workspace, sessions),
-        complete_while_typing=True,
-        key_bindings=bindings,
-        history=FileHistory(str(path)) if path is not None else None,
-        enable_history_search=True,
-    )
-    return session.prompt
-
+    return QueuedPrompt(workspace, sessions)
 
 class DirectoryBrowser:
     """逐级选择电脑中的文件夹：↑↓ 移动，Enter 进入/确认，Backspace 返回上级。"""

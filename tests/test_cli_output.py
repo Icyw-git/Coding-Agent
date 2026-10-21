@@ -55,6 +55,8 @@ def test_workspace_diff_reports_status_and_line_changes(monkeypatch, tmp_path):
     import harness
     import workspace_diff
 
+    (tmp_path / '.git').mkdir()   # repo_root 走文件系统快路径，不再为它起 git 进程
+
     def fake_git(args, **kwargs):
         if 'rev-parse' in args:
             return SimpleNamespace(returncode=0, stdout=f'{tmp_path}\n')
@@ -219,3 +221,27 @@ def test_prompt_text_includes_git_branch(tmp_path, monkeypatch):
                         lambda: SimpleNamespace(sandbox_mode='workspace-write'))
 
     assert harness.prompt_text().strip() == f'{tmp_path.name} (main) [rw] >'
+
+
+def test_folded_tool_output_can_be_expanded(monkeypatch):
+    import io
+    import sys
+
+    import harness
+
+    class _TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    fake = _TTY()
+    monkeypatch.setattr(sys, 'stdout', fake)
+    monkeypatch.setattr(harness, 'ACTIVE_TICKER', None)
+    output = '\n'.join(f'line {i}' for i in range(20))
+
+    harness._print_tool_activity('read', {'path': 'x.py'}, 0.1, False,
+                                 False, '20 行', output)
+
+    text = fake.getvalue()
+    assert '已折叠' in text and '/expand' in text
+    number = text.rsplit('/expand ', 1)[1].splitlines()[0].strip()
+    assert harness.format_tool_output(number) == output

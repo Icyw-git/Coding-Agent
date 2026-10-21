@@ -54,3 +54,19 @@ def test_format_line_appends_result_hint():
 
     assert ok.endswith('→ 42 行')
     assert '→' not in failed
+
+
+def test_preview_lines_folds_long_output():
+    output = '\n'.join(f'line {i}' for i in range(20))
+
+    lines, hidden = tool_activity.preview_lines(output)
+
+    assert lines[0] == 'line 0' and lines[-1] == 'line 19'
+    assert lines[4] == '…'
+    assert hidden == 14
+
+
+def test_preview_lines_keeps_short_output_intact():
+    lines, hidden = tool_activity.preview_lines('a\nb')
+
+    assert lines == ['a', 'b'] and hidden == 0

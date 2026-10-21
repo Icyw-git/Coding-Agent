@@ -38,13 +38,28 @@ def _git(args: list[str], workspace: Path, *, timeout: float = GIT_TIMEOUT):
         return None
 
 
+_REPO_ROOTS: dict[Path, Path] = {}
+
+
 def repo_root(workspace: Path) -> Path | None:
-    """返回仓库根；不是 Git 仓库或 git 不可用时返回 None。"""
-    proc = _git(['rev-parse', '--show-toplevel'], workspace)
-    if proc is None or proc.returncode != 0:
+    """返回最近的含 `.git` 的祖先目录；没有则 None。
+
+    提示符与每轮改动检测都会调用，起 `git rev-parse` 太贵（Windows 约 26ms/次）；
+    最近的 `.git` 目录就是工作树根（worktree/submodule 同样是 `.git` 文件）。
+    只缓存肯定结果：目录之后 `git init` 时仍能重新发现。
+    """
+    try:
+        key = Path(workspace).resolve()
+    except OSError:
         return None
-    root = proc.stdout.strip()
-    return Path(root) if root else None
+    cached = _REPO_ROOTS.get(key)
+    if cached is not None:
+        return cached
+    for parent in (key, *key.parents):
+        if (parent / '.git').exists():
+            _REPO_ROOTS[key] = parent
+            return parent
+    return None
 
 
 def _split_porcelain(data: str) -> list[tuple[str, str, str | None]]:

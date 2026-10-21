@@ -2139,3 +2139,73 @@ TOCTOU 型 SSRF。重定向已有复检，但同一次请求内仍有这个窗�
 
 - 提示符状态的每个字段都要有「求值成本预算」：读文件可以，起进程不行。
 - 缺失信息时省略而不是报错，是提示符这类高频 UI 的基本要求。
+## 回合中排队输入与工具输出折叠
+
+**问题**：回合进行时终端只能看、不能输入；工具输出一长就把终端刷屏，而模型其实只需要
+头尾。Codex / Pi 在这两点上都支持「边跑边输入」和「长输出可展开」。
+
+**做法**：
+
+- `src/turn_control.py`：`ACTIVE` / `CANCEL` 两个事件描述「回合进行中」与「请求取消」。
+- `cli_input.QueuedPrompt`：TTY 下由后台线程跑 `PromptSession`，主线程从队列取行；
+  回合中输入的句子排队，回合结束后按顺序执行；Ctrl-J 换行、历史和补全保持不变。
+- `patch_stdout` 包住整个 REPL：回合内的工具行、流式文本与进度行都打印到提示符上方。
+- Ctrl-C 在回合中只置取消位（`on_delta` 检查后抛 KeyboardInterrupt），空闲时才作为
+  「提示 / 退出」事件；避免取消一次却多出一次退出提示。
+- 工具输出超过 8 行折叠成头 4 + 尾 2，存进 `TOOL_OUTPUTS` 环形缓存（最近 20 条），
+  工具行末尾给出 `/expand <编号>`；非 TTY 不折叠，输出保持原样。
+
+**踩过的坑**：
+
+- 输入线程一启动就会消费事件：测试必须先进入 `begin_turn()` 再构造 reader，否则 Ctrl-C
+  会被当作空闲中断。
+- 取消不能用「往队列塞 KeyboardInterrupt」：主线程正在 `agent_loop` 里，队列没人读；
+  必须用共享事件，由流式回调在主线程抛异常。
+- `patch_stdout` 必须包住整个循环，而不只是 `agent_loop`：命令输出（`/help`、`/status`）
+  同样会破坏提示符。
+- 折叠不能丢内容：全文进环形缓存并可用 `/expand` 取回；缓存上限 20 条，避免长期会话
+  把内存撑大。
+
+**测试**：新增 `tests/test_queued_input.py`（顺序、EOF、空闲 Ctrl-C、回合中 Ctrl-C），
+`test_tool_activity.py` 补折叠用例，`test_cli_output.py` 补「折叠后可展开」；
+总回归 1079 passed / 1 skipped。
+
+**收获**：
+
+- 输入线程与主循环之间只共享「队列 + 事件」，不要共享终端对象。
+- 任何「折叠」都必须给用户取回全文的路径，否则只是丢信息。
+
+## 启动与每轮性能优化
+
+**测量**（本机，Windows）：
+
+- `import harness`：341ms → 252ms。
+- 纯文本回合（假 client）：非 git 工作区 241ms → 125ms；git 工作区 266ms → 134ms。
+
+**做法**：
+
+- 删除 harness 中未使用的 `argparse` 与 `web_access` 导入（约 90ms 启动）。
+- `exec_policy` / `tool_exec` 把 `web_access` 延迟到真正用到时导入；策略层只在校验
+  URL 时才需要 urllib。
+- `workspace_diff.repo_root` 改为向上找最近的 `.git` 目录（只缓存肯定结果），
+  不再每轮两次 `git rev-parse`；非 git 工作区直接返回 None。
+- `checkpoints._git_baseline`：非 git 工作区直接返回空基线，不再每轮起一个注定失败的
+  `git status`。
+- 工作区基线延迟到**首个工具批次**再取：纯文本回合（没有工具）完全不跑 `git status`，
+  也不做回合末改动汇总。
+
+**踩过的坑**：
+
+- 测试用假的 `git rev-parse` 返回仓库根，但目录里没有 `.git`：新的文件系统快路径
+  直接判定「非仓库」。测试需要补一个 `.git` 目录；真实场景里 worktree/submodule 的
+  `.git` 文件同样能被发现。
+- `CheckpointManager` 的单测用 `__new__` 构造、没有 `workspace` 属性：新加的快速
+  返回必须 `getattr(self, 'workspace', None)`，否则老测试会 AttributeError。
+- 延迟取基线改变了 `/diff` 的语义边界：只有真正执行过工具的回合才统计本轮改动；
+  纯问答本来也不会改文件，代价可接受，但要在文档里说清楚。
+
+**收获**：
+
+- 每轮固定开销优先砍「注定失败的子进程」：非 git 目录里的 `git status` 纯粹是浪费。
+- 用文件系统判断替代 `git rev-parse` 是几十毫秒级的收益，但必须覆盖 worktree 与
+  GIT_DIR 这类边界。

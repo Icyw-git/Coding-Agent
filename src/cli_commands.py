@@ -28,6 +28,8 @@ COMMANDS = (
     Command('/archive', (), '[天数|all|empty|restore]', '归档旧会话；默认 30 天，可查看全部或恢复归档', '会话'),
     Command('/delete', (), '', '永久删除已归档会话及关联快照（不可恢复）', '会话'),
     Command('/status', (), '', '查看当前会话与运行状态', '常用'),
+    Command('/expand', (), '<编号>',
+            '查看被折叠的工具输出全文（编号见工具行末尾）', '常用'),
     Command('/watch', (), '[bg_id|--list] [--timeout 秒]',
             '跟踪最新的后台任务；--list 查看全部，无需记住编号', '常用'),
     Command('/diff', (), '', '查看当前工作区未提交改动的逐行 diff（只读）', '常用'),

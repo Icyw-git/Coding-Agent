@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 
 import sandbox
-import web_access
 from exec_policy import resolve_tool_path
 from process_utils import close_process, kill_process_tree
 
@@ -145,10 +144,12 @@ def run_kill_background(bg_id: str) -> str:
 
 
 def fetch_url(url: str, max_chars: int = 20000, *, gate) -> str:
+    from web_access import WebAccessError, check_url, fetch
+
     # 私网/本机地址在审批之前就拒掉：不给「批准一次 localhost 探测」的机会。
     try:
-        web_access.check_url(url)
-    except web_access.WebAccessError as exc:
+        check_url(url)
+    except WebAccessError as exc:
         return f'Error: {exc}'
     try:
         max_chars = int(max_chars)
@@ -159,8 +160,8 @@ def fetch_url(url: str, max_chars: int = 20000, *, gate) -> str:
     if denied:
         return denied
     try:
-        result = web_access.fetch(url)
-    except web_access.WebAccessError as exc:
+        result = fetch(url)
+    except WebAccessError as exc:
         return f'Error: {exc}'
     text = result['text']
     header = (f'URL: {result["final_url"]}\n'

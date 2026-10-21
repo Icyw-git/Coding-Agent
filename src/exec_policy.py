@@ -26,8 +26,6 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from web_access import WebAccessError, validate_url
-
 ALLOW = 'allow'
 ASK = 'ask'
 DENY = 'deny'
@@ -386,6 +384,8 @@ class Policy:
         这里只做语法校验，不解析 DNS：策略层保持纯函数，私网/重定向校验在
         网络层（web_access.check_url）发出请求前完成。
         """
+        from web_access import WebAccessError, validate_url
+
         url = str(args.get('url', '') or '')
         try:
             parsed = validate_url(url)
@@ -1060,6 +1060,8 @@ def approval_class(tool: str, args) -> str:
     if tool in ('read', 'write', 'edit', 'apply_patch'):
         return ''
     if tool == 'web_fetch':
+        from web_access import WebAccessError, validate_url
+
         try:
             return f'web_fetch:{validate_url(str(args.get("url", "") or "")).hostname}'
         except WebAccessError:

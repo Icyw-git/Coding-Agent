@@ -385,6 +385,12 @@ class CheckpointManager:
         依赖 v1 行结构（line[3:] 取路径），不能直接存 v2 原文。
         非 git 目录/命令失败时维持原行为：head=''、status=[]。
         """
+        from workspace_diff import repo_root
+
+        workspace = getattr(self, 'workspace', None)
+        if workspace is not None and repo_root(workspace) is None:
+            # 非 git 工作区：没必要为每轮快照起一个注定失败的 git 进程。
+            return {'head': '', 'status': []}
         raw = self._git('status', '--porcelain=v2', '--branch')
         head, status = '', []
         for line in raw.splitlines():

@@ -61,3 +61,18 @@ def result_hint(output) -> str:
 def is_failure(output) -> bool:
     """工具约定：错误以 `Error` 开头，拒绝以 `Permission denied` 开头。"""
     return str(output).lstrip().startswith(('Error', 'Permission denied'))
+
+
+FOLD_THRESHOLD = 8
+
+
+def preview_lines(output, head: int = 4, tail: int = 2,
+                  threshold: int = FOLD_THRESHOLD) -> tuple[list[str], int]:
+    """长输出折叠成「头 + … + 尾」；返回 (行列表, 被折叠的行数)。"""
+    lines = str(output).splitlines()
+    if len(lines) <= threshold:
+        return lines, 0
+    hidden = len(lines) - head - tail
+    if hidden <= 0:
+        return lines, 0
+    return [*lines[:head], '…', *lines[-tail:]], hidden
