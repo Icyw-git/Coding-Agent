@@ -2582,3 +2582,30 @@ UI 测试 56 passed。
 **测试**：`test_ui.py` 断言 `!echo hi` 不进模型队列、聊天区出现输出、历史记录；
 `tests/test_cli_output.py` 断言行式 `!` 直接执行且 `agent_loop` 不被调用。
 总回归 1097 passed / 1 skipped，UI 测试 58 passed。
+## TUI 候选列表与只读快捷键
+
+**问题**：`/`、`@` 之前的实现只有一行文字提示 + Tab 补第一个；Codex/Pi 是逐键
+候选列表，可以上下选。另缺一个「临时切只读」的快捷键。
+
+**做法**：
+
+- 新增 `completion_items(text, files)`：`/` 返回 TUI 支持的命令名+描述，`@` 返回
+  文件路径；`_update_command_hint` 把它渲染成带 `▸` 标记的多行列表（最多 6 行）。
+- `PromptArea` 绑定：`Tab` 采用当前候选（命令名或替换 `@token`），
+  `Alt+↑` / `Alt+↓` 循环选择；`accept_suggestion` 处理 `/` 与 `@` 两种替换位置。
+- `Ctrl+R`：在读档位 `read-only` 与 `workspace-write` 之间切换，调用
+  `harness.apply_sandbox_tier`（与 `/sandbox` 同一条策略层路径），状态栏的档位胶囊
+  与提示同时更新。
+- 提示行 CSS 从固定 1 行改为 `height: auto; max-height: 7`，候选多时不挤压聊天区。
+
+**取舍**：
+
+- 仍是「提示行内的列表」而不是悬浮 overlay：Textual 的 Float 需要额外的焦点管理，
+  当前方案在窄终端也不会盖住消息，Tab/Alt 键路径足够完成选择。
+- `Alt+↑/↓` 而非 `↑/↓`：后者在多行输入里必须保留光标移动。
+- `Ctrl+R` 只切换两个档位；`danger-full-access` 仍需 `/sandbox danger-full-access`，
+  避免误触高风险档位。
+
+**测试**：`completion_items` 的命令/文件两类数据；run_test 下 Tab 采用、Alt 切换、
+`@` 替换位置；`Ctrl+R` 调用档位切换并更新状态。总回归 1097 passed / 1 skipped，
+UI 测试 61 passed。

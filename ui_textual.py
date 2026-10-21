@@ -90,7 +90,7 @@ Collapsible:focus { border-left: thick $info; }
 #bottom-bar { dock: bottom; height: auto; background: $surface; }
 #input-line { height: auto; max-height: 8; padding: 0 2; background: $surface; color: $text; border: none; }
 #input-line:focus { border: none; }
-#command-hint { height: 1; padding: 0 2; color: $muted; background: $surface; }
+#command-hint { height: auto; max-height: 7; padding: 0 2; color: $muted; background: $surface; }
 #status-line { height: 1; background: $surface; color: $muted; padding: 0 2; }
 #status-main { width: 1fr; }
 #status-context { width: auto; min-width: 24; }
@@ -239,6 +239,33 @@ _TUI_COMMANDS = frozenset({
 })
 
 
+def completion_items(text: str, files: list[str],
+                     limit: int = 6) -> list[tuple[str, str]]:
+    """逐键补全的下拉数据：(插入值, 展示文本)。
+
+    `/` 前缀给命令名，`@` 前缀给文件路径；其余输入返回空列表。
+    """
+    value = text or ''
+    if value.startswith('/'):
+        from cli_commands import COMMANDS
+        typed = value.strip().lower()
+        items = []
+        for command in COMMANDS:
+            names = (command.name, *command.aliases)
+            supported = any(name.lstrip('/') in _TUI_COMMANDS for name in names)
+            if supported and any(name.startswith(typed) for name in names):
+                items.append((command.name,
+                              f'{command.name}  {command.description}'))
+            if len(items) >= limit:
+                break
+        return items
+    mention = mention_token(value)
+    if mention is None:
+        return []
+    matches = match_mentions(files, mention[1], limit)
+    return [(format_mention(path), path) for path in matches]
+
+
 def command_hint_text(text: str, limit: int = 8) -> str:
     """输入 `/...` 时在输入框下方显示匹配命令；普通聊天返回空串。"""
     if not (text or '').startswith('/'):
@@ -289,6 +316,8 @@ class PromptArea(TextArea):
         Binding('enter', 'submit', 'Send', show=False, priority=True),
         Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
         Binding('tab', 'complete', 'Complete', show=False),
+        Binding('alt+up', 'suggest_prev', 'Previous suggestion', show=False),
+        Binding('alt+down', 'suggest_next', 'Next suggestion', show=False),
         Binding('up', 'history_prev', 'History', show=False),
         Binding('down', 'history_next', 'History', show=False),
     ]
@@ -301,7 +330,13 @@ class PromptArea(TextArea):
         self.insert(chr(10))
 
     def action_complete(self) -> None:
-        self.app.complete_input()
+        self.app.accept_suggestion()
+
+    def action_suggest_prev(self) -> None:
+        self.app.cycle_suggestion(-1)
+
+    def action_suggest_next(self) -> None:
+        self.app.cycle_suggestion(1)
 
     def action_history_prev(self) -> None:
         if chr(10) in self.text:      # 多行时保留光标移动
@@ -328,6 +363,7 @@ class CCApp(App):
         ("ctrl+shift+f", "failures", "Failed tools"),
         ("ctrl+l", "clear", "Clear"),
         ("ctrl+e", "export", "Export"),
+        ("ctrl+r", "toggle_readonly", "Read-only mode"),
         ("escape", "jump_bottom", "Cancel / jump to latest"),
     ]
 
@@ -347,6 +383,8 @@ class CCApp(App):
         self._mention_files: list[str] = []
         self._mention_root = None
         self._mention_at = 0.0
+        self._suggestions: list[tuple[str, str]] = []
+        self._suggestion_index = 0
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
@@ -459,11 +497,46 @@ class CCApp(App):
         return '正在处理当前消息…' + (f'（已排队 {queued} 条）' if queued else '')
 
     def _update_command_hint(self, value: str) -> None:
-        if (value or '').startswith('/'):
-            self._set_hint(command_hint_text(value))
+        self._suggestions = completion_items(
+            value, self._workspace_mention_files() if value else [])
+        self._suggestion_index = 0
+        self._render_suggestions()
+
+    def _render_suggestions(self) -> None:
+        if self._suggestions:
+            lines = []
+            for index, (_value, label) in enumerate(self._suggestions):
+                marker = '▸' if index == self._suggestion_index else ' '
+                lines.append(f' {marker} {label}')
+            self._set_hint(chr(10).join(lines))
             return
-        mention = mention_hint_text(value, self._workspace_mention_files())
-        self._set_hint(mention or self._busy_hint())
+        self._set_hint(self._busy_hint())
+
+    def accept_suggestion(self) -> None:
+        """Tab：采用当前候选（命令名或文件路径）。"""
+        if not self._suggestions or not hasattr(self, '_input'):
+            return
+        value, _label = self._suggestions[self._suggestion_index]
+        text = self._input.text
+        if text.startswith('/'):
+            self._input.text = value
+        else:
+            mention = mention_token(text)
+            if mention is not None:
+                self._input.text = f'{text[:mention[0]]}{value}'
+        self._suggestions = []
+        self._set_hint(self.DEFAULT_HINT)
+        self._cursor_to_end()
+
+    def cycle_suggestion(self, delta: int) -> None:
+        if not self._suggestions:
+            return
+        count = len(self._suggestions)
+        self._suggestion_index = (self._suggestion_index + delta) % count
+        self._render_suggestions()
+
+    def complete_input(self) -> None:   # 兼容旧调用点
+        self.accept_suggestion()
 
     def _workspace_mention_files(self) -> list[str]:
         """@ 文件索引：按工作区缓存 5s，避免逐键遍历仓库。"""
@@ -481,25 +554,6 @@ class CCApp(App):
         text = self._input.text
         lines = text.split(chr(10))
         self._input.cursor_location = (len(lines) - 1, len(lines[-1]))
-
-    def complete_input(self) -> None:
-        """Tab：优先补全 / 命令，其次 @ 文件。"""
-        if not hasattr(self, '_input'):
-            return
-        value = self._input.text
-        if value.startswith('/'):
-            from cli_commands import COMMANDS
-            typed = value.strip().lower()
-            for command in COMMANDS:
-                names = (command.name, *command.aliases)
-                if any(name.startswith(typed) for name in names):
-                    self._input.text = command.name
-                    break
-        else:
-            completed = complete_mention_text(value, self._workspace_mention_files())
-            if completed is not None:
-                self._input.text = completed
-        self._cursor_to_end()
 
     def history_prev(self) -> None:
         if not self._history or not hasattr(self, '_input'):
@@ -532,6 +586,7 @@ class CCApp(App):
             self._history_index = len(self._history)
             self.run_worker(lambda: self._run_shell(command), thread=True)
             return
+        self._suggestions = []
         command = slash_command(text)
         if command is not None:      # / 命令不进入对话
             self._update_command_hint('')
@@ -608,6 +663,21 @@ class CCApp(App):
 
     def action_failures(self) -> None:
         self.execute_command('failures')
+
+    def action_toggle_readonly(self) -> None:
+        """Ctrl+R：在 read-only 与 workspace-write 之间切换（策略层档位）。"""
+        import harness
+        current = harness.load_policy().sandbox_mode
+        target = ('workspace-write' if current == 'read-only' else 'read-only')
+        try:
+            message = harness.apply_sandbox_tier(target)
+        except Exception as exc:
+            asyncio.create_task(self._show_notice(
+                f'Unable to switch tier: {type(exc).__name__}: {exc}'))
+            return
+        self._last_status['sandbox'] = target
+        self._refresh_status_line()
+        asyncio.create_task(self._show_notice(message))
 
     def action_jump_bottom(self) -> None:
         """回合中 = 取消当前请求；空闲 = 回到最新一条消息。"""
@@ -858,7 +928,8 @@ class CCApp(App):
         busy = busy or bool(queued)
         self._busy = busy
         if hasattr(self, '_input'):
-            self._set_hint(self._busy_hint())
+            if not self._suggestions:
+                self._set_hint(self._busy_hint())
             if not busy and not self._exiting:
                 self._input.focus()
         self._refresh_status_line()
