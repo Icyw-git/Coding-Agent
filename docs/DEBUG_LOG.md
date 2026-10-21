@@ -1678,3 +1678,34 @@ tools 里而无法搬走；直接 `import tools` 会形成循环依赖。
 
 - 注入点要选在「替换实现」和「替换查找函数」之间：后端签名越简单，测试越稳。
 - 迁移前后都要确认再导出名字仍被引用，否则 lint 会静默删掉兼容层。
+## 拆分图片与文档工具
+
+**问题**：`ImageResult`、图片签名识别、缓存落盘与三个文档 handler 约占 200 行，仍是
+tools 里最大的一块。它们只依赖路径解析/边界门、`documents`/`document_render` 与
+`TOOL_RESULTS_DIR`，和工具注册表无关。
+
+**做法**：
+
+- 新增 `src/tool_documents.py`：`ImageResult`、`image_type`、`cache_image`、
+  `view_image`、`read_document`、`render_document`；缓存根目录由 tools 注入。
+- tools 保留 `_IMAGE_MAX_BYTES`（测试按 tools 打补丁），包装器在调用时把它传给
+  `view_image(..., max_bytes=...)`，补丁仍然生效。
+- `ImageResult` 继续从 tools 再导出（harness / subagent / headless 直接 import）。
+
+**踩过的坑**：
+
+- Ruff 会把「只被再导出」的 `ImageResult` 当未使用删掉，`subagent.py` 的
+  `from tools import ImageResult` 在 conftest 阶段就 ImportError。再导出必须显式
+  `# noqa: F401` 并注明消费方。
+- 缓存目录不能在导入时读取 `harness.TOOL_RESULTS_DIR`：conftest 每例都会重定向它。
+  包装器改为调用时读取，测试的 monkeypatch 才能生效。
+- 大小上限与后端实现分离：上限留在 tools（可打补丁），实现只接收参数。
+
+**测试**：新增 `tests/test_tool_documents.py`（拒绝时不解析、格式不符、内容寻址去重、
+渲染页引用落在注入目录）；总回归 1015 passed / 1 skipped；
+`tools.py` 1571 → 1467 行。
+
+**收获**：
+
+- 迁移带「类型出口」的代码时，先把消费方列出来，再决定哪些名字需要 noqa 再导出。
+- 依赖运行时目录的参数要用「调用时读取」，导入时快照会冻结测试隔离。
