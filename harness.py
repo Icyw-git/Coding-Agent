@@ -99,6 +99,7 @@ from background_task import (
     should_run_background,
     start_background_task,
 )
+from background_watch import watch_command
 from checkpoints import CheckpointError, CheckpointManager
 from cli_commands import command_error, format_command_help, parse_command
 from cron_scheduler import (
@@ -1106,6 +1107,9 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command == '/status':
         print(format_status(session_store))
+
+    elif command == '/watch':
+        print(watch_command(argument))
 
     elif command == '/diff':
         print(format_workspace_diff(color=sys.stdout.isatty()))

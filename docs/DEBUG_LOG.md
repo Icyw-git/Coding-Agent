@@ -1945,3 +1945,43 @@ TOCTOU 型 SSRF。重定向已有复检，但同一次请求内仍有这个窗�
 
 - 防 SSRF 的校验和连接必须绑在同一次解析结果上，否则校验只是一次采样。
 - 代理是安全边界的黑洞：代码能做的只有明确降级并写进边界文档，而不是假装覆盖。
+## 新增 /watch：后台任务跟踪
+
+**问题**：长命令转入后台后，CLI 侧只能反复调用 `background_output(wait=true)` 或轮询；
+`design-principles` 的「当前边界」里还挂着「`/watch` 第四阶段未实施」，但仓库里从
+没有 `/watch` 的任何阶段。飞书进度卡片已经是约 0.6s 的 tick 刷新，不需要单独的事件推送，
+所以这轮只补 CLI 的缺口，并把边界描述改成事实。
+
+**做法**：
+
+- `background_task.list_background_tasks()`：返回活跃 + 最近完成任务（含 id），按时间倒序。
+- `src/background_watch.py`：`format_tasks` / `watch` / `watch_command`。
+  - `/watch` 列出任务：状态图标、已用时、命令；
+  - `/watch <bg_id> [--timeout 秒]` 等到终态后打印全文与总用时；
+  - 运行中每秒刷新一行状态；超时或 Ctrl-C 只停止跟踪，任务继续在后台跑。
+- 命令注册进 `cli_commands`，harness 增加一个 dispatch 分支；帮助里自动出现。
+
+**没做的事（有意）**：
+
+- 不做「实时 tail 进程输出」：后台 worker 只在结束时把结果写进 `background_results`，
+  运行中拿不到增量字节。假装能 tail 只能靠改 worker 的落盘方式，属于另一个改动。
+- 不做飞书侧的独立事件推送：卡片已经按进度 tick 刷新，再加一套推送只会增加频控风险。
+
+**踩过的坑**：
+
+- 终止态任务会被 `read_background_result` 移出活跃表并写入历史，`/watch` 必须用
+  `background_snapshot` 判断状态、再调 `read_background_result` 取全文，顺序反了会
+  把任务「消费」掉。
+- 超时循环用 `clock()` 计算剩余时间、`sleep(min(interval, remaining))` 限幅，
+  测试里把两者都注入，才能不真的等满 10 分钟。
+- Ctrl-C 不能吞掉任务：只退出循环并提示「任务继续在后台运行」，否则用户会以为
+  命令停了任务也停了。
+
+**测试**：新增 `tests/test_background_watch.py`（空列表/列表格式、终态直取、running→completed
+跟随、超时保留运行状态、Ctrl-C 脱离、未知 id、参数校验）；总回归 1052 passed / 1 skipped。
+
+**收获**：
+
+- 「未实施」的边界条目要先确认它到底指什么；仓库里没有设计时，按最小可用语义实现并
+  写清没做的部分，比照搬一个不存在的「第四阶段」更可靠。
+- 阻塞式观看命令必须有脱离路径和「不影响后台任务」的明确提示。

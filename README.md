@@ -47,6 +47,8 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 - `/cache [gc [天数] [--apply]]`：查看 `.cache/tool_results` 占用；`/cache gc 7` 预览、
   加 `--apply` 才会删除「超过保留期且未被任何会话引用」的文件。
 - `/sandbox`：查看并切换执行档位与审批档位，见「执行安全与审批」。
+- `/watch [bg_id] [--timeout 秒]`：列出后台任务；带 `bg_id` 时等到终态并打印全文
+  （运行中只刷新状态与已用时，Ctrl-C 可停止跟踪，任务继续在后台执行）。
 - `/status` 查看状态，`/quit`（`/exit`）退出。
 
 新建会话保留当前工作区；恢复会话会同时恢复已记录的工作目录。旧会话未记录目录时，明确提示并保留当前目录；目录不存在时不会切换。`/sessions` 只读取本地摘要，不调用模型。工作区切换不会自动新建会话。
@@ -132,7 +134,7 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 同步 shell 工具默认 120 秒超时，可用 `timeout` 调整（上限 3600 秒），超时会请求终止进程树
 并向 Agent 返回超时结果。`cwd` 让单条命令在指定目录执行；显式 `run_in_background` 或命中
 安装/构建/测试等慢命令关键词时转入后台（后台默认上限 3600 秒），用 `background_output`
-等待或读取输出、`kill_background` 终止。
+等待或读取输出、`kill_background` 终止；终端里也可以用 `/watch <bg_id>` 跟踪到结束。
 
 ## 项目说明与技能
 
@@ -584,6 +586,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tools.py` | 工具接线：路径边界、`run_*` 薄包装、`tool_registry` |
 | `src/tool_schemas.py` | 37 个工具的 schema（顺序即契约，有快照测试锁定） |
 | `src/tool_teams.py` | 团队协作：派生 teammate、消息收发、shutdown/plan 协议 |
+| `src/background_watch.py` | `/watch`：后台任务列表与跟踪到终态（Ctrl-C 可脱离） |
 | `src/tool_exec.py` | `bash` / 后台任务 / `web_fetch`：超时、审批门与抓取边界 |
 | `src/tool_tasks.py` | 任务与 cron 工具：封装 task_system/cron_scheduler 并统一输出 |
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |

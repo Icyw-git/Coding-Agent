@@ -133,6 +133,17 @@ def _remember_finished(bg_id:str, task:dict, output:str) -> None:
         background_finished.pop(next(iter(background_finished)))
 
 
+def list_background_tasks()->list[dict]:
+    """活跃与最近完成任务的快照（含 id），按开始/结束时间倒序，供 /watch 展示。"""
+    with background_lock:
+        active=[dict(task, id=bg_id) for bg_id,task in background_tasks.items()]
+        finished=[dict(task, id=bg_id) for bg_id,task in background_finished.items()]
+    return sorted(active+finished,
+                  key=lambda task: task.get('created_at')
+                  or task.get('ended_at') or 0,
+                  reverse=True)
+
+
 def background_snapshot(bg_id:str)->dict|None:
     with background_lock:
         task=background_tasks.get(bg_id)
