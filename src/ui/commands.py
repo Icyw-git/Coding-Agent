@@ -125,8 +125,30 @@ _BY_NAME = {name.lower(): spec for spec in COMMANDS
             for name in (spec.name, *spec.aliases)}
 
 
+def skill_commands() -> list[CommandSpec]:
+    """动态技能命令（Pi 的 `skill:name`）：工作区切换/技能编辑后自动跟随。"""
+    try:
+        import skill_system
+        skill_system.scan_skills()
+        return [CommandSpec(f'skill:{skill["name"]}',
+                            f'[skill] {skill["description"]}')
+                for skill in skill_system.SKILL_REGISTRY.values()]
+    except Exception:
+        return []
+
+
+def all_commands() -> list[CommandSpec]:
+    return [*COMMANDS, *skill_commands()]
+
+
 def find(name: str) -> CommandSpec | None:
-    return _BY_NAME.get((name or '').lstrip('/').lower())
+    key = (name or '').lstrip('/').lower()
+    spec = _BY_NAME.get(key)
+    if spec is not None:
+        return spec
+    if key.startswith('skill:'):
+        return next((item for item in skill_commands() if item.name == key), None)
+    return None
 
 
 def matches(query: str) -> list[CommandSpec]:
@@ -134,7 +156,7 @@ def matches(query: str) -> list[CommandSpec]:
     query = (query or '').strip()
     if not query:
         return [spec for spec in COMMANDS if spec.ported][:8]
-    return fuzzy_filter(COMMANDS, query,
+    return fuzzy_filter(all_commands(), query,
                         lambda spec: f'{spec.name} {spec.description}')[:8]
 
 
@@ -150,7 +172,7 @@ def argument_suggestions(spec: CommandSpec,
 
 
 def did_you_mean(name: str) -> str | None:
-    candidates = fuzzy_filter(COMMANDS, name, lambda spec: spec.name)
+    candidates = fuzzy_filter(all_commands(), name, lambda spec: spec.name)
     return f'/{candidates[0].name}' if candidates else None
 
 
@@ -163,6 +185,10 @@ def help_text() -> str:
     if unported:
         lines.append('Only in line REPL (--ui ansi):')
         lines.append('  ' + '  '.join(f'/{spec.name}' for spec in unported))
+    skills = skill_commands()
+    if skills:
+        lines.append(f'Skills ({len(skills)}): ' + '  '.join(
+            f'/{spec.name}' for spec in skills))
     return chr(10).join(lines)
 
 

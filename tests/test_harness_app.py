@@ -407,3 +407,56 @@ def test_help_with_argument_shows_command_details(monkeypatch):
             assert '仅行式 REPL' in text
 
     asyncio.run(scenario())
+
+
+def test_skill_command_expands_into_user_message(monkeypatch):
+    import skill_system
+
+    captured = []
+
+    def fake_loop(messages, **kwargs):
+        captured.append(list(messages))
+        return 'ok'
+
+    monkeypatch.setattr(harness, 'agent_loop', fake_loop)
+    monkeypatch.setattr(skill_system, 'load_skill',
+                        lambda name: f'BODY of {name}')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/skill:demo extra args')
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if captured:
+                    break
+            assert captured
+            content = captured[-1][-1]['content']
+            assert '<skill name="demo">' in content
+            assert 'BODY of demo' in content
+            assert 'extra args' in content
+            assert app.model.snapshot()[-1].kind == 'user'
+
+    asyncio.run(scenario())
+
+
+def test_unknown_skill_reports_error(monkeypatch):
+    import skill_system
+
+    monkeypatch.setattr(skill_system, 'load_skill',
+                        lambda name: f'Error: skill {name} not found')
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('unknown skill must not run')))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/skill:nope')
+            await pilot.pause()
+            notice = app.model.snapshot()[-1]
+            assert notice.kind == 'notice'
+            assert 'Unknown skill' in notice.payload['text']
+
+    asyncio.run(scenario())

@@ -573,6 +573,10 @@ class HarnessApp(App):
         verb = verb.lower()
         argument = argument.strip()
 
+        if verb.startswith('skill:'):
+            self.submit_skill(verb[len('skill:'):], argument)
+            return True
+
         spec = commands.find(verb)
         if spec is None:
             hint = commands.did_you_mean(verb)
@@ -746,12 +750,27 @@ class HarnessApp(App):
             return
         if self._handle_command(text):
             return
+        self._send_user(text)
+
+    def _send_user(self, text: str) -> None:
         self.model.append('user', {'text': text})
         self._mark_dirty()
         self._pending.put(text)
         self._refresh_queue()
         if not self._busy:
             self._start_worker()
+
+    def submit_skill(self, name: str, argument: str = '') -> None:
+        """`/skill:<name> args`：把技能正文展开成一条 user 消息（同 Pi）。"""
+        import skill_system
+        body = skill_system.load_skill(name)
+        if body.startswith('Error:'):
+            self._notice(f'Unknown skill: {name}', level='error')
+            return
+        content = f'<skill name="{name}">' + chr(10) + body + chr(10) + '</skill>'
+        if argument.strip():
+            content += chr(10) + chr(10) + argument.strip()
+        self._send_user(content)
 
     def _start_worker(self) -> None:
         self._busy = True

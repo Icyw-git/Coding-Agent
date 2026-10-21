@@ -21,6 +21,8 @@
   元数据，`/hotkeys` 与快捷键表同源；`!` shell、Esc 取消、Ctrl+O 展开。
 - P5c：对齐 Pi `getArgumentCompletions`：`/resume` 会话、`/model` 模型、
   `/allow|deny|ask` 工具、`/help` 命令名；`/help <cmd>` 显示用法/可用性。
+- P5d：动态技能命令 `/skill:<name> [args]`（展开技能正文为 user 消息，同 Pi
+  `_expandSkillCommand`）；技能自动进入补全/帮助/模糊建议。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

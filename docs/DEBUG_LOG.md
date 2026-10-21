@@ -2842,3 +2842,25 @@ Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。
 
 **测试**：`test_harness_app.py` 补参数替换、`/resume` 会话候选、`/help model`、
 仅行式命令提示；总回归 1135 passed / 1 skipped，旧 UI 64 passed。
+## TUI 重构 P5d：动态技能命令
+
+**Pi 的实现**（`core/agent-session.ts::_expandSkillCommand`）：
+- 命令名单来自资源加载器，命名 `skill:<name>`（补全同时匹配裸名）；
+- 执行时读技能文件，剥掉 frontmatter，包成
+  `<skill name="..." location="...">body</skill>`，有参数则附在块后；
+- 未知技能原样透传；读取失败通过 extension runner 报错。
+
+**我们的实现**：
+
+- `commands.skill_commands()` 从 `skill_system.SKILL_REGISTRY` 动态生成
+  `skill:<name>` 的 `CommandSpec`（描述来自 manifest），自动进入补全、`/help`
+  与未知命令建议；工作区切换/技能编辑后随扫描更新。
+- App 收到 `/skill:<name> [args]` 时展开成 `<skill name="name">body</skill>
+
+args`
+  作为一条 user 消息交给 agent（不占额外回合逻辑），未知技能提示错误。
+- 与内建命令用前缀隔离，不会出现 Pi 里“扩展命令与内建命令重名”的冲突；
+  暂未实现 prompt 模板/扩展命令两个动态来源。
+
+**测试**：`test_harness_app.py` 技能展开（含参数）与未知技能；`test_ui_commands.py`
+动态注册/匹配；总回归 1138 passed / 1 skipped，旧 UI 64 passed。

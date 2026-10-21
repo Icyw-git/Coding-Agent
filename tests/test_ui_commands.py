@@ -31,3 +31,14 @@ def test_help_lists_ported_and_line_only_commands():
     assert '/sessions' in text
     assert 'Only in line REPL' in text and '/review' in text
     assert 'Ctrl+O' in commands.hotkeys_text()
+
+
+def test_skill_commands_are_registered_dynamically():
+    skills = commands.skill_commands()
+    if not skills:      # 发行版可以不带技能
+        return
+    spec = skills[0]
+    assert spec.name.startswith('skill:')
+    assert spec.ported
+    assert commands.find(spec.name) is not None
+    assert any(item.name == spec.name for item in commands.matches('skill:'))
