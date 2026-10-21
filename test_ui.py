@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cc_ui as ui
 import renderer
@@ -435,7 +437,7 @@ def test_textual_streaming_flow():
             parts = [str(w.render())]
             for c in w.children:
                 parts.append(_collect_text(c))
-            return '\n'.join(parts)
+            return chr(10).join(parts)
 
         harness.agent_loop = fake_agent_loop
         app = ui_textual.CCApp([])
@@ -682,3 +684,55 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------- / 命令提示与路由 ----------
+
+def test_slash_command_and_hint_text():
+    pytest.importorskip('textual')
+    import ui_textual
+
+    assert ui_textual.slash_command('/help') == 'help'
+    assert ui_textual.slash_command('  /status  ') == 'status'
+    assert ui_textual.slash_command('hello') is None
+
+    assert '/help' in ui_textual.command_hint_text('/he')
+    assert ui_textual.command_hint_text('hello') == ''
+    assert '没有匹配' in ui_textual.command_hint_text('/zzz')
+
+
+def test_textual_input_shows_slash_hints_and_routes_commands():
+    import asyncio
+    from types import SimpleNamespace
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    def chat_text(app):
+        parts = []
+
+        def walk(widget):
+            parts.append(str(widget.render()))
+            for child in widget.children:
+                walk(child)
+
+        walk(app.query_one('#chat'))
+        return chr(10).join(parts)
+
+    async def scenario():
+        app = ui_textual.CCApp([])
+        async with app.run_test() as pilot:
+            app._input.value = '/he'
+            await pilot.pause()
+            await asyncio.sleep(0.02)
+            assert '/help' in str(app.query_one('#command-hint').render())
+
+            app.on_input_submitted(SimpleNamespace(value='/help'))
+            await pilot.pause()
+            await asyncio.sleep(0.05)
+            assert 'Commands:' in chat_text(app)
+            assert app._user_input_q.empty()   # 命令没有进入对话队列
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())

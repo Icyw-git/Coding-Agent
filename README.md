@@ -494,8 +494,11 @@ python entrypoint.py
 ```
 
 首次启动时，程序会进入交互式 Agent 会话。默认是 ANSI 行式界面；设置
-`HARNESS_UI=textual` 可启用 Textual 全屏 TUI（需要 `pip install textual`，
-依赖见 `pyproject.toml` 的 `ui` extra）。
+`HARNESS_UI=textual`（或 `--ui textual`）可启用 Textual 全屏 TUI（需要
+`pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。TUI 输入 `/`
+会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
+`/diff`、`/review`、`/cache` 等只存在于行式 REPL 的命令会明确提示改用
+`python harness.py --ui ansi`。
 
 启动前检查本地配置和目录：
 

@@ -2431,3 +2431,29 @@ Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI �
 
 **教训**：跨分支合并时，「锁由谁持有」和「锁在哪一层加」必须重新核对一遍；
 直接构造 UI 组件的测试覆盖不到入口层的锁顺序，端到端要至少有一条经过 `main()`。
+## TUI 的 `/` 命令提示
+
+**问题**：行式 REPL 输入 `/` 会弹出补全菜单，但 Textual TUI 的输入框把 `/help`
+当成普通聊天发给模型——既没有提示，也没有命令路由。合并后默认 UI 是 textual，
+用户体感就是「`/` 的提示不见了」。
+
+**做法**：
+
+- `on_input_submitted`：以 `/` 开头的文本不再进入对话队列，交给 `_execute_command`。
+- 输入框下方新增 `#command-hint`：`on_input_changed` 时按 `cli_commands.COMMANDS`
+  过滤出「TUI 支持」的命令（help/status/model/pwd/quit/clear/export/sessions/
+  resume/allow/search/failures/all…），只列这些，避免提示里出现点了没反应的死路。
+- `_execute_command` 补齐 `quit/exit`、`status/model/pwd`；`/diff`、`/review`、
+  `/cache` 等仅行式命令给出明确提示「用 `python harness.py --ui ansi`」。
+- 底部栏高度从 2 调到 3，提示行与状态行分开；输入框 placeholder 增加「/ 命令 ·
+  Ctrl+P 面板」。
+
+**取舍**：
+
+- 没有实现逐键过滤的下拉补全（Textual Input 不内建）：先用单行提示 + 过滤列出，
+  Enter 直接执行；这比假装有下拉但键盘不可选更可靠。
+- 命令提示只列 TUI 真能执行的命令；完整命令表仍由 `Ctrl+P` 面板与 `/help` 提供。
+
+**测试**：`test_ui.py` 新增 `/` 解析与提示文本用例、`run_test` 下
+「输入 `/he` 出现提示、提交 `/help` 不进入对话队列」；总回归 1094 passed /
+1 skipped，UI 测试 49 passed。

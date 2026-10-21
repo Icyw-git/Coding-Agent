@@ -86,9 +86,10 @@ Collapsible:focus { border-left: thick $info; }
 .diff-title { margin: 1 2 0 2; color: $muted; }
 
 /* ---- 底部输入框 + 状态栏（dock 固定：输入在上，状态在下） ---- */
-#bottom-bar { dock: bottom; height: 2; background: $surface; }
+#bottom-bar { dock: bottom; height: 3; background: $surface; }
 #input-line { height: 1; padding: 0 2; background: $surface; color: $text; border: none; }
 #input-line:focus { border: none; }
+#command-hint { height: 1; padding: 0 2; color: $muted; background: $surface; }
 #status-line { height: 1; background: $surface; color: $muted; padding: 0 2; }
 #status-main { width: 1fr; }
 #status-context { width: auto; min-width: 24; }
@@ -222,6 +223,41 @@ class SearchModal(ModalScreen):
         self.dismiss()
 
 
+def slash_command(text: str) -> str | None:
+    """`/help` → `help`；普通聊天返回 None。"""
+    stripped = (text or '').strip()
+    return stripped[1:].strip() if stripped.startswith('/') else None
+
+
+# TUI 支持的命令（其余命令仍只在行式 REPL 提供，提示里不再列出死路）
+_TUI_COMMANDS = frozenset({
+    'help', '?', 'status', 'model', 'pwd', 'quit', 'exit', 'q',
+    'clear', 'export', 'sessions', 'transcripts', 'resume',
+    'allow', 'deny', 'ask', 'search', 'failures', 'failed', 'all',
+    'show-all',
+})
+
+
+def command_hint_text(text: str, limit: int = 8) -> str:
+    """输入 `/...` 时在输入框下方显示匹配命令；普通聊天返回空串。"""
+    if not (text or '').startswith('/'):
+        return ''
+    from cli_commands import COMMANDS
+
+    typed = text.strip().lower()
+    matches = []
+    for command in COMMANDS:
+        names = (command.name, *command.aliases)
+        supported = any(name.lstrip('/') in _TUI_COMMANDS for name in names)
+        if supported and any(name.startswith(typed) for name in names):
+            matches.append(f'{command.name} {command.description}')
+        if len(matches) >= limit:
+            break
+    if not matches:
+        return '  （没有匹配的命令；Ctrl+P 打开命令面板）'
+    return '  ' + ' · '.join(matches)
+
+
 class CCApp(App):
     TITLE = "harness"
     CSS = CSS
@@ -257,7 +293,9 @@ class CCApp(App):
                 yield Static('', id='session-summary')
                 yield Static('', id='recent-tools')
         with Vertical(id="bottom-bar"):
-            yield Input(placeholder="输入消息，Enter 发送 · Ctrl+C 退出", id="input-line")
+            yield Input(placeholder="输入消息，Enter 发送 · / 命令 · Ctrl+P 面板",
+                        id="input-line")
+            yield Static('', id="command-hint")
             with Horizontal(id="status-line"):
                 yield Static('', id="status-main")
                 yield Static('', id="status-context")
@@ -277,6 +315,7 @@ class CCApp(App):
         self._session_summary = self.query_one('#session-summary', Static)
         self._recent_tools_widget = self.query_one('#recent-tools', Static)
         self._input = self.query_one('#input-line', Input)
+        self._command_hint = self.query_one('#command-hint', Static)
         self._active_tools: list = []   # 执行中的工具块（FIFO 匹配 tool_end）
         self._last_status: dict = {}    # 最后已知状态指标（thinking/idle 时状态栏常驻显示）
         self._active_widgets: dict = {}   # mid -> 流式中的 assistant Static（增量追加）
@@ -337,6 +376,16 @@ class CCApp(App):
 
     # ---------- 底部输入框：多轮对话 ----------
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if getattr(event.input, 'id', '') != 'input-line':
+            return
+        self._update_command_hint(event.value)
+
+    def _update_command_hint(self, value: str) -> None:
+        hint = getattr(self, '_command_hint', None)
+        if hint is not None:
+            hint.update(command_hint_text(value or ''))
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Enter 提交：文本进队列交给 agent 线程，同时渲染为 user 消息。"""
         if self._busy or self._exiting:
@@ -344,6 +393,11 @@ class CCApp(App):
         text = (event.value or '').strip()
         self._input.value = ''
         if not text:
+            return
+        command = slash_command(text)
+        if command is not None:      # / 命令不进入对话，交给命令通道
+            self._update_command_hint('')
+            self.execute_command(command)
             return
         self._set_input_busy(True)
         self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
@@ -397,7 +451,30 @@ class CCApp(App):
         verb, _, argument = raw.partition(' ')
         verb = verb.lower()
         argument = argument.strip()
-        if verb in ('help', '?'):
+        if verb in ('quit', 'exit', 'q'):
+            self.action_quit()
+        elif verb in ('status', 'model', 'pwd'):
+            import os
+
+            import harness
+            state = self._display_status(self._last_status)
+            model = state.get('model') or os.getenv('LLM_MODEL_ID', '')
+            lines = [f'model: {model or "unset"}',
+                     f'workspace: {harness.get_workdir()}']
+            if state.get('ctx_pct') is not None:
+                lines.append(f"context: {state['ctx_pct']:.0f}% "
+                             f"({state.get('ctx_tokens')}/{state.get('ctx_window')})")
+            if state.get('tools') is not None:
+                lines.append(f"tools: {state.get('tools')}")
+            await self._show_notice(chr(10).join(lines))
+        elif verb in ('diff', 'review', 'cache', 'sandbox', 'checkpoint',
+                      'checkpoints', 'rewind', 'undo', 'fork', 'archive',
+                      'delete', 'watch', 'expand', 'approvals', 'revoke',
+                      'workspaces', 'workspace', 'cd', 'new', 'compact',
+                      'find', 'rename'):
+            await self._show_notice(
+                f'/{verb} 暂只在行式 REPL 提供；用 python harness.py --ui ansi 打开。')
+        elif verb in ('help', '?'):
             await self._show_notice(
                 'Commands: clear | export | sessions | resume <n> | allow <tool> '
                 '| deny <tool> | ask <tool> | search <text> | failures | all | help')
