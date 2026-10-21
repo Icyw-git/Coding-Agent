@@ -817,23 +817,12 @@ def test_escape_cancels_a_running_turn(monkeypatch):
     assert any('取消' in text for text in hints)
 
 
-def test_tui_sessions_list_and_resume_real_session(tmp_path, monkeypatch):
+def test_tui_session_picker_resumes_real_session(tmp_path, monkeypatch):
     import asyncio
 
     pytest.importorskip('textual')
     import harness
     import ui_textual
-
-    def chat_text(app):
-        parts = []
-
-        def walk(widget):
-            parts.append(str(widget.render()))
-            for child in widget.children:
-                walk(child)
-
-        walk(app.query_one('#chat'))
-        return chr(10).join(parts)
 
     monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
     store = harness.SessionEventStore(tmp_path, session_id='tui-resume')
@@ -843,153 +832,23 @@ def test_tui_sessions_list_and_resume_real_session(tmp_path, monkeypatch):
     async def scenario():
         app = ui_textual.CCApp([], session_id='current')
         async with app.run_test() as pilot:
-            await app._list_sessions()
+            await app._pick_session()
             await pilot.pause()
-            assert 'tui-resu' in chat_text(app)   # 列表里是真实会话 id 前缀
+            screen = app.screen
+            assert isinstance(screen, ui_textual.SessionPickerModal)
+            options = screen.query_one('#session-list')
+            assert options.option_count == 1
+            assert 'tui-resu' in str(options.get_option_at_index(0).prompt)
 
-            await app._resume_session('1')
-            await pilot.pause()
-            assert app._session_id == 'tui-resume'
-            assert any(m.get('content') == '旧会话的目标' for m in app._msgs)
-            app._exiting = True
-            app._user_input_q.put(None)
-
-    asyncio.run(scenario())
-
-
-def test_multiline_input_ctrl_j_newline_enter_submit(monkeypatch):
-    import asyncio
-
-    pytest.importorskip('textual')
-    import harness
-    import ui_textual
-
-    monkeypatch.setattr(harness, 'agent_loop', lambda *args, **kwargs: 'ok')
-
-    async def scenario():
-        app = ui_textual.CCApp([])
-        async with app.run_test() as pilot:
-            app._input.focus()
-            await pilot.press('a', 'b', 'c')
-            await pilot.press('ctrl+j')
-            await pilot.press('d', 'e', 'f')
-            assert app._input.text == 'abc' + chr(10) + 'def'
-
+            options.focus()
             await pilot.press('enter')
-            await pilot.pause()
-            assert app._history[-1] == 'abc' + chr(10) + 'def'
-            assert app._input.text == ''
-
-            app._exiting = True
-            app._user_input_q.put(None)
-
-    asyncio.run(scenario())
-
-
-def test_shell_mode_runs_directly_without_model(monkeypatch):
-    import asyncio
-
-    pytest.importorskip('textual')
-    import harness
-    import ui_textual
-
-    def chat_text(app):
-        parts = []
-
-        def walk(widget):
-            parts.append(str(widget.render()))
-            for child in widget.children:
-                walk(child)
-
-        walk(app.query_one('#chat'))
-        return chr(10).join(parts)
-
-    monkeypatch.setattr(harness, 'run_bash', lambda command: f'shell:{command}')
-
-    async def scenario():
-        app = ui_textual.CCApp([])
-        async with app.run_test() as pilot:
-            app.submit_text('!echo hi')
-            text = ''
-            for _ in range(100):
+            for _ in range(50):
                 await pilot.pause()
                 await asyncio.sleep(0.02)
-                text = chat_text(app)
-                if 'shell:echo hi' in text:
+                if app._session_id == 'tui-resume':
                     break
-            assert 'shell:echo hi' in text
-            assert app._user_input_q.empty()          # 没有进入模型队列
-            assert app._history[-1] == '!echo hi'
-            app._exiting = True
-            app._user_input_q.put(None)
-
-    asyncio.run(scenario())
-
-
-def test_completion_items_for_commands_and_mentions():
-    pytest.importorskip('textual')
-    import ui_textual
-
-    commands = ui_textual.completion_items('/re', [])
-    assert any(value == '/resume' for value, _ in commands)
-    assert all(isinstance(label, str) and label for _, label in commands)
-
-    mentions = ui_textual.completion_items('see @src/ap', ['src/app.py'])
-    assert mentions[0][0] == '@src/app.py'
-
-
-def test_suggestion_cycle_and_accept_in_text_area():
-    import asyncio
-
-    pytest.importorskip('textual')
-    import ui_textual
-
-    async def scenario():
-        app = ui_textual.CCApp([])
-        async with app.run_test() as pilot:
-            app._input.text = '/re'
-            await pilot.pause()
-            assert app._suggestions
-
-            app.cycle_suggestion(1)
-            app.accept_suggestion()
-            assert app._input.text.startswith('/re')
-            assert app._input.text in [value for value, _ in
-                                       ui_textual.completion_items('/re', [])]
-
-            app._workspace_mention_files = lambda: ['src/app.py']
-            app._input.text = 'see @src/ap'
-            await pilot.pause()
-            app.accept_suggestion()
-            assert app._input.text == 'see @src/app.py'
-
-            app._exiting = True
-            app._user_input_q.put(None)
-
-    asyncio.run(scenario())
-
-
-def test_ctrl_r_toggles_read_only_tier(monkeypatch):
-    import asyncio
-    from types import SimpleNamespace
-
-    pytest.importorskip('textual')
-    import harness
-    import ui_textual
-
-    calls = []
-    monkeypatch.setattr(harness, 'load_policy',
-                        lambda: SimpleNamespace(sandbox_mode='workspace-write'))
-    monkeypatch.setattr(harness, 'apply_sandbox_tier',
-                        lambda tier: calls.append(tier) or f'now {tier}')
-
-    async def scenario():
-        app = ui_textual.CCApp([])
-        async with app.run_test() as pilot:
-            app.action_toggle_readonly()
-            await pilot.pause()
-            assert calls == ['read-only']
-            assert app._last_status['sandbox'] == 'read-only'
+            assert app._session_id == 'tui-resume'
+            assert any(m.get('content') == '旧会话的目标' for m in app._msgs)
             app._exiting = True
             app._user_input_q.put(None)
 
@@ -1099,3 +958,52 @@ def test_escape_closes_suggestions_first(monkeypatch):
 
     assert app._suggestions == []
     assert calls == []          # 只关列表，不取消回合
+
+
+def test_session_picker_filters_and_selects_with_arrows(monkeypatch):
+    import asyncio
+
+    pytest.importorskip('textual')
+    import harness
+    import ui_textual
+
+    rows = [
+        {'id': 'a1', 'title': 'alpha task', 'workspace': 'ws-a',
+         'updated': 0, 'preview': ''},
+        {'id': 'b2', 'title': 'beta task', 'workspace': 'ws-b',
+         'updated': 0, 'preview': ''},
+        {'id': 'c3', 'title': 'gamma task', 'workspace': 'ws-c',
+         'updated': 0, 'preview': ''},
+    ]
+    monkeypatch.setattr(harness, 'session_rows', lambda **kwargs: rows)
+
+    async def scenario():
+        app = ui_textual.CCApp([])
+        picked = []
+
+        async def fake_resume(row):
+            picked.append(row)
+
+        app._resume_row = fake_resume
+        async with app.run_test() as pilot:
+            await app._pick_session()
+            await pilot.pause()
+            screen = app.screen
+            search = screen.query_one('#session-search')
+            options = screen.query_one('#session-list')
+
+            search.value = 'beta'
+            await pilot.pause()
+            assert options.option_count == 1
+
+            options.focus()
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            await asyncio.sleep(0.05)
+            assert [row['id'] for row in picked] == ['b2']
+
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())

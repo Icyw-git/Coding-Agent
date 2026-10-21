@@ -25,7 +25,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Collapsible, Input, Markdown, Static, TextArea
+from textual.widgets import Collapsible, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 from file_mentions import format_mention, match_mentions, mention_token, workspace_files
 from ui_events import UIEvent, bus
@@ -172,6 +173,81 @@ class PermissionModal(ModalScreen):
             return
         bus.emit('permission_resolve', req_id=self.req_id, approved=False)
         self.dismiss()
+
+
+class SessionSearchInput(Input):
+    """搜索框里按下方向键进入列表，Enter 选第一条。"""
+
+    BINDINGS = [
+        Binding('down', 'focus_list', 'To list', show=False),
+        Binding('enter', 'first', 'Select first', show=False, priority=True),
+    ]
+
+    def action_focus_list(self) -> None:
+        try:
+            self.screen.query_one('#session-list', OptionList).focus()
+        except Exception:
+            pass
+
+    def action_first(self) -> None:
+        try:
+            options = self.screen.query_one('#session-list', OptionList)
+            if options.option_count:
+                options.highlighted = 0
+                options.focus()
+        except Exception:
+            pass
+
+
+class SessionPickerModal(ModalScreen):
+    """会话选择器：搜索过滤 + ↑↓ 选择 + Enter 恢复（对齐 Codex /resume）。"""
+
+    BINDINGS = [('escape', 'dismiss', 'Close')]
+
+    def __init__(self, rows: list[dict]):
+        super().__init__()
+        self.rows = list(rows)
+        self._by_id = {row['id']: row for row in self.rows}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='session-box'):
+            yield Static('Resume session', classes='modal-title')
+            yield SessionSearchInput(placeholder='搜索标题 / 工作区 / 会话 ID',
+                                     id='session-search')
+            yield OptionList(id='session-list')
+            yield Static('↑↓ 选择 · Enter 恢复 · Esc 取消', classes='modal-hint')
+
+    def on_mount(self) -> None:
+        self._filter('')
+        self.query_one('#session-search', SessionSearchInput).focus()
+
+    def _filter(self, query: str) -> None:
+        from turn_progress import relative_time
+
+        needle = (query or '').strip().casefold()
+        options = self.query_one('#session-list', OptionList)
+        options.clear_options()
+        for row in self.rows:
+            haystack = ' '.join(str(row.get(key, '')) for key in
+                                ('title', 'workspace', 'id')).casefold()
+            if needle and needle not in haystack:
+                continue
+            workspace = row.get('workspace') or 'workspace unrecorded'
+            label = (f"{row['title']}  ·  {workspace}"
+                     f"  ·  {relative_time(row.get('updated'))}"
+                     f"  ·  {row['id'][:8]}")
+            options.add_option(Option(label, id=row['id']))
+        if options.option_count:
+            options.highlighted = 0   # 首项高亮：聚焦后 Enter 即可恢复
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if getattr(event.input, 'id', '') == 'session-search':
+            self._filter(event.value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        row = self._by_id.get(str(event.option.id))
+        if row is not None:
+            self.dismiss(row)
 
 
 class CommandModal(ModalScreen):
@@ -749,9 +825,12 @@ class CCApp(App):
         elif verb == 'export':
             await self._export_conversation()
         elif verb in ('sessions', 'transcripts'):
-            await self._list_sessions()
+            await self._pick_session()
         elif verb == 'resume':
-            await self._resume_session(argument)
+            if argument:
+                await self._resume_session(argument)
+            else:
+                await self._pick_session()
         elif verb in ('more', 'older'):
             await self._load_older_history()
         elif verb in ('allow', 'deny', 'ask'):
@@ -794,33 +873,44 @@ class CCApp(App):
             return
         await self._show_notice(f'Exported Markdown: {path}')
 
-    async def _list_sessions(self) -> None:
-        """列出的必须是「会话」而不是 transcript 快照：与 /resume 一致。"""
+    async def _pick_session(self) -> None:
+        """打开会话选择器（搜索 + 上下键 + Enter），与 /resume 共用同一份数据。"""
         import harness
-        from turn_progress import relative_time
         rows = harness.session_rows(limit=None, include_empty=False)
         if not rows:
             await self._show_notice('No saved sessions.')
             return
-        lines = ['Saved sessions (/resume <n>):']
-        for index, row in enumerate(rows, 1):
-            workspace = row.get('workspace') or 'workspace unrecorded'
-            lines.append(
-                f"{index}. {row['title']}  ·  {workspace}"
-                f"  ·  {relative_time(row.get('updated'))}"
-                f"  ·  {row['id'][:8]}")
-        await self._show_notice(chr(10).join(lines))
+        self.push_screen(SessionPickerModal(rows), self._on_session_picked)
 
-    async def _set_permission_policy(self, policy: str, tool: str) -> None:
-        if not tool:
-            await self._show_notice(f'Use {policy} <tool>.')
-            return
+    def _on_session_picked(self, row) -> None:
+        if row:
+            asyncio.create_task(self._resume_row(row))
+
+    async def _resume_row(self, selected: dict) -> None:
         import harness
-        harness.permission_gate.set_policy(tool, policy)
-        await self._show_notice(f'Permission policy for {tool}: {policy}.')
+        if self._busy:
+            await self._show_notice('Cannot resume while a request is running.')
+            return
+        try:
+            path = harness.resolve_session_path(selected['id'])
+            store = harness.SessionEventStore.open(path)
+            messages = store.rebuild_openai_history(recover_pending=True)
+            summary = store.session_summary()
+        except (FileNotFoundError, ValueError, harness.SessionReplayError) as exc:
+            await self._show_notice(f'Unable to resume session: {exc}')
+            return
+        if summary.get('workspace'):
+            harness.set_workspace(summary['workspace'])
+        self._msgs[:] = messages
+        self._session_id = store.session_id
+        self._session_title = summary.get('title', '')
+        await self._render_history(messages)
+        hidden = max(0, len(messages) - HISTORY_RENDER_LIMIT)
+        suffix = f'（已折叠更早的 {hidden} 条）' if hidden else ''
+        await self._show_notice(f"Resumed {summary['title']}{suffix}.")
 
     async def _resume_session(self, argument: str) -> None:
-        """与行式 /resume 共用会话事件流：按序号、ID 前缀或标题匹配。"""
+        """按序号、ID 前缀或标题直接恢复；无参时由 _pick_session 打开选择器。"""
         if self._busy:
             await self._show_notice('Cannot resume while a request is running.')
             return
@@ -828,9 +918,6 @@ class CCApp(App):
         rows = harness.session_rows(limit=None, include_empty=False)
         if not rows:
             await self._show_notice('No saved sessions.')
-            return
-        if not argument:
-            await self._show_notice('Use resume <number> from sessions.')
             return
         selected = None
         if argument.strip().isdigit():
@@ -845,27 +932,12 @@ class CCApp(App):
                 selected = matches[0]
             elif len(matches) > 1:
                 await self._show_notice(
-                    f'{len(matches)} sessions match; use resume <n> from sessions.')
+                    f'{len(matches)} sessions match; use /sessions to pick one.')
                 return
         if selected is None:
             await self._show_notice(f'No session matches {argument!r}.')
             return
-        try:
-            path = harness.resolve_session_path(selected['id'])
-            store = harness.SessionEventStore.open(path)
-            messages = store.rebuild_openai_history(recover_pending=True)
-            summary = store.session_summary()
-        except (FileNotFoundError, ValueError, harness.SessionReplayError) as exc:
-            await self._show_notice(f'Unable to resume session: {exc}')
-            return
-        if summary.get('workspace'):
-            harness.set_workspace(summary['workspace'])
-        self._msgs[:] = messages
-        self._session_id = store.session_id
-        await self._render_history(messages)
-        hidden = max(0, len(messages) - HISTORY_RENDER_LIMIT)
-        suffix = f'（已折叠更早的 {hidden} 条）' if hidden else ''
-        await self._show_notice(f"Resumed {summary['title']}{suffix}.")
+        await self._resume_row(selected)
 
     async def _clear_rendered_conversation(self) -> None:
         self._active_tools.clear()

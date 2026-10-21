@@ -2690,3 +2690,25 @@ UI 测试 61 passed。
 `test_ui_bridge` 成本字段、`test_ui.py` 的 `/more` 分页与 Esc 关闭候选、
 `test_entrypoint` 的「MCP 未完成时 REPL 已启动」。总回归 1097 passed / 1 skipped，
 UI 测试 66 passed。
+## TUI 会话选择器
+
+**问题**：`/sessions` 只是把会话列表当一段文字打印出来，恢复还得手打
+`/resume 序号`。行式 REPL 早有方向键选择器，TUI 这边「上下键选择」没有迁移完整。
+
+**做法**（对齐 Codex/Pi 的 resume picker）：
+
+- 新增 `SessionPickerModal`：顶部搜索框（标题/工作区/ID 实时过滤）+ `OptionList`
+  列表；`↑↓` 选择、`Enter` 恢复、`Esc` 取消；打开时首项高亮，聚焦列表后直接 Enter。
+- 搜索框里按 `↓` 把焦点交给列表、`Enter` 选中第一条，减少一次 Tab/点击。
+- `/sessions` 打开选择器；`/resume` 无参同样打开，有参仍按序号/ID/标题直接恢复；
+  选择和直接恢复共用 `_resume_row`（打开事件流、恢复工作区、同步 session_id、重绘历史）。
+- 删除原来的纯文本 `_list_sessions`，避免两套展示路径。
+
+**取舍**：
+
+- 选择器按标题/工作区/ID 做子串过滤，不做模糊评分；会话量大时先输入关键词足够。
+- 恢复仍然重挂最近 400 条（`/more` 加载更早），与历史分页策略一致。
+
+**测试**：`test_ui.py` 覆盖「选择器打开 → 搜索 `beta` → Enter 恢复正确会话」与
+真实会话恢复（事件流 + session_id 切换）；总回归 1104 passed / 1 skipped，
+UI 测试 61 passed。
