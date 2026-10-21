@@ -994,3 +994,39 @@ def test_ctrl_r_toggles_read_only_tier(monkeypatch):
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_tui_initial_history_is_batched_and_capped():
+    import asyncio
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    messages = []
+    for index in range(500):
+        role = 'user' if index % 2 == 0 else 'assistant'
+        messages.append({'role': role, 'content': f'history {index}'})
+
+    async def scenario():
+        app = ui_textual.CCApp(messages)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await asyncio.sleep(0.2)
+            chat = app.query_one('#chat')
+            assert len(chat.children) <= ui_textual.HISTORY_RENDER_LIMIT + 1
+
+            parts = []
+
+            def walk(widget):
+                parts.append(str(widget.render()))
+                for child in widget.children:
+                    walk(child)
+
+            walk(chat)
+            text = chr(10).join(parts)
+            assert 'history 498' in text
+            assert 'earlier messages hidden' in text
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())

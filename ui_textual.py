@@ -351,6 +351,11 @@ class PromptArea(TextArea):
         self.app.history_next()
 
 
+HISTORY_RENDER_LIMIT = 400    # 恢复/启动时最多渲染的历史消息数（更早的折叠成一行）
+HISTORY_BATCH = 200           # 批量 mount 的块大小：Textual 逐条 await 是 O(n²)
+HISTORY_MARKDOWN_TAIL = 10    # 只有最后几条历史用 Markdown，老消息用轻量 Static
+
+
 class CCApp(App):
     TITLE = "harness"
     CSS = CSS
@@ -447,10 +452,11 @@ class CCApp(App):
         self.set_interval(0.1, self._stream_tick)
         self.set_interval(0.1, self._flush_status)
         self.set_interval(0.04, self._animate_context)
-        # 初始用户输入先入队（在工具/回复之前渲染，保持对话顺序）
-        for m in self._msgs:
-            if isinstance(m, dict):
-                self._event_queue.put(UIEvent('history_message', {'message': m}))
+        # 历史整体入队：批量 mount 比「一条消息一个事件」快一个数量级
+        history = [m for m in self._msgs if isinstance(m, dict)]
+        if history:
+            self._event_queue.put(UIEvent('history_messages',
+                                          {'messages': list(history)}))
         # 单一消费者 worker：严格 FIFO 处理事件（mount 是异步操作，必须 await）
         self.run_worker(self._consume_events, thread=False)
         self.run_worker(self._run_agent, thread=True)
@@ -843,9 +849,10 @@ class CCApp(App):
         self._msgs[:] = messages
         self._session_id = store.session_id
         await self._clear_rendered_conversation()
-        for message in messages:
-            await self._render_history_message(message)
-        await self._show_notice(f"Resumed {summary['title']}.")
+        await self._render_history(messages)
+        hidden = max(0, len(messages) - HISTORY_RENDER_LIMIT)
+        suffix = f'（已折叠更早的 {hidden} 条）' if hidden else ''
+        await self._show_notice(f"Resumed {summary['title']}{suffix}.")
 
     async def _clear_rendered_conversation(self) -> None:
         self._active_tools.clear()
@@ -1008,8 +1015,8 @@ class CCApp(App):
             # 用户输入可能含方括号 → 用 Text 对象（不做 markup 解析，避免 MarkupError）
             await self._chat.mount(Static(Text(f"\u276f {e.payload.get('text', '')}"),
                                           classes='user-msg'))
-        elif e.type == 'history_message':
-            await self._render_history_message(e.payload.get('message', {}))
+        elif e.type == 'history_messages':
+            await self._render_history(e.payload.get('messages', []))
         elif e.type == 'assistant_text':
             # 流式打字机：先挂空 Markdown，再由独立 task 分块增量渲染（CC 流式渲染轻量版）
             md = Markdown('')
@@ -1152,15 +1159,40 @@ class CCApp(App):
                 logger.info('background task completed: %s', task_id)
         self._chat.scroll_end(animate=False)   # scroll_end 是同步方法（返回 None）
 
-    async def _render_history_message(self, message: dict) -> None:
+    def _history_widget(self, message: dict, *, rich: bool):
+        """单条历史的轻量控件；tool 输出截断，避免恢复大历史时 mount 巨量文本。"""
         role = message.get('role')
         content = message.get('content') or ''
         if role == 'user':
-            await self._chat.mount(Static(Text(f"❯ {content}"), classes='user-msg'))
-        elif role == 'assistant':
-            await self._chat.mount(Markdown(str(content)))
-        elif role == 'tool':
-            await self._chat.mount(Static(Text(str(content)), classes='tool-output'))
+            return Static(Text(f"❯ {str(content)[:2000]}"), classes='user-msg')
+        if role == 'assistant':
+            if rich:
+                return Markdown(str(content))
+            text = str(content)
+            return Static(Text(text[:4000] + ('…' if len(text) > 4000 else '')))
+        if role == 'tool':
+            text = str(content)
+            if len(text) > 800:
+                text = text[:800] + f'… ({len(text)} chars)'
+            return Static(Text(text), classes='tool-output')
+        return None
+
+    async def _render_history(self, messages: list[dict]) -> None:
+        """批量恢复历史：限量 + 分块 mount_all + 老消息不走 Markdown。"""
+        shown = messages[-HISTORY_RENDER_LIMIT:]
+        hidden = len(messages) - len(shown)
+        widgets = []
+        if hidden:
+            widgets.append(Static(
+                Text(f'… {hidden} earlier messages hidden; use /export for the full log'),
+                classes='muted'))
+        tail_start = max(0, len(shown) - HISTORY_MARKDOWN_TAIL)
+        for index, message in enumerate(shown):
+            widget = self._history_widget(message, rich=index >= tail_start)
+            if widget is not None:
+                widgets.append(widget)
+        for start in range(0, len(widgets), HISTORY_BATCH):
+            await self._chat.mount_all(widgets[start:start + HISTORY_BATCH])
 
     async def _stream_typing(self, md: Markdown, text: str) -> None:
         """打字机效果：分块增量渲染 Markdown（约 80 步完成，模拟流式）。"""

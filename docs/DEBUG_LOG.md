@@ -2609,3 +2609,37 @@ UI 测试 56 passed。
 **测试**：`completion_items` 的命令/文件两类数据；run_test 下 Tab 采用、Alt 切换、
 `@` 替换位置；`Ctrl+R` 调用档位切换并更新状态。总回归 1097 passed / 1 skipped，
 UI 测试 61 passed。
+## TUI 大历史渲染性能
+
+**测量**（2000 条历史消息、每条约 250 字符）：
+
+| 方案 | 耗时 |
+|---|---|
+| 逐条 `await mount`（原实现） | 66.5 s |
+| `mount_all` 一次性 2000 个 Static | 1.8 s |
+| 分批 `mount_all`（200/批） | 2.3 s |
+| 分批 + 历史 Markdown 换 Static | 分块 Markdown 2000 条仍需 9.8 s |
+| 现在：最近 400 条 + 分批 + 老消息 Static | **0.46 s** |
+
+**根因**：Textual 的 `mount` 是异步的，逐条 `await` 会每条都触发一次布局/刷新，
+复杂度接近 O(n²)；历史 assistant 消息用 `Markdown` 每次都要重新解析，代价更高。
+
+**做法**：
+
+- `_render_history(messages)`：只取最近 `HISTORY_RENDER_LIMIT=400` 条，更早的折叠为
+  一行提示（`/export` 看全文）；`HISTORY_BATCH=200` 分批 `mount_all`。
+- 只有最后 `HISTORY_MARKDOWN_TAIL=10` 条用 Markdown，其余 assistant 历史用
+  `Static(Text)`；历史 tool 输出截断到 800 字符（完整内容仍在事件流/转录里）。
+- 启动时的初始历史从「每条消息一个事件」改为一个 `history_messages` 事件，走同一
+  批量渲染路径。
+- `/resume` 完成后提示里带上「已折叠更早的 N 条」。
+
+**设计对照**：Codex/Pi 的对话区是虚拟化列表，可以直接展示全量历史；Textual 的
+`VerticalScroll` 不做虚拟化，所以这里用「限量 + 折叠提示」换取可交互的恢复速度，
+语义上仍保留全量导出路径。
+
+**取舍**：超过 400 条的历史不会自动出现在滚动区，需要 `/export` 或行式 REPL 查看；
+这是为了恢复速度和内存占用做的显式折中。
+
+**测试**：新增「500 条初始历史 → 控件数受限、末尾消息可见、折叠提示存在」；
+总回归 1097 passed / 1 skipped，UI 测试 62 passed。
