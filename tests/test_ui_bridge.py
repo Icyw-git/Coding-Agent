@@ -204,3 +204,35 @@ def test_status_reports_estimated_cost_for_known_model(tmp_path, monkeypatch,
     assert status.payload['cost_source'] == 'estimated'
     assert status.payload['currency'] == 'CNY'
     assert float(status.payload['cost']) > 0
+
+
+def test_agent_loop_injects_steering_messages_between_requests(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    seen = []
+
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(role='assistant', content='ok',
+                                    tool_calls=None),
+            finish_reason='stop')],
+        usage=_usage())
+
+    def fake_stream(kwargs, hook):
+        seen.append([m.get('content') for m in kwargs['messages']])
+        return response
+
+    monkeypatch.setattr(harness, '_stream_completion', fake_stream)
+    pending = ['steered note']
+
+    def take():
+        if pending:
+            return [pending.pop()]
+        return []
+
+    store = harness.SessionEventStore(tmp_path, session_id='steer')
+    harness.agent_loop([{'role': 'user', 'content': 'hello'}],
+                       session_store=store, housekeeping=False,
+                       steer_provider=take)
+    assert seen
+    assert 'steered note' in seen[0]

@@ -3085,3 +3085,25 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
 
 **测试**：审批盒子尺寸、Ctrl-C 选中复制、/copy、畸形 Markdown fallback；总回归
 1167 passed / 1 skipped，旧 UI 64 passed。
+## 队列：steer / follow-up / dequeue / cancel
+
+之前所有“回合中输入”都进入 `_pending` 顺序队列，Alt+Up 只看 `_pending` 且只取最后
+一条，所以和 Pi 的语义不一致；用户在流式期间发的消息也不会进入当前上下文。
+
+现在：
+
+- **Enter（运行中）→ steer**：进入 `_steering`，`agent_loop(steer_provider=...)`
+  在每轮请求前和最终回答前 drain，追加为 user message 到同一个上下文；
+- **Alt+Enter → follow-up**：进入 `_pending`，等本次 `agent_loop` 结束再处理；
+- **Alt+↑ / F2 / `/dequeue`**：把 steering + follow-up 全部取回编辑器（不再只取
+  最后一条），队列条分别标 `steer:` / `next:`；
+- **Esc 取消**：设置 cancel 后调用 `dequeue_all()`，未消费的消息回到输入框，
+  不会在取消后自动继续执行；
+- UI 对 steer 消息先显示 user 块，agent loop 注入时不重复发 user 事件；
+- `active` 计数、footer 和 composer 的 `N queued` 都合并两个队列。
+
+限制：steer 不能中断已经在传输中的 HTTP 流，只能在下一轮请求/工具批次前注入；
+这是 Pi 同类的边界。若终端不识别 Alt+Up，可用 F2 或 `/dequeue`。
+
+**测试**：steer/follow-up 分队列、Alt+Up 全部取回、Esc 取消回填、agent_loop 注入；
+总回归 1170 passed / 1 skipped，旧 UI 64 passed。

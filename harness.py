@@ -1673,7 +1673,7 @@ def _stream_completion(create_kwargs, on_delta):
 
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None, *,
-               on_event=None, housekeeping=True):
+               on_event=None, housekeeping=True, steer_provider=None):
     """Run one OpenAI session, recording an append-only event stream for recovery.
 
     ``on_event`` mirrors tool execution for one-shot transports; ``housekeeping``
@@ -1720,9 +1720,28 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     baseline_taken = False
     turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
 
+    def _drain_steering() -> bool:
+        """把 TUI 运行中的 steer 消息注入当前上下文（下一轮请求前）。"""
+        if steer_provider is None:
+            return False
+        try:
+            texts = steer_provider() or []
+        except Exception:
+            return False
+        injected = False
+        for text in texts:
+            if not text:
+                continue
+            message = {'role': 'user', 'content': str(text)}
+            messages.append(message)
+            session_store.append_message(message)
+            injected = True
+        return injected
+
     while True:
         if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
             raise KeyboardInterrupt
+        _drain_steering()
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
         _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
 
@@ -1894,6 +1913,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
 
 
         if response.choices[0].finish_reason != "tool_calls":
+            # 若本轮已产生最终回答，但运行中又有 steer 消息，先继续同一 loop。
+            if _drain_steering():
+                continue
             force=trigger_hooks('Stop',messages)
             if force:
                 messages.append({'role':'user','content':force})

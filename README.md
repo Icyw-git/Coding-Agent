@@ -502,9 +502,11 @@ python entrypoint.py
 `pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。TUI 输入 `/`
 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
 `/diff`、`/review`、`/cache` 等只存在于行式 REPL 的命令会明确提示改用
-`python harness.py --ui ansi`。TUI 与行式 REPL 行为对齐：回合进行中可以继续输入
-（消息排队，按顺序执行，状态行显示 `N queued`）；`@` 列出并补全工作区文件（Tab）；
-`↑`/`↓` 翻输入历史；状态栏显示模型、git 分支、执行档位与上下文占用；
+`python harness.py --ui ansi`。TUI 与行式 REPL 行为对齐：回合进行中按 Enter 会 **steer**（下一轮请求前注入
+当前上下文），Alt+Enter 则作为 follow-up 等本回合结束再做；状态行显示
+`N queued`，`Alt+↑`/F2 或 `/dequeue` 可把 steering/follow-up 全部取回输入框。
+`@` 列出并补全工作区文件（Tab）；`↑`/`↓` 翻输入历史；状态栏常驻当前目录与
+git 分支，并显示模型、上下文占用、token 和缓存命中率；
 输入框支持多行：`Enter` 发送、`Ctrl-J` 换行（高度随内容增长，最多 8 行）。
 输入 `!命令`（如 `!pytest -q`）直接执行 shell 并展示输出，不进入模型上下文；
 审批、超时与沙箱规则仍由策略层决定。输入 `/` 或 `@` 时，输入框下方显示逐键

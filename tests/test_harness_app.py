@@ -150,8 +150,8 @@ def test_queue_strip_and_take_back(monkeypatch):
                     break
             assert started.is_set()
 
-            app.submit_text('two')
-            app.submit_text('three')
+            app.submit_text('two', mode='followup')
+            app.submit_text('three', mode='followup')
             await pilot.pause()
             assert len(app._pending) == 2
             assert app._queue_widget.display is True
@@ -1015,4 +1015,80 @@ def test_permission_modal_is_centered_box_not_fullscreen():
             box = app.screen.query_one('#perm-box')
             assert box.region.width < 100
             assert box.region.height < 30
+    asyncio.run(scenario())
+
+
+def test_steering_queue_and_dequeue_all(monkeypatch):
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_loop(messages, **kwargs):
+        started.set()
+        release.wait(5)
+        return 'ok'
+
+    monkeypatch.setattr(harness, 'agent_loop', blocking_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('one')
+            for _ in range(50):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if started.is_set():
+                    break
+            app.submit_text('steer me')
+            app.submit_text('follow up', mode='followup')
+            await pilot.pause()
+            assert app._steering.snapshot() == ['steer me']
+            assert app._pending.snapshot() == ['follow up']
+            # Alt+Up 应把 steering + follow-up 一起取回，而不是只取最后一条
+            await pilot.press('alt+up')
+            await pilot.pause()
+            assert not app._steering.snapshot()
+            assert not app._pending.snapshot()
+            assert 'steer me' in app._composer.text
+            assert 'follow up' in app._composer.text
+            release.set()
+            app._exiting = True
+            app._pending.put(None)
+
+    asyncio.run(scenario())
+
+
+def test_cancel_restores_queued_messages(monkeypatch):
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_loop(messages, **kwargs):
+        started.set()
+        release.wait(5)
+        return 'ok'
+
+    monkeypatch.setattr(harness, 'agent_loop', blocking_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('one')
+            for _ in range(50):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if started.is_set():
+                    break
+            app.submit_text('follow up', mode='followup')
+            await pilot.pause()
+            app.cancel_turn()
+            await pilot.pause()
+            assert not app._pending.snapshot()
+            assert 'follow up' in app._composer.text
+            release.set()
+            app._exiting = True
+            app._pending.put(None)
+
     asyncio.run(scenario())

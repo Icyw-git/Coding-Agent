@@ -50,6 +50,8 @@
   try/fallback，畸形链接不炸帧；支持选中文本 Ctrl-C/Ctrl+Shift+C 复制和 `/copy`
   复制最近工具输出。Profile：10k 块布局约 30ms、滚动约 1ms；Markdown 10k 文本约
   63ms，瓶颈在 markdown_it parse + rich render，已用 120ms 限频。
+- P5n：队列语义对齐 Pi：Enter 运行中=steer，Alt+Enter=follow-up；Alt+↑/F2 或
+  `/dequeue` 取回全部；Esc 取消时把队列内容退回编辑器。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

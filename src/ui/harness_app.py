@@ -142,6 +142,13 @@ class PendingQueue:
         with self._lock:
             return [item for item in self._items if item is not None]
 
+    def drain(self) -> list[str]:
+        """取走全部消息（用于 steer 注入或 Esc 取回）。"""
+        with self._lock:
+            items = [item for item in self._items if item is not None]
+            self._items.clear()
+            return items
+
     def __len__(self) -> int:
         return len(self.snapshot())
 
@@ -153,8 +160,11 @@ class Composer(TextArea):
         Binding('enter', 'submit', 'Send', show=False, priority=True),
         Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
         Binding('tab', 'complete', 'Complete', show=False),
-        Binding('alt+up', 'queued_prev', 'Prev', show=False),
+        Binding('alt+up', 'queued_prev', 'Dequeue', show=False),
         Binding('alt+down', 'queued_next', 'Next', show=False),
+        Binding('alt+enter', 'submit_followup', 'Follow-up', show=False,
+                priority=True),
+        Binding('f2', 'dequeue', 'Dequeue', show=False, priority=True),
         Binding('up', 'suggest_prev', 'Prev', show=False),
         Binding('down', 'suggest_next', 'Next', show=False),
         Binding('ctrl+o', 'expand_tool', 'Expand tool', show=False,
@@ -165,6 +175,10 @@ class Composer(TextArea):
     def action_submit(self) -> None:
         # 有候选时 Enter 先采用候选：命令候选采用后直接执行，路径/@ 候选只回填。
         self.app.submit_composer()
+
+    def action_submit_followup(self) -> None:
+        # Alt+Enter：当前回合结束后再处理，不打断正在进行的回答。
+        self.app.submit_composer(followup=True)
 
     def action_newline(self) -> None:
         self.insert(chr(10))
@@ -188,11 +202,14 @@ class Composer(TextArea):
         if self.app.has_suggestions():
             self.app.cycle_suggestion(-1)
         else:
-            self.app.take_last_queued()
+            self.app.dequeue_all()
 
     def action_queued_next(self) -> None:
         if self.app.has_suggestions():
             self.app.cycle_suggestion(1)
+
+    def action_dequeue(self) -> None:
+        self.app.dequeue_all()
 
     def action_escape(self) -> None:
         if self.app.has_suggestions():
@@ -294,6 +311,7 @@ class HarnessApp(App):
                                follow_end=FOLLOW_END)
         self._events: queue.Queue = queue.Queue()
         self._pending = PendingQueue()
+        self._steering = PendingQueue()
         self._tool_blocks: dict[str, str] = {}
         self._dirty = True
         self._busy = False
@@ -438,7 +456,7 @@ class HarnessApp(App):
         if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
             symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
             parts.append(f"~{symbol}{self._status['cost']}")
-        queued = len(self._pending)
+        queued = len(self._pending) + len(self._steering)
         if queued:
             parts.append(f'{queued} queued')
         if self._busy:
@@ -534,18 +552,43 @@ class HarnessApp(App):
         self._composer.cursor_location = (0, len(item))
         self._refresh_queue()
 
+    def dequeue_all(self) -> None:
+        """Alt+Up / F2 / Esc：把 steering 和 follow-up 全部取回输入框。"""
+        if self._composer is None:
+            return
+        items = self._steering.drain() + self._pending.drain()
+        items = [item for item in items if item]
+        if not items:
+            self._notice('No queued messages to restore.')
+            return
+        current = self._composer.text.strip()
+        text = chr(10).join(items)
+        if current:
+            text = current + chr(10) + text
+        self._programmatic_text = text
+        self._composer.text = text
+        self._composer.cursor_location = (0, len(text))
+        self._composer.focus()
+        self._refresh_queue()
+        self._notice(f'Restored {len(items)} queued message(s) to editor.')
+
     def _refresh_queue(self) -> None:
         if self._queue_widget is None:
             return
-        items = self._pending.snapshot()
+        steering = self._steering.snapshot()
+        followup = self._pending.snapshot()
+        items = steering + followup
         if not items:
             self._queue_widget.display = False
             self._queue_widget.update('')
             return
-        preview = ' | '.join(item.replace(chr(10), ' ')[:24] for item in items[:3])
+        preview = ' | '.join(
+            ('steer:' if index < len(steering) else 'next:')
+            + item.replace(chr(10), ' ')[:20]
+            for index, item in enumerate(items[:3]))
         more = f' … +{len(items) - 3}' if len(items) > 3 else ''
         self._queue_widget.update(f'⏳ {len(items)} queued: {preview}{more} '
-                                  '· Alt+↑ 取回')
+                                  '· Alt+↑/F2 取回')
         self._queue_widget.display = True
 
     # ---------- 状态 ----------
@@ -559,7 +602,7 @@ class HarnessApp(App):
             return
         elapsed = max(0.0, time.monotonic() - self._turn_started)
         spinner = SPINNERS[int(time.monotonic() * 8) % len(SPINNERS)]
-        queued = len(self._pending)
+        queued = len(self._pending) + len(self._steering)
         title = f'{spinner} Working {elapsed:4.1f}s'
         if queued:
             title += f' · {queued} queued'
@@ -884,6 +927,8 @@ class HarnessApp(App):
             self.start_review()
         elif verb == 'copy':
             self.copy_last_tool()
+        elif verb == 'dequeue':
+            self.dequeue_all()
         elif verb == 'expand':
             self.toggle_last_tool()
             self._notice('Toggled the most recent tool block.')
@@ -1212,11 +1257,12 @@ class HarnessApp(App):
         self._notice(f"Resumed {summary['title']}.")
 
     def cancel_turn(self) -> None:
-        """Esc：仅当回合进行中才发取消，避免空闲时误触。"""
+        """Esc：取消当前回合，并把 steering/follow-up 取回编辑器（同 Pi）。"""
         if not self._busy:
             return
         import turn_control
         turn_control.request_cancel()
+        self.dequeue_all()
         if self._composer is not None:
             self._composer.border_title = 'cancelling…'
 
@@ -1256,7 +1302,7 @@ class HarnessApp(App):
                           output=str(output), duration_ms=duration_ms)
         self._mark_dirty()
 
-    def submit_composer(self) -> None:
+    def submit_composer(self, followup: bool = False) -> None:
         """Enter 的统一入口：候选优先采用，命令候选随后执行。"""
         if self._composer is None:
             return
@@ -1266,14 +1312,14 @@ class HarnessApp(App):
             if text.lstrip().startswith('/'):
                 self._programmatic_text = ''
                 self._composer.text = ''
-                self.submit_text(text)
+                self.submit_text(text, mode='followup' if followup else 'steer')
             return
         text = self._composer.text
         self._programmatic_text = ''
         self._composer.text = ''
-        self.submit_text(text)
+        self.submit_text(text, mode='followup' if followup else 'steer')
 
-    def submit_text(self, text: str) -> None:
+    def submit_text(self, text: str, mode: str = 'steer') -> None:
         text = (text or '').strip()
         if not text or self._exiting:
             return
@@ -1284,16 +1330,20 @@ class HarnessApp(App):
             return
         if self._handle_command(text):
             return
-        self._send_user(text)
+        self._send_user(text, mode=mode)
 
-    def _send_user(self, text: str) -> None:
+    def _send_user(self, text: str, mode: str = 'steer') -> None:
         self.model.append('user', {'text': text})
         self._mark_dirty()
         self._flush_layout(force=True)      # 先画出用户消息，不必等 50ms 定时器
+        if self._busy:
+            # Pi 语义：运行中 Enter=steer（下一轮请求前注入），Alt+Enter=follow-up。
+            (self._pending if mode == 'followup' else self._steering).put(text)
+            self._refresh_queue()
+            return
         self._pending.put(text)
         self._refresh_queue()
-        if not self._busy:
-            self._start_worker()
+        self._start_worker()
 
     def submit_skill(self, name: str, argument: str = '') -> None:
         """`/skill:<name> args`：把技能正文展开成一条 user 消息（同 Pi）。"""
@@ -1332,8 +1382,11 @@ class HarnessApp(App):
                         # agent_loop 仍会 print tokens/结果；Textual 已接管屏幕，
                         # 这些写入会盖住 UI 并拖慢重绘，全部收进内存。
                         with contextlib.redirect_stdout(io.StringIO()):
-                            kwargs = ({'session_store': self._store}
-                                      if self._store is not None else {})
+                            kwargs = {
+                                'steer_provider': self._steering.drain,
+                            }
+                            if self._store is not None:
+                                kwargs['session_store'] = self._store
                             answer = harness.agent_loop(self._messages, **kwargs)
                 except KeyboardInterrupt:
                     pass
