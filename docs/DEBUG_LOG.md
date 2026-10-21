@@ -2786,3 +2786,16 @@ Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。
 **测试**：`tests/test_tool_renderer.py`（状态/耗时/diff/预览/展开）、
 `tests/test_tool_diff_capture.py`（写文件产生 diff、秘密文件不产生 diff）；
 总回归 1121 passed / 1 skipped，旧 UI 64 passed。
+## TUI 重构 P5：共享模态与命令路由
+
+- `PermissionModal`、`SessionPickerModal`/`SessionSearchInput` 从旧 `ui/app.py`
+  抽到 `src/ui/modals/`，旧/新 TUI 共用同一份实现（CSS 由各自 App 提供）。
+- 新 TUI（`textual-next`）补上 `/` 命令路由：help/status/model/pwd/clear/export/
+  sessions/resume/allow/deny/ask/quit；其余命令明确提示「暂未迁移，用 --ui ansi」。
+- `/sessions` 打开共享会话选择器，选择后按真实事件流恢复（工作区、session_id、
+  历史重绘）；`/resume <n|前缀|标题>` 直接恢复。
+- `permission_request` 事件打开审批弹窗，`y`/`n` 通过总线应答，agent 线程解除
+  阻塞（与旧 TUI 一致）；新 TUI 也带 200ms 防误触。
+
+**测试**：`tests/test_harness_app.py` 新增命令本地处理、选择器恢复真实会话、
+审批弹窗应答；总回归 1124 passed / 1 skipped，旧 UI 66 passed。

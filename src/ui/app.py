@@ -25,10 +25,11 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Collapsible, Input, Markdown, OptionList, Static, TextArea
-from textual.widgets.option_list import Option
+from textual.widgets import Collapsible, Input, Markdown, Static, TextArea
 
 from file_mentions import format_mention, match_mentions, mention_token, workspace_files
+from ui.modals.approval import PermissionModal
+from ui.modals.sessions import SessionPickerModal
 from ui_events import UIEvent, bus
 
 logger = logging.getLogger('harness.ui')
@@ -112,142 +113,6 @@ Collapsible:focus { border-left: thick $info; }
 
 for _name, _color in PALETTE.items():
     CSS = CSS.replace(f'${_name}', _color)
-
-
-class PermissionModal(ModalScreen):
-    """权限确认覆盖层：y 允许 / n|Esc 拒绝。应答后 dismiss（gate 自动唤醒 agent 线程）。
-
-    200ms 防误触：弹窗后 0.2s 内按键无效（对应 CC 的 anti-misclick 设计）。"""
-
-    BINDINGS = [
-        ("y", "approve", "Allow"),
-        ("n", "reject", "Deny"),
-        ("escape", "reject", "Deny"),
-    ]
-
-    ARM_DELAY = 0.2
-
-    def __init__(self, req_id: str, tool: str, args: dict, title: str = 'Permission needed',
-                 risk: str = 'warning'):
-        super().__init__()
-        self.req_id = req_id
-        self.tool = tool
-        self.args = args
-        self.title = title
-        self.risk = risk if risk in ('warning', 'danger') else 'warning'
-        self._armed = False
-
-    def on_mount(self) -> None:
-        self.set_timer(self.ARM_DELAY, self._arm)
-
-    def _arm(self) -> None:
-        self._armed = True
-
-    def compose(self) -> ComposeResult:
-        with Static(id="perm-box", classes=f"risk-{self.risk}"):
-            label = 'HIGH RISK' if self.risk == 'danger' else 'CONFIRM ACTION'
-            title_color = 'red' if self.risk == 'danger' else 'yellow'
-            yield Static(f"[{title_color}][bold]{label}[/]  {markup_escape(self.title)}[/]",
-                         id="perm-title")
-            yield Static(Text("Tool: ", style="dim") + Text(self.tool))
-            yield Static(Text("Target: ", style="dim") + Text(self._target_text()))
-            yield Static("")
-            yield Static("[yellow]y[/] = Allow    [yellow]n[/]/[yellow]Esc[/] = Deny    "
-                         f"([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])")
-
-    def _target_text(self) -> str:
-        """Prefer the actionable command/path over a noisy raw argument dict."""
-        for key in ('command', 'path', 'file_path', 'pattern'):
-            if self.args.get(key):
-                return str(self.args[key])
-        return str(self.args)
-
-    def action_approve(self):
-        if not self._armed:
-            return
-        bus.emit('permission_resolve', req_id=self.req_id, approved=True)
-        self.dismiss()
-
-    def action_reject(self):
-        if not self._armed:
-            return
-        bus.emit('permission_resolve', req_id=self.req_id, approved=False)
-        self.dismiss()
-
-
-class SessionSearchInput(Input):
-    """搜索框里按下方向键进入列表，Enter 选第一条。"""
-
-    BINDINGS = [
-        Binding('down', 'focus_list', 'To list', show=False),
-        Binding('enter', 'first', 'Select first', show=False, priority=True),
-    ]
-
-    def action_focus_list(self) -> None:
-        try:
-            self.screen.query_one('#session-list', OptionList).focus()
-        except Exception:
-            pass
-
-    def action_first(self) -> None:
-        try:
-            options = self.screen.query_one('#session-list', OptionList)
-            if options.option_count:
-                options.highlighted = 0
-                options.focus()
-        except Exception:
-            pass
-
-
-class SessionPickerModal(ModalScreen):
-    """会话选择器：搜索过滤 + ↑↓ 选择 + Enter 恢复（对齐 Codex /resume）。"""
-
-    BINDINGS = [('escape', 'dismiss', 'Close')]
-
-    def __init__(self, rows: list[dict]):
-        super().__init__()
-        self.rows = list(rows)
-        self._by_id = {row['id']: row for row in self.rows}
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id='session-box'):
-            yield Static('Resume session', classes='modal-title')
-            yield SessionSearchInput(placeholder='搜索标题 / 工作区 / 会话 ID',
-                                     id='session-search')
-            yield OptionList(id='session-list')
-            yield Static('↑↓ 选择 · Enter 恢复 · Esc 取消', classes='modal-hint')
-
-    def on_mount(self) -> None:
-        self._filter('')
-        self.query_one('#session-search', SessionSearchInput).focus()
-
-    def _filter(self, query: str) -> None:
-        from turn_progress import relative_time
-
-        needle = (query or '').strip().casefold()
-        options = self.query_one('#session-list', OptionList)
-        options.clear_options()
-        for row in self.rows:
-            haystack = ' '.join(str(row.get(key, '')) for key in
-                                ('title', 'workspace', 'id')).casefold()
-            if needle and needle not in haystack:
-                continue
-            workspace = row.get('workspace') or 'workspace unrecorded'
-            label = (f"{row['title']}  ·  {workspace}"
-                     f"  ·  {relative_time(row.get('updated'))}"
-                     f"  ·  {row['id'][:8]}")
-            options.add_option(Option(label, id=row['id']))
-        if options.option_count:
-            options.highlighted = 0   # 首项高亮：聚焦后 Enter 即可恢复
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if getattr(event.input, 'id', '') == 'session-search':
-            self._filter(event.value)
-
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        row = self._by_id.get(str(event.option.id))
-        if row is not None:
-            self.dismiss(row)
 
 
 class CommandModal(ModalScreen):

@@ -8,6 +8,7 @@ pytest.importorskip('textual')
 import harness  # noqa: E402
 import ui_events  # noqa: E402
 from ui.harness_app import HarnessApp  # noqa: E402
+from ui_events import UIEvent  # noqa: E402
 
 
 def _line_texts(app):
@@ -186,3 +187,78 @@ def test_working_status_in_composer_border(monkeypatch):
             app._pending.put(None)
 
     asyncio.run(scenario())
+
+
+def test_slash_help_is_handled_locally(monkeypatch):
+    def fail_loop(messages, **kwargs):
+        raise AssertionError('command must not reach the model')
+
+    monkeypatch.setattr(harness, 'agent_loop', fail_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/help')
+            await pilot.pause()
+            assert len(app.model) == 1
+            assert app.model.snapshot()[0].kind == 'notice'
+            assert 'Commands:' in str(app.model.snapshot()[0].payload['text'])
+            assert len(app._pending) == 0
+
+    asyncio.run(scenario())
+
+
+def test_sessions_picker_resumes_real_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    store = harness.SessionEventStore(tmp_path, session_id='next-resume')
+    store.append_message({'role': 'user', 'content': 'old goal'})
+    store.append_message({'role': 'assistant', 'content': 'old answer'})
+
+    async def scenario():
+        app = HarnessApp([], session_id='current')
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.open_session_picker()
+            await pilot.pause()
+            screen = app.screen
+            assert type(screen).__name__ == 'SessionPickerModal'
+            options = screen.query_one('#session-list')
+            assert options.option_count == 1
+            options.focus()
+            await pilot.press('enter')
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if app._session_id == 'next-resume':
+                    break
+            assert app._session_id == 'next-resume'
+            assert any(m.get('content') == 'old goal' for m in app._messages)
+
+    asyncio.run(scenario())
+
+
+def test_permission_request_opens_modal_and_resolves():
+    resolved = []
+
+    def record(event):
+        if event.type == 'permission_resolve':
+            resolved.append(event)
+
+    ui_events.bus.subscribe(record)
+    try:
+        async def scenario():
+            app = HarnessApp([])
+            async with app.run_test(size=(80, 24)) as pilot:
+                app._apply(UIEvent('permission_request', {
+                    'req_id': 'perm-1', 'tool': 'bash',
+                    'args': {'command': 'rm x'}, 'title': 'destructive'}))
+                await pilot.pause()
+                assert type(app.screen).__name__ == 'PermissionModal'
+                await asyncio.sleep(0.25)     # 防误触
+                await pilot.press('y')
+                await pilot.pause()
+                assert resolved and resolved[-1].payload['approved'] is True
+                assert resolved[-1].payload['req_id'] == 'perm-1'
+
+        asyncio.run(scenario())
+    finally:
+        ui_events.bus.unsubscribe(record)

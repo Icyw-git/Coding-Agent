@@ -4,6 +4,7 @@ feature flag：`HARNESS_UI=textual-next`。旧 `ui/app.py` 仍是默认实现。
 """
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 import time
@@ -19,6 +20,8 @@ from textual.widgets import Static, TextArea
 
 from file_mentions import workspace_files
 from ui.composer.completions import apply_suggestion, suggestions
+from ui.modals.approval import PermissionModal
+from ui.modals.sessions import SessionPickerModal
 from ui.renderers.tools import tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
@@ -155,6 +158,13 @@ class HarnessApp(App):
     #completions { position: absolute; overlay: screen; layer: overlay;
                    display: none; background: $surface; border: round $accent;
                    padding: 0 1; }
+    #perm-box { width: 76; padding: 2 3; border: round $warning;
+                background: $boost; }
+    #perm-box.risk-danger { border: round $error; }
+    #session-box { width: 90; max-height: 28; padding: 1 2;
+                   border: round $accent; background: $boost; }
+    #session-list { height: auto; max-height: 18; }
+    #session-search { margin: 0 0 1 0; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -458,6 +468,13 @@ class HarnessApp(App):
             self.model.append('notice', {'text': str(payload.get('msg', '')),
                                          'level': 'error'})
             self._mark_dirty()
+        elif kind == 'permission_request':
+            self.push_screen(PermissionModal(
+                str(payload.get('req_id', '')),
+                str(payload.get('tool', '')),
+                payload.get('args') or {},
+                str(payload.get('title', 'Permission needed')),
+                str(payload.get('risk', 'warning'))))
         elif kind == 'status':
             self._status.update(payload)
             self._refresh_footer()
@@ -528,12 +545,132 @@ class HarnessApp(App):
         if block_id:
             self.toggle_tool(block_id)
 
+    def _notice(self, text: str, level: str = 'info') -> None:
+        self.model.append('notice', {'text': text, 'level': level})
+        self._mark_dirty()
+
+    def _handle_command(self, text: str) -> bool:
+        """返回 True 表示已作为命令处理，不再发给模型。"""
+        if not text.startswith('/'):
+            return False
+        raw = text[1:].strip()
+        verb, _, argument = raw.partition(' ')
+        verb = verb.lower()
+        argument = argument.strip()
+        import harness
+        if verb in ('quit', 'exit', 'q'):
+            self.exit()
+        elif verb in ('help', '?'):
+            self._notice('Commands: /help /status /model /pwd /sessions /resume <n> '
+                         '/export /clear /allow|/deny|/ask <tool> /quit')
+        elif verb == 'clear':
+            self.model.clear()
+            self._mark_dirty()
+        elif verb in ('status', 'model', 'pwd'):
+            state = self._display_status()
+            lines = [f"model: {harness.os.getenv('LLM_MODEL_ID', '') or 'unset'}",
+                     f'workspace: {harness.get_workdir()}']
+            if state.get('ctx_pct') is not None:
+                lines.append(f"context: {state['ctx_pct']:.0f}%")
+            if state.get('tokens'):
+                lines.append(f"tokens: {state['tokens']}")
+            self._notice(chr(10).join(lines))
+        elif verb in ('sessions', 'transcripts'):
+            self.open_session_picker()
+        elif verb == 'resume':
+            if argument:
+                asyncio.create_task(self._resume_by_argument(argument))
+            else:
+                self.open_session_picker()
+        elif verb == 'export':
+            try:
+                path = harness.export_session(self._messages)
+                self._notice(f'Exported transcript: {path}')
+            except Exception as exc:
+                self._notice(f'Export failed: {exc}', level='error')
+        elif verb in ('allow', 'deny', 'ask'):
+            if not argument:
+                self._notice(f'Use /{verb} <tool>.')
+            else:
+                harness.permission_gate.set_policy(argument, verb)
+                self._notice(f'Permission policy for {argument}: {verb}')
+        elif verb in ('more', 'older', 'find', 'search', 'diff', 'review',
+                      'cache', 'sandbox', 'checkpoint', 'rewind', 'undo',
+                      'fork', 'archive', 'delete', 'watch', 'expand',
+                      'approvals', 'revoke', 'workspaces', 'workspace', 'cd',
+                      'new', 'compact', 'rename'):
+            self._notice(f'/{verb} 暂未迁移到 textual-next；请用 --ui ansi。')
+        else:
+            self._notice(f'Unknown command: /{verb}', level='error')
+        return True
+
+    def _display_status(self) -> dict:
+        return dict(self._status)
+
+    def open_session_picker(self) -> None:
+        import harness
+        rows = harness.session_rows(limit=None, include_empty=False)
+        if not rows:
+            self._notice('No saved sessions.')
+            return
+        self.push_screen(SessionPickerModal(rows), self._on_session_picked)
+
+    def _on_session_picked(self, row) -> None:
+        if row:
+            asyncio.create_task(self._resume_session_row(row))
+
+    async def _resume_by_argument(self, argument: str) -> None:
+        import harness
+        rows = harness.session_rows(limit=None, include_empty=False)
+        if not rows:
+            self._notice('No saved sessions.')
+            return
+        selected = None
+        if argument.isdigit():
+            index = int(argument)
+            if 1 <= index <= len(rows):
+                selected = rows[index - 1]
+        else:
+            matches = [row for row in rows
+                       if row['id'].startswith(argument)
+                       or argument.casefold() in (row['title'] or '').casefold()]
+            if len(matches) == 1:
+                selected = matches[0]
+            elif len(matches) > 1:
+                self._notice(f'{len(matches)} sessions match; use /sessions.')
+                return
+        if selected is None:
+            self._notice(f'No session matches {argument!r}.')
+            return
+        await self._resume_session_row(selected)
+
+    async def _resume_session_row(self, row: dict) -> None:
+        import harness
+        try:
+            store = harness.SessionEventStore.open(
+                harness.resolve_session_path(row['id']))
+            messages = store.rebuild_openai_history(recover_pending=True)
+            summary = store.session_summary()
+        except Exception as exc:
+            self._notice(f'Unable to resume: {exc}', level='error')
+            return
+        if summary.get('workspace'):
+            harness.set_workspace(summary['workspace'])
+        self._messages = list(messages)
+        self._session_id = store.session_id
+        self.model.clear()
+        self._load_history(messages)
+        self._refresh_footer()
+        self._notice(f"Resumed {summary['title']}.")
+
     def submit_text(self, text: str) -> None:
         text = (text or '').strip()
         if not text or self._exiting:
             return
         self.close_suggestions()
         self._programmatic_text = ''    # Composer 提交后会清空文本
+        if self._handle_command(text):
+            return
         self.model.append('user', {'text': text})
         self._mark_dirty()
         self._pending.put(text)
