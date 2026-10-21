@@ -94,3 +94,95 @@ def test_submit_queues_and_calls_agent(monkeypatch):
             assert app.model.snapshot()[0].kind == 'user'
 
     asyncio.run(scenario())
+
+
+def test_completion_overlay_and_accept():
+    from ui.composer.completions import apply_suggestion, suggestions
+
+    assert apply_suggestion('/he', '/help') == '/help'
+    assert apply_suggestion('see @src/ap', '@src/app.py') == 'see @src/app.py'
+    assert suggestions('/he', [])[0][0] == '/help'
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app._composer.text = '/he'
+            await pilot.pause()
+            assert app.has_suggestions()
+            assert app._popup.display is True
+
+            app.accept_suggestion()
+            await pilot.pause()
+            assert app._composer.text == '/help'
+            assert not app.has_suggestions()
+
+            app._composer.text = '/st'
+            await pilot.pause()
+            assert app._popup.display is True
+            app._composer.action_escape()
+            assert app._popup.display is False
+
+    asyncio.run(scenario())
+
+
+def test_queue_strip_and_take_back(monkeypatch):
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_loop(messages, **kwargs):
+        started.set()
+        release.wait(5)
+        return 'ok'
+
+    monkeypatch.setattr(harness, 'agent_loop', blocking_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('one')
+            for _ in range(50):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if started.is_set():
+                    break
+            assert started.is_set()
+
+            app.submit_text('two')
+            app.submit_text('three')
+            await pilot.pause()
+            assert len(app._pending) == 2
+            assert app._queue_widget.display is True
+            assert '2 queued' in str(app._queue_widget.render())
+
+            app.take_last_queued()
+            assert app._composer.text == 'three'
+            assert len(app._pending) == 1
+
+            release.set()
+            app._exiting = True
+            app._pending.put(None)
+
+    asyncio.run(scenario())
+
+
+def test_working_status_in_composer_border(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: release.wait(5))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('work')
+            await pilot.pause()
+            app._tick_border_status()
+            assert 'Working' in app._composer.border_title
+            release.set()
+            app._exiting = True
+            app._pending.put(None)
+
+    asyncio.run(scenario())

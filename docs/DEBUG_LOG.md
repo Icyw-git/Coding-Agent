@@ -2757,3 +2757,18 @@ UI 测试 61 passed。
 **测试**：新增 `tests/test_harness_app.py`（300 条历史、流式+工具事件、提交调用
 agent）与 `test_textual_next_flag_runs_new_app`；总回归 1114 passed / 1 skipped，
 UI 测试 66 passed。
+## TUI 重构 P3：浮层补全、队列条与边框状态
+
+- `src/ui/composer/completions.py`：`/` 命令与 `@` 文件候选、`apply_suggestion`
+  纯函数，便于单测与复用。
+- `CompletionPopup`：Textual 8.2 `position: absolute + overlay: screen + offset`，
+  贴在 Composer 上方；焦点不离开编辑器。`Tab` 采用、`Alt+↑/↓` 选择、`Esc` 关闭。
+- `PendingQueue`：worker 取队头、用户 `Alt+↑` 取回最后一条编辑；`#pending` 行显示
+  `N queued` 与预览。
+- editor 边框内嵌状态：`⠋ Working 12.3s · 2 queued`（Pi 的 embedWorkingStatus）。
+- footer 基础指标：会话标题、模型、工作区(分支)、ctx%、tokens、估算成本、队列数。
+- 程序化写回输入框（采用候选/取回队列）用 `_programmatic_text` 屏蔽 Changed，
+  避免补全浮层“刚关闭又被重开”。
+
+**测试**：`tests/test_harness_app.py` 新增 overlay/采用/Esc、队列条/取回、边框
+Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。

@@ -1,7 +1,6 @@
-"""新 TUI 骨架（P2）：ConversationModel + VirtualTranscript。
+"""新 TUI（P2/P3）：行模型 + 虚拟视口 + 浮层补全 + 队列条。
 
-仍是 feature flag 阶段；旧 `ui/app.py` 继续作为默认实现，迁移完成后再切换。
-这里先打通「事件 → 块模型 → 虚拟视口」的主链路。
+feature flag：`HARNESS_UI=textual-next`。旧 `ui/app.py` 仍是默认实现。
 """
 from __future__ import annotations
 
@@ -18,11 +17,15 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Static, TextArea
 
+from file_mentions import workspace_files
+from ui.composer.completions import apply_suggestion, suggestions
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
 
 TOOL_PREVIEW_LINES = 10
 FOLLOW_END = True
+SUGGESTION_LIMIT = 6
+SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
 
 def _render_lines(renderable, width: int) -> list[Text]:
@@ -48,12 +51,53 @@ def _tool_summary(name: str, args: dict) -> str:
     return ''
 
 
+class PendingQueue:
+    """待发送消息队列：worker 取头部，用户可取回最后一条编辑。"""
+
+    def __init__(self) -> None:
+        self._items: list[str | None] = []
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+
+    def put(self, item: str | None) -> None:
+        with self._cv:
+            self._items.append(item)
+            self._cv.notify()
+
+    def get(self) -> str | None:
+        with self._cv:
+            while not self._items:
+                self._cv.wait()
+            return self._items.pop(0)
+
+    def take_last(self) -> str | None:
+        with self._lock:
+            if not self._items:
+                return None
+            item = self._items[-1]
+            if item is None:
+                return None
+            self._items.pop()
+            return item
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return [item for item in self._items if item is not None]
+
+    def __len__(self) -> int:
+        return len(self.snapshot())
+
+
 class Composer(TextArea):
-    """多行输入：Enter 发送、Ctrl-J 换行（P3 会加浮层补全）。"""
+    """多行输入：Enter 发送、Ctrl-J 换行、Tab 补全、Alt+↑ 取回队列。"""
 
     BINDINGS = [
         Binding('enter', 'submit', 'Send', show=False, priority=True),
         Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
+        Binding('tab', 'complete', 'Complete', show=False),
+        Binding('alt+up', 'suggest_prev', 'Prev', show=False),
+        Binding('alt+down', 'suggest_next', 'Next', show=False),
+        Binding('escape', 'escape', 'Close', show=False, priority=True),
     ]
 
     def action_submit(self) -> None:
@@ -62,6 +106,39 @@ class Composer(TextArea):
 
     def action_newline(self) -> None:
         self.insert(chr(10))
+
+    def action_complete(self) -> None:
+        self.app.accept_suggestion()
+
+    def action_suggest_prev(self) -> None:
+        if self.app.has_suggestions():
+            self.app.cycle_suggestion(-1)
+        else:
+            self.app.take_last_queued()
+
+    def action_suggest_next(self) -> None:
+        if self.app.has_suggestions():
+            self.app.cycle_suggestion(1)
+
+    def action_escape(self) -> None:
+        self.app.close_suggestions()
+
+
+class CompletionPopup(Static):
+    """绝对定位的补全浮层；不抢焦点，键盘仍由 Composer 分发。"""
+
+    def show(self, items: list[tuple[str, str]], index: int) -> None:
+        lines = []
+        for position, (_value, label) in enumerate(items[:SUGGESTION_LIMIT]):
+            marker = '▸' if position == index else ' '
+            lines.append(f' {marker} {label}')
+        if len(items) > SUGGESTION_LIMIT:
+            lines.append(f'   … {len(items) - SUGGESTION_LIMIT} more')
+        self.update(Text('\n'.join(lines)))
+        self.display = True
+
+    def hide_popup(self) -> None:
+        self.display = False
 
 
 class Transcript(VirtualTranscript):
@@ -77,10 +154,16 @@ class HarnessApp(App):
 
     CSS = """
     Screen { background: $background; }
-    #footer { height: 1; padding: 0 2; color: $text-muted; background: $surface; }
+    #pending { height: 1; padding: 0 2; color: #d7af5f;
+               background: $surface; display: none; }
+    #footer { height: 1; padding: 0 2; color: $text-muted;
+              background: $surface; }
     #dock { dock: bottom; height: auto; background: $surface; }
     #composer { height: auto; max-height: 8; padding: 0 1;
                 border: round $accent; background: $surface; }
+    #completions { position: absolute; overlay: screen; layer: overlay;
+                   display: none; background: $surface; border: round $accent;
+                   padding: 0 1; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -95,7 +178,7 @@ class HarnessApp(App):
         self.view = Transcript(self.model, self.doc_layout,
                                follow_end=FOLLOW_END)
         self._events: queue.Queue = queue.Queue()
-        self._input_q: queue.Queue = queue.Queue()
+        self._pending = PendingQueue()
         self._tool_blocks: dict[str, str] = {}
         self._dirty = True
         self._busy = False
@@ -103,29 +186,46 @@ class HarnessApp(App):
         self._status: dict = {}
         self._footer = None
         self._composer = None
+        self._popup = None
+        self._queue_widget = None
+        self._suggestions: list[tuple[str, str]] = []
+        self._suggestion_index = 0
+        self._programmatic_text: str | None = None
+        self._mention_files: list[str] = []
+        self._mention_root = None
+        self._mention_at = 0.0
+        self._turn_started = 0.0
 
     # ---------- 布局 ----------
 
     def compose(self) -> ComposeResult:
         yield self.view
         with Vertical(id='dock'):
-            yield Static('', id='footer')
+            yield Static('', id='pending')
             yield Composer(id='composer')
+            yield Static('', id='footer')
+        yield CompletionPopup('', id='completions')
 
     def on_mount(self) -> None:
         bus.subscribe(self._on_event)
         self._composer = self.query_one('#composer', Composer)
         self._footer = self.query_one('#footer', Static)
+        self._popup = self.query_one('#completions', CompletionPopup)
+        self._queue_widget = self.query_one('#pending', Static)
         self._load_history(self._source_messages)
         self._refresh_footer()
         self._composer.focus()
         self.set_interval(0.03, self._drain_events)
         self.set_interval(0.05, self._flush_layout)
+        self.set_interval(0.2, self._tick_border_status)
 
     def on_unmount(self) -> None:
         self._exiting = True
         bus.unsubscribe(self._on_event)
-        self._input_q.put(None)
+        self._pending.put(None)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._place_popup()
 
     def _flush_layout(self) -> None:
         if not self._dirty:
@@ -142,17 +242,140 @@ class HarnessApp(App):
         try:
             import harness
             parts.append(harness.os.getenv('LLM_MODEL_ID', '') or '(model unset)')
-            parts.append(str(harness.get_workdir()))
+            workspace = harness.get_workdir()
+            branch = harness.current_branch(workspace)
+            label = f'{workspace.name} ({branch})' if branch else workspace.name
+            parts.append(str(label))
         except Exception:
             pass
         if self._status.get('ctx_pct') is not None:
             parts.append(f"ctx {self._status['ctx_pct']:.0f}%")
-        queued = self._input_q.qsize()
+        tokens = self._status.get('tokens')
+        if tokens:
+            parts.append(f'tok {tokens}')
+        if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
+            symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
+            parts.append(f"~{symbol}{self._status['cost']}")
+        queued = len(self._pending)
         if queued:
             parts.append(f'{queued} queued')
         if self._busy:
             parts.append('working')
-        self._footer.update('  ·  '.join(p for p in parts if p))
+        self._footer.update('  ·  '.join(part for part in parts if part))
+
+    # ---------- 补全 ----------
+
+    def _workspace_files(self) -> list[str]:
+        import harness
+        root = harness.get_workdir()
+        now = time.monotonic()
+        if root != self._mention_root or now - self._mention_at > 5.0:
+            self._mention_files = workspace_files(root)
+            self._mention_root = root
+            self._mention_at = now
+        return self._mention_files
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if getattr(event.text_area, 'id', '') != 'composer':
+            return
+        if self._programmatic_text is not None:
+            if event.text_area.text == self._programmatic_text:
+                return    # 程序化写入：保持补全关闭，直到用户再次编辑
+            self._programmatic_text = None
+        self._update_suggestions(event.text_area.text)
+
+    def _update_suggestions(self, value: str) -> None:
+        files = self._workspace_files() if '@' in (value or '') else []
+        self._suggestions = suggestions(value, files)
+        self._suggestion_index = 0
+        if self._suggestions:
+            self._popup.show(self._suggestions, self._suggestion_index)
+            self._place_popup()
+        else:
+            self._popup.hide_popup()
+
+    def _place_popup(self) -> None:
+        if self._popup is None or self._composer is None or not self._suggestions:
+            return
+        region = self._composer.region
+        if region.width <= 0:
+            return
+        rows = min(len(self._suggestions), SUGGESTION_LIMIT) + 2
+        width = min(max(24, region.width), 100)
+        x = region.x
+        y = max(0, region.y - rows)
+        self._popup.styles.offset = (x, y)
+        self._popup.styles.width = width
+        self._popup.styles.height = rows
+
+    def has_suggestions(self) -> bool:
+        return bool(self._suggestions)
+
+    def accept_suggestion(self) -> None:
+        if not self._suggestions or self._composer is None:
+            return
+        value, _label = self._suggestions[self._suggestion_index]
+        text = self._composer.text
+        new_text = apply_suggestion(text, value)
+        self._programmatic_text = new_text
+        self._composer.text = new_text
+        self.close_suggestions()
+        self._composer.cursor_location = (0, len(new_text))
+
+    def cycle_suggestion(self, delta: int) -> None:
+        if not self._suggestions:
+            return
+        self._suggestion_index = ((self._suggestion_index + delta)
+                                  % len(self._suggestions))
+        self._popup.show(self._suggestions, self._suggestion_index)
+        self._place_popup()
+
+    def close_suggestions(self) -> None:
+        self._suggestions = []
+        if self._popup is not None:
+            self._popup.hide_popup()
+
+    # ---------- 队列 ----------
+
+    def take_last_queued(self) -> None:
+        item = self._pending.take_last()
+        if item is None or self._composer is None:
+            return
+        self._programmatic_text = item
+        self._composer.text = item
+        self._composer.cursor_location = (0, len(item))
+        self._refresh_queue()
+
+    def _refresh_queue(self) -> None:
+        if self._queue_widget is None:
+            return
+        items = self._pending.snapshot()
+        if not items:
+            self._queue_widget.display = False
+            self._queue_widget.update('')
+            return
+        preview = ' | '.join(item.replace(chr(10), ' ')[:24] for item in items[:3])
+        more = f' … +{len(items) - 3}' if len(items) > 3 else ''
+        self._queue_widget.update(f'⏳ {len(items)} queued: {preview}{more} '
+                                  '· Alt+↑ 取回')
+        self._queue_widget.display = True
+
+    # ---------- 状态 ----------
+
+    def _tick_border_status(self) -> None:
+        if self._composer is None:
+            return
+        if not self._busy:
+            if self._composer.border_title:
+                self._composer.border_title = ''
+            return
+        elapsed = max(0.0, time.monotonic() - self._turn_started)
+        spinner = SPINNERS[int(time.monotonic() * 8) % len(SPINNERS)]
+        queued = len(self._pending)
+        title = f'{spinner} Working {elapsed:4.1f}s'
+        if queued:
+            title += f' · {queued} queued'
+        self._composer.border_title = title
 
     # ---------- 事件 ----------
 
@@ -330,14 +553,18 @@ class HarnessApp(App):
         text = (text or '').strip()
         if not text or self._exiting:
             return
+        self.close_suggestions()
+        self._programmatic_text = ''    # Composer 提交后会清空文本
         self.model.append('user', {'text': text})
         self._mark_dirty()
-        self._input_q.put(text)
+        self._pending.put(text)
+        self._refresh_queue()
         if not self._busy:
             self._start_worker()
 
     def _start_worker(self) -> None:
         self._busy = True
+        self._turn_started = time.monotonic()
         self._refresh_footer()
         threading.Thread(target=self._run_agent, daemon=True).start()
 
@@ -346,10 +573,11 @@ class HarnessApp(App):
         import turn_control
         try:
             while not self._exiting:
-                text = self._input_q.get()
+                text = self._pending.get()
                 if text is None:
                     break
                 self._messages.append({'role': 'user', 'content': text})
+                self.call_from_thread(self._refresh_queue)
                 turn_control.begin_turn()
                 try:
                     with harness.agent_lock:
@@ -360,9 +588,10 @@ class HarnessApp(App):
                 finally:
                     turn_control.end_turn()
                     harness.permission_gate.use_ui = False
-                self._busy = False
+                self.call_from_thread(self._refresh_queue)
                 self.call_from_thread(self._refresh_footer)
-                if self._input_q.empty():
+                if len(self._pending) == 0:
+                    self._busy = False
                     break
         finally:
             self._busy = False
