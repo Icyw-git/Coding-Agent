@@ -2712,3 +2712,22 @@ UI 测试 66 passed。
 **测试**：`test_ui.py` 覆盖「选择器打开 → 搜索 `beta` → Enter 恢复正确会话」与
 真实会话恢复（事件流 + session_id 切换）；总回归 1104 passed / 1 skipped，
 UI 测试 61 passed。
+
+## TUI 重构 P1/P0：拆包与虚拟化原型
+
+**P1 拆包**：`ui_textual.py`（约 1600 行）迁到 `src/ui/app.py`，根目录保留同名薄壳
+导出 `CCApp`/`run`/常量，`harness.run_repl` 与现有测试无需改动。UI 测试 75 条全绿。
+
+**P0 虚拟化原型**：
+
+- `src/ui/transcript/model.py`：`Block` + `ConversationModel`，流式只改一个块的
+  payload/version，并用 `revision`/`take_dirty()` 暴露增量。
+- `src/ui/transcript/layout.py`：`TranscriptLayout` 缓存每块 `(width, version)` 的行，
+  增量更新、前缀行索引、`visible()` 切片、`block_at()` 命中测试。
+- `scripts/bench_ui.py`（10k blocks）：布局 27ms、滚动切片 1.4ms/帧、
+  流式增量 3.2ms（优化前 11.4ms，因每帧重建 entry 列表）。
+- 浮层 spike：Textual 8.2 的 `position: absolute` + `overlay: screen` + `offset`
+  可用，浮层不抢焦点，按 editor 坐标定位；下一步实现 CompletionPopup。
+
+**测试**：新增 `tests/test_transcript_layout.py`（缓存复用、宽度变化、切片、
+命中测试）；总回归 1109 passed / 1 skipped，UI 66 passed。

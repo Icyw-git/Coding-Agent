@@ -1,6 +1,13 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：计划稿（尚未开始改代码）
+状态：实施中（P1 完成、P0 虚拟化原型完成）
+进展：
+- P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
+- P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、
+  滚动 1.4ms/帧、流式增量 3.2ms。
+- P0 浮层：Textual 8.2 `position:absolute + overlay:screen + offset` 验证通过，
+  补全浮层可按 editor 坐标定位且不抢焦点。
+下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21
 
