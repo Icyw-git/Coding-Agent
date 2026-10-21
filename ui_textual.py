@@ -15,7 +15,6 @@ bus 事件进线程安全队列，由 UI 事件循环里的消费者 worker 顺�
 启用：HARNESS_UI=textual 且 stdout 为 TTY（否则自动回退 ANSI）。
 """
 import asyncio
-import json
 import logging
 import queue
 import time
@@ -633,15 +632,21 @@ class CCApp(App):
         await self._show_notice(f'Exported Markdown: {path}')
 
     async def _list_sessions(self) -> None:
+        """列出的必须是「会话」而不是 transcript 快照：与 /resume 一致。"""
         import harness
-        sessions = harness.list_transcripts()
-        if not sessions:
+        from turn_progress import relative_time
+        rows = harness.session_rows(limit=None, include_empty=False)
+        if not rows:
             await self._show_notice('No saved sessions.')
             return
-        lines = ['Saved sessions:']
-        for index, session in enumerate(sessions, 1):
-            lines.append(f"{index}. {session['name']}")
-        await self._show_notice('\n'.join(lines))
+        lines = ['Saved sessions (/resume <n>):']
+        for index, row in enumerate(rows, 1):
+            workspace = row.get('workspace') or 'workspace unrecorded'
+            lines.append(
+                f"{index}. {row['title']}  ·  {workspace}"
+                f"  ·  {relative_time(row.get('updated'))}"
+                f"  ·  {row['id'][:8]}")
+        await self._show_notice(chr(10).join(lines))
 
     async def _set_permission_policy(self, policy: str, tool: str) -> None:
         if not tool:
@@ -652,26 +657,52 @@ class CCApp(App):
         await self._show_notice(f'Permission policy for {tool}: {policy}.')
 
     async def _resume_session(self, argument: str) -> None:
+        """与行式 /resume 共用会话事件流：按序号、ID 前缀或标题匹配。"""
         if self._busy:
             await self._show_notice('Cannot resume while a request is running.')
             return
         import harness
-        sessions = harness.list_transcripts()
+        rows = harness.session_rows(limit=None, include_empty=False)
+        if not rows:
+            await self._show_notice('No saved sessions.')
+            return
         if not argument:
             await self._show_notice('Use resume <number> from sessions.')
             return
+        selected = None
+        if argument.strip().isdigit():
+            index = int(argument.strip())
+            if 1 <= index <= len(rows):
+                selected = rows[index - 1]
+        else:
+            matches = [row for row in rows
+                       if row['id'].startswith(argument)
+                       or argument.casefold() in (row['title'] or '').casefold()]
+            if len(matches) == 1:
+                selected = matches[0]
+            elif len(matches) > 1:
+                await self._show_notice(
+                    f'{len(matches)} sessions match; use resume <n> from sessions.')
+                return
+        if selected is None:
+            await self._show_notice(f'No session matches {argument!r}.')
+            return
         try:
-            index = int(argument)
-            path = sessions[index - 1]['path']
-            messages = harness.load_transcript(path)
-        except (ValueError, IndexError, json.JSONDecodeError) as exc:
+            path = harness.resolve_session_path(selected['id'])
+            store = harness.SessionEventStore.open(path)
+            messages = store.rebuild_openai_history(recover_pending=True)
+            summary = store.session_summary()
+        except (FileNotFoundError, ValueError, harness.SessionReplayError) as exc:
             await self._show_notice(f'Unable to resume session: {exc}')
             return
+        if summary.get('workspace'):
+            harness.set_workspace(summary['workspace'])
         self._msgs[:] = messages
+        self._session_id = store.session_id
         await self._clear_rendered_conversation()
         for message in messages:
             await self._render_history_message(message)
-        await self._show_notice(f'Resumed {sessions[index - 1]["name"]}.')
+        await self._show_notice(f"Resumed {summary['title']}.")
 
     async def _clear_rendered_conversation(self) -> None:
         self._active_tools.clear()

@@ -2510,3 +2510,26 @@ Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI �
 **测试**：`tests/test_ui_bridge.py` 断言取消位让 `agent_loop` 抛 `KeyboardInterrupt`；
 `test_ui.py` 断言 Esc 在忙碌时只请求取消、不改输入内容。总回归 1096 passed /
 1 skipped，UI 测试 55 passed。
+## TUI 的会话切换改回真实会话
+
+**问题**：`ui_textual` 的 `/sessions` 和 `/resume` 用的是 `list_transcripts` /
+`load_transcript`——那是导出的 JSONL 快照，不是 `SessionEventStore` 的事件流。
+表现是：列表里的编号与行式 `/resume` 对不上，恢复后也没有工作区、会话 id 与
+后续事件连续性。
+
+**做法**：
+
+- `/sessions` 改用 `harness.session_rows()`（与行式 REPL 同源），显示标题、工作区、
+  最近活跃与 id 前缀。
+- `/resume <n | ID前缀 | 标题>`：按序号或匹配解析；`SessionEventStore.open` +
+  `rebuild_openai_history(recover_pending=True)` 恢复历史；有工作区则
+  `harness.set_workspace`；同步 `self._session_id`（事件过滤用）；重绘历史消息。
+- 多个匹配时要求用序号，避免误恢复；找不到时给出明确提示。
+- transcript 导出仍走 `/export`，职责分开。
+
+**取舍**：恢复后旧会话的待审批请求不会自动重放（与行式 `/resume` 一致），
+需要重新执行；跨会话搜索仍走行式 `/find`。
+
+**测试**：`test_ui.py` 新增真实会话的列目录 + 按序号恢复（tmp 会话、
+断言 session_id 与消息历史切回）；总回归 1096 passed / 1 skipped，
+UI 测试 56 passed。

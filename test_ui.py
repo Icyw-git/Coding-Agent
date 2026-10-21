@@ -816,3 +816,43 @@ def test_escape_cancels_a_running_turn(monkeypatch):
 
     assert calls == [True]
     assert '取消' in app._input.placeholder
+
+
+def test_tui_sessions_list_and_resume_real_session(tmp_path, monkeypatch):
+    import asyncio
+
+    pytest.importorskip('textual')
+    import harness
+    import ui_textual
+
+    def chat_text(app):
+        parts = []
+
+        def walk(widget):
+            parts.append(str(widget.render()))
+            for child in widget.children:
+                walk(child)
+
+        walk(app.query_one('#chat'))
+        return chr(10).join(parts)
+
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    store = harness.SessionEventStore(tmp_path, session_id='tui-resume')
+    store.append_message({'role': 'user', 'content': '旧会话的目标'})
+    store.append_message({'role': 'assistant', 'content': '旧会话的回答'})
+
+    async def scenario():
+        app = ui_textual.CCApp([], session_id='current')
+        async with app.run_test() as pilot:
+            await app._list_sessions()
+            await pilot.pause()
+            assert 'tui-resu' in chat_text(app)   # 列表里是真实会话 id 前缀
+
+            await app._resume_session('1')
+            await pilot.pause()
+            assert app._session_id == 'tui-resume'
+            assert any(m.get('content') == '旧会话的目标' for m in app._msgs)
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())
