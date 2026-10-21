@@ -1648,6 +1648,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
 
     while True:
+        if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
+            raise KeyboardInterrupt
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
         _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
 
@@ -1714,6 +1716,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 return client.chat.completions.create(**kwargs)
 
             def _delta_hook(part, probe=stream_probe, hook=on_delta):  # noqa: B023
+                if turn_control.cancel_requested():
+                    raise KeyboardInterrupt
                 if not probe['started']:
                     probe['started'] = True
                     ui_emit('assistant_start', mid=probe['mid'])

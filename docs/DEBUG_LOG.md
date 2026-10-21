@@ -2485,3 +2485,28 @@ Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI �
 **测试**：`test_ui.py` 新增 `@` 提示/补全、排队输入（不禁用、占位符与 `queued`
 状态）、历史前后翻阅；`tests/test_ui_bridge.py` 断言 `status` 事件带 branch/sandbox。
 总回归 1095 passed / 1 skipped，UI 测试 52 passed。
+## TUI 的 Esc 取消
+
+**问题**：TUI 只有 `Ctrl+C` 退出，没有「取消当前回合」的快捷方式；行式 REPL 的
+`Ctrl-C` 取消依赖 `on_delta` 包装，而 TUI 走的是事件流路径，取消信号此前没有
+进入主循环。
+
+**做法**：
+
+- `agent_loop` 每轮开头与流式 `_delta_hook` 检查 `turn_control.cancel_requested()`，
+  命中就抛 `KeyboardInterrupt`（与行式 REPL 同一条收敛路径）。
+- `ui_textual`：`Esc`（`action_jump_bottom`）在 `_busy` 时改为请求取消，空闲时
+  保持「回到最新消息」；`action_quit` 也改用同一个取消源。
+- `_run_agent` 用 `turn_control.begin_turn()` / `end_turn()` 包裹每个回合，
+  并显式捕获 `KeyboardInterrupt` → 发 `activity(cancelled)`，不再按失败处理。
+- 取消后 `end_turn()` 清空取消位，下一条排队消息不会继承上一次的取消状态。
+
+**已知边界**：
+
+- 取消在「下一次模型增量 / 下一轮开头」生效；正在阻塞的 HTTP 请求不会被强杀，
+  这点与行式 REPL 一致。
+- 工具执行中途取消会在工具返回后生效，不会中断子进程。
+
+**测试**：`tests/test_ui_bridge.py` 断言取消位让 `agent_loop` 抛 `KeyboardInterrupt`；
+`test_ui.py` 断言 Esc 在忙碌时只请求取消、不改输入内容。总回归 1096 passed /
+1 skipped，UI 测试 55 passed。

@@ -156,3 +156,24 @@ def test_status_payload_carries_branch_and_sandbox(tmp_path, monkeypatch, capsys
 
     status = next(e for e in events if e.type == 'status')
     assert 'branch' in status.payload and 'sandbox' in status.payload
+
+
+def test_agent_loop_honours_cancel_request(tmp_path, monkeypatch):
+    import turn_control
+
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    store = harness.SessionEventStore(tmp_path, session_id='ui-cancel')
+
+    turn_control.begin_turn()
+    turn_control.request_cancel()
+    try:
+        try:
+            harness.agent_loop([{'role': 'user', 'content': 'x'}],
+                               session_store=store, housekeeping=False)
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError('cancelled turn should raise KeyboardInterrupt')
+    finally:
+        turn_control.end_turn()

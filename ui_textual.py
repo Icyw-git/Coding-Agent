@@ -314,7 +314,7 @@ class CCApp(App):
         ("ctrl+shift+f", "failures", "Failed tools"),
         ("ctrl+l", "clear", "Clear"),
         ("ctrl+e", "export", "Export"),
-        ("escape", "jump_bottom", "Jump to latest"),
+        ("escape", "jump_bottom", "Cancel / jump to latest"),
     ]
 
     def __init__(self, msgs: list, session_id: str | None = None):
@@ -508,8 +508,8 @@ class CCApp(App):
     def action_quit(self) -> None:
         """Ctrl+C / Ctrl+D：拒绝待审批并唤醒 agent 线程退出。"""
         self._exiting = True
-        from ui_events import request_cancel
-        request_cancel()
+        import turn_control
+        turn_control.request_cancel()
         try:
             import harness
             harness.permission_gate.cancel_pending()
@@ -538,7 +538,13 @@ class CCApp(App):
         self.execute_command('failures')
 
     def action_jump_bottom(self) -> None:
-        """Return to the newest conversation item while browsing history."""
+        """回合中 = 取消当前请求；空闲 = 回到最新一条消息。"""
+        if self._busy:
+            import turn_control
+            turn_control.request_cancel()
+            if hasattr(self, '_input'):
+                self._input.placeholder = '正在取消当前请求…'
+            return
         if self._chat is not None:
             self._chat.scroll_end(animate=False)
         if not self._exiting and hasattr(self, '_input'):
@@ -788,14 +794,20 @@ class CCApp(App):
                 if text is None:
                     break
                 self._msgs.append({'role': 'user', 'content': text})
+                import turn_control
                 try:
+                    turn_control.begin_turn()
                     with harness.agent_lock:
                         harness.permission_gate.use_ui = True
                         harness.agent_loop(self._msgs)
+                except KeyboardInterrupt:
+                    bus.emit('activity', state='cancelled',
+                             detail='Request cancelled')
                 except Exception as exc:
                     bus.emit('activity', state='failed', detail='Request failed')
                     bus.emit('error', msg=f'{type(exc).__name__}: {exc}')
                 finally:
+                    turn_control.end_turn()
                     if not self._exiting:
                         self.call_from_thread(self._set_input_busy, False)
         finally:

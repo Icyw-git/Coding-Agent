@@ -795,3 +795,24 @@ def test_textual_input_history_navigation():
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_escape_cancels_a_running_turn(monkeypatch):
+    from types import SimpleNamespace
+
+    pytest.importorskip('textual')
+    import turn_control
+    import ui_textual
+
+    calls = []
+    monkeypatch.setattr(turn_control, 'request_cancel',
+                        lambda: calls.append(True))
+    app = ui_textual.CCApp([])
+    app._input = SimpleNamespace(value='', disabled=False, placeholder='',
+                                 cursor_position=0, focus=lambda: None)
+    app._busy = True
+
+    app.action_jump_bottom()
+
+    assert calls == [True]
+    assert '取消' in app._input.placeholder
