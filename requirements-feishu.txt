@@ -1,0 +1,4 @@
+# Optional: only needed to run src/feishu_gateway.py (Lark/Feishu bot adapter).
+# Install after requirements-api.txt.
+lark-oapi>=1.4,<2
+websocket-client>=1.6,<2

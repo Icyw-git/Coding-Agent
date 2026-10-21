@@ -1,0 +1,15 @@
+# Optional document tooling for read_document / render_document.
+# The base install (requirements.txt) runs the agent without these; missing
+# packages only disable PDF text extraction and page rendering, and the tools
+# return an install hint instead of failing the process.
+#
+#   pip install -r requirements-docs.txt
+#
+# DOCX/PPTX *rendering* additionally needs LibreOffice (soffice) in PATH or
+# HARNESS_SOFFICE; DOCX/PPTX/XLSX *text* extraction uses the standard library.
+# PDF text layer for read_document (pure Python; no OCR)
+pypdf>=5,<7
+# PDF page rendering for render_document (PDFium; no OCR)
+pypdfium2>=4,<6
+# Bitmap conversion used by pypdfium2 rendering
+Pillow>=10

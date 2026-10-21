@@ -1,0 +1,39 @@
+# Ruff 配置。规则取舍与 docs/coding-standards.md 一一对应，改规则前先读那份文档。
+#
+# 门禁只设「能被稳定判定为缺陷」的规则，存量违规按文件逐个收敛：
+# 全库一次性 ruff format 会重排 84 个文件中的 82 个（约 1.1 万行 diff），
+# 一次提交毁掉全库 blame，所以格式统一走增量——改哪个文件顺手 format 哪个。
+
+line-length = 120
+target-version = "py310"          # 回归解释器 aitest01_py310
+src = [".", "src", "tests"]
+
+extend-exclude = [
+    "archive",                    # 遗留快照，不参与演进
+    "visualizer",
+]
+
+[lint]
+select = [
+    "E", "W", "F",                # pycodestyle / pyflakes 基线
+    "I",                          # import 分组：标准库 / 三方 / 项目内
+    "PTH",                        # 「路径一律 Path」
+    "B",                          # 异常作用域、闭包捕获循环变量这类真缺陷
+]
+ignore = [
+    # 标准约束的是路径构造，不要求把 open() 换成 Path.open()
+    "PTH123",
+    # 歧义变量名 l / I / O：存量不追溯
+    "E741",
+]
+
+[lint.per-file-ignores]
+# harness.py 必须先做环境变量快照、load_dotenv() 与 sys.path 注入，
+# 之后才能 import src/ 下的模块（见 harness.py:83 的策略注释）
+#
+# F401 同样要在 harness.py 关掉：它是 CLI / 网关 / 测试的聚合命名面，
+# src/ 下 8 个模块用 `import harness` + getattr 回读，外部还直接访问
+# harness.load_durable_jobs()（entrypoint.py:26）、harness.agent_lock
+# （entrypoint.py:37）、harness.persist_large_output()（tests/test_compress.py:227）。
+# 自动删除这些「未用」import 是运行时 AttributeError，不是清理。
+"harness.py" = ["E402", "F401"]

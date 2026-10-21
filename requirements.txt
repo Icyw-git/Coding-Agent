@@ -1,0 +1,10 @@
+# Runtime dependencies
+openai>=1.0
+python-dotenv>=1.0
+prompt-toolkit>=3.0,<4
+
+# Optional document tools (read_document / render_document) live in
+# requirements-docs.txt: the agent runs without them, and the tools return an
+# install hint when the package is missing.
+
+# Test tooling: pytest and ruff live in requirements-dev.txt.

@@ -1,0 +1,289 @@
+"""TaskManager unit tests: state machine, logs, persistence, stop, isolation."""
+
+import json
+import threading
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import pytest
+
+from task_manager import TaskManager
+
+
+@pytest.fixture
+def manager_factory():
+    managers = []
+    def create(*args, **kwargs):
+        manager = TaskManager(*args, **kwargs)
+        managers.append(manager)
+        return manager
+    yield create
+    for manager in reversed(managers):
+        manager.close()
+
+
+def test_task_runs_to_success_and_persists(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path)
+    record = manager.create('python -c "print(42)"')
+
+    for _ in range(100):
+        record = manager.get(record.id)
+        if record.status in ('succeeded', 'failed'):
+            break
+        time.sleep(0.05)
+
+    assert record.status == 'succeeded', record.detail
+    assert record.exit_code == 0
+    assert record.started_at and record.ended_at
+    assert '42' in manager.tail_logs(record.id)
+    assert record.log_path and Path(record.log_path).exists()
+
+    saved = json.loads((tmp_path / f'{record.id}.json').read_text(encoding='utf-8'))
+    assert saved['status'] == 'succeeded'
+    assert saved['exit_code'] == 0
+
+
+def test_failing_command_records_exit_code(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path)
+    record = manager.create('python -c "raise SystemExit(3)"')
+    for _ in range(100):
+        record = manager.get(record.id)
+        if record.status in ('succeeded', 'failed'):
+            break
+        time.sleep(0.05)
+    assert record.status == 'failed'
+    assert record.exit_code == 3
+
+
+def test_stop_cancels_running_task(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path)
+    record = manager.create('python -c "import time; time.sleep(30)"')
+    for _ in range(100):
+        if manager.get(record.id).status == 'running':
+            break
+        time.sleep(0.05)
+    assert manager.get(record.id).status == 'running'
+
+    stopped = manager.stop(record.id)
+    assert stopped.status == 'cancelled'
+    assert stopped.ended_at is not None
+    with pytest.raises(RuntimeError):
+        manager.stop(record.id)   # already terminal → 409 at the API layer
+
+
+def test_reload_marks_active_tasks_interrupted(tmp_path, manager_factory):
+    from task_manager import TaskRecord
+
+    record = TaskRecord('task_orphan', 'echo old', str(tmp_path), 'running',
+                        time.time(), pid=12345)
+    (tmp_path / 'task_orphan.json').write_text(json.dumps(asdict(record)))
+    reloaded = manager_factory(tmp_path)
+    survivor = reloaded.get(record.id)
+    assert survivor.status == 'interrupted'
+    assert 'restart' in survivor.detail
+    assert survivor.exit_code is None
+    assert survivor.ended_at is None
+
+
+def test_cwd_outside_allowed_root_rejected(tmp_path, manager_factory):
+    inside = tmp_path / 'workspace'
+    inside.mkdir()
+    outside = tmp_path / 'elsewhere'
+    outside.mkdir()
+    manager = manager_factory(tmp_path / 'tasks', allowed_root=inside)
+    with pytest.raises(ValueError):
+        manager.create('echo hi', cwd=str(outside))
+    record = manager.create('echo hi', cwd=str(inside))
+    assert record.cwd == str(inside)
+
+
+def test_multiple_allowed_roots_accept_each_root(tmp_path, manager_factory):
+    first = tmp_path / 'first'
+    second = tmp_path / 'second'
+    outside = tmp_path / 'outside'
+    for directory in (first, second, outside):
+        directory.mkdir()
+    manager = manager_factory(tmp_path / 'tasks', allowed_roots=[first, second])
+
+    assert manager.allowed_root == first
+    assert manager.create('echo hi', cwd=str(first)).cwd == str(first)
+    assert manager.create('echo hi', cwd=str(second)).cwd == str(second)
+    with pytest.raises(ValueError, match='outside the allowed root'):
+        manager.create('echo hi', cwd=str(outside))
+
+
+def test_nested_roots_sandbox_uses_most_specific_root(
+        tmp_path, manager_factory, monkeypatch):
+    import task_manager
+
+    outer = tmp_path / 'outer'
+    inner = outer / 'inner'
+    inner.mkdir(parents=True)
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+        def wait(self):
+            return 0
+
+    def fake_spawn(command, *, cwd, stdout, workspace=None):
+        captured['workspace'] = workspace
+        return FakeProc()
+
+    monkeypatch.setattr(task_manager, 'spawn_shell', fake_spawn)
+    manager = manager_factory(tmp_path / 'tasks', allowed_roots=[outer, inner])
+    record = manager.create('echo hi', cwd=str(inner))
+    for _ in range(100):
+        record = manager.get(record.id)
+        if record.status in ('succeeded', 'failed'):
+            break
+        time.sleep(0.05)
+
+    assert record.status == 'succeeded'
+    assert captured['workspace'] == str(inner)
+
+
+def test_allowed_root_keyword_still_works(tmp_path, manager_factory):
+    inside = tmp_path / 'inside'
+    inside.mkdir()
+    manager = manager_factory(tmp_path / 'tasks', allowed_root=inside)
+    assert manager.allowed_roots == [inside]
+    assert manager.allowed_root == inside
+
+
+def test_list_orders_newest_first(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path)
+    first = manager.create('echo one')
+    second = manager.create('echo two')
+    listing = manager.list()
+    assert [r.id for r in listing][:2] == [second.id, first.id]
+
+
+def test_cancelled_queued_task_never_spawns(tmp_path, monkeypatch, manager_factory):
+    from unittest.mock import Mock
+
+    gate = threading.Event()
+    original = TaskManager._run
+    def delayed_run(self, record):
+        gate.wait(5)
+        original(self, record)
+    monkeypatch.setattr(TaskManager, '_run', delayed_run)
+    spawn = Mock(side_effect=AssertionError('cancelled task must not start'))
+    monkeypatch.setattr('task_manager.subprocess.Popen', spawn)
+    manager = manager_factory(tmp_path)
+    record = manager.create('echo cancelled')
+    try:
+        manager.stop(record.id)
+    finally:
+        gate.set()
+        manager.close()
+    assert record.status == 'cancelled'
+    spawn.assert_not_called()
+
+
+def test_close_stops_process_and_flushes_logs(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path)
+    record = manager.create('python -c "import time; time.sleep(30)"')
+    for _ in range(100):
+        with manager._lock:
+            proc = manager._procs.get(record.id)
+        if proc is not None:
+            break
+        time.sleep(0.01)
+    assert proc is not None
+    manager.close()
+    assert proc.poll() is not None
+    assert record.status == 'cancelled'
+    assert not manager._threads
+    assert '[exit ' in manager.tail_logs(record.id)
+    with pytest.raises(RuntimeError, match='closed'):
+        manager.create('echo too late')
+
+
+def test_posix_stop_signals_process_group(monkeypatch):
+    import signal
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    proc = Mock(pid=123)
+    proc.poll.return_value = None
+    killpg = Mock()
+    monkeypatch.setattr('process_utils.os', SimpleNamespace(name='posix', killpg=killpg))
+    TaskManager._kill_tree(proc)
+    killpg.assert_called_once_with(123, getattr(signal, 'SIGKILL', 9))
+    proc.wait.assert_called_once_with(timeout=10)
+
+
+def test_failed_termination_does_not_claim_cancellation(tmp_path, monkeypatch, manager_factory):
+    from unittest.mock import Mock
+
+    from task_manager import TaskRecord
+
+    manager = manager_factory(tmp_path)
+    record = TaskRecord('task_stop_error', 'echo x', str(tmp_path), 'running', time.time())
+    manager._tasks[record.id] = record
+    manager._procs[record.id] = Mock()
+    terminate = Mock(side_effect=RuntimeError('termination denied'))
+    monkeypatch.setattr(manager, '_kill_tree', terminate)
+    with pytest.raises(RuntimeError, match='termination denied'):
+        manager.stop(record.id)
+    assert record.status == 'running'
+    assert record.ended_at is None
+    # Synthetic record, no OS process was spawned.
+    manager._tasks.clear()
+    manager._procs.clear()
+
+
+# ---------- 执行策略接线（第四条路径：HTTP 建的任务不经过 PreToolUse hook） ----------
+
+def _wait_terminal(manager, record, timeout=5.0):
+    for _ in range(int(timeout / 0.05)):
+        record = manager.get(record.id)
+        if record.status not in ('queued', 'running'):
+            return record
+        time.sleep(0.05)
+    pytest.fail(f'task {record.id} never reached a terminal state')
+
+
+def test_enforce_blocks_the_command_before_spawning(tmp_path, monkeypatch, manager_factory):
+    from unittest.mock import Mock
+
+    spawn = Mock(side_effect=AssertionError('blocked command must not start'))
+    monkeypatch.setattr('task_manager.subprocess.Popen', spawn)
+    manager = manager_factory(tmp_path, enforce=lambda command: 'Error: needs approval')
+    record = _wait_terminal(manager, manager.create('echo nope'))
+
+    assert record.status == 'cancelled'
+    assert 'approval' in record.detail      # 拒绝原因留在记录里，/status 能看到
+    assert record.ended_at is not None
+    assert not Path(record.log_path).exists(), '被拦下的任务不该留下日志'
+    spawn.assert_not_called()
+    saved = json.loads((tmp_path / f'{record.id}.json').read_text(encoding='utf-8'))
+    assert saved['status'] == 'cancelled'
+
+
+def test_enforce_allows_the_command_when_the_policy_allows(tmp_path, manager_factory):
+    manager = manager_factory(tmp_path, enforce=lambda command: None)
+    record = _wait_terminal(manager, manager.create('echo gated-ok'))
+    assert record.status == 'succeeded', record.detail
+    assert 'gated-ok' in manager.tail_logs(record.id)
+
+
+def test_enforce_runs_in_the_worker_not_the_request_thread(tmp_path, manager_factory):
+    """POST 立即返回 queued：审批阻塞的是 runner 线程，不是 HTTP 请求线程。"""
+    seen = {}
+
+    def slow_enforce(command):
+        seen['thread'] = threading.current_thread().name
+        time.sleep(0.3)
+        return None
+
+    manager = manager_factory(tmp_path, enforce=slow_enforce)
+    started = time.time()
+    record = manager.create('echo hi')
+    assert time.time() - started < 0.2, 'create() 不应等待审批'
+    assert record.status == 'queued'
+    assert seen.get('thread') not in (None, 'MainThread'), '判定发生在 runner 线程'
+    assert _wait_terminal(manager, record).status == 'succeeded'

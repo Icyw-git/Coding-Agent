@@ -1,0 +1,419 @@
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from autonomous_agent import idle_poll
+from task_system import load_task
+from team_protocols import ProtocolState, handle_inbox_message, new_request_id, pending_requests
+from worktree import WORKTREES_DIR
+
+load_dotenv()
+WORKDIR = Path.cwd().resolve()
+MAILBOX_DIR = WORKDIR / '.mailbox'
+MAILBOX_DIR.mkdir(exist_ok=True)
+
+
+class _LazyLLMClient:
+    """延迟构造 OpenAI 客户端（同 harness._LazyLLMClient）：openai SDK 的
+    import 约 1.5s，只在真正发起团队协作调用时才加载。"""
+
+    def __init__(self):
+        self._real = None
+
+    def _instance(self):
+        if self._real is None:
+            import openai
+            self._real = openai.OpenAI(
+                api_key=os.getenv("LLM_API_KEY"),
+                base_url=os.getenv("LLM_BASE_URL"),
+            )
+        return self._real
+
+    def __getattr__(self, name):
+        return getattr(self._instance(), name)
+
+
+client = _LazyLLMClient()
+
+active_teammates = {}
+AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
+class MessageBus:
+    """消息总线，用于团队成员之间的通信。"""
+    def __init__(self):
+        self._locks: dict[Path, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _inbox_lock(self, inbox: Path) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(inbox, threading.Lock())
+
+    @staticmethod
+    def _validate_agent_name(agent: str) -> str:
+        if not isinstance(agent, str) or not AGENT_NAME_RE.fullmatch(agent):
+            raise ValueError('Invalid agent name: use 1-64 letters, digits, _ or -')
+        return agent
+
+    def _inbox_path(self, agent: str) -> Path:
+        return MAILBOX_DIR / f'{self._validate_agent_name(agent)}.jsonl'
+
+    # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
+    def send(self, from_agent: str, to_agent: str, content: str,
+             msg_type: str = 'message', metadata: dict = None): #发送消息至指定_agent的邮箱
+        msg = {
+            'from': from_agent,
+            'to': to_agent,
+            'content': content,
+            'type': msg_type,
+            'ts': time.time(),
+        }
+        if metadata:
+            msg['metadata'] = metadata
+        inbox = self._inbox_path(to_agent)
+        with self._inbox_lock(inbox):
+            with open(inbox, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+              f"{content[:50]}\033[0m")
+
+    def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
+        """读取指定_agent的邮箱消息，清空邮箱。返回消息列表。"""
+        inbox = self._inbox_path(agent)
+        with self._inbox_lock(inbox):
+            if not inbox.exists():
+                return []
+            msgs = [json.loads(line) for line in
+                    inbox.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip()]
+            inbox.unlink() # 清空邮箱
+            return msgs
+
+    def peek(self, agent: str) -> bool: #检查指定_agent的邮箱是否有消息
+        """检查指定_agent的邮箱是否有消息。返回是否有消息。"""
+        inbox = self._inbox_path(agent)
+        with self._inbox_lock(inbox):
+            return inbox.exists() and inbox.stat().st_size > 0
+
+
+BUS = MessageBus()
+
+
+def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员工具集
+    """teammate 工具集 = harness 核心工具子集 + send_message/submit_plan + 任务工具。
+
+    wt_ctx：{'path': str|None} 当前任务 worktree 目录；非空时 bash/read/write/edit
+    与 glob/grep/ls 在 worktree 内执行（隔离），认领/完成任务时切换/清空。
+    harness 懒导入（在 spawn 时才 import），避免模块级循环导入。
+    """
+    import harness
+    wt_ctx = wt_ctx if wt_ctx is not None else {'path': None}
+
+    def _wt_cwd() -> str:
+        p = wt_ctx.get('path')
+        return str(p) if p else None
+
+    names = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'ls']
+    tools = [t for t in harness.TOOLS if t['function']['name'] in names]
+    tools.append({
+        'type': 'function',
+        'function': {
+            'name': 'send_message',
+            'description': "Send a message to another agent (default 'lead'). "
+                           "Use it to report progress or final results.",
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'to': {
+                        'type': 'string',
+                        'description': "Recipient agent name, default 'lead'"
+                    },
+                    'content': {
+                        'type': 'string'
+                    }
+                },
+                'required': ['content']
+            }
+        }
+    })
+    tools.append({
+        'type': 'function',
+        'function': {
+            'name': 'submit_plan',
+            'description': "Submit a plan for Lead's approval before executing it.",
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'plan': {
+                        'type': 'string',
+                        'description': 'The plan to submit'
+                    }
+                },
+                'required': ['plan']
+            }
+        }
+    })
+    tools.append({
+        'type': 'function',
+        'function': {
+            'name': 'list_tasks',
+            'description': "List all tasks on the task board.",
+            'parameters': {'type': 'object', 'properties': {}}
+        }
+    })
+    tools.append({
+        'type': 'function',
+        'function': {
+            'name': 'claim_task',
+            'description': "Claim a pending task (switches cwd into its worktree if bound).",
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'task_id': {'type': 'string'}
+                },
+                'required': ['task_id']
+            }
+        }
+    })
+    tools.append({
+        'type': 'function',
+        'function': {
+            'name': 'complete_task',
+            'description': "Mark an in-progress task as completed (leaves its worktree).",
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'task_id': {'type': 'string'}
+                },
+                'required': ['task_id']
+            }
+        }
+    })
+    handlers = {n: harness.tool_registry[n] for n in names}
+
+    def safe_bash(command: str) -> str:
+        # 判定已收敛到策略层：teammate 跳过 PreToolUse hook，run_bash 边界按无头路径
+        # 审批（进远程队列，超时拒绝），这里不再重复一套黑名单。
+        return harness.tool_registry['bash'](command, cwd=_wt_cwd())
+
+    handlers['bash'] = safe_bash
+
+    def safe_read(path: str, limit: int = None, offset: int = 0) -> str:
+        return harness.tool_registry['read'](
+            path, limit, offset=offset, cwd=_wt_cwd())
+
+    def safe_write(path: str, content: str) -> str:
+        return harness.tool_registry['write'](path, content, cwd=_wt_cwd())
+
+    def safe_edit(path: str, old_text: str, new_text: str,
+                  replace_all: bool = False) -> str:
+        return harness.tool_registry['edit'](
+            path, old_text, new_text, replace_all=replace_all, cwd=_wt_cwd())
+
+    def safe_glob(pattern: str, path: str = None) -> str:
+        return harness.tool_registry['glob'](pattern, path, cwd=_wt_cwd())
+
+    def safe_grep(pattern: str, path: str = '.', glob: str = None,
+                  case_insensitive: bool = False, max_results: int = 100) -> str:
+        return harness.tool_registry['grep'](
+            pattern, path, glob, case_insensitive, max_results, cwd=_wt_cwd())
+
+    def safe_ls(path: str = '.', all: bool = False) -> str:
+        return harness.tool_registry['ls'](path, all, cwd=_wt_cwd())
+
+    handlers['read'] = safe_read
+    handlers['write'] = safe_write
+    handlers['edit'] = safe_edit
+    handlers['glob'] = safe_glob
+    handlers['grep'] = safe_grep
+    handlers['ls'] = safe_ls
+
+    def send_message(to: str = 'lead', content: str = ''):
+        BUS.send(agent_name, to, content, 'message')
+        return f"Sent to {to}"
+
+    handlers['send_message'] = send_message
+
+    handlers['submit_plan'] = lambda plan: _teammate_submit_plan(agent_name, plan)
+
+    def run_claim_task_t(task_id: str) -> str:
+        result = harness.tool_registry['claim_task'](task_id=task_id)
+        if 'Claimed' in result:
+            try:
+                task = load_task(task_id)
+                wt_ctx['path'] = str(WORKTREES_DIR / task.worktree) if task.worktree else None
+            except Exception:
+                wt_ctx['path'] = None
+        return result
+
+    def run_complete_task_t(task_id: str) -> str:
+        """完成指定任务，清空当前 worktree 目录。返回完成结果。"""
+        result = harness.tool_registry['complete_task'](task_id=task_id)
+        wt_ctx['path'] = None   # 完成任务 → 离开 worktree
+        return result
+
+    handlers['list_tasks'] = harness.tool_registry['list_tasks']
+    handlers['claim_task'] = run_claim_task_t
+    handlers['complete_task'] = run_complete_task_t
+    return tools, handlers
+
+
+def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团队成员线程，用于执行任务
+    """创建团队成员线程，用于执行任务。返回线程名称。"""
+    MessageBus._validate_agent_name(name)
+    if name in active_teammates:
+        return f'Teammate {name} already exists'
+
+    import harness  # Lazy import: harness imports this module during startup.
+
+    system = (f"You are '{name}', a {role}. "
+              f"Use tools to complete tasks. "
+              f"Send results via send_message to 'lead'.")
+
+    def run(): # 团队成员线程运行函数
+        """团队成员线程运行函数，用于执行任务。"""
+        messages = [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': prompt},
+        ]
+        wt_ctx = {'path': None}   # 当前任务 worktree 目录（认领任务后切换，完成任务清空）
+        sub_tools, sub_handlers = _build_team_tools(name, wt_ctx) # 构建团队成员工具集
+        skip_micro_rounds = 0
+        memories_content = harness.load_memories(messages)   # 记忆召回（只读，不提炼，避免污染全局记忆）
+        should_stop=False # 是否停止线程
+
+        while not should_stop:
+            # 收 inbox：协议消息（shutdown/plan_approval）走 handle_inbox_message，其余注入 <inbox>
+            inbox = BUS.read_inbox(name)
+
+            non_protocol = []
+            for msg in inbox:
+                result=handle_inbox_message(name, msg, messages)
+                if result=='shutdown': #收到主线程的shutdown指令，停止线程
+                    should_stop=True
+                    break
+                elif result=='awake':
+                    pass
+
+                else:
+                    non_protocol.append(msg)
+            if should_stop: #跳出循环
+                break
+            if non_protocol:
+                messages.append({
+                    'role': 'user',
+                    'content': f"<inbox>{json.dumps(non_protocol, ensure_ascii=False)}</inbox>",
+                })
+
+            # 与主循环同一套压缩预处理（budget → snip → micro → 超限 LLM 摘要）
+            messages, skip_micro_rounds = harness.pre_compact_messages(messages, skip_micro_rounds)
+            # 记忆注入：只往第一条 user 消息追加，副本不污染 messages；
+            # 图片引用在这里展开成 data URI（历史里始终是轻量引用）。
+            request_messages = harness.expand_image_parts(
+                harness.inject_memories(messages, memories_content))
+            try:
+                response = client.chat.completions.create(
+                    model=os.getenv('LLM_MODEL_ID'),
+                    messages=request_messages,
+                    temperature=0.7,
+                    tools=sub_tools,
+                    max_tokens=8000,
+                )
+            except Exception:
+                break
+            message = response.choices[0].message
+            # 保留 tool_calls：只存 content 会丢 tool_calls → 孤儿 tool 消息 → API 400
+            messages.append(message.model_dump())
+
+            if response.choices[0].finish_reason != "tool_calls":
+                # 空闲：自动认领任务 + 收 inbox；shutdown→退出；work→回 LLM turn
+                while not should_stop:
+                    status = idle_poll(name, messages, role, wt_ctx)
+                    if status == 'shutdown':
+                        should_stop = True
+                        break
+                    if status == 'work':
+                        break
+                    # 'timeout' → 保持存活，继续下一轮空闲轮询
+                continue   # 关键：跳过工具执行段（本轮的 response 没有 tool_calls）
+
+            results = []
+            attachments = []
+            for tool_call in message.tool_calls:
+                # 复用主循环执行路径：hooks=False（teammate 无人交互，判定下移到工具
+                # 边界，run_bash / run_write 会按无头路径审批）；
+                # background=False（teammate 本身已是后台线程，不再嵌套后台任务）
+                _, _, tm, images = harness.exec_tool_call(
+                    tool_call, registry=sub_handlers,
+                    hooks=False, background=False)
+                results.append(tm)
+                if images:
+                    attachments.append(harness.image_attachment_message(images))
+            # tool 结果必须连续，图片附件统一排在整批之后
+            messages.extend(results)   # extend：摊平成多条 tool 消息；append 会嵌套成一条
+            messages.extend(attachments)
+
+        # 取最近一条非空 assistant 文本作为最终汇报（content 可能是 str 或 content blocks）
+        summary = "Done."
+        for msg in reversed(messages):
+            if msg.get('role') != 'assistant':
+                continue
+            content = msg.get('content')
+            if isinstance(content, list):
+                text = "".join(b.get('text', '') for b in content
+                               if isinstance(b, dict) and b.get('type') == 'text')
+            elif isinstance(content, str):
+                text = content
+            else:
+                continue
+            if text.strip():
+                summary = text
+                break
+        BUS.send(name, 'lead', summary, 'result')
+        active_teammates.pop(name, None)
+        print(f"  \033[32m[teammate] {name} finished\033[0m")
+
+    active_teammates[name] = True # 标记为活跃，等待主线程唤醒
+    import hooks
+    from workspace_context import use_workspace
+    workspace = harness.get_workdir()
+    # 派发线程还带着 lead 的会话，teammate 的新线程不会继承（ContextVar 不跨
+    # 线程）：不显式带过去，teammate 的审批白名单就落到进程级键上，一个
+    # teammate 批过的 rm 在所有会话里都免审。
+    session_id = hooks.current_session_id()
+
+    def run_in_workspace():
+        with use_workspace(workspace), hooks.use_session(session_id):
+            run()
+
+    threading.Thread(target=run_in_workspace, daemon=True).start()
+    print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
+    return f"Teammate '{name}' spawned as {role}"
+
+
+def _teammate_submit_plan(from_name:str,plan:str): # 团队成员提交计划函数
+    """团队成员提交计划函数，用于提交任务计划。"""
+    req_id=new_request_id()
+    pending_requests[req_id]=ProtocolState(
+        request_id=req_id,
+        type='plan_approval',
+        sender=from_name,
+        target='lead',
+        status='pending',
+        payload=plan
+
+    )
+    BUS.send(
+        from_name,
+
+        'lead',
+        plan,
+        'plan_approval_request',
+        {'request_id':req_id}
+    )
+    return f'Plan submitted ({req_id}).Waiting for approval...'
+

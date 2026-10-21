@@ -1,0 +1,4 @@
+# Install after requirements.txt when serving the HTTP API.
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+httpx>=0.27,<1
