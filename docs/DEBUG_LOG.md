@@ -1613,3 +1613,36 @@ tools 里而无法搬走；直接 `import tools` 会形成循环依赖。
 - 拆大文件的顺序：先找「不依赖注册表」的纯逻辑，再把它的外部依赖做成参数。
 - 纯逻辑下沉后，每个模块都能用临时目录 + 假注入独立测试，不必启动整个工具面。
 - 兼容层（薄包装 + 再导出）比改所有调用点便宜，但再导出必须显式声明用途。
+## 拆分 read / write / edit
+
+**问题**：`tools.py` 里三个文件 handler 依赖 `_gate_file`、`safe_path`、
+`_capture_checkpoint`，看起来无法搬走。但 handler 本体的逻辑（分页、编码保留、二进制
+保护、先确认能改再抓 pre-image）与工具注册表无关，继续留在 tools 只会让文件反复变长。
+
+**做法**：
+
+- 新增 `src/tool_files.py`：`read_file` / `write_file` / `edit_file`，把边界门（`gate`）、
+  路径解析（`resolve`）、checkpoint 捕获（`capture`）作为关键字参数注入。
+- `tools.py` 的 `run_read` / `run_write` / `run_edit` 变成三行薄包装，运行时读取
+  `safe_path` / `_gate_file` / `_capture_checkpoint`，因此 monkeypatch 这些名字仍然生效。
+- `DOCUMENT_SUFFIXES` 随 `read` 迁走；`read_document` / `render_document` 保持在 tools
+  （它们与工具面、图片缓存关系更紧）。
+
+**踩过的坑**：
+
+- 按标记切片时把两个未计划迁移的 handler（`read_document` / `render_document`）一起删了：
+  切片端点选在 `run_apply_patch` 之前，范围过大。恢复时从 `git show HEAD:src/tools.py`
+  取原块，再用 Ruff 找出被连带删除的导入（`documents` / `document_render`）。
+- Ruff 会自动删掉「暂时未使用」的导入；恢复代码后必须重新加回来，否则 F821 在测试时才暴露。
+- 迁移后残留的 `_DOCUMENT_SUFFIXES` 常量不会触发 lint（模块级赋值不算未使用），
+  必须靠 `rg` 搜引用确认，否则会留下两份真值来源。
+
+**测试**：新增 `tests/test_tool_files.py`（注入顺序、拒绝时不解析/不捕获、CRLF 保留、
+二进制拒绝、edit 命中后才 capture）；总回归 1007 passed / 1 skipped；
+`tools.py` 1893 → 1819 行。
+
+**收获**：
+
+- 切分代码要用精确的起止标记并先 `rg` 确认范围内到底有哪些定义，不能凭行号印象。
+- 迁移后被 lint 删掉的导入是「隐式破坏」，恢复块后要跑一次全量 lint + 相关回归。
+- 同名薄包装是让 monkeypatch 继续生效的关键：调用方不用改，测试也不用改。

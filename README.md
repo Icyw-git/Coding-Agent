@@ -579,6 +579,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/project_context.py` | 工作区 AGENTS.md / CLAUDE.md 注入：路径边界、32 KiB 截断与缓存 |
 | `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |
 | `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
+| `src/tool_files.py` | `read`/`write`/`edit` 实现：边界门、编码保留与二进制保护（依赖注入） |
 | `src/tool_patch.py` | `apply_patch` 解析、规划与原子回滚；路径解析/审批/checkpoint 由 tools 注入 |
 | `src/tool_text.py` | 文件文本 BOM/编码探测、二进制拒绝与换行符保留 |
 | `src/tool_cache.py` | `/cache`：`.cache/tool_results` 统计与引用保护回收 |

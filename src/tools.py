@@ -26,6 +26,7 @@ from exec_policy import is_secret_path, resolve_tool_path
 from process_utils import close_process, kill_process_tree
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
+from tool_files import edit_file, read_file, write_file
 
 # hooks / 策略层从这里取补丁解析入口，保持 tools 作为统一工具面。
 from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
@@ -33,8 +34,6 @@ from tool_patch import apply_patch as _apply_patch
 from tool_text import (
     BinaryFileError,
     decode_text,
-    encode_text,
-    read_text_file,
 )
 from worktree import create_worktree, keep_worktree, remove_worktree
 
@@ -947,10 +946,6 @@ def run_view_image(path: str, cwd: str = None) -> ImageResult | str:
         return f'Error: {exc}'
 
 
-_DOCUMENT_SUFFIXES = frozenset({'.pdf', '.docx', '.pptx', '.xlsx',
-                                '.doc', '.ppt', '.xls'})
-
-
 def run_read_document(path: str, pages: str = None, sheets: str = None,
                       cwd: str = None) -> str:
     denied = _gate_file('read_document', path, cwd)
@@ -1009,89 +1004,20 @@ def run_render_document(path: str, pages: str = None, dpi: int = 110,
 
 def run_read(path: str, limit: Optional[int] = None,
              offset: int = 0, cwd: str = None) -> str:
-    # 读默认放行，但秘密路径是硬拒；teammate 等无头路径不走 PreToolUse，
-    # 边界上必须自己判一次。
-    denied = _gate_file('read', path, cwd)
-    if denied:
-        return denied
-    try:
-        try:
-            offset = int(offset or 0)
-            limit = None if limit is None else int(limit)
-        except (TypeError, ValueError):
-            return 'Error: offset and limit must be integers'
-        if offset < 0 or (limit is not None and limit < 0):
-            return 'Error: offset and limit must be non-negative'
-        file_path = safe_path(path, cwd)
-        if file_path.suffix.lower() in _DOCUMENT_SUFFIXES:
-            return (f'Error: {file_path.suffix} is a document; use read_document '
-                    'to extract its text')
-        text, _encoding, _newline = read_text_file(file_path)
-        lines = text.splitlines()
-        total = len(lines)
-        if offset >= total:
-            return f'(no lines at offset {offset}; file has {total} lines)'
-        end = total if limit is None else min(total, offset + limit)
-        if limit is None and total - offset > 500:
-            # 大文件没传 limit：从 offset 起只取 200 行，并给出下一次的 offset。
-            end = offset + 200
-        chunk = '\n'.join(lines[offset:end])
-        if end < total:
-            chunk += f'\n... ({total - end} more lines; use offset={end})'
-        return chunk if chunk else '(empty file)'
-    except BinaryFileError as exc:
-        return f'Error: {exc}'
-    except Exception as e:
-        return f"Error: {e}"
+    return read_file(path, limit=limit, offset=offset, cwd=cwd,
+                     resolve=safe_path, gate=_gate_file)
 
 
 def run_write(path: str, content: str, cwd: str = None) -> str:
-    # read-only 档 / 无头路径（teammate、后台）的写改同样要在边界拦一道：
-    # 判定参数与 safe_path 一致，两处不会给出相反结论。
-    denied = _gate_file('write', path, cwd)
-    if denied:
-        return denied
-    try:
-        file_path = safe_path(path, cwd)
-        encoding, newline = 'utf-8', '\n'
-        if file_path.is_file():
-            try:
-                _text, encoding, newline = read_text_file(file_path)
-            except BinaryFileError:
-                return f'Error: refusing to overwrite binary file: {path}'
-        _capture_checkpoint(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(encode_text(content, encoding, newline))
-        return f"Wrote {len(content)} bytes to {path}"
-    except Exception as e:
-        return f"Error: {e}"
+    return write_file(path, content, cwd=cwd, resolve=safe_path,
+                      gate=_gate_file, capture=_capture_checkpoint)
 
 
 def run_edit(path: str, old_text: str, new_text: str,
              replace_all: bool = False, cwd: str = None) -> str:
-    denied = _gate_file('edit', path, cwd)
-    if denied:
-        return denied
-    try:
-        if not old_text:
-            return 'Error: old_text must not be empty'
-        file_path = safe_path(path, cwd)
-        text, encoding, newline = read_text_file(file_path)
-        count = text.count(old_text)
-        if count == 0:
-            return f"Error: text not found in {path}"
-        if count > 1 and not replace_all:
-            return (f'Error: text appears {count} times in {path}; '
-                    'provide more context or set replace_all=true')
-        updated = text.replace(old_text, new_text) if replace_all \
-            else text.replace(old_text, new_text, 1)
-        _capture_checkpoint(file_path)   # 确认能改再抓 pre-image，避免记下无意义的快照
-        file_path.write_bytes(encode_text(updated, encoding, newline))
-        return f"Edited {path}"
-    except BinaryFileError as exc:
-        return f'Error: {exc}'
-    except Exception as e:
-        return f"Error: {e}"
+    return edit_file(path, old_text, new_text, replace_all=replace_all,
+                     cwd=cwd, resolve=safe_path, gate=_gate_file,
+                     capture=_capture_checkpoint)
 
 
 def run_apply_patch(patch: str, cwd: str = None) -> str:
