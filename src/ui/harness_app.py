@@ -92,8 +92,10 @@ class Composer(TextArea):
         Binding('enter', 'submit', 'Send', show=False, priority=True),
         Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
         Binding('tab', 'complete', 'Complete', show=False),
-        Binding('alt+up', 'suggest_prev', 'Prev', show=False),
-        Binding('alt+down', 'suggest_next', 'Next', show=False),
+        Binding('alt+up', 'queued_prev', 'Prev', show=False),
+        Binding('alt+down', 'queued_next', 'Next', show=False),
+        Binding('up', 'suggest_prev', 'Prev', show=False),
+        Binding('down', 'suggest_next', 'Next', show=False),
         Binding('ctrl+o', 'expand_tool', 'Expand tool', show=False,
                 priority=True),
         Binding('escape', 'escape', 'Close', show=False, priority=True),
@@ -112,10 +114,22 @@ class Composer(TextArea):
     def action_suggest_prev(self) -> None:
         if self.app.has_suggestions():
             self.app.cycle_suggestion(-1)
+            return
+        self.move_cursor_relative(rows=-1)
+
+    def action_suggest_next(self) -> None:
+        if self.app.has_suggestions():
+            self.app.cycle_suggestion(1)
+            return
+        self.move_cursor_relative(rows=1)
+
+    def action_queued_prev(self) -> None:
+        if self.app.has_suggestions():
+            self.app.cycle_suggestion(-1)
         else:
             self.app.take_last_queued()
 
-    def action_suggest_next(self) -> None:
+    def action_queued_next(self) -> None:
         if self.app.has_suggestions():
             self.app.cycle_suggestion(1)
 
@@ -130,9 +144,14 @@ class Composer(TextArea):
 
 
 class CompletionPopup(Static):
-    """绝对定位的补全浮层；不抢焦点，键盘仍由 Composer 分发。"""
+    """绝对定位的补全浮层；不抢焦点，键盘由 Composer 分发，鼠标点击可选。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._items: list[tuple[str, str]] = []
 
     def show(self, items: list[tuple[str, str]], index: int) -> None:
+        self._items = list(items)
         lines = []
         for position, (_value, label) in enumerate(items[:SUGGESTION_LIMIT]):
             marker = '▸' if position == index else ' '
@@ -141,6 +160,11 @@ class CompletionPopup(Static):
             lines.append(f'   … {len(items) - SUGGESTION_LIMIT} more')
         self.update(Text('\n'.join(lines)))
         self.display = True
+
+    def on_click(self, event: events.Click) -> None:
+        limit = min(len(self._items), SUGGESTION_LIMIT)
+        if 0 <= event.y < limit:
+            self.app.choose_suggestion(event.y)
 
     def hide_popup(self) -> None:
         self.display = False
@@ -157,8 +181,11 @@ class Transcript(VirtualTranscript):
 class HarnessApp(App):
     """行模型驱动的 TUI：聊天区只有一个自绘视口。"""
 
-    BINDINGS = [Binding('ctrl+q', 'quit_app', 'Quit', show=False,
-                        priority=True)]
+    # 子类 BINDINGS 会覆盖 App 默认绑定（默认里本来有 ctrl+c），必须显式写回。
+    BINDINGS = [
+        Binding('ctrl+c', 'quit_app', 'Quit', show=False, priority=True),
+        Binding('ctrl+q', 'quit_app', 'Quit', show=False, priority=True),
+    ]
 
     CSS = """
     Screen { background: $background; }
@@ -347,6 +374,12 @@ class HarnessApp(App):
         self._composer.text = new_text
         self.close_suggestions()
         self._composer.cursor_location = (0, len(new_text))
+        self._composer.focus()
+
+    def choose_suggestion(self, index: int) -> None:
+        if 0 <= index < len(self._suggestions):
+            self._suggestion_index = index
+            self.accept_suggestion()
 
     def cycle_suggestion(self, delta: int) -> None:
         if not self._suggestions:

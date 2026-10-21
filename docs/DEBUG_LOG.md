@@ -2927,3 +2927,25 @@ args`
 
 **测试**：默认选最新、before 语义（选中消息不在新会话、前文保留）、Esc 取消、
 `/clone` 保留完整历史；总回归 1146 passed / 1 skipped，旧 UI 64 passed。
+## TUI 交互自检：Ctrl-C、选择器与鼠标
+
+用户反馈「键鼠对选择器无法操控、Ctrl-C 不能退出」，逐项复现后定位到四类问题：
+
+1. **Ctrl-C 被覆盖**：`HarnessApp` 继承 `App` 时重写了 `BINDINGS`，只留 `ctrl+q`；
+   Textual `App` 默认绑定里的 `ctrl+c` 被整体替换掉，所以按 Ctrl-C 没有任何 action。
+   修复：显式加回 `ctrl+c -> quit_app`（`priority=True`），模态打开时同样生效。
+2. **补全浮层只能 Alt+↑/↓**：普通 ↑/↓ 落到 TextArea 光标移动，用户看起来像“选不中”；
+   且 `CompletionPopup` 是 `Static`，没有 `on_click`，鼠标点击无效。
+   修复：Composer 增加普通 ↑/↓（有候选时切换、否则移动光标），保留 Alt+↑ 取回队列；
+   `CompletionPopup.on_click` 按行号调用 `choose_suggestion`。
+3. **会话选择器焦点在搜索框**：原实现只绑定了 ↓ 才进列表，↑ 是 Input 光标移动；
+   Enter 只把焦点移到列表，还要再按一次。修复：↑/↓ 都进列表；Enter 直接选中当前
+   highlight 并触发 `OptionList.action_select`。
+4. **模态抢焦点时机**：`on_mount` 里立即 `focus()` 在部分终端可能被后续 screen
+   activate 覆盖。改为 `call_after_refresh(focus)`，等 screen 真正激活后再聚焦。
+
+鼠标方面，`OptionList` 本身支持点击；测试覆盖 fork 列表点击第一行、补全浮层点击第二行、
+会话选择器点击行。Esc、↑↓、Enter 在 fork/model/session 三个选择器上都有用例。
+
+**测试**：新增 Ctrl-C（主界面+模态）、选择器键盘/鼠标、补全 ↑↓/鼠标、会话搜索 Enter
+用例；总回归 1149 passed / 1 skipped，旧 UI 64 passed。

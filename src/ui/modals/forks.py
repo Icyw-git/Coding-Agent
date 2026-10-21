@@ -36,7 +36,7 @@ class ForkPickerModal(ModalScreen):
             options.add_option(Option(label, id=str(row['seq'])))
         if options.option_count:
             options.highlighted = options.option_count - 1
-        options.focus()
+        self.call_after_refresh(options.focus)
 
     def on_option_list_option_selected(self,
                                        event: OptionList.OptionSelected) -> None:

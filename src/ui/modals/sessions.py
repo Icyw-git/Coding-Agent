@@ -14,12 +14,15 @@ class SessionSearchInput(Input):
 
     BINDINGS = [
         Binding('down', 'focus_list', 'To list', show=False),
-        Binding('enter', 'first', 'Select first', show=False, priority=True),
+        Binding('up', 'focus_list', 'To list', show=False),
+        Binding('enter', 'first', 'Select', show=False, priority=True),
     ]
 
     def action_focus_list(self) -> None:
         try:
-            self.screen.query_one('#session-list', OptionList).focus()
+            options = self.screen.query_one('#session-list', OptionList)
+            if options.option_count:
+                options.focus()
         except Exception:
             pass
 
@@ -27,8 +30,10 @@ class SessionSearchInput(Input):
         try:
             options = self.screen.query_one('#session-list', OptionList)
             if options.option_count:
-                options.highlighted = 0
+                if options.highlighted is None:
+                    options.highlighted = 0
                 options.focus()
+                options.action_select()
         except Exception:
             pass
 
@@ -56,7 +61,9 @@ class SessionPickerModal(ModalScreen):
 
     def on_mount(self) -> None:
         self._filter('')
-        self.query_one('#session-search', SessionSearchInput).focus()
+        search = self.query_one('#session-search', SessionSearchInput)
+        # 等 screen 真正激活后再抢焦点，避免打开瞬间按键仍落在 Composer。
+        self.call_after_refresh(search.focus)
 
     def _filter(self, query: str) -> None:
 

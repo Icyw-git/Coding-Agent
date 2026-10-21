@@ -224,7 +224,7 @@ def test_sessions_picker_resumes_real_session(tmp_path, monkeypatch):
             assert type(screen).__name__ == 'SessionPickerModal'
             options = screen.query_one('#session-list')
             assert options.option_count == 1
-            options.focus()
+            # 焦点在搜索框时 Enter 直接选中第一条（无需先 Tab/↓）。
             await pilot.press('enter')
             for _ in range(60):
                 await pilot.pause()
@@ -671,5 +671,79 @@ def test_fork_picker_cancel_keeps_session(tmp_path):
             await pilot.press('escape')
             await pilot.pause()
             assert app._session_id == old
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_c_exits_app_and_modal(tmp_path):
+    store = _temp_store(tmp_path)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press('ctrl+c')
+            await pilot.pause()
+            assert not app.is_running
+
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.submit_text('/fork')
+            await pilot.pause()
+            assert type(app.screen).__name__ == 'ForkPickerModal'
+            await pilot.press('ctrl+c')
+            await pilot.pause()
+            assert not app.is_running
+
+    asyncio.run(scenario())
+
+
+def test_selector_keyboard_and_mouse(tmp_path):
+    store = _temp_store(tmp_path, (
+        {'role': 'user', 'content': 'first'},
+        {'role': 'user', 'content': 'second'},
+    ))
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.submit_text('/fork')
+            await pilot.pause()
+            options = app.screen.query_one('#fork-list')
+            assert options.highlighted == 1
+            await pilot.press('up')
+            assert options.highlighted == 0
+            await pilot.press('down')
+            assert options.highlighted == 1
+            # 鼠标点第一行：应直接选中并关闭弹窗
+            await pilot.click(options, offset=(4, 1))
+            await pilot.pause()
+            assert type(app.screen).__name__ == 'Screen'
+
+    asyncio.run(scenario())
+
+
+def test_completion_up_down_and_mouse(monkeypatch):
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._suggestions = [('/help', '/help'), ('/hotkeys', '/hotkeys')]
+            app._suggestion_index = 0
+            app._popup.show(app._suggestions, 0)
+            app._composer.focus()
+            await pilot.press('down')
+            assert app._suggestion_index == 1
+            await pilot.press('up')
+            assert app._suggestion_index == 0
+            app._popup.show(app._suggestions, 0)
+            app._place_popup()
+            await pilot.click('#completions', offset=(4, 1))
+            await pilot.pause()
+            assert app._composer.text == '/hotkeys'
+            assert not app.has_suggestions()
 
     asyncio.run(scenario())

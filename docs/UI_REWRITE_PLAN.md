@@ -32,6 +32,8 @@
 - P5g：Pi 风格 `/fork` 消息选择器 `ForkPickerModal`：列出 user 消息、默认最新、
   Enter 从所选消息**之前**分叉并把原文回填输入框；`/clone` 改为独立命令
   （复制当前叶），保留 `/fork <seq>` 作为 inclusive 兼容入口。
+- P5h：交互自检修复：Ctrl-C 退出、补全候选 ↑↓/鼠标点击、会话选择器搜索框
+  ↑↓/Enter、模态焦点延后到 screen 激活后。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

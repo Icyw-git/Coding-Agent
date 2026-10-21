@@ -31,7 +31,7 @@ class ModelPickerModal(ModalScreen):
             options.add_option(Option(label, id=model))
         if options.option_count:
             options.highlighted = 0
-        options.focus()
+        self.call_after_refresh(options.focus)
 
     def on_option_list_option_selected(self,
                                        event: OptionList.OptionSelected) -> None:
