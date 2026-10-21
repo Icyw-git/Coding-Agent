@@ -2373,3 +2373,24 @@ Textual 可见），以及 teammate 的工具事件会混进主会话聊天区�
 
 **测试**：`tests/test_permission_gate.py` 新增两条：UI 模式走弹窗且不读 stdin、
 不向控制台打印；弹窗拒绝时正确返回 denied。总回归 1089 passed / 1 skipped。
+## UI 端到端回归：真实 agent_loop → Textual
+
+**问题**：此前的 UI 测试都是「注入事件」或「monkeypatch agent_loop」，只验证了渲染层；
+真正把 main 的流式、工具执行、事件桥与 TUI 串起来的链路没有测试。第一次跑端到端就
+暴露了一个真实缺陷：Textual 占用终端时，行式工具活动行仍尝试用 GBK 控制台打印 `•`，
+`UnicodeEncodeError` 直接把回合打断，TUI 里显示成一段错误文本。
+
+**做法**：
+
+- `_print_tool_activity`：Textual 模式（`permission_gate.use_ui`）直接不打印，
+  工具块交给事件流；非 TUI 下遇到 `UnicodeEncodeError` 用当前编码替换后重试，
+  展示问题不再打断回合。
+- 新增 `tests/test_ui_integration.py`：只替换模型调用（`_stream_completion`），
+  审批、工具执行、事件桥、会话存储与 Textual 渲染全走真实路径：
+  1. 流式两段文本 → TUI 最终 Markdown 含完整回答；
+  2. 工具轮（read）→ TUI 中出现工具块与结果，随后正常收尾。
+
+**取舍**：端到端测试用 120 次短轮询等待渲染，避免固定 sleep 造成的慢与抖动；
+它依赖 textual，缺包时 skip。
+
+**测试**：`pytest tests/` 1091 passed / 1 skipped；根 UI 测试 49 passed；`ruff` 通过。

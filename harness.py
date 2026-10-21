@@ -993,6 +993,9 @@ def _print_tool_activity(name, args, elapsed, failed, background=False,
     """交互终端的工具活动行；长输出折叠为头尾 + /expand 提示。"""
     if not sys.stdout.isatty():
         return
+    if getattr(permission_gate, 'use_ui', False):
+        # Textual 占用终端：工具块由事件流渲染，行式输出只会刷坏 TUI。
+        return
     from tool_activity import format_line, preview_lines
     line = format_line(name, args, elapsed, failed=failed,
                        background=background, hint=hint)
@@ -1008,7 +1011,13 @@ def _print_tool_activity(name, args, elapsed, failed, background=False,
     if ACTIVE_TICKER is not None:
         ACTIVE_TICKER.emit_line(block)
         return
-    print(block, flush=True)
+    try:
+        print(block, flush=True)
+    except UnicodeEncodeError:
+        # 控制台编码（如 GBK）放不下 '•'/'→'：替换后重试，别让展示问题打断回合。
+        encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+        print(block.encode(encoding, 'replace').decode(encoding, 'replace'),
+              flush=True)
 
 
 def _batch_bash_commands(tool_calls):
