@@ -27,7 +27,8 @@ from cli_commands import command_error
 from exec_policy import load_policy, session_allow_key
 from hooks import GATE
 
-SPAWN = 'tools.subprocess.Popen'
+# 进程只由 sandbox.spawn_shell 启动；补丁点必须落在真正调用 Popen 的模块。
+SPAWN = 'sandbox.subprocess.Popen'
 
 
 @pytest.fixture()

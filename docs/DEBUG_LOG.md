@@ -1776,3 +1776,36 @@ cron 错误透传、调度/列表/取消、空 cron 列表）；总回归 1025 p
 
 - 没有运行时状态依赖的域可以直接「搬函数 + 再导出」，不需要注入层。
 - 再导出的 noqa 是兼容声明：它告诉后来者这些名字不是死代码，而是注册表的入口。
+## 拆分 shell / 后台任务 / 联网抓取
+
+**问题**：`run_bash` 与两个后台任务 handler、`run_web_fetch` 共约 180 行。它们依赖
+`sandbox`、`process_utils`、`web_access` 和入口注入的工作区/审批门，但本体与工具
+注册表无关。
+
+**做法**：
+
+- 新增 `src/tool_exec.py`：`bash_timeout` / `bash` / `run_background_output` /
+  `run_kill_background` / `fetch_url`。工作区、审批门与三个超时常量由 tools 注入。
+- tools 保留 `BASH_TIMEOUT` 等常量（测试按 `tools.BASH_TIMEOUT` 打补丁），
+  `run_bash` / `run_web_fetch` 是薄包装；两个后台任务 handler 直接再导出。
+- 审批门作为函数传入（`gate('bash', {...})`），不再在实现里取 `_gate()`。
+
+**踩过的坑**：
+
+- 测试用 `tools.subprocess.Popen` 拦截进程启动，靠的是「tools 曾 import subprocess」
+  这个副作用。搬走后 tools 不再有 subprocess 属性，补丁点直接 ImportError。
+  补丁点改成 `sandbox.subprocess.Popen`——真正调用 Popen 的模块，语义也更准确。
+- 超时常量不能搬进实现：`tests/test_turn_progress.py` 会改 `tools.BASH_TIMEOUT`
+  来缩短等待。把常量做成参数、由包装器每次传入，补丁才能生效。
+- 后台任务的 `current_background_id` 是 contextvar，读取必须发生在调用时，
+  不能在导入时求值。
+
+**测试**：新增 `tests/test_tool_exec.py`（超时校验、拒绝时不 spawn、超时非法值不 spawn、
+fetch 拒绝时不联网、截断与响应头、后台 id 校验）；更新 `test_execution_paths.py` 的
+补丁点；总回归 1031 passed / 1 skipped；`tools.py` 1309 → 1167 行。
+
+**收获**：
+
+- 迁移会「顺带」破坏基于模块属性的补丁点，测试通过与否取决于是否 import 过某模块；
+  补丁应指向真正执行副作用的模块。
+- 可调常量保持「入口持有、实现接收」，是兼容测试补丁的低成本做法。

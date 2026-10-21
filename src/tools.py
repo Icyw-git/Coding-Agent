@@ -1,19 +1,12 @@
 """工具系统：TOOLS schema + 全部 run_* handler + tool_registry。
 可变全局（WORKDIR 等）由 harness 持有，通过 _h() 在运行时读取（便于测试 patch）。
 """
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
 
-import sandbox
-import web_access
 from agent_teams import BUS, spawn_teammate_thread
 from exec_policy import resolve_tool_path
-from process_utils import close_process, kill_process_tree
 from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
-
-# harness / subagent / headless 从这里取多模态结果类型。
 from tool_documents import (
     ImageResult,  # noqa: F401
     cache_image,
@@ -21,6 +14,9 @@ from tool_documents import (
     render_document,
     view_image,
 )
+
+# harness / subagent / headless 从这里取多模态结果类型。
+from tool_exec import bash, fetch_url, run_background_output, run_kill_background
 from tool_files import edit_file, read_file, write_file
 
 # hooks / 策略层从这里取补丁解析入口，保持 tools 作为统一工具面。
@@ -700,159 +696,21 @@ BASH_BACKGROUND_TIMEOUT = 3600
 BASH_MAX_TIMEOUT = 3600
 
 
-def _bash_timeout(timeout) -> float:
-    import background_task
-    if timeout is None:
-        return (BASH_BACKGROUND_TIMEOUT
-                if background_task.current_background_id.get()
-                else BASH_TIMEOUT)
-    try:
-        value = float(timeout)
-    except (TypeError, ValueError):
-        raise ValueError('timeout must be a number of seconds') from None
-    if value <= 0 or value > BASH_MAX_TIMEOUT:
-        raise ValueError(f'timeout must be between 0 and {BASH_MAX_TIMEOUT} seconds')
-    return value
-
-
-def run_bash(command:str, cwd: str = None, timeout=None,
-             run_in_background: bool = False)->str:
-    # 判定只有一处（策略层），第三份黑名单已删：teammate / 后台 worker / 任务 runner
-    # 绕过 PreToolUse hook 直接走到这里，凭据缺失时按无头路径审批（远程队列，超时拒绝）。
-    workspace = _h().get_workdir()
-    try:
-        base_path = (resolve_tool_path(cwd, workspace=workspace)
-                     if cwd else Path(workspace).resolve())
-    except Exception as exc:
-        return f'Error: {exc}'
-    if not base_path.is_dir():
-        return f'Error: cwd does not exist: {base_path}'
-    base = str(base_path)
-    denied = _gate().enforce_headless('bash', {'command': command, 'cwd': base})
-    if denied:
-        return denied
-    try:
-        limit = _bash_timeout(timeout)
-    except ValueError as exc:
-        return f'Error: {exc}'
-    proc = None
-    try:
-        # A descendant can keep a PIPE open after cmd.exe exits. A temporary
-        # output file lets the timeout bound execution without waiting for EOF.
-        with tempfile.TemporaryFile() as output:
-            # cwd 同时是 OS 沙箱的可写根：teammate 在 worktree 里执行时，
-            # 可写范围就是那个 worktree，而不是主工作区。
-            proc = sandbox.spawn_shell(command, cwd=base, stdout=output,
-                                       workspace=base)
-            import background_task
-            background_task.register_process(proc)
-            try:
-                proc.wait(timeout=limit)
-            except subprocess.TimeoutExpired:
-                kill_process_tree(proc)
-                return (f'Error: Command timeout({limit:g}s); '
-                        'process termination requested.')
-            except BaseException:
-                kill_process_tree(proc)
-                raise
-            output.seek(0)
-            raw = output.read(200000)
-        try:
-            out=raw.decode("utf-8")
-        except UnicodeDecodeError:
-            out=raw.decode("gbk",errors="replace")
-        out=out.strip()
-        out=out.replace('\ufffd','?')  # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
-        return out[:50000] if out else "No output"
-    except sandbox.SandboxUnavailable as e:
-        return f'Error: {e}'
-    except subprocess.TimeoutExpired:
-        return 'Error: Timed out while terminating command; process state unknown.'
-    except (FileNotFoundError,OSError) as e:
-        return f'Error:{e}'
-    finally:
-        if proc is not None:
-            try:
-                import background_task
-                background_task.unregister_process(proc)
-            except Exception:
-                pass
-        close_process(proc)
-
-
-def run_background_output(bg_id: str, wait: bool = False,
-                          timeout: float = 30) -> str:
-    """查看后台任务输出；wait=True 时最多阻塞 timeout 秒。"""
-    import background_task
-    if not isinstance(bg_id, str) or not bg_id.strip():
-        return 'Error: bg_id must be a non-empty string'
-    try:
-        wait_seconds = float(timeout if timeout is not None else 30)
-    except (TypeError, ValueError):
-        return 'Error: timeout must be a number of seconds'
-    if wait_seconds < 0:
-        return 'Error: timeout must be non-negative'
-    wait_seconds = min(wait_seconds, 600)
-    task = (background_task.wait_background(bg_id, wait_seconds)
-            if wait else background_task.background_snapshot(bg_id))
-    if task is None:
-        return f'Error: unknown background task {bg_id}'
-    status = task['status']
-    if status in ('running', 'queued'):
-        return (f'[{bg_id}] {status}: {task.get("command", "")}\n'
-                'call again with wait=true to block for completion')
-    task, output = background_task.read_background_result(bg_id)
-    if task is None:
-        return f'Error: unknown background task {bg_id}'
-    text = str(output if output is not None else task.get('result', ''))
-    if len(text) > 50000:
-        text = text[:50000] + '\n... (truncated)'
-    return (f'[{bg_id}] {status}\nCommand: {task.get("command", "")}\n'
-            f'Output:\n{text or "(no output)"}')
-
-
-def run_kill_background(bg_id: str) -> str:
-    import background_task
-    if not isinstance(bg_id, str) or not bg_id.strip():
-        return 'Error: bg_id must be a non-empty string'
-    task = background_task.kill_background(bg_id)
-    if task is None:
-        return f'Error: unknown background task {bg_id}'
-    status = task['status']
-    if status in ('completed', 'failed', 'cancelled'):
-        return f'[{bg_id}] already {status}'
-    return f'[{bg_id}] cancel requested; use background_output to confirm'
+def run_bash(command: str, cwd: str = None, timeout=None,
+             run_in_background: bool = False) -> str:
+    return bash(command, cwd=cwd, timeout=timeout,
+                run_in_background=run_in_background,
+                workdir=_h().get_workdir(),
+                gate=_gate().enforce_headless,
+                default_timeout=BASH_TIMEOUT,
+                background_timeout=BASH_BACKGROUND_TIMEOUT,
+                max_timeout=BASH_MAX_TIMEOUT)
 
 
 def run_web_fetch(url: str, max_chars: int = 20000) -> str:
-    # 私网/本机地址在审批之前就拒掉：不给「批准一次 localhost 探测」的机会。
-    try:
-        web_access.check_url(url)
-    except web_access.WebAccessError as exc:
-        return f'Error: {exc}'
-    try:
-        max_chars = int(max_chars)
-    except (TypeError, ValueError):
-        return 'Error: max_chars must be an integer'
-    max_chars = max(1, min(max_chars, 100000))
-    denied = _gate().enforce_headless('web_fetch', {'url': url})
-    if denied:
-        return denied
-    try:
-        result = web_access.fetch(url)
-    except web_access.WebAccessError as exc:
-        return f'Error: {exc}'
-    text = result['text']
-    header = (f'URL: {result["final_url"]}\n'
-              f'Content-Type: {result["content_type"]}\n\n')
-    if not text:
-        return header + '(empty response)'
-    if len(text) > max_chars:
-        omitted = len(text) - max_chars
-        text = text[:max_chars] + f'\n... (truncated; {omitted} chars omitted)'
-    if result['truncated']:
-        text += '\n... (response exceeded 2 MiB and was truncated)'
-    return header + text
+    return fetch_url(url, max_chars=max_chars,
+                     gate=_gate().enforce_headless)
+
 
 def safe_path(p: str, cwd: str = None) -> Path:
     """解析工具路径。
