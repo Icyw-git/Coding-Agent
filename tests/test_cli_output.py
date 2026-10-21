@@ -206,3 +206,16 @@ def test_prompt_text_shows_workspace_and_mode(monkeypatch):
                         lambda: SimpleNamespace(sandbox_mode='read-only'))
 
     assert harness.prompt_text().strip() == 'proj [ro] >'
+
+
+def test_prompt_text_includes_git_branch(tmp_path, monkeypatch):
+    import harness
+
+    (tmp_path / '.git').mkdir()
+    (tmp_path / '.git' / 'HEAD').write_text(
+        'ref: refs/heads/main\n', encoding='utf-8')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'load_policy',
+                        lambda: SimpleNamespace(sandbox_mode='workspace-write'))
+
+    assert harness.prompt_text().strip() == f'{tmp_path.name} (main) [rw] >'

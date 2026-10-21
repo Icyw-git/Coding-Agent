@@ -115,6 +115,7 @@ from cron_scheduler import (
     wait_for_cron_idle,
 )
 from exec_policy import is_readonly_command, load_policy, set_tier
+from git_branch import current_branch
 from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
@@ -1876,11 +1877,16 @@ def run_agent_turn_locked():
 
 
 def prompt_text() -> str:
-    """提示符带上工作区名与档位缩写：多会话/多目录时不至于发错地方。"""
+    """提示符带上工作区名、分支与档位：多会话/多目录/多分支时不容易发错地方。"""
+    workspace = get_workdir()
     mode = load_policy().sandbox_mode
     mark = {'read-only': 'ro', 'workspace-write': 'rw',
             'danger-full-access': '!!'}.get(mode, mode)
-    return f'\n{get_workdir().name} [{mark}] > '
+    branch = current_branch(workspace)
+    label = workspace.name or str(workspace)
+    if branch:
+        label = f'{label} ({branch})'
+    return f'\n{label} [{mark}] > '
 
 
 def run_repl(initial_messages:list, session_store=None):
