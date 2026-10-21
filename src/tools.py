@@ -1,11 +1,8 @@
 """工具系统：TOOLS schema + 全部 run_* handler + tool_registry。
 可变全局（WORKDIR 等）由 harness 持有，通过 _h() 在运行时读取（便于测试 patch）。
 """
-import ast
-import json
 import subprocess
 import tempfile
-import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -32,6 +29,9 @@ from tool_files import edit_file, read_file, write_file
 from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
 from tool_patch import apply_patch as _apply_patch
 from tool_search import _grep_with_ripgrep, _rg_binary, glob_files, grep_files, ls_dir
+
+# 测试夹具直接清空内存缓存；harness 从 tools 取 restore_todos。
+from tool_todos import _TODOS, _TODOS_LOCK, read_todos, restore, write_todos  # noqa: F401
 from worktree import create_worktree, keep_worktree, remove_worktree
 
 
@@ -942,12 +942,6 @@ def run_ls(path: str = '.', all: bool = False, cwd: str = None) -> str:
     return ls_dir(path, all, cwd, gate=_gate_file, resolve=safe_path)
 
 
-_TODO_MAX_ITEMS = 100
-_TODO_MAX_CHARS = 500
-_TODOS: dict[str, list[dict]] = {}
-_TODOS_LOCK = threading.Lock()
-
-
 def _todo_scope() -> str:
     """todo 按会话分区；没有会话上下文时退回进程级（测试/单次调用）。"""
     try:
@@ -965,122 +959,18 @@ def _todo_store():
     return getattr(manager, 'session_store', None)
 
 
-def _normalize_todos(todos):
-    if isinstance(todos, str):
-        try:
-            todos = json.loads(todos)
-        except json.JSONDecodeError:
-            try:
-                todos = ast.literal_eval(todos)
-            except (SyntaxError, ValueError):
-                return None, "Error: todos must be a list or JSON array string"
-    if not isinstance(todos, list):
-        return None, "Error: todos must be a list"
-    if len(todos) > _TODO_MAX_ITEMS:
-        return None, f"Error: at most {_TODO_MAX_ITEMS} todos are supported"
-    normalized = []
-    seen = set()
-    active = []
-    for i, t in enumerate(todos):
-        if not isinstance(t, dict):
-            return None, f"Error: todos[{i}] must be an object"
-        if "content" not in t or "status" not in t:
-            return None, f"Error: todos[{i}] missing 'content' or 'status'"
-        if t["status"] not in ("pending", "in_progress", "completed"):
-            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
-        content = str(t["content"]).strip()
-        if not content:
-            return None, f"Error: todos[{i}] content must not be empty"
-        if len(content) > _TODO_MAX_CHARS:
-            return None, (f"Error: todos[{i}] content is too long "
-                          f"(max {_TODO_MAX_CHARS} chars)")
-        if content in seen:
-            return None, f"Error: duplicate todo content: {content}"
-        seen.add(content)
-        if t["status"] == "in_progress":
-            active.append(i)
-        normalized.append({"content": content, "status": t["status"]})
-    if len(active) > 1:
-        return None, (f"Error: only one todo may be in_progress (got indexes "
-                      f"{', '.join(str(i) for i in active)})")
-    return normalized, None
-
-
-def _todo_stats(todos: list[dict]) -> str:
-    counts = {"completed": 0, "in_progress": 0, "pending": 0}
-    for t in todos:
-        counts[t["status"]] += 1
-    return (f"{counts['completed']}/{len(todos)} completed · "
-            f"{counts['in_progress']} in progress · {counts['pending']} pending")
-
-
-def _format_todos(todos: list[dict]) -> str:
-    icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-    return '\n'.join(f'{icons[t["status"]]} {t["content"]}' for t in todos)
-
-
-def _print_todos(todos: list[dict]) -> None:
-    print("\n\033[33m## Current Tasks\033[0m")
-    icons = {"pending": " ", "in_progress": "\033[36m▸\033[0m",
-             "completed": "\033[32m✓\033[0m"}
-    for t in todos:
-        print(f"  [{icons[t['status']]}] {t['content']}")
-    print(f"  \033[90m{_todo_stats(todos)}\033[0m")
-
-
 def restore_todos(session_store, scope: str | None = None) -> list[dict]:
-    """从事件流恢复最后一次 todo_write 的状态（会话重启后仍可读）。"""
-    if session_store is None:
-        return []
-    target = scope or session_store.session_id
-    try:
-        events = session_store.read_events()
-    except Exception:
-        return []
-    last = next((event for event in reversed(events)
-                 if event.get('type') == 'todos'
-                 and isinstance(event.get('todos'), list)), None)
-    if last is None:
-        return []
-    normalized, error = _normalize_todos(last['todos'])
-    if error:
-        return []
-    with _TODOS_LOCK:
-        _TODOS[target] = normalized
-    return normalized
+    return restore(session_store, scope)
 
 
 def run_todo_write(todos: list) -> str:
-    normalized, error = _normalize_todos(todos)
-    if error:
-        return error
-    scope = _todo_scope()
-    with _TODOS_LOCK:
-        _TODOS[scope] = normalized
-    store = _todo_store()
-    if store is not None:
-        try:
-            store.append('todos', todos=normalized)
-        except Exception:
-            pass   # 事件落盘失败不回滚内存里的计划
-    _print_todos(normalized)
-    if not normalized:
-        return "Task list cleared."
-    return (f"Updated {len(normalized)} tasks ({_todo_stats(normalized)}).\n"
-            + _format_todos(normalized))
+    return write_todos(todos, scope=_todo_scope(),
+                       session_store=_todo_store())
 
 
 def run_todo_read() -> str:
-    scope = _todo_scope()
-    with _TODOS_LOCK:
-        todos = list(_TODOS.get(scope, []))
-    if not todos:
-        store = _todo_store()
-        if store is not None:
-            todos = restore_todos(store, scope)
-    if not todos:
-        return "No tasks. Use todo_write to create a task list."
-    return f"{_todo_stats(todos)}.\n{_format_todos(todos)}"
+    return read_todos(scope=_todo_scope(), session_store=_todo_store())
+
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: Optional[List[str]] = None) -> str:

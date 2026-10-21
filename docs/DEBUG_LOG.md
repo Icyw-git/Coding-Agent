@@ -1709,3 +1709,38 @@ tools 里最大的一块。它们只依赖路径解析/边界门、`documents`/`
 
 - 迁移带「类型出口」的代码时，先把消费方列出来，再决定哪些名字需要 noqa 再导出。
 - 依赖运行时目录的参数要用「调用时读取」，导入时快照会冻结测试隔离。
+## 拆分 todo 清单
+
+**问题**：todo 的校验、内存缓存、事件流写入与格式化约占 130 行，和工具注册表无关。
+它唯一依赖的是「当前会话 id」和「当前会话事件流」，而这两个都是 tools 从
+`_gate()` / `active_checkpoint_manager()` 拿到的运行时状态。
+
+**做法**：
+
+- 新增 `src/tool_todos.py`：`normalize_todos` / `stats` / `format_todos` /
+  `print_todos` / `restore` / `write_todos` / `read_todos`；scope 与 session_store
+  作为参数传入。
+- tools 保留 `_todo_scope()` 与 `_todo_store()` 两个采集函数，`run_todo_write` /
+  `run_todo_read` / `restore_todos` 变成薄包装。
+- `_TODOS` 与 `_TODOS_LOCK` 继续从 tools 再导出：测试夹具直接清空内存缓存，
+  导入的是同一份对象，清空对实现生效。
+
+**踩过的坑**：
+
+- 会话隔离靠的是「每个会话一个 store」，不是「scope 参数过滤事件」。测试里给两个
+  scope 传同一个 store，会误把 A 会话的事件恢复进 B；改为各自独立的 store 才符合
+  真实调用路径。
+- 内存字典只是缓存，事件流才是唯一持久源：`read_todos` 在内存为空时必须先
+  `restore`，否则进程重启后读到空清单。
+- 再次导出可变对象（dict + lock）比导出函数更微妙：必须确认是同一对象而非拷贝，
+  否则测试清空的是另一份缓存。
+
+**测试**：新增 `tests/test_tool_todos.py`（重复项/多 in_progress/超长校验、事件落盘、
+会话隔离、事件恢复、空会话）；总回归 1019 passed / 1 skipped；
+`tools.py` 1467 → 1357 行。
+
+**收获**：
+
+- 运行时状态用「采集函数留在入口、纯逻辑放 src」的方式拆，既保持单向依赖，
+  又不改变原有 monkeypatch 入口。
+- 测试隔离要按真实数据流设计：会话隔离的最小单位是事件流，不是 scope 字符串。
