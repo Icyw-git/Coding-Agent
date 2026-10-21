@@ -27,9 +27,11 @@
   （后台+进度块）`/model`（选择器）`/expand` `/approvals`；参数补全覆盖
   sandbox/cache。
 - P5f：对照 Pi 会话命令命名后迁移 `/new` `/rename`（别名 `/name`）`/fork`
-  （别名 `/clone`）`/checkpoints` `/compact`；`/status` 增加 `/session`
-  别名。Pi 用消息树（`/tree`）而非 checkpoint/rewind，语义差异记录在
-  DEBUG_LOG，暂不强行改名。
+  `/checkpoints` `/compact`；`/status` 增加 `/session` 别名。Pi 用消息树
+  （`/tree`）而非 checkpoint/rewind，语义差异记录在 DEBUG_LOG，暂不强行改名。
+- P5g：Pi 风格 `/fork` 消息选择器 `ForkPickerModal`：列出 user 消息、默认最新、
+  Enter 从所选消息**之前**分叉并把原文回填输入框；`/clone` 改为独立命令
+  （复制当前叶），保留 `/fork <seq>` 作为 inclusive 兼容入口。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

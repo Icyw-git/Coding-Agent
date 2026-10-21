@@ -2909,3 +2909,21 @@ args`
 
 **测试**：rename/fork/new 换会话、checkpoints、compact 后台块；总回归 1144 passed /
 1 skipped，旧 UI 64 passed。
+## TUI 重构 P5g：/fork 消息选择器
+
+按 Pi `UserMessageSelectorComponent` 的交互补齐：
+
+- 数据：只取 `type=message` 且 `role=user` 的事件，过滤空文本和压缩 marker；
+- 展示：`Fork from message` + 单行截断 + `i/N`，最多 16 行，默认高亮最新一条；
+- 键位：↑↓、Enter、Esc；Esc 不改变当前会话；
+- 语义：选中 seq `s` 后 `fork(upto_seq=s-1)`，即 **before**，新会话不包含选中的
+  那条 user 消息；原文回填 composer（不改 `_programmatic_text` 会被当作用户输入
+  自动补全，所以设置后直接聚焦）；
+- `/clone` 独立成命令，等价 Pi 的 `position:"at"`（复制到当前叶）；
+- `/fork <seq>` 仍保留，语义是 inclusive 前缀复制，供脚本/高级用法。
+
+**与 Pi 的差异**：Pi fork 后整条消息文本进入编辑器并等待用户改完再发；我们同样
+回填但不自动发送。Pi 的 `/tree` 仍然没有实现（事件流没有树结构）。
+
+**测试**：默认选最新、before 语义（选中消息不在新会话、前文保留）、Esc 取消、
+`/clone` 保留完整历史；总回归 1146 passed / 1 skipped，旧 UI 64 passed。

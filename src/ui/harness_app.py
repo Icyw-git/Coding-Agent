@@ -22,6 +22,7 @@ from file_mentions import workspace_files
 from ui import commands
 from ui.composer.completions import apply_suggestion, suggestions
 from ui.modals.approval import PermissionModal
+from ui.modals.forks import ForkPickerModal
 from ui.modals.models import ModelPickerModal
 from ui.modals.sessions import SessionPickerModal
 from ui.renderers.tools import tool_view
@@ -178,6 +179,9 @@ class HarnessApp(App):
                    border: round $accent; background: $boost; }
     #session-list { height: auto; max-height: 18; }
     #session-search { margin: 0 0 1 0; }
+    #fork-box { width: 76; max-height: 24; padding: 1 2;
+                border: round $accent; background: $boost; }
+    #fork-list { height: auto; max-height: 16; }
     #model-box { width: 60; max-height: 20; padding: 1 2;
                  border: round $accent; background: $boost; }
     #model-list { height: auto; max-height: 14; }
@@ -659,7 +663,12 @@ class HarnessApp(App):
         elif verb == 'rename':
             self.rename_session(argument)
         elif verb == 'fork':
-            self.fork_session(argument)
+            if argument:
+                self.fork_session(argument)
+            else:
+                self.open_fork_picker()
+        elif verb == 'clone':
+            self.fork_session('')
         elif verb == 'checkpoints':
             self.show_checkpoints()
         elif verb == 'compact':
@@ -781,7 +790,7 @@ class HarnessApp(App):
         self._notice(f"Session title: {self._title}")
 
     def fork_session(self, argument: str = '') -> None:
-        """`/fork [事件序号]`，无参等价 Pi `/clone`（复制到当前叶）。"""
+        """`/fork [事件序号]`；`/clone` 无参复制到当前叶。"""
         if not self._store:
             self._notice('No session context; cannot fork.', level='error')
             return
@@ -791,15 +800,72 @@ class HarnessApp(App):
                 self._notice('用法：/fork [事件序号]', level='error')
                 return
             upto = int(argument)
+        if self._fork_to(upto):
+            self._notice(f'Forked to {self._session_id} (original kept).')
+
+    def _fork_to(self, upto: int | None) -> bool:
         try:
             forked = self._store.__class__.fork(self._store, upto_seq=upto)
             messages = forked.rebuild_openai_history(recover_pending=True)
             summary = forked.session_summary()
         except Exception as exc:
             self._notice(f'Fork failed: {exc}', level='error')
-            return
+            return False
         self._adopt_session(forked, messages, summary.get('title', ''))
-        self._notice(f'Forked to {forked.session_id} (original kept).')
+        return True
+
+    def open_fork_picker(self) -> None:
+        """Pi 风格 `/fork`：列出用户消息，默认选最新一条。"""
+        if not self._store:
+            self._notice('No session context; cannot fork.', level='error')
+            return
+        rows = self._forkable_messages()
+        if not rows:
+            self._notice('No messages to fork from.')
+            return
+        self._fork_rows = {row['seq']: row['text'] for row in rows}
+        self.push_screen(ForkPickerModal(rows), self._on_fork_picked)
+
+    def _forkable_messages(self) -> list[dict]:
+        rows = []
+        try:
+            events = self._store.read_events()
+        except Exception:
+            return rows
+        for event in events:
+            if event.get('type') != 'message':
+                continue
+            message = event.get('message') or {}
+            if message.get('role') != 'user':
+                continue
+            content = message.get('content')
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = ''.join(str(block.get('text', ''))
+                               for block in content
+                               if isinstance(block, dict)
+                               and block.get('type') == 'text')
+            else:
+                text = ''
+            text = text.strip()
+            if not text or text.startswith('[Compacted]'):
+                continue
+            rows.append({'seq': int(event.get('seq', 0)), 'text': text})
+        return rows
+
+    def _on_fork_picked(self, seq) -> None:
+        if seq is None:
+            return
+        text = getattr(self, '_fork_rows', {}).get(int(seq), '')
+        if not self._fork_to(max(0, int(seq) - 1)):
+            return
+        if text and self._composer is not None:
+            self._programmatic_text = text
+            self._composer.text = text
+            self._composer.cursor_location = (0, len(text))
+            self._composer.focus()
+        self._notice(f'Forked to {self._session_id}; message restored to editor.')
 
     def show_checkpoints(self) -> None:
         import harness

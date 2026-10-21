@@ -584,7 +584,7 @@ def test_session_rename_fork_and_new(tmp_path, monkeypatch):
             assert store.session_summary()['title'] == 'Fresh title'
 
             old_id = app._session_id
-            app.submit_text('/fork')
+            app.submit_text('/clone')
             await pilot.pause()
             assert app._session_id != old_id
             assert app._store.session_id == app._session_id
@@ -627,5 +627,49 @@ def test_checkpoints_and_compact_commands(tmp_path, monkeypatch):
                 if '已压缩' in text:
                     break
             assert '已压缩' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+
+
+def test_fork_picker_forks_before_selected_message(tmp_path):
+    store = _temp_store(tmp_path, (
+        {'role': 'user', 'content': 'first question'},
+        {'role': 'assistant', 'content': 'answer'},
+        {'role': 'user', 'content': 'second question'},
+    ))
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.submit_text('/fork')
+            await pilot.pause()
+            options = app.screen.query_one('#fork-list')
+            assert options.option_count == 2
+            assert options.highlighted == 1        # 默认最新一条
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._session_id != store.session_id
+            assert app._composer.text == 'second question'
+            contents = [str(m.get('content')) for m in app._messages]
+            assert any('first question' in text for text in contents)
+            assert all('second question' not in text for text in contents)
+
+    asyncio.run(scenario())
+
+
+def test_fork_picker_cancel_keeps_session(tmp_path):
+    store = _temp_store(tmp_path)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            old = app._session_id
+            app.submit_text('/fork')
+            await pilot.pause()
+            await pilot.press('escape')
+            await pilot.pause()
+            assert app._session_id == old
 
     asyncio.run(scenario())
