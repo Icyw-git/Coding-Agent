@@ -150,3 +150,22 @@ def test_prompt_session_tab_and_eof(tmp_path):
                 await session.prompt_async('> ')
 
     asyncio.run(exercise())
+
+
+def test_at_mention_completes_workspace_files(tmp_path):
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'app.py').write_text('', encoding='utf-8')
+    (tmp_path / 'src' / 'apple.py').write_text('', encoding='utf-8')
+    completer = SlashCompleter(lambda: tmp_path, lambda: [])
+
+    items = choices(completer, '读一下 @src/ap')
+
+    assert '@src/app.py' in [item.text for item in items]
+    assert all(item.start_position == -len('@src/ap') for item in items)
+    assert all(item.display_meta for item in items)
+
+
+def test_email_is_not_treated_as_a_mention(tmp_path):
+    completer = SlashCompleter(lambda: tmp_path, lambda: [])
+
+    assert choices(completer, 'mail a@b') == []

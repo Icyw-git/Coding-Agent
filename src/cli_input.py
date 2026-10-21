@@ -2,12 +2,14 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 
 from cli_commands import COMMANDS, parse_command
+from file_mentions import format_mention, match_mentions, mention_token, workspace_files
 from session_views import display_text, group_sessions, relative_time, session_details, session_status
 
 
@@ -247,13 +249,39 @@ def directory_completions(argument, workspace):
 
 
 class SlashCompleter(Completer):
+    MENTION_CACHE_SECONDS = 5.0
+
     def __init__(self, workspace, sessions):
         self.workspace = workspace
         self.sessions = sessions
+        self._files = None
+        self._files_root = None
+        self._files_at = 0.0
+
+    def _workspace_files(self):
+        """按工作区缓存文件索引；每 5s 或换工作区后重扫，避免逐键遍历。"""
+        root = Path(self.workspace()).resolve()
+        now = time.monotonic()
+        if (self._files is None or root != self._files_root
+                or now - self._files_at > self.MENTION_CACHE_SECONDS):
+            self._files = workspace_files(root)
+            self._files_root = root
+            self._files_at = now
+        return self._files
+
+    def _mentions(self, text, at):
+        _, query = mention_token(text) or (at, '')
+        for path in match_mentions(self._workspace_files(), query):
+            yield Completion(format_mention(path),
+                             start_position=-(len(text) - at),
+                             display=path, display_meta='文件')
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         if not text.startswith('/'):
+            mention = mention_token(text)
+            if mention is not None:
+                yield from self._mentions(text, mention[0])
             return
         if not any(char.isspace() for char in text):
             for command in COMMANDS:
