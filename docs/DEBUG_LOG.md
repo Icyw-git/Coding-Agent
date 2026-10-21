@@ -1837,3 +1837,32 @@ plan 请求、审批通过/已处理/不存在、派生透传）；总回归 103
 
 - 纯委托型 handler 最适合直接搬迁：没有状态、没有注入，测试用假 BUS 即可。
 - 共享可变状态（pending_requests）的测试隔离必须显式写，不能靠用例顺序。
+## 拆分工具 schema
+
+**问题**：`tools.py` 里约 900 行是 `TOOLS` 的 JSON 字面量，与 handler 交错排列。
+它既不是逻辑也不是配置，却让这个文件永远无法变短。
+
+**做法**：
+
+- 新增 `src/tool_schemas.py`：`TOOL_SCHEMAS` 保存 37 个工具定义，顺序与拆分前逐字一致。
+  内容由运行时 `TOOLS` 用 `pprint(sort_dicts=False)` 生成，避免手抄出错。
+- `tools.py` 只保留 `TOOLS = list(TOOL_SCHEMAS)`，仍然是可变列表（MCP 运行期追加）。
+- 拆分前先加 `tests/test_tool_schemas.py`：锁定工具名称顺序、`json.dumps` 指纹、
+  「除 checkpoint/compact 外每个 schema 都有 handler」。拆分后三条全部通过。
+
+**踩过的坑**：
+
+- 用 `ast` 取语句行号后**按升序边删边改**，后面的行号全部错位：第一段 583 行被替换成
+  1 行，剩余 14 个 append 全没删到，文件反而保留了两份 schema。正确做法是从后往前删，
+  或先收集所有待删区间再一次性重建。
+- 发现错位后先 `git checkout` 还原，再重跑；不要在已经错位的文件上继续打补丁。
+- `TOOL_SCHEMAS` 的 import 不能留在文件中部（E402），但 `TOOLS = list(...)` 保留原位，
+  这样 diff 只动 schema 行。
+
+**测试**：`pytest` 1040 passed / 1 skipped（新增 3 条 schema 快照）；`ruff` 通过；
+`tools.py` 1119 → 245 行，`tool_schemas.py` 504 行。
+
+**收获**：
+
+- 大块数据搬迁先「从运行态生成」再「删源码」，比手工复制安全；生成物用快照测试锁住。
+- 按行号批量编辑必须在「删除/替换」前固定坐标系；倒序处理是最小改动方案。
