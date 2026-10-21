@@ -851,9 +851,9 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
             output = f"Error: {e}"
     elapsed = time.perf_counter() - started
     if on_activity is not None:
-        from tool_activity import is_failure
+        from tool_activity import is_failure, result_hint
         on_activity(name, args, elapsed, is_failure(output),
-                    background_started)
+                    background_started, result_hint(output))
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
@@ -885,13 +885,14 @@ PARALLEL_MAX_WORKERS = 4
 ACTIVE_TICKER = None   # 交互回合进行中的进度行；工具活动行借它原子换行
 
 
-def _print_tool_activity(name, args, elapsed, failed, background=False):
+def _print_tool_activity(name, args, elapsed, failed, background=False,
+                         hint=''):
     """交互终端的工具活动行；管道、测试与无头模式保持 stdout 干净。"""
     if not sys.stdout.isatty():
         return
     from tool_activity import format_line
     line = format_line(name, args, elapsed, failed=failed,
-                       background=background)
+                       background=background, hint=hint)
     if ACTIVE_TICKER is not None:
         ACTIVE_TICKER.emit_line(line)
         return
@@ -1497,6 +1498,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     skip_micro_rounds=0 #跳过 micro_compact 轮数
     rounds_since_todo=0 #距离上次 todo 提醒的轮数
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
+    turn_started=time.monotonic() #本回合起始（tokens 行显示总用时）
     turn_tokens=0 #本回合累计 tokens（含工具轮次）
     turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末打印）
     ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
@@ -1669,8 +1671,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     print(message.content)
             if turn_tokens:
                 cum = session_store.usage_totals()   # 逐调用 usage 事件聚合
+                from turn_progress import format_duration
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
                       f'会话累计 {_fmt_tokens(cum["total"])}'
+                      f' · 用时 {format_duration(time.monotonic() - turn_started)}'
                       f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
@@ -1871,6 +1875,14 @@ def run_agent_turn_locked():
         print('\n[会话已中断]')
 
 
+def prompt_text() -> str:
+    """提示符带上工作区名与档位缩写：多会话/多目录时不至于发错地方。"""
+    mode = load_policy().sandbox_mode
+    mark = {'read-only': 'ro', 'workspace-write': 'rw',
+            'danger-full-access': '!!'}.get(mode, mode)
+    return f'\n{get_workdir().name} [{mark}] > '
+
+
 def run_repl(initial_messages:list, session_store=None):
     """最小交互循环：普通输入走 agent_loop，/ 开头的走 checkpoint 命令（见 handle_command）。
 
@@ -1908,7 +1920,7 @@ def run_repl(initial_messages:list, session_store=None):
     interrupted = 0
     while True:
         try:
-            line=read_line('\n> ').strip()
+            line=read_line(prompt_text()).strip()
             interrupted = 0
         except EOFError:
             print('\n[会话已结束]')

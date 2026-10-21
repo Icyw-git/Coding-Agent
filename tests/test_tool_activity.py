@@ -38,3 +38,19 @@ def test_is_failure_matches_tool_error_convention():
     assert tool_activity.is_failure('Error: nope')
     assert tool_activity.is_failure('  Permission denied by user')
     assert not tool_activity.is_failure('ok')
+
+
+def test_result_hint_reports_multiline_without_content():
+    assert tool_activity.result_hint('a' + chr(10) + 'b' + chr(10) + 'c') == '3 行'
+    assert tool_activity.result_hint('single line') == ''
+    assert tool_activity.result_hint('No output') == '无输出'
+    assert tool_activity.result_hint('') == '空'
+
+
+def test_format_line_appends_result_hint():
+    ok = tool_activity.format_line('read', {'path': 'a.py'}, 0.1, hint='42 行')
+    failed = tool_activity.format_line('read', {'path': 'a.py'}, 0.1,
+                                       failed=True, hint='42 行')
+
+    assert ok.endswith('→ 42 行')
+    assert '→' not in failed

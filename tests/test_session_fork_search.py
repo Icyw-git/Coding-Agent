@@ -133,7 +133,9 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(harness.client.chat.completions, 'create', fake_create)
     harness.agent_loop([{'role': 'user', 'content': '统计 token'}], session_store=store)
     out = capsys.readouterr().out
-    assert '[tokens] 本轮 120 · 会话累计 120 · 缓存命中 96%' in out
+    assert '[tokens] 本轮 120 · 会话累计 120' in out
+    assert '用时 00:00' in out
+    assert '缓存命中 96%' in out
     assert 'tokens：120' in harness.format_status(store)   # /status 显示会话累计
     assert '缓存命中 96%' in harness.format_status(store)
     # 埋点持久化：usage 事件写入事件流（prompt/completion/cached/cached_seen 明细）

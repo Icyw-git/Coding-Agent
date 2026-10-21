@@ -34,14 +34,28 @@ def summarize(name: str, arguments: dict | None) -> str:
 
 
 def format_line(name: str, arguments: dict | None, elapsed: float,
-                failed: bool = False, background: bool = False) -> str:
-    """`  • bash  pytest -q  3.40s ✓` 形式的单行活动。"""
+                failed: bool = False, background: bool = False,
+                hint: str = '') -> str:
+    """`  • bash  pytest -q  3.40s ✓  → 42 行` 形式的单行活动。"""
     parts = [f'• {name}{" ↗后台" if background else ""}']
     detail = summarize(name, arguments)
     if detail:
         parts.append(detail)
     parts.append(f'{elapsed:.2f}s {"✗" if failed else "✓"}')
+    if hint and not failed:
+        parts.append(f'→ {hint}')
     return '  ' + '  '.join(parts)
+
+
+def result_hint(output) -> str:
+    """工具输出的体量提示：多行只报行数，不预览内容。"""
+    text = str(output).strip()
+    if not text:
+        return '空'
+    if text == 'No output':
+        return '无输出'
+    lines = text.count('\n') + 1
+    return f'{lines} 行' if lines > 1 else ''
 
 
 def is_failure(output) -> bool:

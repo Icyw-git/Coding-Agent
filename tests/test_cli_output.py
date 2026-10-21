@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -195,3 +196,13 @@ def test_first_ctrl_c_hints_and_second_exits(tmp_path, monkeypatch, capsys):
     assert '再按一次 Ctrl-C' in output
     assert '会话已结束' in output
     assert len(calls) == 2
+
+
+def test_prompt_text_shows_workspace_and_mode(monkeypatch):
+    import harness
+
+    monkeypatch.setattr(harness, 'get_workdir', lambda: Path('D:/proj'))
+    monkeypatch.setattr(harness, 'load_policy',
+                        lambda: SimpleNamespace(sandbox_mode='read-only'))
+
+    assert harness.prompt_text().strip() == 'proj [ro] >'
