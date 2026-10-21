@@ -2158,6 +2158,14 @@ def run_repl(initial_messages:list, session_store=None):
                 continue
             if not line:
                 continue
+            if line.startswith('!') and line[1:].strip():
+                # `!cmd`：直接执行 shell，输出只显示在终端，不进入模型上下文。
+                command = line[1:].strip()
+                try:
+                    print(run_bash(command))
+                except Exception as exc:
+                    print(f'Error: {exc}')
+                continue
             if line.startswith('/') or line == 'cd' or line.startswith('cd '):
                 if line == 'cd' or line.startswith('cd '):
                     line = '/' + line

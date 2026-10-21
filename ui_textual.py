@@ -523,6 +523,15 @@ class CCApp(App):
         text = (text or '').strip()
         if not text:
             return
+        if text.startswith('!') and text[1:].strip():
+            if self._busy:
+                self._set_hint('回合进行中：先等当前请求结束，或用 Esc 取消')
+                return
+            command = text[1:].strip()
+            self._history.append(text)
+            self._history_index = len(self._history)
+            self.run_worker(lambda: self._run_shell(command), thread=True)
+            return
         command = slash_command(text)
         if command is not None:      # / 命令不进入对话
             self._update_command_hint('')
@@ -533,6 +542,40 @@ class CCApp(App):
         self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
         self._user_input_q.put(text)
         self._set_input_busy(True)
+
+    def _run_shell(self, command: str) -> None:
+        """`!cmd`：直接执行 shell，输出按工具块渲染，不进入模型上下文。"""
+        import time
+
+        import harness
+        import turn_control
+        from ui_bridge import emit as ui_emit
+        from ui_bridge import set_agent, set_session
+
+        started = time.monotonic()
+        set_agent('shell')
+        set_session(self._session_id)
+        try:
+            harness.permission_gate.use_ui = True
+            turn_control.begin_turn()
+            ui_emit('tool_start', name='bash', args={'command': command})
+            output = harness.run_bash(command)
+            failed = str(output).lstrip().startswith(('Error', 'Permission denied'))
+            ui_emit('tool_end', name='bash', args={'command': command},
+                    output_preview=str(output)[:2000],
+                    output_len=len(str(output)), ok=not failed,
+                    outcome='failed' if failed else 'completed',
+                    background=False,
+                    duration_ms=round((time.monotonic() - started) * 1000))
+        except Exception as exc:
+            ui_emit('tool_end', name='bash', args={'command': command},
+                    output_preview=str(exc), output_len=len(str(exc)),
+                    ok=False, outcome='failed', background=False,
+                    duration_ms=round((time.monotonic() - started) * 1000))
+            ui_emit('error', msg=f'{type(exc).__name__}: {exc}')
+        finally:
+            turn_control.end_turn()
+            harness.permission_gate.use_ui = False
 
     def action_quit(self) -> None:
         """Ctrl+C / Ctrl+D：拒绝待审批并唤醒 agent 线程退出。"""

@@ -2558,3 +2558,27 @@ UI 测试 56 passed。
 **测试**：`test_ui.py` 用 `run_test` 模拟输入 `abc` + `Ctrl-J` + `def` + `Enter`，
 断言输入框保留换行、提交后进入历史且输入清空；其余输入相关测试改用 `.text` /
 `submit_text`。总回归 1096 passed / 1 skipped，UI 测试 57 passed。
+## `!` shell 模式
+
+**问题**：想跑一条命令时，要么让模型调 `bash`（多一轮请求、输出进上下文），
+要么切到另一个终端。Codex/Pi 都支持 `!cmd` 直接执行。
+
+**做法**：
+
+- TUI：`submit_text` 识别 `!cmd`，在 Textual worker 线程里调 `harness.run_bash`；
+  执行期间把 `permission_gate.use_ui` 置 True、`turn_control` 包住回合，让审批弹窗、
+  超时与取消语义与 agent 回合一致。结果通过 `ui_bridge.emit('tool_start'/'tool_end')`
+  渲染成普通工具块（可折叠、带耗时），输出不进入模型上下文。
+- 行式 REPL：`run_repl` 在解析命令前识别 `!cmd`，直接 `print(run_bash(cmd))`；
+  不写入会话消息，`continue` 回到提示符。
+- 两者都保留策略层的审批/沙箱/超时：`!` 只是省掉一次模型调用，不是绕过执行边界。
+
+**取舍**：
+
+- TUI 在回合进行中暂不允许 `!`（避免两个回合同时抢审批与输出块），提示先等结束或 Esc 取消。
+- `!` 输出只展示，不进入上下文；需要模型看到结果就正常提问让模型执行。
+- 行式 REPL 的 `!` 输出不做折叠（终端原生滚动），TUI 复用已有的 Collapsible 工具块。
+
+**测试**：`test_ui.py` 断言 `!echo hi` 不进模型队列、聊天区出现输出、历史记录；
+`tests/test_cli_output.py` 断言行式 `!` 直接执行且 `agent_loop` 不被调用。
+总回归 1097 passed / 1 skipped，UI 测试 58 passed。

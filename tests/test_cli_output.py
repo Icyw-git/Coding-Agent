@@ -245,3 +245,21 @@ def test_folded_tool_output_can_be_expanded(monkeypatch):
     assert '已折叠' in text and '/expand' in text
     number = text.rsplit('/expand ', 1)[1].splitlines()[0].strip()
     assert harness.format_tool_output(number) == output
+
+
+def test_bang_runs_shell_without_calling_the_agent(tmp_path, monkeypatch, capsys):
+    import cli_input
+    import harness
+
+    commands = iter(['!echo hi', '/quit'])
+    monkeypatch.setattr(cli_input, 'create_reader',
+                        lambda *args: lambda _: next(commands))
+    monkeypatch.setattr(harness, 'run_bash', lambda command: f'shell:{command}')
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('agent must not run for !cmd')))
+    store = harness.SessionEventStore(tmp_path, session_id='bang')
+
+    harness.run_repl([], store)
+
+    assert 'shell:echo hi' in capsys.readouterr().out

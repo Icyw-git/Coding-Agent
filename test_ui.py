@@ -884,3 +884,43 @@ def test_multiline_input_ctrl_j_newline_enter_submit(monkeypatch):
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_shell_mode_runs_directly_without_model(monkeypatch):
+    import asyncio
+
+    pytest.importorskip('textual')
+    import harness
+    import ui_textual
+
+    def chat_text(app):
+        parts = []
+
+        def walk(widget):
+            parts.append(str(widget.render()))
+            for child in widget.children:
+                walk(child)
+
+        walk(app.query_one('#chat'))
+        return chr(10).join(parts)
+
+    monkeypatch.setattr(harness, 'run_bash', lambda command: f'shell:{command}')
+
+    async def scenario():
+        app = ui_textual.CCApp([])
+        async with app.run_test() as pilot:
+            app.submit_text('!echo hi')
+            text = ''
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                text = chat_text(app)
+                if 'shell:echo hi' in text:
+                    break
+            assert 'shell:echo hi' in text
+            assert app._user_input_q.empty()          # 没有进入模型队列
+            assert app._history[-1] == '!echo hi'
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())
