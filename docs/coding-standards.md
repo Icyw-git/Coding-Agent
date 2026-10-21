@@ -51,7 +51,7 @@ stdout 打印诊断；进度展示只暴露 `phase / tool / elapsed`，工具内
 
 规则表（斜杠命令、白名单、前缀集合）与文档同步更新：新增斜杠命令必须同步
 `tests/test_cli_input.py` 的 SlashCompleter 前缀断言；改工具行为必须同步
-`tools.py` 的 schema 与相关文档。
+`tool_schemas.py` 与相关文档；顺序由 `tests/test_tool_schemas.py` 锁定。
 
 ## 空行与逻辑块
 

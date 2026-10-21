@@ -6,6 +6,7 @@ usage 事件的归因。schema 搬到独立模块后，这份快照是第一道�
 import hashlib
 import json
 
+import tool_schemas
 import tools
 
 ORDER = [
@@ -38,3 +39,9 @@ def test_every_schema_has_a_handler():
 
     # checkpoint / compact 由主循环特判，没有注册 handler。
     assert missing == ['checkpoint', 'compact']
+
+
+def test_tools_is_a_mutable_copy_of_the_schema_list():
+    # MCP 运行期会 append 到 TOOLS；不能污染模块级的规范列表。
+    assert tools.TOOLS is not tool_schemas.TOOL_SCHEMAS
+    assert tools.TOOLS == tool_schemas.TOOL_SCHEMAS

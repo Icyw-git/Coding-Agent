@@ -1866,3 +1866,44 @@ plan 请求、审批通过/已处理/不存在、派生透传）；总回归 103
 
 - 大块数据搬迁先「从运行态生成」再「删源码」，比手工复制安全；生成物用快照测试锁住。
 - 按行号批量编辑必须在「删除/替换」前固定坐标系；倒序处理是最小改动方案。
+## 重构收尾检查
+
+**检查范围**：拆分完成后对文档、死代码、格式与契约做一次盘点。
+
+**发现并修正**：
+
+- `tools._cache_image` 在迁移后已无调用方（`run_view_image` / `run_render_document`
+  直接用 `_tool_results_dir()`），删除包装与对应的 `cache_image` 导入。
+- `TOOLS = list(TOOL_SCHEMAS)` 后残留三连空行；顺手把紧凑的 `tool_registry`
+  字典改成每行一项，文件已经足够短，可读性比省行更重要。
+- `README` 项目结构表缺 `src/tools.py` 一行；`design-principles` 与
+  `HARNESS_LOOP_ARCHITECTURE` 的模块表仍写着「tools.py 含 schema 与任务/团队实现」，
+  改为「接线与注册表 + `tool_schemas.py` + `tool_*.py`」。
+- `HARNESS_LOOP_ARCHITECTURE` 里 `compact` 的说明引用了已失效的
+  `tools.py:670-680` 行号，改为指向 `tool_schemas.py`。
+- `coding-standards` 的「改工具行为必须同步 tools.py 的 schema」改为
+  `tool_schemas.py`，并注明顺序由快照测试锁定。
+- `tool_schemas.py` 头部补充重新生成方式与「顺序即契约」的说明。
+
+**新增护栏**：`test_tools_is_a_mutable_copy_of_the_schema_list` 断言
+`tools.TOOLS is not tool_schemas.TOOL_SCHEMAS`，防止将来改成直接别名后，
+MCP 运行期 `append` 污染规范列表（进而让下次启动多出重复工具）。
+
+**验证**：`pytest` 1041 passed / 1 skipped；`ruff check harness.py src tests`
+通过；`--doctor` 正常。
+
+**核对过但无需改动**：
+
+- `tool_registry` 覆盖 37 个 schema 中 35 个，`checkpoint` / `compact` 由主循环特判，
+  与既有设计一致。
+- `harness.TOOLS.append` 与 `tools.TOOLS` 是同一列表对象（`from tools import TOOLS`），
+  MCP 动态注册路径未受影响。
+- 十个 `tool_*` 模块都有同名测试文件；`tool_text` / `tool_patch` 等纯函数模块
+  不依赖 harness，子进程隔离断言仍在。
+
+**收获**：
+
+- 重构后的「收尾检查」应当把文档当作代码审计：本轮所有偏差都在文档与死代码，
+  没有行为回归。
+- 兼容性再导出最容易留下死名字；每次拆分后跑一次 `rg` 确认调用方，
+  比等 lint 发现更早。

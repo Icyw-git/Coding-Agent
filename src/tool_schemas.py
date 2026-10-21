@@ -1,7 +1,16 @@
 """工具 schema 定义（按注册顺序排列）。
 
 顺序属于对外契约：system prompt 里的工具清单、`_tools_fingerprint` 与请求前缀
-缓存都依赖它。新增工具请追加到末尾，并同步 tests/test_tool_schemas.py 的快照。
+缓存都依赖它。新增工具请追加到末尾，并同步 tests/test_tool_schemas.py 的 ORDER
+与 SCHEMA_SHA1。
+
+内容从运行时 `tools.TOOLS` 生成，重新生成时用 `pprint(sort_dicts=False)` 保持
+列表顺序与 dict 键序，例如：
+
+    import pprint, sys
+    sys.path[:0] = ['.', 'src']
+    import tools
+    print(pprint.pformat(tools.TOOLS, width=99, sort_dicts=False))
 """
 from __future__ import annotations
 

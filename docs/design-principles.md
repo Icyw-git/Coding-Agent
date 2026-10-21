@@ -13,7 +13,7 @@
 | `src/session_store.py`    | append-only 事件流、确定性回放、分叉与跨会话搜索；唯一恢复真相源                                     |
 | `src/agent_runtime.py`    | 会话服务（列表/恢复/分叉/搜索/重命名），摘要缓存归属于此                                             |
 | `src/harness_api.py`      | FastAPI 控制面 + SSE 进度流（直接 tail 会话 JSONL，无事件总线）                                      |
-| `src/tools.py` + registry | 工具实现与注册；执行统一走 `exec_tool_call`（hook → 执行 → 截断）                                    |
+| `src/tools.py` + registry | 工具接线与注册表；schema 在 tool_schemas.py，实现分域在 tool_*.py；统一走 exec_tool_call             |
 | 任务子系统                | `task_manager`（.cache/os_tasks）、`cron_scheduler`、`background_task` 各自拥有存储与锁              |
 | 传输网关                  | `feishu_gateway` / `gateway_sim` 只做协议适配，不持有业务状态                                        |
 

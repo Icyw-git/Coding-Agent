@@ -9,7 +9,6 @@ from typing import Optional
 from exec_policy import resolve_tool_path
 from tool_documents import (
     ImageResult,  # noqa: F401
-    cache_image,
     read_document,
     render_document,
     view_image,
@@ -67,8 +66,7 @@ def _gate_file(tool: str, path: str, cwd: str | None) -> str | None:
     return _gate().enforce_headless(tool, args)
 
 
-TOOLS = list(TOOL_SCHEMAS)
-
+TOOLS = list(TOOL_SCHEMAS)   # MCP 运行期会 append，必须是独立可变列表
 
 
 BASH_TIMEOUT = 120
@@ -113,11 +111,8 @@ _IMAGE_MAX_BYTES = 8 * 1024 * 1024   # 实现读取这个值，测试按模块�
 
 
 def _tool_results_dir():
+    """缓存根目录在调用时读取：跟随 conftest 的隔离与 /cache 的统计口径。"""
     return getattr(_h(), 'TOOL_RESULTS_DIR', None)
-
-
-def _cache_image(data: bytes, suffix: str) -> Path:
-    return cache_image(data, suffix, _tool_results_dir())
 
 
 def run_view_image(path: str, cwd: str = None):
@@ -172,6 +167,7 @@ def run_glob(pattern: str, path: str = None, cwd: str = None) -> str:
 
 
 def _grep_backend(pattern, root, glob, case_insensitive, limit):
+    """保持后端 5 参数签名；rg 查找函数由 tools 注入，测试可替换。"""
     return _grep_with_ripgrep(pattern, root, glob, case_insensitive, limit,
                               rg_binary=_rg_binary)
 
@@ -206,6 +202,7 @@ def _todo_store():
 
 
 def restore_todos(session_store, scope: str | None = None) -> list[dict]:
+    """会话恢复后从事件流重建 todo；harness 在打开会话时调用。"""
     return restore(session_store, scope)
 
 
@@ -218,18 +215,38 @@ def run_todo_read() -> str:
     return read_todos(scope=_todo_scope(), session_store=_todo_store())
 
 
-tool_registry={'bash':run_bash,'background_output':run_background_output,
-               'kill_background':run_kill_background,
-               'read':run_read,'write':run_write,'edit':run_edit,
-               'view_image':run_view_image,'read_document':run_read_document,
-               'render_document':run_render_document,
-               'apply_patch':run_apply_patch,
-               'web_fetch':run_web_fetch,
-               'glob':run_glob,'grep':run_grep,'ls':run_ls,'todo_write':run_todo_write,
-               'todo_read':run_todo_read,
-               'create_task':run_create_task,'list_tasks':run_list_tasks,'get_task':run_get_task,
-               'claim_task':run_claim_task,'complete_task':run_complete_task,
-               'schedule_cron':run_schedule_cron,'list_crons':run_list_crons,'cancel_cron':run_cancel_cron,
-               'spawn_teammate':run_spawn_teammate,'send_message':run_send_message,'check_inbox':run_check_inbox,
-               'request_shutdown':run_request_shutdown,'request_plan':run_request_plan,'review_plan':run_review_plan,
-               'create_worktree':create_worktree,'remove_worktree':remove_worktree,'keep_worktree':keep_worktree}
+tool_registry = {
+    'bash': run_bash,
+    'background_output': run_background_output,
+    'kill_background': run_kill_background,
+    'read': run_read,
+    'write': run_write,
+    'edit': run_edit,
+    'view_image': run_view_image,
+    'read_document': run_read_document,
+    'render_document': run_render_document,
+    'apply_patch': run_apply_patch,
+    'web_fetch': run_web_fetch,
+    'glob': run_glob,
+    'grep': run_grep,
+    'ls': run_ls,
+    'todo_write': run_todo_write,
+    'todo_read': run_todo_read,
+    'create_task': run_create_task,
+    'list_tasks': run_list_tasks,
+    'get_task': run_get_task,
+    'claim_task': run_claim_task,
+    'complete_task': run_complete_task,
+    'schedule_cron': run_schedule_cron,
+    'list_crons': run_list_crons,
+    'cancel_cron': run_cancel_cron,
+    'spawn_teammate': run_spawn_teammate,
+    'send_message': run_send_message,
+    'check_inbox': run_check_inbox,
+    'request_shutdown': run_request_shutdown,
+    'request_plan': run_request_plan,
+    'review_plan': run_review_plan,
+    'create_worktree': create_worktree,
+    'remove_worktree': remove_worktree,
+    'keep_worktree': keep_worktree,
+}

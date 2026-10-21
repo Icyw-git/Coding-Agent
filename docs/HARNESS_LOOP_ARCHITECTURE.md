@@ -12,7 +12,8 @@
 | --------------------- | ------------------------------------------------------------------------------------------------ |
 | `harness.py`          | 主 agent loop、请求构造、工具编排、cron 注入、会话恢复入口                                       |
 | `agent_core.py`       | hooks、记忆、上下文压缩、transcript 快照、记忆注入                                               |
-| `tools.py`            | OpenAI tool schema、工具注册表、任务/cron/团队工具实现                                           |
+| `tools.py`            | 工具接线、路径边界与 `tool_registry`                                                             |
+| `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
 | `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收（见 `CHECKPOINT_DESIGN.md`） |
 | `recovery.py`         | 429/overload 重试、备用模型、输出截断和上下文超限判断                                            |
@@ -233,7 +234,7 @@ tool messages 加回 canonical history
 
 ## 9. `compact` 特殊工具
 
-`compact` 在 [`tools.py:670-680`](tools.py:670) 暴露给模型，但不放入普通 `tool_registry` 执行。
+`compact` 在 `tool_schemas.py` 暴露给模型，但不放入普通 `tool_registry` 执行。
 
 在 [`harness.py:450-475`](harness.py:450) 中：
 
