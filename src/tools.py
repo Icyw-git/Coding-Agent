@@ -4,15 +4,13 @@
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import sandbox
 import web_access
 from agent_teams import BUS, spawn_teammate_thread
-from cron_scheduler import cancel_job, cron_lock, schedule_job, scheduled_jobs
 from exec_policy import resolve_tool_path
 from process_utils import close_process, kill_process_tree
-from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 from team_protocols import ProtocolState, consume_lead_inbox, new_request_id, pending_requests
 
 # harness / subagent / headless 从这里取多模态结果类型。
@@ -31,6 +29,16 @@ from tool_patch import apply_patch as _apply_patch
 from tool_search import _grep_with_ripgrep, _rg_binary, glob_files, grep_files, ls_dir
 
 # 测试夹具直接清空内存缓存；harness 从 tools 取 restore_todos。
+from tool_tasks import (  # noqa: F401  注册表与 Teammate 从这里取 handler
+    run_cancel_cron,
+    run_claim_task,
+    run_complete_task,
+    run_create_task,
+    run_get_task,
+    run_list_crons,
+    run_list_tasks,
+    run_schedule_cron,
+)
 from tool_todos import _TODOS, _TODOS_LOCK, read_todos, restore, write_todos  # noqa: F401
 from worktree import create_worktree, keep_worktree, remove_worktree
 
@@ -971,62 +979,6 @@ def run_todo_write(todos: list) -> str:
 def run_todo_read() -> str:
     return read_todos(scope=_todo_scope(), session_store=_todo_store())
 
-
-def run_create_task(subject: str, description: str = "",
-                    blockedBy: Optional[List[str]] = None) -> str:
-    task = create_task(subject, description, blockedBy)
-    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
-    return f"Created {task.id}: {task.subject}{deps}"
-
-def run_list_tasks() -> str:
-    tasks = list_tasks()
-    if not tasks:
-        return "No tasks. Use create_task to add some."
-    lines = []
-    for t in tasks:
-        icon = {"pending": "○", "in_progress": "●",
-                "completed": "✓"}.get(t.status, "?")
-        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
-        owner = f" [{t.owner}]" if t.owner else ""
-        lines.append(f"  {icon} {t.id}: {t.subject} "
-                     f"[{t.status}]{owner}{deps}")
-    return "\n".join(lines)
-
-def run_get_task(task_id: str) -> str:
-    try:
-        return get_task(task_id)
-    except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
-
-def run_claim_task(task_id: str) -> str:
-    return claim_task(task_id, owner="agent")
-
-def run_complete_task(task_id: str) -> str:
-    return complete_task(task_id)
-
-def run_schedule_cron(cron: str, prompt: str,
-                      recurring: bool = True, durable: bool = True) -> str:
-    result = schedule_job(cron, prompt, recurring, durable)
-    if isinstance(result, str):
-        return f"Error: {result}"
-    return f"Scheduled {result.id}: '{cron}' → {prompt}"
-
-def run_list_crons() -> str:
-    with cron_lock:
-        jobs = list(scheduled_jobs.values())
-    if not jobs:
-        return "No cron jobs. Use schedule_cron to add one."
-    lines = []
-    for j in jobs:
-        tag = "recurring" if j.recurring else "one-shot"
-        dur = "durable" if j.durable else "session"
-        lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
-                     f"[{tag}, {dur}]")
-    return "\n".join(lines)
-
-def run_cancel_cron(job_id: str) -> str:
-    return cancel_job(job_id)
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)

@@ -1744,3 +1744,35 @@ tools 里最大的一块。它们只依赖路径解析/边界门、`documents`/`
 - 运行时状态用「采集函数留在入口、纯逻辑放 src」的方式拆，既保持单向依赖，
   又不改变原有 monkeypatch 入口。
 - 测试隔离要按真实数据流设计：会话隔离的最小单位是事件流，不是 scope 字符串。
+## 拆分任务与 cron 工具
+
+**问题**：任务与 cron 共 8 个 handler 约 60 行，混在 tools 里。它们不依赖 harness
+状态，只调用 `task_system` / `cron_scheduler`，再拼输出文本。
+
+**做法**：
+
+- 新增 `src/tool_tasks.py`：`run_create_task` / `run_list_tasks` / `run_get_task` /
+  `run_claim_task` / `run_complete_task` / `run_schedule_cron` / `run_list_crons` /
+  `run_cancel_cron`，直接依赖两个子系统的公开函数。
+- tools 不再保留同名定义，改为从 `tool_tasks` 导入并再导出；`tool_registry` 与
+  `TOOLS` schema 不变。
+- 依赖按模块名调用（`tool_tasks.schedule_job`），测试可以只替换一个名字，
+  不用拉起真实 cron 存储。
+
+**踩过的坑**：
+
+- 这组没有 `_h()` 依赖，因此不需要薄包装；直接 import 即可，注册表引用的是同一个
+  函数对象。
+- 再导出的 8 个名字都会被 Ruff 当作未使用（注册表用的是模块全局查找），必须整块
+  `# noqa: F401` 并注明「注册表与 Teammate 从这里取 handler」。
+- `cron_scheduler` 的持久化路径是模块级常量，handler 测试要替换 `scheduled_jobs`
+  与 `schedule_job`，不能真写 `.cache/crons.json`。
+
+**测试**：新增 `tests/test_tool_tasks.py`（空列表、owner/依赖格式、任务不存在、
+cron 错误透传、调度/列表/取消、空 cron 列表）；总回归 1025 passed / 1 skipped；
+`tools.py` 1357 → 1309 行。
+
+**收获**：
+
+- 没有运行时状态依赖的域可以直接「搬函数 + 再导出」，不需要注入层。
+- 再导出的 noqa 是兼容声明：它告诉后来者这些名字不是死代码，而是注册表的入口。
