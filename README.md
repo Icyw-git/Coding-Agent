@@ -29,6 +29,12 @@ Harness Agent 是一个面向大语言模型应用的 Agent Harness：它负责�
 `/resume ` 可补全会话 ID，`/cd ` 可补全当前工作区下的目录（支持带空格的路径），
 `/help ` 和 `/rewind --` 也支持补全。普通对话不弹出命令菜单，非交互输入仍按纯文本读取。
 
+终端体验与 Codex / Pi 对齐：启动时显示会话、模型、工作区、执行档位与沙箱状态；等待模型时
+在最后一行显示 `⏳ 已用时 · 当前工具`，回答开始后自动清除；每个工具完成后打印一行
+`• bash  pytest -q  3.40s ✓`（后台任务标 `↗后台`，拒绝/报错标 `✗`）。输入支持跨会话历史
+（`.cache/cli_history`，↑ 前缀搜索），Ctrl-J 插入换行、Enter 提交；回合中 Ctrl-C 中断，
+空闲时第一次 Ctrl-C 只提示、第二次退出，Ctrl-D 直接退出。非交互/管道模式保持纯文本输出。
+
 - `/new`（`/n`）：新建会话；先选择工作区（当前目录、已登记工作区和最近会话目录按最近
   活跃排序；也可以选「浏览电脑中的文件夹…」逐级挑选：在首行「进入此文件夹」按 Enter
   确认，在子目录上按 Enter 进入，不需要输入路径）。`/new --ws <序号|名称|路径>` 直接
@@ -588,6 +594,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_schemas.py` | 37 个工具的 schema（顺序即契约，有快照测试锁定） |
 | `src/tool_teams.py` | 团队协作：派生 teammate、消息收发、shutdown/plan 协议 |
 | `src/background_watch.py` | `/watch`：后台任务列表与跟踪到终态（Ctrl-C 可脱离） |
+| `src/tool_activity.py` | CLI 工具活动行：参数摘要、耗时与成功/失败标记 |
 | `src/tool_exec.py` | `bash` / 后台任务 / `web_fetch`：超时、审批门与抓取边界 |
 | `src/tool_tasks.py` | 任务与 cron 工具：封装 task_system/cron_scheduler 并统一输出 |
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |

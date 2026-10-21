@@ -791,13 +791,15 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
 
 
 def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
-                   on_event=None):
+                   on_event=None, on_activity=None):
     """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
     返回 (name, args, tool 消息 dict, images)。images 是 view_image 的附件引用，
     由调用方作为独立 user 消息追加（tool 角色里放图片各家支持不一致）。
     主循环与 teammate 共用同一条安全/兜底路径。
     hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。
-    on_event：无头 JSONL 的事件出口，按 ``(类型, 载荷)`` 回调。"""
+    on_event：无头 JSONL 的事件出口，按 ``(类型, 载荷)`` 回调。
+    on_activity：交互终端的工具活动行出口，参数为
+    ``(name, args, elapsed, failed, background)``。"""
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments)
@@ -825,6 +827,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     else:
         blocked = None
     images = []
+    background_started = False
+    started = time.perf_counter()
     if blocked:
         output = blocked
     elif name not in registry:
@@ -833,6 +837,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
         try:
             if background and should_run_background(name, args):
                 bg_id = start_background_task(tool_call, registry)
+                background_started = True
                 output = (f"[Background task {bg_id} started] "
                           f"Command: {args.get('command', '')}. "
                           f"Result will be available when complete.")
@@ -844,6 +849,11 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
         except Exception as e:
             # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
             output = f"Error: {e}"
+    elapsed = time.perf_counter() - started
+    if on_activity is not None:
+        from tool_activity import is_failure
+        on_activity(name, args, elapsed, is_failure(output),
+                    background_started)
     if hooks:
         trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
@@ -870,6 +880,22 @@ PARALLEL_SAFE_TOOLS = frozenset({
     'list_crons', 'check_inbox', 'load_skill', 'background_output',
 })
 PARALLEL_MAX_WORKERS = 4
+
+
+ACTIVE_TICKER = None   # 交互回合进行中的进度行；工具活动行借它原子换行
+
+
+def _print_tool_activity(name, args, elapsed, failed, background=False):
+    """交互终端的工具活动行；管道、测试与无头模式保持 stdout 干净。"""
+    if not sys.stdout.isatty():
+        return
+    from tool_activity import format_line
+    line = format_line(name, args, elapsed, failed=failed,
+                       background=background)
+    if ACTIVE_TICKER is not None:
+        ACTIVE_TICKER.emit_line(line)
+        return
+    print(line, flush=True)
 
 
 def _batch_bash_commands(tool_calls):
@@ -905,19 +931,29 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
         parallel = (commands is not None
                     and all(is_readonly_command(command) for command in commands))
     if parallel:
+        activities = {}
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)   # 原序登记全部 started
+
+        def run_parallel(tc):
+            return contextvars.copy_context().run(
+                exec_tool_call, tc, on_event=on_event,
+                on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
+
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
-            executed = list(pool.map(
-                lambda tc: contextvars.copy_context().run(
-                    exec_tool_call, tc, on_event=on_event),
-                tool_calls))
+            executed = list(pool.map(run_parallel, tool_calls))
+        for tool_call in tool_calls:   # 并行完成顺序不定，按原序补打活动行
+            activity = activities.get(tool_call.id)
+            if activity is not None:
+                _print_tool_activity(*activity)
     else:
         executed = []
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)
-            executed.append(exec_tool_call(tool_call, on_event=on_event))
+            executed.append(exec_tool_call(
+                tool_call, on_event=on_event,
+                on_activity=_print_tool_activity))
     for _, _, tool_message, _images in executed:   # 原序写回结果
         tool_messages.append(tool_message)
         session_store.append_message(tool_message)
@@ -1851,9 +1887,13 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
-    print(f"  会话：{session_store.session_summary()['title']}")
-    print(f'  工作区：{WORKDIR}')
-    print('  输入消息开始对话；/ 查看命令，/resume 恢复会话，/quit 退出。')
+    policy = load_policy()
+    print(f"  会话 {session_store.session_id[:8]} · "
+          f"{session_store.session_summary()['title']}")
+    print(f"  模型 {os.getenv('LLM_MODEL_ID', '未配置')} · 工作区 {WORKDIR}")
+    print(f'  档位 {policy.sandbox_mode} / 审批 {policy.approval_policy} · '
+          f'沙箱 {sandbox.configured_mode()}')
+    print('  输入消息开始；/ 命令 · /resume 恢复 · Ctrl-C 中断 · Ctrl-D 退出')
 
     from cli_input import choose_session, create_reader
 
@@ -1865,12 +1905,22 @@ def run_repl(initial_messages:list, session_store=None):
 
     read_line = create_reader(lambda: WORKDIR, session_choices)
 
+    interrupted = 0
     while True:
         try:
             line=read_line('\n> ').strip()
-        except (EOFError,KeyboardInterrupt):
+            interrupted = 0
+        except EOFError:
             print('\n[会话已结束]')
             break
+        except KeyboardInterrupt:
+            # Codex 习惯：第一次 Ctrl-C 只提示，第二次才退出，避免误触丢会话。
+            if interrupted:
+                print('\n[会话已结束]')
+                break
+            interrupted += 1
+            print('\n  再按一次 Ctrl-C 退出（Ctrl-D 也可退出）。')
+            continue
         if not line:
             continue
         if line.startswith('/') or line == 'cd' or line.startswith('cd '):
@@ -1995,12 +2045,34 @@ def run_repl(initial_messages:list, session_store=None):
         messages[:] = session_store.rebuild_openai_history(recover_pending=True)
         messages.append({'role':'user','content':line})
         session_store.append_message(messages[-1])
+        global ACTIVE_TICKER
+        ticker = None
+        if sys.stdout.isatty():
+            from turn_progress import ProgressTicker, TurnProgress
+            progress = TurnProgress()
+            try:
+                progress.follow(session_store, session_store.path.stat().st_size)
+            except OSError:
+                progress.follow(session_store, 0)
+            ticker = ProgressTicker(progress).start()
+            ACTIVE_TICKER = ticker
+
+        def on_delta(part):
+            nonlocal ticker
+            if ticker is not None:
+                ticker.stop()   # 正文开始上屏前清掉进度行
+                ticker = None
+            print(part, end='', flush=True)
+
         try:
             # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
-            agent_loop(messages, session_store=session_store,
-                       on_delta=lambda part: print(part, end='', flush=True))
+            agent_loop(messages, session_store=session_store, on_delta=on_delta)
         except KeyboardInterrupt:
             print('\n[会话已中断]')
+        finally:
+            if ticker is not None:
+                ticker.stop()
+                ACTIVE_TICKER = None
         messages[:]=session_store.rebuild_openai_history(recover_pending=True)
 
 

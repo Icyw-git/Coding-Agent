@@ -308,12 +308,38 @@ class SlashCompleter(Completer):
         yield from directory_completions(argument, self.workspace)
 
 
+def _history_path():
+    """跨会话的命令历史；不可写时退回无历史，不影响启动。"""
+    try:
+        base = Path(__file__).resolve().parents[1] / '.cache'
+        base.mkdir(parents=True, exist_ok=True)
+        return base / 'cli_history'
+    except OSError:
+        return None
+
+
 def create_reader(workspace, sessions):
     """Use plain input for pipes and test runners, never force a terminal UI."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return input
-    session = PromptSession(completer=SlashCompleter(workspace, sessions),
-                            complete_while_typing=True)
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+
+    bindings = KeyBindings()
+
+    @bindings.add('c-j')
+    def _insert_newline(event):
+        # Enter 提交、Ctrl-J 换行：多行消息不用先学 /paste。
+        event.current_buffer.insert_text('\n')
+
+    path = _history_path()
+    session = PromptSession(
+        completer=SlashCompleter(workspace, sessions),
+        complete_while_typing=True,
+        key_bindings=bindings,
+        history=FileHistory(str(path)) if path is not None else None,
+        enable_history_search=True,
+    )
     return session.prompt
 
 

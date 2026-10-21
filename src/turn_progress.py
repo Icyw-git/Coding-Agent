@@ -1,5 +1,7 @@
 """Read live tool progress from the existing session event stream."""
 
+import sys
+import threading
 import time
 
 
@@ -59,3 +61,63 @@ class TurnProgress:
             'elapsed': int(elapsed),
             'elapsed_text': format_duration(elapsed),
         }
+
+
+def format_progress_line(snapshot: dict) -> str:
+    """单行进度：阶段、当前工具与已用时；不换行，由调用方负责清除。"""
+    elapsed = snapshot.get('elapsed_text') or format_duration(
+        snapshot.get('elapsed', 0))
+    if snapshot.get('phase') == 'tool':
+        return f"  ⏳ {elapsed} · 正在执行 {snapshot.get('tool') or '工具'}"
+    return f'  ⏳ {elapsed} · 思考中（Ctrl-C 中断）'
+
+
+class ProgressTicker:
+    """在等待模型/工具时于同一行刷新进度；停止时清除该行。
+
+    只用于交互终端：非 TTY（测试、管道、无头）不启动线程，避免污染 stdout。
+    """
+
+    def __init__(self, progress: TurnProgress, stream=None, interval: float = 0.5):
+        self.progress = progress
+        self.stream = stream or sys.stdout
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def start(self) -> 'ProgressTicker':
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self._write(format_progress_line(self.progress.snapshot()))
+
+    def _write(self, text: str) -> None:
+        with self._lock:
+            self.stream.write('\r\033[K' + text)
+            self.stream.flush()
+
+    def emit_line(self, text: str) -> None:
+        """在进度行位置原子地换行输出一条（工具活动行），避免与 tick 互相覆盖。"""
+        with self._lock:
+            self.stream.write('\r\033[K' + text + '\n')
+            self.stream.flush()
+
+    def stop(self) -> None:
+        """停止并清除进度行；可重复调用。"""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+        with self._lock:
+            self.stream.write('\r\033[K')
+            self.stream.flush()
+
+    def __enter__(self) -> 'ProgressTicker':
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.stop()

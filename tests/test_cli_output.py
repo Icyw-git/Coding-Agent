@@ -120,3 +120,78 @@ def test_manual_compact_replaces_history_and_records_event(monkeypatch, tmp_path
     assert messages == [{'role': 'user', 'content': '[Compacted]\n\nsummary'}]
     assert any(event['type'] == 'compaction' for event in store.read_events())
     assert '完整记录已保存' in capsys.readouterr().out
+
+
+def test_exec_tool_call_prints_activity_line_on_tty(monkeypatch):
+    import io
+    import sys
+
+    import harness
+
+    class _TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    fake = _TTY()
+    monkeypatch.setattr(sys, 'stdout', fake)
+    tool_call = SimpleNamespace(
+        id='call-1',
+        function=SimpleNamespace(name='read', arguments='{"path":"a.py"}'))
+
+    harness.exec_tool_call(tool_call, registry={'read': lambda path: 'ok'},
+                           hooks=False,
+                           on_activity=harness._print_tool_activity)
+
+    output = fake.getvalue()
+    assert '• read' in output and 'a.py' in output and '✓' in output
+
+
+def test_exec_tool_call_is_silent_without_a_tty(capsys):
+    import harness
+
+    tool_call = SimpleNamespace(
+        id='call-1',
+        function=SimpleNamespace(name='read', arguments='{"path":"a.py"}'))
+
+    harness.exec_tool_call(tool_call, registry={'read': lambda path: 'ok'},
+                           hooks=False)
+
+    assert capsys.readouterr().out == ''
+
+
+def test_repl_header_shows_model_policy_and_shortcuts(tmp_path, monkeypatch, capsys):
+    import cli_input
+    import harness
+
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
+    monkeypatch.setenv('LLM_MODEL_ID', 'demo-model')
+    store = harness.SessionEventStore(tmp_path, session_id='abcdef1234567890')
+
+    harness.run_repl([], store)
+
+    output = capsys.readouterr().out
+    assert 'abcdef12' in output          # 会话只显示短前缀
+    assert 'demo-model' in output
+    assert '档位' in output and '沙箱' in output
+    assert 'Ctrl-C' in output
+
+
+def test_first_ctrl_c_hints_and_second_exits(tmp_path, monkeypatch, capsys):
+    import cli_input
+    import harness
+
+    calls = []
+
+    def reader(_prompt):
+        calls.append(1)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: reader)
+    store = harness.SessionEventStore(tmp_path, session_id='s1')
+
+    harness.run_repl([], store)
+
+    output = capsys.readouterr().out
+    assert '再按一次 Ctrl-C' in output
+    assert '会话已结束' in output
+    assert len(calls) == 2
