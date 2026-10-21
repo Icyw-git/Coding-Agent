@@ -2996,3 +2996,25 @@ args`
 
 **测试**：工具 50 行点击 10↔40、最终回答兜底（无事件）、兜底不与正常
 流式重复；总回归 1154 passed / 1 skipped，旧 UI 64 passed。
+## 对话无输出与状态栏缺失：session_store 断链
+
+用户反馈“输入后只有 Working/用时，没有回答；上一轮结果要 resume 才出现”。定位到
+worker 调 `harness.agent_loop(self._messages)` 时**没有传 `session_store`**：
+
+- `agent_loop` 每次都会新建一个 SessionEventStore（不同 session id）；
+- 事件桥给事件打上新 session id，App 只渲染当前会话，于是本轮 user/assistant/tool
+  事件全被过滤；
+- 会话文件确实写了新内容，所以 resume 时能重建出来，看起来像“下一轮才刷新”。
+
+修复：
+
+- `_run_agent` 把 App 当前的 `self._store` 作为 `session_store=` 传入；没有 store
+  （测试/独立用法）才退回旧行为；
+- worker 捕获非 KeyboardInterrupt 异常，转成可见的 `Error:` 回答，不再无声退出；
+- footer 增加 `ctx N% 50.0k/200.0k`、`cache N%`（cached/prompt，clamp 100%），
+  并处理 `round_end` 的 prompt/cached/total/cost；状态栏先放指标再放较长的
+  workspace，窄终端不会被挤掉；
+- `/status` 同步显示 cache 命中率。
+
+**测试**：worker 传入的 store 与 App 一致、事件能落块；footer 的 ctx/cache 文案；
+总回归 1156 passed / 1 skipped，旧 UI 64 passed。

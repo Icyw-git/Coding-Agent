@@ -31,6 +31,20 @@ from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
 
+
+def _short_count(value) -> str:
+    """12345 -> 12.3k，避免状态栏在窄终端被挤掉。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number >= 1_000_000:
+        return f'{number / 1_000_000:.1f}m'
+    if number >= 10_000:
+        return f'{number / 1000:.1f}k'
+    return str(number)
+
+
 FOLLOW_END = True
 SUGGESTION_LIMIT = 6
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
@@ -297,20 +311,34 @@ class HarnessApp(App):
         try:
             import harness
             parts.append(harness.os.getenv('LLM_MODEL_ID', '') or '(model unset)')
+        except Exception:
+            pass
+        ctx_pct = self._status.get('ctx_pct')
+        ctx_tokens = self._status.get('ctx_tokens')
+        ctx_window = self._status.get('ctx_window')
+        if ctx_pct is not None:
+            detail = f'ctx {float(ctx_pct):.0f}%'
+            if ctx_tokens and ctx_window:
+                detail += f' {_short_count(ctx_tokens)}/{_short_count(ctx_window)}'
+            parts.append(detail)
+        tokens = self._status.get('tokens')
+        if tokens:
+            parts.append(f'tok {_short_count(tokens)}')
+        prompt_tokens = self._status.get('prompt_tokens')
+        cached_tokens = self._status.get('cached_tokens')
+        if prompt_tokens and cached_tokens is not None:
+            parts.append(f'cache {100 * min(1.0, cached_tokens / prompt_tokens):.0f}%')
+        if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
+            symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
+            parts.append(f"~{symbol}{self._status['cost']}")
+        try:
+            import harness
             workspace = harness.get_workdir()
             branch = harness.current_branch(workspace)
             label = f'{workspace.name} ({branch})' if branch else workspace.name
             parts.append(str(label))
         except Exception:
             pass
-        if self._status.get('ctx_pct') is not None:
-            parts.append(f"ctx {self._status['ctx_pct']:.0f}%")
-        tokens = self._status.get('tokens')
-        if tokens:
-            parts.append(f'tok {tokens}')
-        if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
-            symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
-            parts.append(f"~{symbol}{self._status['cost']}")
         queued = len(self._pending)
         if queued:
             parts.append(f'{queued} queued')
@@ -535,6 +563,21 @@ class HarnessApp(App):
                 payload.get('args') or {},
                 str(payload.get('title', 'Permission needed')),
                 str(payload.get('risk', 'warning'))))
+        elif kind == 'round_end':
+            self._status.update({
+                'prompt_tokens': payload.get('prompt_tokens'),
+                'cached_tokens': payload.get('cached_tokens'),
+                'tokens': payload.get('total_tokens'),
+                'cost': payload.get('cost'),
+                'cost_source': payload.get('cost_source'),
+            })
+            window = self._status.get('ctx_window')
+            prompt_tokens = payload.get('prompt_tokens')
+            if window and prompt_tokens:
+                self._status['ctx_tokens'] = prompt_tokens
+                self._status['ctx_pct'] = min(
+                    100.0, 100.0 * prompt_tokens / max(1, int(window)))
+            self._refresh_footer()
         elif kind == 'status':
             self._status.update(payload)
             self._refresh_footer()
@@ -679,6 +722,11 @@ class HarnessApp(App):
                 lines.append(f"context: {state['ctx_pct']:.0f}%")
             if state.get('tokens'):
                 lines.append(f"tokens: {state['tokens']}")
+            prompt_tokens = state.get('prompt_tokens')
+            cached_tokens = state.get('cached_tokens')
+            if prompt_tokens and cached_tokens is not None:
+                lines.append(
+                    f"cache: {100 * min(1.0, cached_tokens / prompt_tokens):.0f}%")
             self._notice(chr(10).join(lines))
         elif verb == 'model':
             if argument:
@@ -1157,9 +1205,13 @@ class HarnessApp(App):
                         # agent_loop 仍会 print tokens/结果；Textual 已接管屏幕，
                         # 这些写入会盖住 UI 并拖慢重绘，全部收进内存。
                         with contextlib.redirect_stdout(io.StringIO()):
-                            answer = harness.agent_loop(self._messages)
+                            kwargs = ({'session_store': self._store}
+                                      if self._store is not None else {})
+                            answer = harness.agent_loop(self._messages, **kwargs)
                 except KeyboardInterrupt:
                     pass
+                except Exception as exc:
+                    answer = f'Error: {type(exc).__name__}: {exc}'
                 finally:
                     turn_control.end_turn()
                     harness.permission_gate.use_ui = False

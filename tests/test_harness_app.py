@@ -871,3 +871,49 @@ def test_final_answer_fallback_does_not_duplicate_stream(monkeypatch):
             assert [b.payload['text'] for b in assistants] == ['hello world']
 
     asyncio.run(scenario())
+
+
+def test_worker_passes_current_session_store(tmp_path, monkeypatch):
+    store = _temp_store(tmp_path)
+    seen = {}
+
+    def fake_loop(messages, **kwargs):
+        seen.update(kwargs)
+        ui_events.bus.emit('assistant_text', text='from store',
+                           session_id=store.session_id)
+        return 'from store'
+
+    monkeypatch.setattr(harness, 'agent_loop', fake_loop)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('question')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if any(b.kind == 'assistant' for b in app.model.snapshot()):
+                    break
+            assert seen.get('session_store') is store
+            assert any(b.kind == 'assistant' for b in app.model.snapshot())
+
+    asyncio.run(scenario())
+
+
+def test_footer_shows_context_and_cache_hit_rate():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(100, 20)) as pilot:
+            app._apply(UIEvent('status', {
+                'ctx_pct': 25.0, 'ctx_tokens': 50_000,
+                'ctx_window': 200_000, 'tokens': 12_000,
+                'prompt_tokens': 50_000, 'cached_tokens': 25_000,
+                'cost': '0.0123', 'cost_source': 'builtin',
+            }))
+            await pilot.pause()
+            footer = str(app._footer.render())
+            assert 'ctx 25%' in footer
+            assert 'cache 50%' in footer
+
+    asyncio.run(scenario())

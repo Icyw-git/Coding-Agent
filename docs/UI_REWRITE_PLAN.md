@@ -37,6 +37,9 @@
 - P5i：响应体验：提交后立即刷出用户消息；屏蔽 agent_loop 对 Textual 屏幕的
   print；回合结束用 agent_loop 返回值兜底最后一答（先 drain 事件防重复）；
   工具块点击在 10/40 行预览间切换（show more/show less），Ctrl+O 仍展开全文。
+- P5j：修复 worker 未把 `session_store` 传给 `agent_loop` 导致事件 session_id
+  对不上（UI 不显示本轮结果，重开才从会话文件刷出）；footer 增加上下文
+  `ctx N% 50k/200k` 与 `cache N%`，并处理 `round_end` 的 usage。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21
