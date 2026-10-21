@@ -572,7 +572,23 @@ def run_doctor() -> int:
           f'approval_policy={policy.approval_policy}（策略级判定）')
     print(f'[os-sandbox] {sandbox.ENV}={sandbox.configured_mode()}'
           f'（Windows 低完整性，仅约束 shell 子进程）')
+    print(f'[optional] documents: {_document_extras_status()}')
     return 0 if all(passed for _, passed in checks) else 1
+
+
+def _document_extras_status() -> str:
+    """文档工具是可选依赖：doctor 只报告可用性，缺包不算启动失败。"""
+    from importlib.util import find_spec
+
+    missing = [
+        label for label, module in (
+            ('pypdf', 'pypdf'), ('pypdfium2', 'pypdfium2'), ('Pillow', 'PIL'))
+        if find_spec(module) is None
+    ]
+    if not missing:
+        return 'installed'
+    return (f"missing {', '.join(missing)} "
+            f'(pip install -r requirements-docs.txt)')
 
 
 # ============================================================

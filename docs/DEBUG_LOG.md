@@ -1519,3 +1519,26 @@ Office 文本抽取走标准库，PDF 文本抽取与页面渲染需要可选包
 - 「拆文件」不等于「解耦」：判断标准是模块能否在没有入口的情况下被 import 并测试。
 - 依赖方向要单向：入口采集 → src 纯逻辑。反向回读会把入口差异带进共享模块。
 - 薄包装层是保留兼容补丁点的低成本方案，代价只是入口多二十来行接线。
+## 基础安装验证
+
+**问题**：`requirements.txt` 把 pytest 混进运行时依赖；也从未在「只装基础依赖」的环境验证过，
+可选依赖一旦泄漏成必需依赖，只有用户装完才会炸。
+
+**做法**：
+
+- pytest 移到 `requirements-dev.txt`，`requirements.txt` 只保留 openai / python-dotenv /
+  prompt-toolkit。
+- `--doctor` 增加 `[optional] documents:` 行，报告 pypdf / pypdfium2 / Pillow 是否可用并指向
+  `requirements-docs.txt`；缺包只提示，不影响退出码。
+- 用 `sys.meta_path` 拦截器模拟缺包：`entrypoint` / `harness` 可导入，35 个工具完成注册，
+  `build_system()` 正常，doctor 退出 0，`read_document` / `render_document` 返回安装提示。
+
+**踩过的坑**：
+
+- 本机新建 venv 安装 `requirements.txt` 时 pip 报 openai wheel hash mismatch（期望 264f…，
+  实得 3f02…）。这是本机网络/镜像的问题，不是依赖关系问题；为不阻塞验证改用拦截器。
+- 拦截器只拦 import、不拦 `find_spec`，所以 `--doctor` 的缺包分支必须在真空环境才准确；
+  测试里改用 monkeypatch `importlib.util.find_spec` 覆盖 installed / missing 两条分支。
+- 拦截器模拟不了「包存在但版本太老」：版本下限仍只能靠干净环境安装验证。
+
+**测试**：entrypoint / prompt assembly / documents 回归 33 passed；`ruff` 通过。

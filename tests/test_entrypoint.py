@@ -64,3 +64,13 @@ def test_main_doctor_returns_without_starting_services(monkeypatch):
 
     assert entrypoint.main(['--doctor']) == 3
     assert called == ['doctor']
+
+
+def test_doctor_reports_optional_document_extras(monkeypatch):
+    monkeypatch.setattr('importlib.util.find_spec', lambda name: None)
+    missing = entrypoint.harness._document_extras_status()
+    assert 'pypdf' in missing and 'pypdfium2' in missing
+    assert 'requirements-docs.txt' in missing
+
+    monkeypatch.setattr('importlib.util.find_spec', lambda name: object())
+    assert entrypoint.harness._document_extras_status() == 'installed'

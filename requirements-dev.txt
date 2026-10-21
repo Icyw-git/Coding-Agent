@@ -10,4 +10,5 @@
 #
 # 全量回归需要可选的文档依赖（test_documents / test_document_render）：
 #   <env>\python.exe -m pip install -r requirements-docs.txt
+pytest>=8.0
 ruff==0.17.1

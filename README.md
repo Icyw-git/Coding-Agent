@@ -457,7 +457,8 @@ python -m pip install -r requirements.txt
 - DOCX/PPTX 页面渲染：在可选依赖之外还需要系统里可用的 LibreOffice（`soffice`）；
   只读文字不需要它。
 
-缺少可选包时只会影响对应工具并返回安装提示，其他工具不受影响。LibreOffice 装在非标准
+缺少可选包时只会影响对应工具并返回安装提示，其他工具不受影响。`pytest`/`ruff`
+属于开发工具（见 `requirements-dev.txt`），不参与运行时安装。LibreOffice 装在非标准
 目录时，用 `HARNESS_SOFFICE` 指向 `soffice.exe`
 （例如 `D:\Tools\LibreOffice\program\soffice.exe`）；该变量只认文件，不做 PATH 回退。
 
@@ -541,6 +542,7 @@ npm run preview
 ## 测试
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
