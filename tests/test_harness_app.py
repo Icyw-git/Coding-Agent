@@ -555,3 +555,77 @@ def test_review_runs_in_background_and_updates_block(monkeypatch):
             assert '1 issue' in app.model.snapshot()[-1].payload['text']
 
     asyncio.run(scenario())
+
+
+def _temp_store(tmp_path, messages=({'role': 'user', 'content': 'hello'},)):
+    import harness
+    store = harness.SessionEventStore(tmp_path)
+    for message in messages:
+        store.append_message(dict(message))
+    return store
+
+
+def test_session_rename_fork_and_new(tmp_path, monkeypatch):
+    import harness
+    store = _temp_store(tmp_path)
+
+    def fake_new(workspace=None, session_id=None):
+        return harness.SessionEventStore(tmp_path / 'new')
+
+    monkeypatch.setattr(harness, 'start_new_session', fake_new)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/rename Fresh title')
+            await pilot.pause()
+            assert app._title == 'Fresh title'
+            assert store.session_summary()['title'] == 'Fresh title'
+
+            old_id = app._session_id
+            app.submit_text('/fork')
+            await pilot.pause()
+            assert app._session_id != old_id
+            assert app._store.session_id == app._session_id
+            assert any(block.kind == 'user' for block in app.model.snapshot())
+
+            app.submit_text('/new')
+            await pilot.pause()
+            assert app._session_id != old_id
+            assert app.model.snapshot()[-1].kind == 'notice'
+
+    asyncio.run(scenario())
+
+
+def test_checkpoints_and_compact_commands(tmp_path, monkeypatch):
+    import harness
+    store = _temp_store(tmp_path)
+    monkeypatch.setattr(harness, 'get_checkpoint_manager',
+                        lambda store: object())
+    monkeypatch.setattr(harness, 'format_checkpoint_list',
+                        lambda manager: 'cp-1  manual')
+    monkeypatch.setattr(harness, 'compact_history',
+                        lambda messages: [{'role': 'user',
+                                           'content': '[Compacted]\n\nsummary'}])
+    monkeypatch.setattr(harness, '_record_compaction',
+                        lambda store, messages, strategy: None)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/checkpoints')
+            await pilot.pause()
+            assert 'cp-1' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text('/compact')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                text = str(app.model.snapshot()[-1].payload.get('text', ''))
+                if '已压缩' in text:
+                    break
+            assert '已压缩' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())

@@ -1595,7 +1595,7 @@ class CCApp(App):
 
 
 def run(msgs: list, session_id: str | None = None,
-        title: str = '') -> None:
+        title: str = '', session_store=None) -> None:
     """以 Textual 模式启动会话（阻塞直到 agent_loop 结束）。
 
     调用方（harness __main__）已保证 stdout 为 TTY；此处只负责切换渲染后端。"""

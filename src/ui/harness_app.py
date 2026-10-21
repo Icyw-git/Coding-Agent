@@ -184,12 +184,14 @@ class HarnessApp(App):
     """
 
     def __init__(self, messages: list | None = None,
-                 session_id: str | None = None, title: str = '') -> None:
+                 session_id: str | None = None, title: str = '',
+                 session_store=None) -> None:
         super().__init__()
         self._source_messages = list(messages or [])
         self._messages = list(messages or [])
         self._session_id = session_id or ''
         self._title = title
+        self._store = session_store
         self.model = ConversationModel()
         self.doc_layout = TranscriptLayout(self._render_block)
         self.view = Transcript(self.model, self.doc_layout,
@@ -652,6 +654,16 @@ class HarnessApp(App):
             self._notice('Toggled the most recent tool block.')
         elif verb == 'approvals':
             self._notice(harness.format_pending_approvals())
+        elif verb == 'new':
+            self.start_new_session(argument)
+        elif verb == 'rename':
+            self.rename_session(argument)
+        elif verb == 'fork':
+            self.fork_session(argument)
+        elif verb == 'checkpoints':
+            self.show_checkpoints()
+        elif verb == 'compact':
+            self.start_compact(argument)
         elif verb == 'sessions':
             self.open_session_picker()
         elif verb == 'resume':
@@ -730,6 +742,120 @@ class HarnessApp(App):
             self.model.update(block_id, text=str(text))
             self._mark_dirty()
 
+    def _adopt_session(self, store, messages: list, title: str = '') -> None:
+        self._store = store
+        self._session_id = store.session_id
+        self._messages = list(messages)
+        self._title = title or self._title
+        self.model.clear()
+        self._load_history(messages)
+        self._refresh_footer()
+        self._mark_dirty()
+
+    def start_new_session(self, argument: str = '') -> None:
+        """`/new`：在当前工作区新建会话（Pi `/new` / newSession）。"""
+        import harness
+        if argument and not argument.replace('-', '').replace('_', '').isalnum():
+            self._notice('用法：/new [会话ID]', level='error')
+            return
+        try:
+            store = harness.start_new_session(workspace=harness.get_workdir(),
+                                              session_id=argument or None)
+            summary = store.session_summary()
+        except Exception as exc:
+            self._notice(f'New session failed: {exc}', level='error')
+            return
+        self._adopt_session(store, [], summary.get('title', ''))
+        self._notice(f"New session: {store.session_id}")
+
+    def rename_session(self, argument: str) -> None:
+        if not self._store:
+            self._notice('No session context; cannot rename.', level='error')
+            return
+        if not argument:
+            self._notice('用法：/rename <标题>', level='error')
+            return
+        title = self._store.append_session_title(argument[:80], source='user')
+        self._title = title['title']
+        self._refresh_footer()
+        self._notice(f"Session title: {self._title}")
+
+    def fork_session(self, argument: str = '') -> None:
+        """`/fork [事件序号]`，无参等价 Pi `/clone`（复制到当前叶）。"""
+        if not self._store:
+            self._notice('No session context; cannot fork.', level='error')
+            return
+        upto = None
+        if argument:
+            if not argument.isdigit():
+                self._notice('用法：/fork [事件序号]', level='error')
+                return
+            upto = int(argument)
+        try:
+            forked = self._store.__class__.fork(self._store, upto_seq=upto)
+            messages = forked.rebuild_openai_history(recover_pending=True)
+            summary = forked.session_summary()
+        except Exception as exc:
+            self._notice(f'Fork failed: {exc}', level='error')
+            return
+        self._adopt_session(forked, messages, summary.get('title', ''))
+        self._notice(f'Forked to {forked.session_id} (original kept).')
+
+    def show_checkpoints(self) -> None:
+        import harness
+        if not self._store:
+            self._notice('No session context.', level='error')
+            return
+        try:
+            manager = harness.get_checkpoint_manager(self._store)
+            self._notice(harness.format_checkpoint_list(manager))
+        except Exception as exc:
+            self._notice(f'Checkpoints failed: {exc}', level='error')
+
+    def start_compact(self, instructions: str = '') -> None:
+        """`/compact`：后台压缩当前上下文（Pi `/compact [instructions]`）。"""
+        if self._busy:
+            self._notice('Cannot compact while a request is running.')
+            return
+        if not self._store:
+            self._notice('No session context.', level='error')
+            return
+        if not self._messages:
+            self._notice('当前会话没有可压缩的内容。')
+            return
+        self._busy = True
+        block = self.model.append('notice', {'text': 'compact: running…'})
+        self._mark_dirty()
+        threading.Thread(target=self._run_compact,
+                         args=(block.id, list(self._messages)),
+                         daemon=True).start()
+
+    def _run_compact(self, block_id: str, messages: list) -> None:
+        import harness
+        try:
+            compacted = harness.compact_history(list(messages))
+            harness._record_compaction(self._store, compacted, 'manual')
+        except Exception as exc:
+            self.call_from_thread(self._compact_done, block_id, None,
+                                  f'Compact failed: {exc}')
+            return
+        self.call_from_thread(self._compact_done, block_id, compacted, '')
+
+    def _compact_done(self, block_id: str, compacted, error: str = '') -> None:
+        self._busy = False
+        if compacted is not None:
+            self._messages[:] = compacted
+            text = (f'已压缩会话上下文：{len(compacted)} 条消息。'
+                    '完整记录已保存。')
+        else:
+            text = error
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=text)
+        self._mark_dirty()
+        self._refresh_footer()
+        if self._pending.snapshot() and not self._busy:
+            self._start_worker()
+
     def open_session_picker(self) -> None:
         import harness
         rows = harness.session_rows(limit=None, include_empty=False)
@@ -779,6 +905,7 @@ class HarnessApp(App):
             return
         if summary.get('workspace'):
             harness.set_workspace(summary['workspace'])
+        self._store = store
         self._messages = list(messages)
         self._session_id = store.session_id
         self.model.clear()
@@ -900,5 +1027,6 @@ class HarnessApp(App):
 
 
 def run(messages: list | None = None, session_id: str | None = None,
-        title: str = '') -> None:
-    HarnessApp(messages or [], session_id=session_id, title=title).run()
+        title: str = '', session_store=None) -> None:
+    HarnessApp(messages or [], session_id=session_id, title=title,
+               session_store=session_store).run()

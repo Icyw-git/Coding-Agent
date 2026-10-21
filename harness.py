@@ -2210,7 +2210,8 @@ def run_repl(initial_messages:list, session_store=None):
             try:
                 module.run(messages,
                            session_id=session_store.session_id,
-                           title=session_store.session_summary()['title'])
+                           title=session_store.session_summary()['title'],
+                           session_store=session_store)
                 return
             except Exception as exc:   # 渲染驱动/终端不兼容：回退行式
                 print(f'[ui] Textual 运行失败，回退行式 REPL：'

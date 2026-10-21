@@ -2880,3 +2880,32 @@ args`
 
 **测试**：新增 diff/sandbox、cache 委派、model picker、review 后台进度块用例；
 总回归 1142 passed / 1 skipped，旧 UI 64 passed。
+## 会话命令调研：Pi 的命名与模型
+
+先读 Pi `interactive-mode.ts` 的会话相关 handler，结论是**同名不同义**要分开看：
+
+| Pi | 语义 | 我们的对应 | 处理 |
+|---|---|---|---|
+| `/new` | `runtimeHost.newSession()`（可含工作区/信任选择） | `/new` 新建事件会话 | 迁移，当前工作区；参数=会话 ID |
+| `/resume` | 会话选择器 | `/sessions`（无参 `/resume`） | 已有 |
+| `/fork` | 选择某条 **user 消息** 处分叉 | `/fork [seq]` 按事件序号 | 迁移，补 `/clone` 别名（当前叶） |
+| `/tree` | 消息树任意节点切换 + 分支摘要 | 无 | 不硬套；checkpoint/rewind 不是树 |
+| `/clone` | 从当前叶复制会话 | `/fork` 无参 | 别名 |
+| `/name` | 重命名会话 | `/rename` | 别名 |
+| `/session` | 会话信息/统计 | `/status` | 别名 |
+| `/compact [instructions]` | 压缩上下文，可带自定义指示 | `/compact` | 迁移；暂忽略自定义指示 |
+| `/checkpoints` `/rewind` `/undo` | 无（Pi 靠 tree/fork） | 文件快照 + 事件回退 | 保留我们的语义，`/checkpoints` 先迁移 |
+
+实现要点：
+
+- `harness.run_repl` 把 `session_store` 传给新 App，旧 App 增加同名参数忽略；
+- 新 App 的 `/new` `/fork` 通过 `_adopt_session` 统一换 store、重建消息和视图；
+- `/fork` 复用 `SessionEventStore.fork`，原会话保留；`/rename` 写 `session_title`
+  事件并刷新 footer；`/compact` 后台线程压缩 + `_record_compaction`，结果写进度块；
+- `/checkpoints` 复用 `get_checkpoint_manager` / `format_checkpoint_list`。
+
+**暂缓**：`/tree`、`/rewind`、`/undo`（需要消息树/确认弹窗）、`/archive` `/delete`
+（Pi 在 CLI，不在 TUI）、`/find` `/workspaces` `/cd`。
+
+**测试**：rename/fork/new 换会话、checkpoints、compact 后台块；总回归 1144 passed /
+1 skipped，旧 UI 64 passed。
