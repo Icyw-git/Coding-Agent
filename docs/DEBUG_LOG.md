@@ -2743,3 +2743,17 @@ UI 测试 61 passed。
   滚动不重算布局。
 
 **测试**：总回归 1110 passed / 1 skipped；UI 64 passed（另 bridge/integration 11 条）。
+## TUI 重构 P2：事件→块模型→虚拟视口打通
+
+- 新增 `src/ui/harness_app.py`（`HARNESS_UI=textual-next` 试验入口）：
+  `history_messages/user_message/assistant_*/tool_*/diff/error/status` 全部写入
+  `ConversationModel`，刷新时只走 `VirtualTranscript`；不再按消息创建 Textual 控件。
+- 工具块按 `call_id` 关联 start/end；点击视口命中 block 切换展开，`Ctrl+O` 可扩
+  最后一个工具块（后续接键位）。
+- 提交走 `submit_text` + worker 队列，`turn_control`/`permission_gate.use_ui` 与旧
+  TUI 一致；`HARNESS_UI=textual` 仍运行旧实现，便于对照。
+- 新入口带异常回退：Textual 启动失败时回退行式 REPL。
+
+**测试**：新增 `tests/test_harness_app.py`（300 条历史、流式+工具事件、提交调用
+agent）与 `test_textual_next_flag_runs_new_app`；总回归 1114 passed / 1 skipped，
+UI 测试 66 passed。

@@ -9,6 +9,8 @@
   补全浮层可按 editor 坐标定位且不抢焦点。
 - P2 起步：`VirtualTranscript(ScrollView)` 用 `virtual_size + render_line`
   只画可见行；滚动不重算布局，视口外不创建 widget。
+- P2 骨架：`src/ui/harness_app.py` 打通事件→块模型→视口（历史/流式/工具/
+  提交），以 `HARNESS_UI=textual-next` 提供试验入口，默认仍是旧实现。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

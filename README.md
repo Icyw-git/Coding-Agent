@@ -384,7 +384,7 @@ LLM_MODEL_ID=your-model-id
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 
-# 可选：ansi（默认，保留原生滚动区）或 textual（全屏 TUI）
+# 可选：ansi（默认）| textual（现有全屏 TUI）| textual-next（行模型+虚拟视口，试验）
 HARNESS_UI=ansi
 
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off

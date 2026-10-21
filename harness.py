@@ -898,7 +898,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     images = []
     background_started = False
     started = time.perf_counter()
-    ui_emit('tool_start', name=name, args=args)
+    ui_emit('tool_start', name=name, args=args, call_id=tool_call.id)
     if blocked:
         output = blocked
     elif name not in registry:
@@ -922,7 +922,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     elapsed = time.perf_counter() - started
     text_output = str(output)
     failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
-    ui_emit('tool_end', name=name, args=args,
+    ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
             output_preview=text_output[:2000], output_len=len(text_output),
             ok=not (blocked or failed),
             outcome=('denied' if blocked else
@@ -2138,18 +2138,21 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
-    if os.getenv('HARNESS_UI', 'ansi') == 'textual' and sys.stdin.isatty():
+    ui_mode = os.getenv('HARNESS_UI', 'ansi')
+    if ui_mode in ('textual', 'textual-next') and sys.stdin.isatty():
+        module_name = ('ui.harness_app' if ui_mode == 'textual-next'
+                       else 'ui_textual')
         try:
-            import ui_textual
+            module = __import__(module_name, fromlist=['run'])
         except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
             print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
         else:
             try:
-                ui_textual.run(messages,
-                               session_id=session_store.session_id,
-                               title=session_store.session_summary()['title'])
+                module.run(messages,
+                           session_id=session_store.session_id,
+                           title=session_store.session_summary()['title'])
                 return
-            except Exception as exc:   # 渲染驱动/终端不兼容：回退行式，不吞掉会话
+            except Exception as exc:   # 渲染驱动/终端不兼容：回退行式
                 print(f'[ui] Textual 运行失败，回退行式 REPL：'
                       f'{type(exc).__name__}: {exc}')
 
