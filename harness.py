@@ -30,6 +30,7 @@ def enforce_trusted_policy_env() -> None:
 
 import concurrent.futures
 import contextvars
+import difflib
 import hashlib
 import json
 import re
@@ -48,6 +49,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
+import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
 import sandbox
@@ -113,7 +115,7 @@ from cron_scheduler import (
     scheduled_jobs,
     wait_for_cron_idle,
 )
-from exec_policy import is_readonly_command, load_policy, set_tier
+from exec_policy import is_readonly_command, is_secret_path, load_policy, set_tier
 from git_branch import current_branch
 from perf import record as perf_record
 from perf import reset as perf_reset
@@ -134,7 +136,7 @@ from session_title import generate_session_title as _generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
-from tools import TOOLS, ImageResult, restore_todos, run_bash, tool_registry
+from tools import TOOLS, ImageResult, patch_paths, restore_todos, run_bash, safe_path, tool_registry
 from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
@@ -859,6 +861,61 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
     return messages, skip_micro_rounds
 
 
+_DIFF_TOOLS = frozenset({'write', 'edit', 'apply_patch'})
+_DIFF_MAX_FILE_BYTES = 1_000_000
+_DIFF_MAX_CHARS = 20_000
+
+
+def _diff_targets(name, args):
+    """要比较的文件（写入类工具）；路径解析失败/秘密文件直接跳过。"""
+    try:
+        if name in ('write', 'edit'):
+            raw = str(args.get('path') or '')
+            targets = [safe_path(raw, args.get('cwd'))] if raw else []
+        elif name == 'apply_patch' and args.get('patch'):
+            targets = [safe_path(path, args.get('cwd'))
+                       for path in patch_paths(str(args['patch']))]
+        else:
+            return []
+    except Exception:
+        return []
+    return [path for path in targets
+            if not is_secret_path(path, checkpoints.DEFAULT_SECRETS)]
+
+
+def _file_bytes(path):
+    try:
+        if path.is_file() and path.stat().st_size <= _DIFF_MAX_FILE_BYTES:
+            return path.read_bytes()
+    except OSError:
+        pass
+    return None
+
+
+def _capture_tool_files(name, args):
+    return {str(path): _file_bytes(path) for path in _diff_targets(name, args)}
+
+
+def _tool_diff(before):
+    chunks = []
+    for raw_path, old in before.items():
+        path = Path(raw_path)
+        new = _file_bytes(path)
+        if old == new:
+            continue
+        try:
+            old_text = (old or b'').decode('utf-8')
+            new_text = (new or b'').decode('utf-8')
+        except UnicodeDecodeError:
+            continue    # 二进制/编码不明：不做行 diff
+        diff = list(difflib.unified_diff(
+            old_text.splitlines(), new_text.splitlines(),
+            fromfile=raw_path, tofile=raw_path, lineterm=''))
+        if diff:
+            chunks.append(chr(10).join(diff))
+    return chr(10).join(chunks)[:_DIFF_MAX_CHARS]
+
+
 def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
                    on_event=None, on_activity=None):
     """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
@@ -897,6 +954,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
         blocked = None
     images = []
     background_started = False
+    diff_before = (_capture_tool_files(name, args)
+                   if name in _DIFF_TOOLS else {})
     started = time.perf_counter()
     ui_emit('tool_start', name=name, args=args, call_id=tool_call.id)
     if blocked:
@@ -924,6 +983,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
     ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
             output_preview=text_output[:2000], output_len=len(text_output),
+            diff=_tool_diff(diff_before) if diff_before else '',
             ok=not (blocked or failed),
             outcome=('denied' if blocked else
                      'queued' if background_started else

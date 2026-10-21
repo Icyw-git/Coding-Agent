@@ -19,10 +19,10 @@ from textual.widgets import Static, TextArea
 
 from file_mentions import workspace_files
 from ui.composer.completions import apply_suggestion, suggestions
+from ui.renderers.tools import tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
 
-TOOL_PREVIEW_LINES = 10
 FOLLOW_END = True
 SUGGESTION_LIMIT = 6
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
@@ -40,15 +40,6 @@ def _render_lines(renderable, width: int) -> list[Text]:
             (segment.text, segment.style) for segment in segments
             if segment.text]))
     return result or [Text('')]
-
-
-def _tool_summary(name: str, args: dict) -> str:
-    for key in ('command', 'path', 'pattern', 'url', 'query', 'name'):
-        value = (args or {}).get(key)
-        if value:
-            text = ' '.join(str(value).split())
-            return text if len(text) <= 72 else text[:69] + '...'
-    return ''
 
 
 class PendingQueue:
@@ -454,6 +445,7 @@ class HarnessApp(App):
                 self.model.update(
                     block.id, state=state,
                     output=str(payload.get('output_preview', '')),
+                    diff=str(payload.get('diff') or ''),
                     duration_ms=payload.get('duration_ms', 0))
             self._mark_dirty()
         elif kind == 'diff':
@@ -504,20 +496,7 @@ class HarnessApp(App):
                 return _render_lines(Text(text), width)
             return _render_lines(RichMarkdown(text), width)
         if kind == 'tool':
-            name = payload.get('name', 'tool')
-            state = payload.get('state', 'running')
-            summary = _tool_summary(name, payload.get('args') or {})
-            duration = payload.get('duration_ms')
-            dur = f' {duration / 1000:.1f}s' if duration else ''
-            header = Text(f'▸ {name} {summary}{dur} [{state}]',
-                          style='bold #d78757')
-            output = str(payload.get('output', ''))
-            lines = output.splitlines()
-            if not payload.get('expanded') and len(lines) > TOOL_PREVIEW_LINES:
-                hidden = len(lines) - TOOL_PREVIEW_LINES
-                lines = lines[:TOOL_PREVIEW_LINES] + [f'… {hidden} more lines']
-            body = Text('\n'.join(lines), style='#bcbcbc')
-            return _render_lines(Text('\n').join([header, body]), width)
+            return _render_lines(tool_view(payload), width)
         if kind == 'diff':
             title = Text(f"diff {payload.get('path', '')}",
                          style='bold #d78757')

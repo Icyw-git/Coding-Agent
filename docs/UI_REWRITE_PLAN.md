@@ -13,6 +13,8 @@
   提交），以 `HARNESS_UI=textual-next` 提供试验入口，默认仍是旧实现。
 - P3：补全浮层（overlay，Tab/Alt+↑↓/Esc）、待发送队列条（Alt+↑ 取回）、
   editor 边框内嵌 Working 状态、footer 基础指标（分支/ctx/tokens/cost）。
+- P4：工具块 renderer（调用/结果/diff 着色/预览/展开）；harness 为
+  write/edit/apply_patch 生成 unified diff（跳过秘密/二进制、20k 上限）。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

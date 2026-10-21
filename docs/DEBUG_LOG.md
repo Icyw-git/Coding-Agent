@@ -2772,3 +2772,17 @@ UI 测试 66 passed。
 
 **测试**：`tests/test_harness_app.py` 新增 overlay/采用/Esc、队列条/取回、边框
 Working；总回归 1117 passed / 1 skipped，旧 UI 66 passed。
+## TUI 重构 P4：工具 renderer 与写入 diff
+
+- 新增 `src/ui/renderers/tools.py`：工具块统一渲染 header（名称/摘要/耗时/状态）、
+  diff（`+/-/@@` 着色，最多 80 行）、输出预览（默认 10 行，展开后全量）。
+- harness 的 `exec_tool_call` 为写入类工具采集前后快照并生成 unified diff，
+  放进 `tool_end.diff`：
+  - `write`/`edit` 按 path，`apply_patch` 按补丁涉及的全部路径；
+  - 跳过秘密文件（`is_secret_path`）、二进制/非 UTF-8、>1MB 文件；
+  - diff 截断到 20k 字符，避免事件/模型上下文被撑大。
+- 新 TUI 的 tool block 存 `diff` 并交给 renderer；旧 TUI 忽略该字段，行为不变。
+
+**测试**：`tests/test_tool_renderer.py`（状态/耗时/diff/预览/展开）、
+`tests/test_tool_diff_capture.py`（写文件产生 diff、秘密文件不产生 diff）；
+总回归 1121 passed / 1 skipped，旧 UI 64 passed。
