@@ -219,7 +219,13 @@ client = _LazyLLMClient()
 from ui_events import PermissionGate, bus  # noqa: E402  UI 依赖放在配置区之后
 
 permission_gate = PermissionGate(bus)
-from ui_bridge import METRICS, status_payload, streaming_enabled  # noqa: E402
+from ui_bridge import (  # noqa: E402
+    METRICS,
+    set_agent,
+    set_session,
+    status_payload,
+    streaming_enabled,
+)
 from ui_bridge import emit as ui_emit
 
 
@@ -1598,6 +1604,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
     session_store.record_workspace(get_workdir())
+    set_session(session_store.session_id)
+    set_agent('lead')   # 子代理会临时覆盖，退出后恢复
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -1808,9 +1816,16 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             if turn_tokens:
                 cum = session_store.usage_totals()   # 逐调用 usage 事件聚合
                 from turn_progress import format_duration
+                ctx_note = ''
+                if ctx_tokens is not None:
+                    window = _context_window(
+                        recovery_state.current_model
+                        or os.getenv('LLM_MODEL_ID') or '')
+                    ctx_note = f' · ctx {min(100, 100 * ctx_tokens // window)}%'
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
                       f'会话累计 {_fmt_tokens(cum["total"])}'
                       f' · 用时 {format_duration(time.monotonic() - turn_started)}'
+                      f'{ctx_note}'
                       f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
@@ -2036,6 +2051,22 @@ def prompt_text() -> str:
     return f'\n{label} [{mark}] > '
 
 
+_REPL_RENDERER_ATTACHED = False
+
+
+def _attach_repl_renderer() -> None:
+    """TTY 行式 REPL 订阅事件总线；非 TTY（测试/管道）保持纯文本。
+
+    只 attach 一次：同一进程多次 run_repl 时不重复订阅。
+    """
+    global _REPL_RENDERER_ATTACHED
+    if _REPL_RENDERER_ATTACHED or not sys.stdout.isatty():
+        return
+    from renderer import ReplRenderer
+    bus.subscribe(ReplRenderer().on_event)
+    _REPL_RENDERER_ATTACHED = True
+
+
 def run_repl(initial_messages:list, session_store=None):
     """最小交互循环：普通输入走 agent_loop，/ 开头的走 checkpoint 命令（见 handle_command）。
 
@@ -2060,9 +2091,10 @@ def run_repl(initial_messages:list, session_store=None):
         except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
             print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
         else:
-            ui_textual.run(messages)
+            ui_textual.run(messages, session_id=session_store.session_id)
             return
 
+    _attach_repl_renderer()
     policy = load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "
           f"{session_store.session_summary()['title']}")

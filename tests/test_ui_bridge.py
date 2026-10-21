@@ -89,3 +89,46 @@ def test_transcript_export_roundtrip(tmp_path, monkeypatch):
     assert path.is_file()
     assert path in harness.list_transcripts()
     assert harness.load_transcript(path) == messages
+
+
+def test_events_carry_session_and_agent_tags(monkeypatch):
+    import ui_bridge
+
+    events = _collect()
+    try:
+        ui_bridge.set_session('s-1')
+        ui_bridge.set_agent('lead')
+        ui_bridge.emit('activity', state='thinking')
+        with ui_bridge.agent_context('subagent'):
+            ui_bridge.emit('activity', state='tool')
+    finally:
+        ui_events.bus.unsubscribe(events.append)
+
+    assert events[0].payload['session_id'] == 's-1'
+    assert events[0].payload['agent'] == 'lead'
+    assert events[1].payload['agent'] == 'subagent'
+    # 离开 agent_context 后恢复 lead
+    assert ui_bridge._AGENT.get() == 'lead'
+
+
+def test_textual_filters_events_from_other_sessions():
+    import ui_textual
+
+    app = ui_textual.CCApp([], session_id='s-mine')
+    app._on_event(ui_events.UIEvent('status', {'session_id': 's-other'}))
+    app._on_event(ui_events.UIEvent('status', {'session_id': 's-mine'}))
+    app._on_event(ui_events.UIEvent('status', {}))   # 未打标（测试/旧事件）仍可见
+
+    assert app._event_queue.qsize() == 2
+
+
+def test_repl_renderer_skips_channels_the_repl_prints(capsys):
+    from renderer import ReplRenderer
+
+    renderer = ReplRenderer()
+    renderer.on_event(ui_events.UIEvent('tool_start',
+                                        {'name': 'read', 'args': {}}))
+    assert capsys.readouterr().out == ''
+
+    renderer.on_event(ui_events.UIEvent('error', {'msg': 'boom'}))
+    assert 'boom' in capsys.readouterr().out

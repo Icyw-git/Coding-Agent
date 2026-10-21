@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 import threading
 
 try:
@@ -72,15 +73,55 @@ class SessionMetrics:
 
 METRICS = SessionMetrics()
 
+# 事件归属：主循环/子代理/teammate 各自打标，渲染层按会话过滤。
+# 未设置时保持 None（测试直接 emit 的事件仍可见）。
+_SESSION = contextvars.ContextVar('ui_session', default=None)
+_AGENT = contextvars.ContextVar('ui_agent', default=None)
+
+
+class agent_context:
+    """临时切换事件归属，退出时恢复（子代理同步调用最常用）。"""
+
+    def __init__(self, agent: str, session_id: str | None = None):
+        self._agent = agent
+        self._session = session_id
+        self._tokens = []
+
+    def __enter__(self):
+        self._tokens.append((_AGENT, _AGENT.set(self._agent)))
+        if self._session is not None:
+            self._tokens.append((_SESSION, _SESSION.set(self._session)))
+        return self
+
+    def __exit__(self, *exc):
+        while self._tokens:
+            var, token = self._tokens.pop()
+            var.reset(token)
+
 
 def streaming_enabled() -> bool:
     """有 UI 渲染后端订阅时才为它开启流式（无订阅者走非流式）。"""
     return bus is not None and bus.has_subscribers()
 
+def set_agent(agent: str | None) -> None:
+    _AGENT.set(agent)
+
+
+def set_session(session_id: str | None) -> None:
+    _SESSION.set(session_id)
+
+
 def emit(event_type: str, **payload) -> None:
-    """转发到 UI 总线；没有 UI 资产时静默跳过。"""
-    if bus is not None:
-        bus.emit(event_type, **payload)
+    """转发到 UI 总线；没有 UI 资产时静默跳过。
+
+    自动补上 ``session_id`` / ``agent`` 归属：Textual 只渲染当前会话的事件，
+    teammate/子代理的工具不会混进主会话的聊天区。
+    """
+    if bus is None:
+        return
+    payload.setdefault('session_id', _SESSION.get())
+    payload.setdefault('agent', _AGENT.get())
+    bus.emit(event_type, **payload)
 
 
 def status_payload(*, model: str, workdir: str, ctx_tokens: int,

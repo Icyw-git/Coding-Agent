@@ -2295,3 +2295,33 @@ transcript 往返）；`pytest tests/` 1082 passed / 1 skipped；
 - ANSI 渲染后端（`renderer.py`）尚未接到新 REPL 的 print 路径：目前默认仍是行式
   输出，Textual 走事件流；两条渲染路径没有统一；
 - teammate/后台任务的工具事件会混入主会话事件流，需要按 session/agent 标记区分。
+## feature/ui：事件归属与行式 REPL 的统一
+
+**背景**：上一轮把事件接进总线后还有两个问题：ANSI 模式下渲染器没接（事件只在
+Textual 可见），以及 teammate 的工具事件会混进主会话聊天区。
+
+**做法**：
+
+- **事件归属**：`ui_bridge.emit` 自动补 `session_id` / `agent`；主循环设
+  `lead` + 当前会话，teammate 线程设 `teammate:<name>` + 它继承的会话 id，
+  子代理的工具调用用 `agent_context('subagent')` 包住。
+  `CCApp` 只消费当前会话的事件（未打标的旧事件/测试事件仍然可见）。
+- **行式 REPL 接入总线的正确姿势**：新增 `renderer.ReplRenderer`，订阅同一个
+  bus，但把 REPL 自己已经打印的通道（流式文本、工具行、status、回合收尾）让出去，
+  只渲染 `error`/`diff`/`background`/`permission` 这些 REPL 没覆盖的事件。
+  `_attach_repl_renderer()` 只在 TTY 下 attach 一次，测试/管道保持纯文本。
+- **ANSI 的状态可见性**：回合末 `[tokens]` 行补 `ctx N%`（用真实窗口而不是压缩阈值），
+  行式界面不必为状态栏再引一套渲染。
+
+**取舍**：
+
+- 不把 `AnsiRenderer` 直接接进行式 REPL：它会把流式文本与工具行再打印一遍；
+  与其在两个渲染器之间做去重，不如明确「REPL 负责哪些通道」。
+- 子代理目前不走 `exec_tool_call`（自己调 handler），因此它的工具不会出现在
+  UI 事件流里；要显示需要先把子代理改用统一执行路径，属于后续改动。
+- teammate 的 `assistant_*` 事件没有单独发：teammate 的最终汇报通过 BUS 回到
+  lead，聊天区只显示主会话，符合预期。
+
+**测试**：`tests/test_ui_bridge.py` 补事件归属、Textual 会话过滤、
+`ReplRenderer` 通道过滤；`pytest tests/` 1085 passed / 1 skipped；
+根 UI 测试 49 passed，`ruff` 通过。

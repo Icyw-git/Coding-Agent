@@ -127,6 +127,26 @@ class AnsiRenderer(BaseRenderer):
                     summary.get('tokens', 0), prefix, float(summary.get('cost', 0)))))
 
 
+class ReplRenderer(AnsiRenderer):
+    """行式 REPL 专用后端：流式/工具/指标已由 REPL 自己打印，这里只补遗漏通道。
+
+    REPL 有更细的进度行、工具折叠与回合末 tokens 行；同一批事件再走
+    AnsiRenderer 会重复输出。统一到事件总线的方式是：订阅同一个 bus，
+    但把这些通道让给 REPL，剩下的 error/diff/background 仍由渲染器负责。
+    """
+
+    _REPL_HANDLED = frozenset({
+        'user_message', 'assistant_start', 'assistant_delta', 'assistant_end',
+        'assistant_text', 'tool_start', 'tool_end', 'status', 'round_end',
+        'session_start', 'session_end',
+    })
+
+    def on_event(self, e: UIEvent) -> None:
+        if e.type in self._REPL_HANDLED:
+            return
+        super().on_event(e)
+
+
 # 默认 attach：import renderer 即生效；业务代码无需感知渲染后端。
 # Textual 模式切换时（ui_textual.run）会 unsubscribe default_renderer。
 default_renderer = AnsiRenderer()

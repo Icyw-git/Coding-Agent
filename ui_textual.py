@@ -237,9 +237,11 @@ class CCApp(App):
         ("escape", "jump_bottom", "Jump to latest"),
     ]
 
-    def __init__(self, msgs: list):
+    def __init__(self, msgs: list, session_id: str | None = None):
         super().__init__()
         self._msgs = msgs
+        self._session_id = session_id or ''   # 空 = 不过滤（测试可直接注入事件）
+        self._event_queue: queue.Queue = queue.Queue()
         self._chat = None
         self._user_input_q: queue.Queue = queue.Queue()   # 用户输入 → agent 线程（多轮）
         self._exiting = False
@@ -275,7 +277,6 @@ class CCApp(App):
         self._session_summary = self.query_one('#session-summary', Static)
         self._recent_tools_widget = self.query_one('#recent-tools', Static)
         self._input = self.query_one('#input-line', Input)
-        self._event_queue: queue.Queue = queue.Queue()
         self._active_tools: list = []   # 执行中的工具块（FIFO 匹配 tool_end）
         self._last_status: dict = {}    # 最后已知状态指标（thinking/idle 时状态栏常驻显示）
         self._active_widgets: dict = {}   # mid -> 流式中的 assistant Static（增量追加）
@@ -624,6 +625,9 @@ class CCApp(App):
     # ---------- 事件流：bus 回调（任意线程）→ 队列 → UI 线程顺序应用 ----------
 
     def _on_event(self, e):
+        session_id = e.payload.get('session_id')
+        if session_id and self._session_id and session_id != self._session_id:
+            return   # teammate/子代理/其他会话的事件不混进当前聊天区
         self._event_queue.put(e)   # 线程安全；由 _consume_events worker 顺序处理
 
     async def _apply(self, e):
@@ -1208,13 +1212,13 @@ class CCApp(App):
         return f'[{color}]{bar}[/] [dim]{label}%[/]'
 
 
-def run(msgs: list) -> None:
+def run(msgs: list, session_id: str | None = None) -> None:
     """以 Textual 模式启动会话（阻塞直到 agent_loop 结束）。
 
     调用方（harness __main__）已保证 stdout 为 TTY；此处只负责切换渲染后端。"""
     from renderer import default_renderer
     bus.unsubscribe(default_renderer.on_event)   # 避免 ANSI 后端双份渲染
     try:
-        CCApp(msgs).run()
+        CCApp(msgs, session_id=session_id).run()
     finally:
         bus.subscribe(default_renderer.on_event)
