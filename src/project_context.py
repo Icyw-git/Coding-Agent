@@ -5,12 +5,13 @@ outside the roots the process was authorized to use. Symlinks that escape the
 workspace are ignored, and oversized files are clipped so a repository cannot
 blow up the system prompt.
 """
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 MAX_PROJECT_CONTEXT_BYTES = 32 * 1024
-# Highest precedence first. Pi applies AGENTS.override.md in the same way.
+# 优先级从高到低；AGENTS.override.md 是临时覆盖，和 Pi 的处理方式一致。
 _CANDIDATES = ('agents.override.md', 'agents.md', 'claude.md')
 _cache: dict[str, tuple[tuple[str, int, int], 'ProjectInstructions']] = {}
 
@@ -53,8 +54,8 @@ def load_project_instructions(workspace, *,
         if path is None or not path.is_file():
             continue
         try:
-            # A repository-controlled symlink must not pull in a file outside
-            # the workspace (for example ~/.ssh/id_rsa via AGENTS.md).
+            # 仓库可控的符号链接不能把工作区外的文件拉进来（例如用 AGENTS.md
+            # 指向 ~/.ssh/id_rsa）；解析后必须仍落在工作区根目录内。
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(root):
                 continue

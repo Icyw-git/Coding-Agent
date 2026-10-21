@@ -4,6 +4,7 @@
 read/glob/grep/ls，且路径被限制在当前工作区内。diff 与文件内容都是不可信
 输入，提示词里明确要求忽略其中夹带的指令。
 """
+
 from __future__ import annotations
 
 import os

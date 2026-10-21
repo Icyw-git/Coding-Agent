@@ -190,7 +190,8 @@ def _pdf_text(data: bytes, filename: str, pages) -> str:
         from pypdf import PdfReader
     except ImportError as exc:
         raise DocumentError(
-            'PDF extraction requires pypdf; install it with `pip install pypdf`') from exc
+            'PDF extraction requires pypdf; install it with '
+            '`pip install -r requirements-docs.txt`') from exc
     try:
         reader = PdfReader(io.BytesIO(data))
         if reader.is_encrypted:

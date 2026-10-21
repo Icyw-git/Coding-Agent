@@ -8,6 +8,8 @@
 | ------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `harness.py` agent_loop   | 唯一 OpenAI 消息主循环：checkpoint、压缩预处理、注入、LLM 调用、工具批次、housekeeping 编排          |
 | `src/agent_core.py`       | 可复用原语：压缩四级流水、记忆系统、hooks 注册表——agent_loop 与 agent_teams 共用同一份，避免双份漂移 |
+| `src/prompt_assembly.py`  | system prompt 分段组装与上下文采集；按 context 指纹缓存，只拼接稳定前缀                              |
+| `src/session_title.py`    | 会话标题副通道：取材、LLM 调用与本地兜底，失败不阻塞回复                                             |
 | `src/session_store.py`    | append-only 事件流、确定性回放、分叉与跨会话搜索；唯一恢复真相源                                     |
 | `src/agent_runtime.py`    | 会话服务（列表/恢复/分叉/搜索/重命名），摘要缓存归属于此                                             |
 | `src/harness_api.py`      | FastAPI 控制面 + SSE 进度流（直接 tail 会话 JSONL，无事件总线）                                      |

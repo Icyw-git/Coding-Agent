@@ -2,11 +2,10 @@
 openai>=1.0
 python-dotenv>=1.0
 prompt-toolkit>=3.0,<4
-# PDF text layer for read_document (pure Python; no OCR)
-pypdf>=5,<7
-# PDF page rendering for render_document (PDFium; no OCR)
-pypdfium2>=4,<6
-Pillow>=10
+
+# Optional document tools (read_document / render_document) live in
+# requirements-docs.txt: the agent runs without them, and the tools return an
+# install hint when the package is missing.
 
 # Test dependencies
 pytest>=8.0

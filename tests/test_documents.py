@@ -1,4 +1,5 @@
 """read_document：PDF/DOCX/PPTX/XLSX 抽取、分页、错误边界与工具接线。"""
+import importlib.util
 import io
 import zipfile
 from pathlib import Path
@@ -9,6 +10,11 @@ import documents
 import exec_policy
 import harness
 import tools
+
+# PDF 文本层是可选依赖（requirements-docs.txt）：没装时跳过整组，而不是收集失败。
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec('pypdf') is None,
+    reason='pypdf is not installed (requirements-docs.txt)')
 
 
 @pytest.fixture(autouse=True)

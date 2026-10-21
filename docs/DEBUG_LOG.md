@@ -1412,3 +1412,54 @@ housekeeping 关闭与「参数解析失败也要配对上报 started/completed�
 - 一次性进程必须显式声明生命周期：后台线程、housekeeping、MCP 连接都要有明确的收尾点。
 - 把 diff 交给模型时，权限要按「这次审阅」收窄，而不是按「这个工具平时能做什么」。
 - 仓库内的说明文件是输入，不是配置：它只影响提示，不影响授权；这条边界要在代码里写死。
+## 依赖分层与主循环减重
+
+**问题**：文档能力把 pypdf / pypdfium2 / Pillow 放进了基础安装，只想要 Agent 本体的用户也得为
+PDF 渲染买单；DOCX/PPTX 渲染还牵连 LibreOffice，容易被误读成「装个 Agent 要先装办公套件」。
+同时 harness.py 继续变长（本批改动后 2248 行），标题生成、prompt 组装这类可复用原语混在循环
+编排里，既难定位，也让文件长度持续上涨。
+
+对照：Codex 并不提供文档渲染工具，它把这件事留给 shell（装了 pdftotext 就用）或用户先转换，
+所以「不用装 LibreOffice」来自没有这个承诺，而不是更聪明的实现。本项目保留能力，但把它降级为
+可选扩展——文字抽取走标准库，只有渲染才需要额外包。
+
+**做法**：
+
+- 新增 `requirements-docs.txt`（`pypdf` / `pypdfium2` / `Pillow`），从基础 `requirements.txt` 移出；
+  `requirements-dev.txt` 注明全量回归需要它。
+- 工具的安装提示统一指向 `requirements-docs.txt`；`pypdfium2` 的 `to_pil()` 单独捕获 Pillow 缺失，
+  避免 `No module named 'PIL'` 被通用渲染错误吞掉。
+- `test_documents` / `test_document_render` 在缺少可选依赖时整组跳过（`importlib.util.find_spec`），
+  而不是测试收集失败。
+- 从 `harness.py` 抽出 `src/prompt_assembly.py`：`PROMPT_SECTIONS`、`assemble_system_prompt`、
+  `get_system_prompt`、`update_context`、`build_system` / `build_sub_system`、
+  `project_prompt_section`。通过 `_h()` 回读 harness，monkeypatch 入口不变；提示词文案逐字保留，
+  避免无谓的前缀变化。
+- 抽出 `src/session_title.py`：取材、LLM 调用与本地兜底；只保留一条 `_is_session_title_candidate`，
+  删除从未被调用的 `_has_session_title_source`。
+- 规范新文件：模块 docstring 后空行、顶层定义之间两空行、解释「为什么」的块注释统一中文。
+
+**踩过的坑**：
+
+- 「可选依赖」要按能力分层，不是按包名：DOCX 文字不需要 LibreOffice，PPTX 备注也不需要，只有
+  渲染才需要。文档里必须按「要读到什么」而不是按扩展名描述安装成本，否则用户会把可选当成必需。
+- `pypdfium2.to_pil()` 是 Pillow 的真正入口：包能 import、页面能 render，最后一步才炸；不单独
+  捕获就只能得到一条通用渲染错误。
+- 移动函数后，测试的 monkeypatch 打在 harness 的名字上：被调方必须经 `_h()` 或模块属性查一次，
+  直接 `from x import y` 会把补丁绕过。
+- prompt 文案是缓存前缀的一部分：搬代码可以，改标点、空格、顺序不行。
+- 拆完以后 `ContextVar` 只能留一份定义（F811）；`_prompt_cache` 跟随模块走，harness 只
+  re-export 同一个对象。
+
+**测试**：`pytest` 976 passed / 1 skipped（缺可选依赖时两组文档用例整组 skip，其余照常）；
+`ruff check harness.py src tests` 通过；`harness.py` 2248 → 2028 行。
+
+**收获**：
+
+- 依赖分层按「能力」而不是「文件类型」：基础安装 = 主循环 + 工具骨架；文档、API、飞书各自可选。
+- 减少文件长度最安全的方向是「可复用原语」下沉到 `src/`，而不是把循环拆碎——循环顺序本身就是
+  不变式。
+- 可选依赖的可用性要在三处保持一致：安装说明、运行时错误提示、测试跳过策略。
+- `tools.py` 仍然是最长的文件（2235 行）。按域拆分（shell / 文件 / 文档 / 任务 / 团队）是下一步，
+  但会移动 600+ 行 schema 与大量 monkeypatch 目标，应在单独一批里按域逐个拆并逐组跑回归；
+  本批只做零风险的原语下沉。

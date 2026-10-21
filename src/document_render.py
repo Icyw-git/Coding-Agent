@@ -62,7 +62,7 @@ def _render_pdf(data: bytes, pages, dpi: int) -> list[tuple[int, bytes]]:
     except ImportError as exc:
         raise RenderError(
             'PDF rendering requires pypdfium2; install it with '
-            '`pip install pypdfium2`') from exc
+            '`pip install -r requirements-docs.txt`') from exc
     try:
         pdf = pdfium.PdfDocument(data)
     except Exception as exc:
@@ -79,7 +79,14 @@ def _render_pdf(data: bytes, pages, dpi: int) -> list[tuple[int, bytes]]:
             limit_dpi = math.sqrt(MAX_PIXELS * 72 * 72 / (width * height))
             effective = max(1, min(dpi, int(limit_dpi)))
             bitmap = page.render(scale=effective / 72)
-            image = bitmap.to_pil().convert('RGB')
+            try:
+                image = bitmap.to_pil().convert('RGB')
+            except ImportError as exc:
+                # pypdfium2.to_pil() 才需要 Pillow；把它当成安装提示上报，
+                # 而不是让 “No module named 'PIL'” 混进通用渲染错误。
+                raise RenderError(
+                    'PDF rendering requires Pillow; install it with '
+                    '`pip install -r requirements-docs.txt`') from exc
             buffer = io.BytesIO()
             image.save(buffer, format='PNG', optimize=True)
             rendered.append((number, buffer.getvalue()))
@@ -126,8 +133,8 @@ def _office_to_pdf(data: bytes, suffix: str) -> bytes:
     soffice = _find_soffice()
     if not soffice:
         raise RenderError(
-            'rendering DOCX/PPTX requires LibreOffice (soffice); '
-            'export the document to PDF first, or install LibreOffice')
+            'rendering DOCX/PPTX requires LibreOffice (soffice); for text only '
+            'use read_document, or export the document to PDF first')
     _check_no_macros(data, suffix)
     with tempfile.TemporaryDirectory(prefix='harness-render-') as tmp:
         source = Path(tmp) / f'source{suffix}'

@@ -50,7 +50,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
-import project_context
 import recovery
 import sandbox
 import web_access
@@ -117,10 +116,20 @@ from exec_policy import is_readonly_command, load_policy, set_tier
 from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
+from prompt_assembly import (
+    _prompt_cache,
+    assemble_system_prompt,
+    build_sub_system,
+    build_system,
+    get_system_prompt,
+    project_prompt_section,
+    update_context,
+)
 from prompt_cache_debug import enabled as cache_debug_enabled
 from prompt_cache_debug import fingerprints as cache_fingerprints
 from prompt_cache_debug import first_divergence as first_cache_divergence
 from session_store import SessionEventStore, SessionReplayError
+from session_title import generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
@@ -143,12 +152,6 @@ APP_DIR = Path(__file__).resolve().parent
 
 def get_workdir() -> Path:
     return current_workspace(WORKDIR)
-
-
-def project_prompt_section(workspace=None) -> str:
-    instructions = project_context.load_project_instructions(
-        workspace or get_workdir())
-    return project_context.format_project_instructions(instructions)
 
 
 SKILLS_DIR=WORKDIR/"skills"                 # 当前工作区的项目技能
@@ -410,114 +413,6 @@ def format_session_list(limit: int = 20) -> str:
     return '\n\n'.join(session_label(row) for row in rows)
 
 
-def generate_session_title(messages: list[dict]) -> str:
-    """Ask the configured model for a compact session topic, with a local fallback.
-
-    取材是「会话在做什么」而非「最后说了什么」：首条有效 user（原始目标）+
-    最近一条 assistant 结论 + 最近用过的工具名。旧实现 exchanges[-8:] 取尾部，
-    长会话标题会变成最后一条助手回复的复述（实测 '工作区当前是干净的…'）。"""
-    from session_store import is_injected_user_content
-    first_user = next((m for m in messages
-                       if m.get('role') == 'user' and isinstance(m.get('content'), str)
-                       and m['content'].strip()
-                       and not is_injected_user_content(m['content'])), None)
-    last_assistant_text = next((m['content'].strip() for m in reversed(messages)
-                                if m.get('role') == 'assistant'
-                                and isinstance(m.get('content'), str)
-                                and m['content'].strip()), '')
-    tool_names = []
-    for m in reversed(messages):
-        for call in m.get('tool_calls') or []:
-            name = (call.get('function') or {}).get('name', '')
-            if name and name not in tool_names:
-                tool_names.append(name)
-    has_tool_context = bool(tool_names)
-    exchanges = []
-    if first_user is not None:
-        exchanges.append(f"user（目标）: {first_user['content'].strip()[:600]}")
-    if last_assistant_text:
-        exchanges.append(f"assistant（最近结论）: {last_assistant_text[:400]}")
-    if tool_names:
-        exchanges.append("最近使用的工具: " + ', '.join(tool_names[:8]))
-    fallback = next((
-        ' '.join(line.split()).strip()[:60]
-        for message in messages
-        if message.get('role') == 'user' and isinstance(message.get('content'), str)
-        and not is_injected_user_content(message['content'])
-        for line in message['content'].splitlines()
-        if _is_session_title_candidate(line)
-    ), None)
-    if fallback is None:
-        fallback = next((
-            ' '.join(line.split()).strip()[:60]
-            for message in messages
-            if message.get('role') == 'assistant' and isinstance(message.get('content'), str)
-            and not is_injected_user_content(message['content'])
-            for line in message['content'].splitlines()
-            if _is_session_title_candidate(line)
-        ), '(untitled session)')
-    if fallback == '(untitled session)' and not has_tool_context:
-        return fallback
-    if not exchanges:
-        return '(untitled session)'
-    try:
-        response = client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
-            messages=[
-                {'role': 'system', 'content': (
-                    '为这段 coding agent 会话概括一个主题标题。只输出标题本体（名词短语，'
-                    '不加句号、前缀或引号），使用用户原语言，不超过 20 个汉字或 8 个英文词。'
-                    '概括的是整个会话在做什么，不是复述最后一条消息或结论。'
-                    '忽略 <reminder>、<task_notification> 等系统注入和“继续、好的、go”等确认语；'
-                    '如果记录没有提供足够信息，只输出 (untitled session)，不要猜测。'
-                )},
-                {'role': 'user', 'content': '\n'.join(exchanges)},
-            ],
-            temperature=0,
-            # 思考模式（deepseek-flash 默认）reasoning 先于正文消耗预算，
-            # 40 会得到空 content——标题静默退回本地兜底
-            max_tokens=8000,
-        )
-        title = (response.choices[0].message.content or '').strip().strip('"“”\'')
-        if title:
-            return ' '.join(title.split())[:60]
-    except Exception as exc:
-        print(f'  [session title] using local fallback: {exc}')
-    return fallback
-
-
-def _is_session_title_candidate(line: str) -> bool:
-    text = ' '.join(line.split()).strip()
-    normalized = text.casefold()
-    if len(text) < 12 or text.startswith(('[', '<', '- out:')):
-        return False
-    if normalized.startswith((
-        'tool results executed before compaction:',
-        'done after compact',
-        'final answer',
-        'recovered',
-        '[scheduled]',
-    )):
-        return False
-    words = normalized.split()
-    return not (len(words) >= 4 and len(set(words)) == 1)
-
-
-def _has_session_title_source(messages: list[dict]) -> bool:
-    if any(
-        message.get('role') == 'assistant' and message.get('tool_calls')
-        for message in messages
-    ):
-        return True
-    return any(
-        _is_session_title_candidate(line)
-        for message in messages
-        if message.get('role') in ('user', 'assistant')
-        and isinstance(message.get('content'), str)
-        for line in message['content'].splitlines()
-    )
-
-
 # ---------- 执行档位（/sandbox）----------
 # 档位只描述「策略层怎么判」，不代表内核强制：见 exec_policy 模块头的边界说明。
 SANDBOX_MODE_HELP = (
@@ -655,73 +550,6 @@ def run_doctor() -> int:
           f'（Windows 低完整性，仅约束 shell 子进程）')
     return 0 if all(passed for _, passed in checks) else 1
 
-PROMPT_SECTIONS={
-    'identity_main':(
-        'You are a coding agent working on Windows at {workdir}. '
-        'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
-    ),
-    'identity_sub':(
-        'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
-        'Complete the task you are given and return a concise final answer to the parent agent. '
-    ),
-    'rules_main':(
-        'Rules: '
-        '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
-        'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
-        '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
-        'To read file contents prefer the read tool (supports limit/offset); avoid PowerShell Get-Content, '
-        'which mis-decodes UTF-8 files on this system. For multi-file or structured edits prefer '
-        'apply_patch (*** Begin Patch ... *** End Patch); it applies atomically and rolls back on failure. '
-        'To read a public web page use web_fetch instead of curl; it enforces outbound approval and '
-        'blocks private addresses. '
-        'Long-running commands (install/build/test) are '
-        'dispatched to the background automatically: use background_output (wait=true to block) to read '
-        'their output and kill_background to cancel. Only modify files when asked. '
-        '(3) Parallel tool calls: when several independent operations have no dependency between them '
-        '(e.g. reading multiple files, searching with glob/grep, running several read-only commands like '
-        'git status / git log / ls), issue ALL of them as multiple tool calls in the SAME turn instead of '
-        'one per turn — they will run in parallel. Calls whose input depends on an earlier result '
-        'must stay sequential. '
-    ),
-    'rules_sub':(
-        'Rules: '
-        '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
-        '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
-        '(3) Independent tool calls with no dependency between them (multiple reads, read-only '
-        'commands) should be issued together in one turn as parallel tool calls. '
-        '(4) If the parent task asks you to write/edit/delete files, still ask yourself whether it is '
-        'destructive; if it is, do NOT execute it silently — report back that user confirmation is required. '
-        '(5) If you hit an error (tool fails, path missing), do not loop on the same command. Try one '
-        'reasonable alternative, then report the situation honestly to the parent. '
-        '(6) Keep the final answer short and structured: what you did, what you found, any issues. '
-        'Do not re-plan the parent task and do not spawn further sub-agents. '
-    ),
-    'skills_usage':(
-        'Skills available:\n{catalog}\n'
-        'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
-    ),
-}
-
-def assemble_system_prompt(context:dict)->str: # 组装系统提示，包含身份、工具、工作目录、记忆、技能、规则等
-    sections=[]
-    sections.append(PROMPT_SECTIONS['identity_main'].format(
-        workdir=context.get('workspace',get_workdir())
-    ))
-    tools=','.join(context.get('enabled_tools',[]))
-    if tools:
-        sections.append(f'Available tools:{tools}.')
-    sections.append(f'Working directory:{context.get("workspace",get_workdir())}.')
-
-    skills=context.get('skills','')
-    if skills:
-        sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
-    sections.append(PROMPT_SECTIONS['rules_main'])
-    project=context.get('project_instructions','')
-    if project:
-        sections.append(project)
-    return '\n\n'.join(sections)
-
-_prompt_cache = ContextVar('prompt_cache', default=None)
 
 # ============================================================
 # 全局配置集中区
@@ -785,25 +613,6 @@ _checkpoint_manager = ContextVar('checkpoint_manager', default=None)
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=3   # 逐次缩尾重试（keep/budget 见 agent_loop 的 attempts），仍超限才 raise
 
-
-def get_system_prompt(context:dict)->str: #获取上下文，如果上下文没有改变，直接返回缓存的系统提示，否则重新组装系统提示
-    key=json.dumps(context,sort_keys=True,ensure_ascii=False,default=str)
-    cached = _prompt_cache.get()
-    if cached is not None and cached[0] == key:
-        if os.getenv('HARNESS_DEBUG') == '1':
-            print("  \033[90m[cache hit] system prompt unchanged\033[0m")
-        return cached[1]
-    prompt = assemble_system_prompt(context)
-    _prompt_cache.set((key, prompt))
-
-    loaded=['identity','tools','workspace','rules']
-    if context.get('skills'):
-        loaded.append('skills')
-    if context.get('project_instructions'):
-        loaded.append('project')
-    if os.getenv('HARNESS_DEBUG') == '1':
-        print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
-    return prompt
 
 _CACHE_DEBUG_SESSIONS = 32
 # 只保留消息摘要而不是整份请求：开关开着跑长会话时，内存不随历史增长。
@@ -870,35 +679,6 @@ def _report_cache_prefix(session_id: str, request_messages: list,
             handle.write(json.dumps(record, ensure_ascii=False) + '\n')
     except OSError:
         pass
-
-
-def update_context(context:dict,messages:list)->dict: # 更新上下文：工具、工作目录、技能
-    # ⚠ 记忆不再进 system prompt：housekeeping 每轮更新 MEMORY_INDEX，若嵌在
-    # system 里，请求前缀每轮逐字变化，供应商前缀缓存（KV 复用）全失效。
-    # 记忆由 inject_memories 作为请求末尾的独立 system 消息注入。
-    return {
-        'enabled_tools':list(tool_registry.keys()),
-        'workspace':str(get_workdir()),
-        'skills':list_skills(),
-        'project_instructions':project_prompt_section(),
-    }
-
-
-def build_system()->str: #暴露给外部调用，返回系统提示
-    return assemble_system_prompt(update_context({},[]))
-
-
-def build_sub_system()->str:
-    sections = [
-        PROMPT_SECTIONS['identity_sub'].format(workdir=get_workdir()),
-        PROMPT_SECTIONS['rules_sub'].format(workdir=get_workdir()),
-    ]
-    project = project_prompt_section()
-    if project:
-        sections.append(project)
-    sections.append(
-        PROMPT_SECTIONS['skills_usage'].format(catalog=list_skills()))
-    return '\n\n'.join(sections)
 
 
 # ── 记忆 / 压缩 / hooks 逻辑已提取到 agent_core.py ──

@@ -38,7 +38,7 @@
 
 1. 如果没有传入 `SessionEventStore`，创建新的 session 日志对象。
 2. 将初始消息写入 `.cache/sessions/session_<id>.jsonl`。
-3. 调用 `update_context()` 收集工作目录、工具、记忆索引、skills 和项目说明（`AGENTS.md`）。
+3. 调用 `update_context()`（`src/prompt_assembly.py`）收集工作目录、工具、记忆索引、skills 和项目说明（`AGENTS.md`）。
 4. 创建 `RecoveryState`。
 5. 触发 `UserPromptSubmit` hook。
 6. 调用 `get_system_prompt()` 组装或读取缓存的 system prompt。
@@ -145,6 +145,10 @@ request_messages =
 - 模型看到相关记忆；
 - 原始消息可用于快照、压缩、重放和记忆提取；
 - 不会重复叠加 system prompt。
+
+system prompt 的分段组装（身份 / 工具 / 工作区 / 技能 / 规则 / 项目说明）与缓存入口在
+[`src/prompt_assembly.py`](src/prompt_assembly.py)：`update_context()` 只采集随回合变化的值，
+`get_system_prompt()` 按 context 指纹决定复用还是重拼；记忆只追加在请求末尾，不入主前缀。
 
 ## 6. LLM 调用与错误恢复
 

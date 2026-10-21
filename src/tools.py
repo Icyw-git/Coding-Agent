@@ -181,7 +181,8 @@ TOOLS=[{
         "description":"Render selected pages of a PDF, DOCX, or PPTX to PNG images for visual "
                       "inspection of layout, charts, tables, and scanned pages. Images are "
                       "attached in the next user message. Prefer read_document for plain text. "
-                      "PDF requires pypdfium2; DOCX/PPTX conversion requires LibreOffice.",
+                      "Both need optional extras: PDF needs pypdfium2, DOCX/PPTX conversion "
+                      "needs LibreOffice; read_document keeps working without them.",
         "parameters":{
             "type":"object",
             "properties":{

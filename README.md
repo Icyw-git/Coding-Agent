@@ -159,11 +159,14 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 - `read_document` 抽取 PDF/DOCX/PPTX/XLSX 的文本进入上下文：PDF 读文本层，`pages` 支持
   `1-5,8` / `10-` / `all`（默认前 20 页）；PPTX 按幻灯片并附演讲者备注；XLSX 按工作表输出
   Markdown 表格（默认前 8 个工作表）。DOCX/PPTX/XLSX 用标准库解析 OOXML，不额外依赖
-  python-docx/pptx；扫描版 PDF 没有文本层，需要先转成图片再用 `view_image`（不做 OCR）。
+  python-docx/pptx，也不需要 LibreOffice；扫描版 PDF 没有文本层，需要先转成图片再用
+  `view_image`（不做 OCR）。读 PDF 文本层需要可选的 `pypdf`。
 - `render_document` 把 PDF/DOCX/PPTX 的指定页渲染成 PNG，走后一轮 user 多模态附件，
   用来查看排版、图表、表格对齐和扫描页。PDF 用 pypdfium2 直接渲染；DOCX/PPTX 先用
   LibreOffice headless 转 PDF 再渲染（未安装时给出明确提示，不启动 Office 桌面程序）。
-  默认前 3 页、单次最多 8 页，`dpi` 支持 72–200；XLSX 请用 `read_document` 读单元格。
+  这两条渲染路径需要可选的 `requirements-docs.txt`，DOCX/PPTX 还需要系统里的 `soffice`；
+  不需要看排版时直接用 `read_document`。默认前 3 页、单次最多 8 页，`dpi` 支持 72–200；
+  XLSX 请用 `read_document` 读单元格。
 - `todo_write` / `todo_read` 维护当前会话的任务清单：整表替换、状态只能是
   `pending/in_progress/completed`、最多 100 项、同一时间只允许一个 `in_progress`。
   清单按会话隔离，并作为 `todos` 事件写入事件流，会话恢复后 `todo_read` 仍能读到。
@@ -446,10 +449,16 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-`pypdf` 只用于 PDF 文本层抽取；DOCX/PPTX/XLSX 由标准库解析。`pypdfium2` + `Pillow`
-用于 `render_document` 的 PDF 页面渲染。缺少对应包时只会影响相关工具并返回安装提示，
-其他工具不受影响；DOCX/PPTX 渲染还需要系统里可用的 LibreOffice（`soffice`）。
-LibreOffice 装在非标准目录时，用 `HARNESS_SOFFICE` 指向 `soffice.exe`
+基础依赖只包含 Agent 运行本身，文档工具是可选能力：
+
+- DOCX/PPTX/XLSX 的文本抽取与所有非文档工具：无需额外包（OOXML 由标准库解析）。
+- PDF 文本层与页面渲染：`python -m pip install -r requirements-docs.txt`
+  （`pypdf` / `pypdfium2` + `Pillow`）。
+- DOCX/PPTX 页面渲染：在可选依赖之外还需要系统里可用的 LibreOffice（`soffice`）；
+  只读文字不需要它。
+
+缺少可选包时只会影响对应工具并返回安装提示，其他工具不受影响。LibreOffice 装在非标准
+目录时，用 `HARNESS_SOFFICE` 指向 `soffice.exe`
 （例如 `D:\Tools\LibreOffice\program\soffice.exe`）；该变量只认文件，不做 PATH 回退。
 
 ### 4. 启动 Agent
@@ -538,6 +547,8 @@ python -m pytest
 测试文件位于 `tests/`，覆盖会话存储、上下文压缩、记忆、任务系统、Worktree、执行策略
 （`test_exec_policy.py` 测判定矩阵，`test_execution_paths.py` 测四条执行入口的接线，
 `test_sandbox.py` 测 OS 沙箱的启动、拒绝写与失败降级；Windows 集成用例在无法打标签时跳过）等模块。
+全量回归还需要可选的文档依赖（`test_documents.py` / `test_document_render.py`）：
+`python -m pip install -r requirements-docs.txt`；未安装时这两组用例整体跳过，不会收集失败。
 测试默认将 `HARNESS_OS_SANDBOX` 固定为 `off`，避免把 `tmp_path` 目录标记为 Low。
 在受限环境中，可为 pytest 指定一个可写的临时目录：
 
@@ -555,6 +566,8 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `harness.py` | Agent 主循环、REPL 和运行时编排 |
 | `src/` | Agent 子系统、工具、会话、任务、MCP 和 Worktree 等 Python 源码 |
 | `src/agent_runtime.py` | 可复用的会话运行时，供 CLI、SDK 和 API 适配层调用 |
+| `src/prompt_assembly.py` | system prompt 组装与上下文采集（工具/工作区/技能/项目说明） |
+| `src/session_title.py` | 会话标题生成：取材、LLM 调用与本地兜底 |
 | `src/headless.py` | 一次性执行与 JSONL 事件流：stdout 纯净输出、工具事件、退出码 |
 | `src/project_context.py` | 工作区 AGENTS.md / CLAUDE.md 注入：路径边界、32 KiB 截断与缓存 |
 | `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |

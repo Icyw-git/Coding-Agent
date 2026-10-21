@@ -1,17 +1,28 @@
 """render_document：PDF 渲染、Office 转 PDF、上限与工具接线。"""
+import importlib.util
 import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 
 import document_render
 import exec_policy
 import harness
 import tools
 from test_documents import _docx, _pdf, _pptx, _xlsx
+
+# 渲染依赖（pypdfium2 / Pillow）是可选的（requirements-docs.txt）。
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec('pypdfium2') is None
+    or importlib.util.find_spec('PIL') is None,
+    reason='document extras are not installed (requirements-docs.txt)')
+
+
+def _open_image(data: bytes):
+    from PIL import Image
+    return Image.open(io.BytesIO(data))
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +37,7 @@ def test_render_pdf_pages_as_png():
     assert [number for number, _ in rendered] == [1, 2]
     for _, png in rendered:
         assert png.startswith(b'\x89PNG\r\n\x1a\n')
-        image = Image.open(io.BytesIO(png))
+        image = _open_image(png)
         assert image.width > 0 and image.height > 0
 
 

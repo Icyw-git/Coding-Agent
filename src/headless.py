@@ -15,6 +15,7 @@ JSONL events emitted by this module (all objects have ``type``):
     turn.completed  session_id / content / usage / files_changed
     error           code / message
 """
+
 from __future__ import annotations
 
 import contextlib
