@@ -122,13 +122,57 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 断流或报错会更新原卡片为“处理未完成”，不会自动重复执行任务。
 运行超过 60 秒时，API 会在 `.cache/api/api-access.log` 记录工作线程调用栈；
 设置 `HARNESS_API_LOG` 后使用对应日志路径。这里的进度心跳不代表任务已完成。
-同步 shell 工具执行超过 120 秒会请求终止进程树，并向 Agent 返回超时结果。
+同步 shell 工具默认 120 秒超时，可用 `timeout` 调整（上限 3600 秒），超时会请求终止进程树
+并向 Agent 返回超时结果。`cwd` 让单条命令在指定目录执行；显式 `run_in_background` 或命中
+安装/构建/测试等慢命令关键词时转入后台（后台默认上限 3600 秒），用 `background_output`
+等待或读取输出、`kill_background` 终止。
+
+## 内建工具
+
+- `read` 支持 `offset` / `limit` 分段读取；超过 500 行且未给 `limit` 时只返回 200 行并提示下一次
+  的 `offset`。编码按 BOM → UTF-8 → GB18030 探测，二进制文件（magic/NUL）直接拒绝。
+- `view_image` 读取本地 PNG/JPEG/GIF/WebP/BMP，图片以独立的 user 多模态消息附到下一轮请求。
+  历史、事件流和转录里只保存缓存文件引用，base64 在每次请求前由 `expand_image_parts` 现读现拼，
+  不会把上下文和会话文件撑大；需要模型本身支持视觉输入。上下文预算按图片实际宽高和模型族
+  （OpenAI 瓦片 / Claude 面积 / Gemini 768 瓦片 / DeepSeek 1024 上限）估算，未知尺寸时
+  用固定兜底值，可用 `HARNESS_IMAGE_TOKEN_ESTIMATE` 调整。DeepSeek 的 `deepseek-flash`
+  同样要求图片只出现在 user 消息里，和这里的附件布局一致。
+- `read_document` 抽取 PDF/DOCX/PPTX/XLSX 的文本进入上下文：PDF 读文本层，`pages` 支持
+  `1-5,8` / `10-` / `all`（默认前 20 页）；PPTX 按幻灯片并附演讲者备注；XLSX 按工作表输出
+  Markdown 表格（默认前 8 个工作表）。DOCX/PPTX/XLSX 用标准库解析 OOXML，不额外依赖
+  python-docx/pptx；扫描版 PDF 没有文本层，需要先转成图片再用 `view_image`（不做 OCR）。
+- `render_document` 把 PDF/DOCX/PPTX 的指定页渲染成 PNG，走后一轮 user 多模态附件，
+  用来查看排版、图表、表格对齐和扫描页。PDF 用 pypdfium2 直接渲染；DOCX/PPTX 先用
+  LibreOffice headless 转 PDF 再渲染（未安装时给出明确提示，不启动 Office 桌面程序）。
+  默认前 3 页、单次最多 8 页，`dpi` 支持 72–200；XLSX 请用 `read_document` 读单元格。
+- `todo_write` / `todo_read` 维护当前会话的任务清单：整表替换、状态只能是
+  `pending/in_progress/completed`、最多 100 项、同一时间只允许一个 `in_progress`。
+  清单按会话隔离，并作为 `todos` 事件写入事件流，会话恢复后 `todo_read` 仍能读到。
+- `write` / `edit` / `apply_patch` 回写时保留原文件编码与换行符（UTF-16/UTF-8 BOM、GBK、CRLF）。
+  `edit` 的 `old_text` 在文件中出现多次时默认报错，确认要全改才传 `replace_all=true`，
+  不会再静默地只替换第一处。
+- `apply_patch` 接受 Codex 风格的 `*** Begin Patch` 补丁，支持 Add/Update/Delete File 和
+  `*** Move to:`。所有目标先规划、校验，再统一落盘；任一步失败会按逆序回滚已写的文件，
+  不会留下半份补丁。每个目标都走与 `write`/`edit` 相同的路径分区与 checkpoint。
+- `bash` 支持 `cwd` / `timeout` / `run_in_background`；后台任务有独立 id，输出在收集后仍保留
+  有限历史供 `background_output` 取回，`kill_background` 终止进程树并标记为 cancelled。
+- `grep` 在可用时走 ripgrep（`--no-ignore` + 秘密/忽略目录过滤），遇到非 ASCII 模式、
+  rg 缺失、编码损坏或异常输出时回落到内置遍历，结果语义保持一致；`glob` / `ls` 与 `grep`
+  同样接受 `cwd`，teammate 在 worktree 里不会误搜主工作区。
+- `web_fetch` 用于读取公开网页：仅允许 http/https，解析后所有地址必须是公网（拒绝回环、
+  私网、链路本地、云元数据主机与 `.internal` 等后缀），每次重定向重新校验；响应上限 2 MiB、
+  默认 20 秒超时，HTML 会提取为文本。它和 `curl` 一样要过出口审批，且不能绕过出口策略。
+- 子代理启动时按当时的工具注册表生成工具面，不会拿到启动时快照里已删除的工具；`task`、
+  teammate/计划/定时任务、worktree、`background_output`/`kill_background` 等控制类工具不向
+  子代理暴露，bash 也不提供 `run_in_background`。
 
 ## 执行安全与审批
 
 所有内建工具中会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
-PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_glob` / `run_grep` / `run_ls` /
-`run_write` / `run_edit`）、Teammate 线程、后台与 HTTP 任务——共用同一套规则和同一句拒绝文案，
+PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / `run_read_document` /
+`run_render_document` / `run_glob` / `run_grep` / `run_ls` / `run_write` / `run_edit` /
+`run_apply_patch` / `run_web_fetch`）、Teammate 线程、后台与 HTTP
+任务——共用同一套规则和同一句拒绝文案，
 不再各写一份黑名单。
 
 两档配置，命名与 Codex 对齐：
@@ -168,6 +212,9 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_glob` / `run_g
   同一台主机发起的读请求；改方法（`-X`/`--request`）、带请求体（`-d`/`-F`/`-T`/`--post-data`…）、
   目标多于一个或只写裸主机名（`nc host 1234`）都没有免审出路。httpie 把方法写在位置参数里，
   aria2c/iwr 的写开关也判不清，只问不记。
+- `web_fetch` 不豁免出口审批：合法 URL 一律 `network_egress` 询问，「同类」键为
+  `web_fetch:主机`；URL 形状不合法或指向非公网地址在审批前就硬拒（`invalid_url`）。
+  这是防 SSRF 的地址校验，不替代人工判断——批准前仍应看清主机。
 - 复合命令（`&&`、`;`、`|`、换行）要每一段归到同一类才记「同类」：只按第一段归类的话，
   批准 `ls && rm x` 会写下 `bash:ls`，之后 `ls; rm -rf ~` 就被同一个键放行。
 - `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位下需要审批的
@@ -182,8 +229,12 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_glob` / `run_g
   不是工作区约束；`.env.example` 等公开模板例外，它们是给开发者抄的，拦下来只会把正常工作流
   赶回 bash）。读取不再限制在工作区内，
   个人助手的文档、日志可以按绝对路径直接读。检索工具（`glob` / `grep` / `ls`）同样是只读且
-  可指向工作区外；`grep` 遍历目录时跳过秘密文件与 `.git`、`.cache`、`node_modules` 等忽略目录，
+  可指向工作区外；`grep` 在装 ripgrep 时走 rg 快路径，非 ASCII 模式、rg 缺失或输出异常时
+  回落到内置遍历，两种后端都跳过秘密文件与 `.git`、`.cache`、`node_modules` 等忽略目录，
   不会成为读取秘密文件的后门。
+- `apply_patch` 的多文件补丁只审批一次，但目标路径会先全部解析并按最严格的分区取值：
+  只要有一个目标是秘密文件或非法路径就整份拒绝，有越界写则整份询问；不存在「前面几个文件
+  免审、到最后一个才拦」的半执行状态。补丁格式错误在策略层直接 `invalid_patch` 硬拒。
 - 文件工具的审批没有「本会话允许同类」：一次写 `a.txt` 的批准不该变成整会话任意路径免审。
   目录范围授权留到后续；越界写每次都看卡片。
 - bash 的写路径按同一套分区判：`cp`/`mv`/`tee`/`dd`/`tar`/`unzip`/`mkdir`/`install` 等
@@ -324,8 +375,11 @@ HARNESS_PERF=1
 飞书网关与 API 服务也分别统计，尚未自动合并为端到端报告。
 嵌套分段存在包含关系，不能直接相加。
 
-常用交互命令还包括 `/diff`（只读查看当前工作区改动）、`/compact`（保存完整记录后压缩当前上下文）、
-`/undo`（回到最近一次快照）、`/revoke`（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
+常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
+展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一次快照）、`/revoke`
+（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。每个回合正常结束时，若本轮
+改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
+事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
 飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke` 和 `/sandbox`；
 文件查看与上下文压缩仍建议在 CLI 中执行。
 
@@ -369,6 +423,12 @@ macOS / Linux：
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
+
+`pypdf` 只用于 PDF 文本层抽取；DOCX/PPTX/XLSX 由标准库解析。`pypdfium2` + `Pillow`
+用于 `render_document` 的 PDF 页面渲染。缺少对应包时只会影响相关工具并返回安装提示，
+其他工具不受影响；DOCX/PPTX 渲染还需要系统里可用的 LibreOffice（`soffice`）。
+LibreOffice 装在非标准目录时，用 `HARNESS_SOFFICE` 指向 `soffice.exe`
+（例如 `D:\Tools\LibreOffice\program\soffice.exe`）；该变量只认文件，不做 PATH 回退。
 
 ### 4. 启动 Agent
 

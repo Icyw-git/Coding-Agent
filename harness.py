@@ -52,6 +52,8 @@ import approval_view  # 审批面的参数渲染（/approvals 列表要显示完
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
 import sandbox
+import web_access
+import workspace_diff
 import workspaces
 from agent_core import (
     HOOKS,
@@ -67,7 +69,9 @@ from agent_core import (
     compact_history,
     consolidate_memories,
     estimate_size,
+    expand_image_parts,
     extract_memories,
+    image_attachment_message,
     inject_memories,
     list_memory_files,
     load_memories,
@@ -119,7 +123,7 @@ from session_store import SessionEventStore, SessionReplayError
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
-from tools import TOOLS, run_bash, tool_registry
+from tools import TOOLS, ImageResult, restore_todos, run_bash, tool_registry
 from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
@@ -592,36 +596,11 @@ def format_status(session_store) -> str:
     )
 
 
-def format_workspace_diff(workspace=None, path='', *, max_chars=12000) -> str:
+def format_workspace_diff(workspace=None, path='', *, max_chars=30000, color=False) -> str:
     """Return a bounded, read-only view of the workspace changes."""
-    workspace = Path(workspace or get_workdir())
-    try:
-        scope = path.strip() or '.'
-        result = subprocess.run(
-            ['git', 'diff', 'HEAD', '--no-ext-diff', '--stat', '--', scope],
-            cwd=workspace, capture_output=True, text=True, timeout=15,
-        )
-        status = subprocess.run(
-            ['git', 'status', '--short', '--untracked-files=all'],
-            cwd=workspace, capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f'  无法读取工作区改动：{exc}'
-    if result.returncode != 0 or status.returncode != 0:
-        return '  当前工作区不是 Git 仓库，无法显示 diff。'
-    lines = []
-    if status.stdout.strip():
-        lines.append('  文件状态：')
-        lines.extend(f'    {line}' for line in status.stdout.splitlines())
-    if result.stdout.strip():
-        lines.append('  已跟踪文件统计：')
-        lines.extend(f'    {line}' for line in result.stdout.splitlines())
-    if not lines:
-        return '  工作区干净，没有未提交改动。'
-    text = '\n'.join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars] + '\n  （diff 过长，已截断…）'
-    return text
+    return workspace_diff.format_diff(
+        Path(workspace or get_workdir()), path,
+        max_chars=max_chars, color=color, ignore=CHECKPOINT_IGNORE)
 
 
 def format_pending_approvals() -> str:
@@ -680,8 +659,14 @@ PROMPT_SECTIONS={
         '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
         'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
         '(2) Prefer safe, non-destructive commands for inspection (dir, type, findstr). '
-        'To read file contents prefer the read tool (supports limit); avoid PowerShell Get-Content, '
-        'which mis-decodes UTF-8 files on this system. Only modify files when asked. '
+        'To read file contents prefer the read tool (supports limit/offset); avoid PowerShell Get-Content, '
+        'which mis-decodes UTF-8 files on this system. For multi-file or structured edits prefer '
+        'apply_patch (*** Begin Patch ... *** End Patch); it applies atomically and rolls back on failure. '
+        'To read a public web page use web_fetch instead of curl; it enforces outbound approval and '
+        'blocks private addresses. '
+        'Long-running commands (install/build/test) are '
+        'dispatched to the background automatically: use background_output (wait=true to block) to read '
+        'their output and kill_background to cancel. Only modify files when asked. '
         '(3) Parallel tool calls: when several independent operations have no dependency between them '
         '(e.g. reading multiple files, searching with glob/grep, running several read-only commands like '
         'git status / git log / ls), issue ALL of them as multiple tool calls in the SAME turn instead of '
@@ -1026,7 +1011,9 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
 
 def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
-    返回 (name, args, tool 消息 dict)。主循环与 teammate 共用同一条安全/兜底路径。
+    返回 (name, args, tool 消息 dict, images)。images 是 view_image 的附件引用，
+    由调用方作为独立 user 消息追加（tool 角色里放图片各家支持不一致）。
+    主循环与 teammate 共用同一条安全/兜底路径。
     hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。"""
     name = tool_call.function.name
     try:
@@ -1035,13 +1022,14 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
             raise ValueError('tool arguments must be a JSON object')
     except (TypeError, ValueError) as exc:
         return name, {}, {'role': 'tool', 'tool_call_id': tool_call.id,
-                          'content': f'Error: invalid tool arguments: {exc}'}
+                          'content': f'Error: invalid tool arguments: {exc}'}, []
     if registry is None:
         registry = tool_registry
     if hooks:
         blocked = trigger_hooks("PreToolUse", name, args)
     else:
         blocked = None
+    images = []
     if blocked:
         output = blocked
     elif name not in registry:
@@ -1055,6 +1043,9 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
                           f"Result will be available when complete.")
             else:
                 output = registry[name](**args)
+                if isinstance(output, ImageResult):
+                    images = output.images
+                    output = output.text
         except Exception as e:
             # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
             output = f"Error: {e}"
@@ -1063,15 +1054,15 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True):
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
     # 形态，前缀天然稳定；全量已落盘可恢复）。hooks 拿到的仍是全量输出。
     return name, args, {"role": "tool", "tool_call_id": tool_call.id,
-                        "content": _bound_tool_output(tool_call.id, output)}
+                        "content": _bound_tool_output(tool_call.id, output)}, images
 
 
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
 # 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为默认串行；
 # 唯一例外见 _run_tool_batch 的只读 bash 批（exec_policy.is_readonly_command）。
 PARALLEL_SAFE_TOOLS = frozenset({
-    'read', 'glob', 'grep', 'ls', 'list_tasks', 'get_task', 'list_crons',
-    'check_inbox', 'load_skill',
+    'read', 'view_image', 'read_document', 'glob', 'grep', 'ls', 'list_tasks', 'get_task',
+    'list_crons', 'check_inbox', 'load_skill', 'background_output',
 })
 PARALLEL_MAX_WORKERS = 4
 
@@ -1121,9 +1112,16 @@ def _run_tool_batch(tool_calls, session_store, tool_messages):
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)
             executed.append(exec_tool_call(tool_call))
-    for _, _, tool_message in executed:   # 原序写回结果
+    for _, _, tool_message, _images in executed:   # 原序写回结果
         tool_messages.append(tool_message)
         session_store.append_message(tool_message)
+    # 图片附件排在整批 tool 结果之后：并行 tool_calls 要求工具结果连续，
+    # 中间插 user 消息会被部分 API 判成孤儿。附件本身也是 user 消息。
+    for _, _, _tool_message, images in executed:
+        if images:
+            attachment = image_attachment_message(images)
+            tool_messages.append(attachment)
+            session_store.append_message(attachment)
 
 def _record_compaction(session_store, compacted_messages, strategy):
     summary = next(
@@ -1165,6 +1163,8 @@ def get_checkpoint_manager(session_store):
             ignore=CHECKPOINT_IGNORE,
             secrets=CHECKPOINT_SECRETS,
         )
+    # todo 工具需要把计划写进当前会话事件流；manager 是唯一跨工具可取的会话锚点。
+    manager.session_store = session_store
     return manager
 
 
@@ -1303,7 +1303,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(format_status(session_store))
 
     elif command == '/diff':
-        print(format_workspace_diff())
+        print(format_workspace_diff(color=sys.stdout.isatty()))
 
     elif command == '/model':
         print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
@@ -1647,6 +1647,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
         memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
+    restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
+    turn_workspace = get_workdir()
+    turn_baseline = workspace_diff.snapshot(turn_workspace, CHECKPOINT_IGNORE)
+    turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
 
     while True:
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
@@ -1691,7 +1695,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
 
 
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
-        request_messages = inject_memories(messages, memories_content, system)
+        # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，
+        # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
+        request_messages = expand_image_parts(
+            inject_memories(messages, memories_content, system))
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
         _report_cache_prefix(
             session_store.session_id, messages,
@@ -1809,8 +1816,25 @@ def agent_loop(messages:list, session_store=None, on_delta=None):
                       f'会话累计 {_fmt_tokens(cum["total"])}'
                       f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
-            session_store.append('turn_completed')
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
+            # 回合结束清单：Git 基线能看见 bash 造成的改动；非 Git 工作区回退到
+            # 本回合 checkpoint 记录的 write/edit/apply_patch 文件。
+            fallback = _safe_checkpoint(
+                checkpoint_manager.changed_files_since, turn_cp_start) or {}
+            try:
+                changes = workspace_diff.turn_changes(
+                    turn_workspace, turn_baseline, fallback, CHECKPOINT_IGNORE)
+            except Exception as exc:   # 汇总失败不影响本轮结果
+                print(f'  [diff] 无法汇总本轮改动：{exc}')
+                changes = []
+            if changes:
+                print(workspace_diff.format_changes(changes))
+                session_store.append('files_changed', files=[
+                    {'code': entry['code'], 'path': entry['path'],
+                     'old': entry.get('old')}
+                    for entry in changes
+                ])
+            session_store.append('turn_completed')
             # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
             # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
             turn_no += 1

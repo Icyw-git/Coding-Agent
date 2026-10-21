@@ -589,3 +589,48 @@ def test_clean_baseline_detects_new_external_change(ws):
 def test_unborn_repository_has_no_head(ws):
     _git_init(ws)
     assert _mgr(ws)._git_baseline()['head'] == ''
+
+
+def test_changed_files_since_reports_net_edits(ws):
+    mgr = _mgr(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    start = mgr.begin_turn(_msgs())
+    mgr.seal()
+
+    mgr.begin_turn(_msgs())
+    mgr.capture_pre_image(ws / 'a.txt')
+    (ws / 'a.txt').write_text('v2', encoding='utf-8')
+    mgr.capture_pre_image(ws / 'new.txt')   # 保存时不存在 → A
+    (ws / 'new.txt').write_text('created', encoding='utf-8')
+    mgr.seal()
+
+    assert mgr.changed_files_since(start) == {'a.txt': 'M', 'new.txt': 'A'}
+
+
+def test_changed_files_since_ignores_reverted_edits_and_start_node(ws):
+    mgr = _mgr(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    start = mgr.begin_turn(_msgs())
+    mgr.seal()
+
+    node = mgr.begin_turn(_msgs())
+    mgr.capture_pre_image(ws / 'a.txt')
+    (ws / 'a.txt').write_text('v2', encoding='utf-8')
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')   # 写了又改回去
+    mgr.seal()
+
+    assert mgr.changed_files_since(start) == {}
+    # start 指向本回合节点时，该节点本身不计入（否则每回合都会重复上报）
+    assert mgr.changed_files_since(node) == {}
+
+
+def test_changed_files_since_sees_active_node_before_seal(ws):
+    mgr = _mgr(ws)
+    start = mgr.begin_turn(_msgs())
+    mgr.seal()
+
+    mgr.begin_turn(_msgs())
+    mgr.capture_pre_image(ws / 'during.txt')
+    (ws / 'during.txt').write_text('x', encoding='utf-8')
+
+    assert mgr.changed_files_since(start) == {'during.txt': 'A'}

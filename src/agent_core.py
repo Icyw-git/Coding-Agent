@@ -8,10 +8,12 @@ harness.agent_loop 与 agent_teams.spawn 共用同一份实现，避免双份漂
   本模块通过 `_h()` 在运行时读取 —— 这样测试可以 `harness.MEMORY_DIR = tmp` /
   patch `harness.client` 直接生效，无需改测试。
 """
+import base64
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 import yaml
 
@@ -118,11 +120,18 @@ def _recent_user_text(messages: list, max_chars: int = 2000) -> str:
         if msg.get('role') == 'user':
             content = msg.get('content', '')
             if isinstance(content, list):
-                content = " ".join(
-                    str(b.get('text', '') if isinstance(b, dict) else getattr(b, 'text', ''))
-                    for b in content
-                    if (b.get('type') if isinstance(b, dict) else getattr(b, 'type', None)) == 'text'
-                )
+                # 只取文本块：图片引用/占位不是用户提问，不参与记忆召回
+                texts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get('type') == 'text':
+                            texts.append(str(part.get('text') or ''))
+                    elif getattr(part, 'type', None) == 'text':
+                        texts.append(str(getattr(part, 'text', '') or ''))
+                text = ' '.join(t for t in texts if t)
+                if text.startswith('[image attachment'):
+                    continue
+                content = text
             if isinstance(content, str):
                 recent_texts.append(content)
             if len(recent_texts) >= 3:
@@ -439,12 +448,256 @@ def _parse_frontmatter(text: str):
 # 工具结果是独立的 role='tool' 消息：tool_call_id + content 字符串）
 # ============================================================
 
+# ============================================================
+# 多模态附件
+# ============================================================
+# 工具结果里只放图片引用（harness_image），真正的 data URI 在每次请求前
+# 由 expand_image_parts 生成。这样历史、转录和会话事件都不会被 base64 撑大，
+# 图片也仍能在会话恢复后重新读取。
+# 上下文预算用的固定兜底，不是账单 token。常见值：GPT-4o 1024² ≈ 765、
+# Claude 1024² ≈ 1398、Gemini 1024² ≈ 1032、DeepSeek 每图上限 1024。图片实际
+# 成本随尺寸/模型/provider 变化，这里只要求「不把窗口算爆」；已知尺寸时
+# estimate_image_tokens 会覆盖它。
+IMAGE_TOKEN_ESTIMATE = 1000
+# DeepSeek 官方只公布「缩放后每图最多 1024 token」，没有公开瓦片公式；
+# 预算按上限计，宁可高估。
+DEEPSEEK_IMAGE_TOKEN_LIMIT = 1024
+
+
+def _env_image_token_estimate() -> int:
+    """未知尺寸/旧引用用的固定兜底值；环境变量可调。"""
+    raw = os.getenv('HARNESS_IMAGE_TOKEN_ESTIMATE')
+    if not raw:
+        return IMAGE_TOKEN_ESTIMATE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return IMAGE_TOKEN_ESTIMATE
+
+
+def image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """从文件头读宽高（不依赖 Pillow）；识别不了返回 None。"""
+    import struct
+    if data.startswith(b'\x89PNG\r\n\x1a\n') and len(data) >= 24:
+        return struct.unpack('>II', data[16:24])
+    if data.startswith((b'GIF87a', b'GIF89a')) and len(data) >= 10:
+        return struct.unpack('<HH', data[6:10])
+    if data.startswith(b'BM') and len(data) >= 26:
+        dib = int.from_bytes(data[14:18], 'little')
+        if dib == 12:
+            width, height = struct.unpack('<HH', data[18:22])
+            return abs(width), abs(height)
+        width, height = struct.unpack('<ii', data[18:26])
+        return abs(width), abs(height)
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        chunk = data[12:16]
+        if chunk == b'VP8X' and len(data) >= 30:
+            return (1 + int.from_bytes(data[24:27], 'little'),
+                    1 + int.from_bytes(data[27:30], 'little'))
+        if chunk == b'VP8L' and len(data) >= 25 and data[20] == 0x2F:
+            bits = int.from_bytes(data[21:25], 'little')
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if (chunk == b'VP8 ' and len(data) >= 30
+                and data[23:26] == b'\x9d\x01\x2a'):
+            return (int.from_bytes(data[26:28], 'little') & 0x3FFF,
+                    int.from_bytes(data[28:30], 'little') & 0x3FFF)
+    if data.startswith(b'\xff\xd8'):
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            index += 2
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                continue
+            if index + 2 > len(data):
+                break
+            length = int.from_bytes(data[index:index + 2], 'big')
+            if length < 2 or index + length > len(data):
+                break
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(data[index + 3:index + 5], 'big')
+                width = int.from_bytes(data[index + 5:index + 7], 'big')
+                return width, height
+            index += length
+    return None
+
+
+def _openai_image_tokens(width: int, height: int) -> int:
+    """GPT-4o 高细节规则：先塞进 2048²，短边缩到 768，再按 512 瓦片计。"""
+    import math
+    scale = min(1.0, 2048 / max(width, height))
+    width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    if min(width, height) > 768:
+        scale = 768 / min(width, height)
+        width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    tiles = math.ceil(width / 512) * math.ceil(height / 512)
+    return 85 + 170 * tiles
+
+
+def _claude_image_tokens(width: int, height: int) -> int:
+    # 旧版 Claude 文档的经验值：长边超过 1568 会缩放，约 (w*h)/750 且上限 ~1600
+    scale = min(1.0, 1568 / max(width, height))
+    width, height = max(1, int(width * scale)), max(1, int(height * scale))
+    return min(1600, max(1, (width * height + 749) // 750))
+
+
+def _gemini_image_tokens(width: int, height: int) -> int:
+    import math
+    return (max(1, math.ceil(width / 768)) * max(1, math.ceil(height / 768))
+            * 258)
+
+
+def _deepseek_image_tokens(width: int, height: int) -> int:
+    # 官方只给「缩放后每图最多 1024」，没有公开公式；按上限保守计。
+    return DEEPSEEK_IMAGE_TOKEN_LIMIT
+
+
+def estimate_image_tokens(data: bytes, model: str | None = None) -> int:
+    """按当前模型族估算图片 token；尺寸未知时退回固定值。
+
+    这是上下文保护，不是计费：宁可略高，避免压缩阈值被低估。设置
+    HARNESS_IMAGE_TOKEN_ESTIMATE 可覆盖固定兜底值。
+    """
+    fallback = _env_image_token_estimate()
+    dimensions = image_dimensions(data)
+    if dimensions is None:
+        return fallback
+    width, height = dimensions
+    if width <= 0 or height <= 0:
+        return fallback
+    model_name = (model or os.getenv('LLM_MODEL_ID') or '').lower()
+    if 'claude' in model_name or 'anthropic' in model_name:
+        estimate = _claude_image_tokens(width, height)
+    elif 'gemini' in model_name:
+        estimate = _gemini_image_tokens(width, height)
+    elif 'deepseek' in model_name:
+        estimate = _deepseek_image_tokens(width, height)
+    else:
+        estimate = _openai_image_tokens(width, height)
+    return max(fallback, estimate)
+
+
+def image_attachment_message(images: list[dict]) -> dict:
+    """把 view_image 的附件包成一条紧随工具结果的 user 消息。
+
+    Chat Completions 的 tool 消息对图片支持不一致（部分模型只认 user 里的
+    image_url），所以图片走独立的 user 消息，tool 结果只保留文字摘要。
+    """
+    names = ', '.join(str(image.get('name') or 'image') for image in images)
+    content = [{
+        'type': 'text',
+        'text': f'[image attachment] {names}. '
+                'Inspect the attached image before continuing.',
+    }]
+    content.extend(dict(image) for image in images)
+    return {'role': 'user', 'content': content}
+
+
+def expand_image_parts(messages: list[dict]) -> list[dict]:
+    """把 harness_image 引用展开成 OpenAI 的 image_url data URI。
+
+    只复制含图片的消息，普通消息保持原对象；文件被清理时降级成一条文本，
+    不让一次读图失败拖垮整个请求。只读 view_image 自己的缓存目录：会话事件
+    可以被用户编辑，引用指向 `.env` 这类文件时不能借多模态通道把它送出去。
+    """
+    try:
+        base = getattr(_h(), 'TOOL_RESULTS_DIR', None)
+        cache_root = (Path(base) / 'images').resolve() if base else None
+    except Exception:
+        cache_root = None
+    result = []
+    for message in messages:
+        content = message.get('content')
+        if not isinstance(content, list) or not any(
+                isinstance(part, dict) and part.get('type') == 'harness_image'
+                for part in content):
+            result.append(message)
+            continue
+        parts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get('type') != 'harness_image':
+                parts.append(part)
+                continue
+            path = Path(str(part.get('path') or ''))
+            name = str(part.get('name') or path.name or 'image')
+            try:
+                resolved = path.resolve()
+                if cache_root is not None and not resolved.is_relative_to(cache_root):
+                    raise OSError('outside image cache')
+                data = resolved.read_bytes()
+            except (OSError, ValueError):
+                parts.append({'type': 'text',
+                              'text': f'[image unavailable: {name}]'})
+                continue
+            mime = str(part.get('mime') or 'image/png')
+            encoded = base64.b64encode(data).decode('ascii')
+            parts.append({'type': 'image_url',
+                          'image_url': {'url': f'data:{mime};base64,{encoded}'}})
+        updated = dict(message)
+        updated['content'] = parts
+        result.append(updated)
+    return result
+
+
+def content_text(content) -> str:
+    """消息 content 的可读文本（字符串原样返回，多模态只取文本和图片占位）。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get('type') == 'text':
+                texts.append(str(part.get('text') or ''))
+            elif part.get('type') == 'harness_image':
+                texts.append(f"[image: {part.get('name') or 'image'}]")
+            elif part.get('type') == 'image_url':
+                texts.append('[image]')
+        return ' '.join(text for text in texts if text)
+    return str(content or '')
+
+
+def _image_token_cost(msgs) -> tuple[int, int]:
+    """遍历消息里的图片 part，返回 (token 合计, 已计数的 part 数)。"""
+    fallback = _env_image_token_estimate()
+    total = 0
+    seen = 0
+    for message in msgs:
+        content = (message.get('content') if isinstance(message, dict)
+                   else getattr(message, 'content', None))
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get('type')
+            if kind == 'harness_image':
+                try:
+                    total += int(part.get('tokens') or fallback)
+                except (TypeError, ValueError):
+                    total += fallback
+                seen += 1
+            elif kind == 'image_url':
+                total += fallback
+                seen += 1
+    return total, seen
+
+
 def estimate_size(msgs):
     # token 启发式：英文约 3.5 字符/token，中文约 1.3 字符/token（与 CONTEXT_LIMIT 同单位）
-    text = str(msgs)
+    raw = str(msgs)
+    # 历史里正常只有引用；万一是旧消息里的 data URI，也不能按字符数把上下文算爆。
+    text = re.sub(r'data:[^;\s]+;base64,[A-Za-z0-9+/=]+', '[image]', raw)
     ascii_chars = sum(1 for ch in text if ord(ch) < 128)
     cjk = len(text) - ascii_chars
-    return max(1, int(ascii_chars / 3.5 + cjk / 1.3))
+    image_tokens, seen = _image_token_cost(msgs)
+    # 旧历史里若有字符串形态的图片引用，遍历不到：按 part 出现次数补齐。
+    raw_images = raw.count("'harness_image'") + raw.count("'image_url'")
+    image_tokens += max(0, raw_images - seen) * _env_image_token_estimate()
+    return max(1, int(ascii_chars / 3.5 + cjk / 1.3) + image_tokens)
 
 
 def _message_has_tool_use(msg):  # 判断是否工具调用
@@ -595,6 +848,16 @@ def _bound_tool_output(tool_call_id, output):
     return (f"{head}\n… [{len(text) - 12000} chars truncated]{saved}\n…\n{tail}")
 
 
+def _content_chars(content) -> int:
+    """工具结果大小：多模态消息只算文本部分，图片按固定成本另计。"""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(str(part.get('text') or ''))
+                   for part in content if isinstance(part, dict))
+    return len(str(content or ''))
+
+
 def tool_result_budget(messages, max_bytes=None, session_store=None, info=None):
     """工具结果总量预算：超大单条输出（>PERSIST_THERSHOLD 字符）落盘换预览。
 
@@ -607,21 +870,24 @@ def tool_result_budget(messages, max_bytes=None, session_store=None, info=None):
     if max_bytes is None:
         max_bytes = int(h.CONTEXT_LIMIT * 0.8 * 3)
     tool_msgs = [m for m in messages if m.get('role') == 'tool']
-    total = sum(len(str(m.get('content', ''))) for m in tool_msgs)
+    total = sum(_content_chars(m.get('content', '')) for m in tool_msgs)
     if total <= max_bytes:
         return messages
-    ranked = sorted(tool_msgs, key=lambda m: len(str(m.get('content', ''))), reverse=True)
+    ranked = sorted(tool_msgs, key=lambda m: _content_chars(m.get('content', '')),
+                    reverse=True)
     for m in ranked:
         if total <= max_bytes:
             break
-        content = str(m.get('content', ''))
+        content = m.get('content', '')
+        if not isinstance(content, str):
+            continue   # 图片/多模态内容不套用文本截断
         if len(content) <= h.PERSIST_THERSHOLD:
             continue
         tid = m.get('tool_call_id', 'unknown')
         m['content'] = persist_large_output(tid, content)  # 持久化大输出，返回引用路径和预览内容
         if session_store is not None:
             session_store.append_tool_compacted(tid, m['content'])
-        total = sum(len(str(x.get('content', ''))) for x in tool_msgs)
+        total = sum(_content_chars(x.get('content', '')) for x in tool_msgs)
     if info is not None:
         info['rewrote'] = True
     return messages
@@ -647,12 +913,13 @@ def _summary_input(messages, budget=80_000):
     字符预算逐条取（消息不劈半）。"""
     lines = []
     first_user = next((m for m in messages
-                       if m.get('role') == 'user' and str(m.get('content', '')).strip()), None)
+                       if m.get('role') == 'user'
+                       and content_text(m.get('content')).strip()), None)
     if first_user is not None:
-        lines.append(f"[原始目标] {str(first_user['content'])[:2000]}")
+        lines.append(f"[原始目标] {content_text(first_user['content'])[:2000]}")
     tail, total = [], 0
     for m in reversed(messages):
-        content = str(m.get('content') or '')
+        content = content_text(m.get('content'))
         if m.get('tool_calls'):
             calls = '; '.join(
                 f"{c.get('function', {}).get('name', '?')}"

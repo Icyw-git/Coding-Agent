@@ -2,17 +2,25 @@
 可变全局（WORKDIR 等）由 harness 持有，通过 _h() 在运行时读取（便于测试 patch）。
 """
 import ast
+import codecs
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import List, Optional
 
 import checkpoints
+import document_render
+import documents
 import sandbox
+import web_access
+from agent_core import estimate_image_tokens
 from agent_teams import BUS, spawn_teammate_thread
 from cron_scheduler import cancel_job, cron_lock, schedule_job, scheduled_jobs
 from exec_policy import is_secret_path, resolve_tool_path
@@ -45,13 +53,27 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"bash",
-        "description":"Execute shell commands",
+        "description":"Execute shell commands. Slow commands (install/build/test) run in the background "
+                      "by default; use background_output to read their output and kill_background to stop them.",
         "parameters":{
             "type":"object",
             "properties":{
                 "command":{
                     "type":"string",
                     "description":"The shell command to execute, e.g. 'ls'"
+                },
+                "cwd":{
+                    "type":"string",
+                    "description":"Optional working directory (relative to the workspace or absolute)"
+                },
+                "timeout":{
+                    "type":"number",
+                    "description":"Optional timeout in seconds (max 3600; background default 3600, foreground 120)"
+                },
+                "run_in_background":{
+                    "type":"boolean",
+                    "description":"Force background (true) or foreground (false) execution, "
+                                  "overriding the slow-command heuristic"
                 }
             },
             "required":[
@@ -77,6 +99,108 @@ TOOLS=[{
                 "limit":{
                     "type":"integer",
                     "description":"Optional maximum number of lines to read"
+                },
+                "offset":{
+                    "type":"integer",
+                    "description":"Optional 0-based line offset to start reading from (default 0)"
+                }
+            },
+            "required":[
+                "path"
+            ]
+
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"view_image",
+        "description":"Read a local image (PNG/JPEG/GIF/WebP/BMP) and attach it to the conversation "
+                      "for visual inspection. Requires a vision-capable model.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "path":{
+                    "type":"string",
+                    "description":"Image path: relative to the workspace (or cwd), or absolute"
+                },
+                "cwd":{
+                    "type":"string",
+                    "description":"Optional directory to resolve a relative path against"
+                }
+            },
+            "required":[
+                "path"
+            ]
+
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"read_document",
+        "description":"Extract text from a local PDF, DOCX, PPTX, or XLSX file. PDF/PPTX accept a "
+                      "1-based pages range such as '1-10,15'; XLSX accepts sheet names or 1-based "
+                      "indexes. Scanned PDFs without a text layer are reported and need view_image "
+                      "on rendered pages (no OCR).",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "path":{
+                    "type":"string",
+                    "description":"Document path: relative to the workspace (or cwd), or absolute"
+                },
+                "pages":{
+                    "type":"string",
+                    "description":"Optional PDF page or PPTX slide range, 1-based (e.g. '1-10,15'). "
+                                  "Default: first 20."
+                },
+                "sheets":{
+                    "type":"string",
+                    "description":"Optional XLSX sheet names or 1-based indexes, comma-separated. "
+                                  "Default: first 8 sheets."
+                },
+                "cwd":{
+                    "type":"string",
+                    "description":"Optional directory to resolve a relative path against"
+                }
+            },
+            "required":[
+                "path"
+            ]
+
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"render_document",
+        "description":"Render selected pages of a PDF, DOCX, or PPTX to PNG images for visual "
+                      "inspection of layout, charts, tables, and scanned pages. Images are "
+                      "attached in the next user message. Prefer read_document for plain text. "
+                      "PDF requires pypdfium2; DOCX/PPTX conversion requires LibreOffice.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "path":{
+                    "type":"string",
+                    "description":"Document path: relative to the workspace (or cwd), or absolute"
+                },
+                "pages":{
+                    "type":"string",
+                    "description":"Optional 1-based page/slide range such as '1-3,5'. "
+                                  "Default: first 3; max 8 per call."
+                },
+                "dpi":{
+                    "type":"integer",
+                    "description":"Render resolution, 72-200 (default 110). Higher costs more tokens."
+                },
+                "cwd":{
+                    "type":"string",
+                    "description":"Optional directory to resolve a relative path against"
                 }
             },
             "required":[
@@ -131,6 +255,10 @@ TOOLS=[{
                 "new_text":{
                     "type":"string",
                     "description":"Replacement text"
+                },
+                "replace_all":{
+                    "type":"boolean",
+                    "description":"Replace every occurrence (default false; otherwise old_text must be unique)"
                 }
             },
             "required":[
@@ -230,13 +358,15 @@ TOOLS=[{
     "type":"function",
     "function":{
         "name":"todo_write",
-        "description":"Update the current task list shown to the user. Use for tracking multi-step work.",
+        "description":"Replace the current task list. Use it to track multi-step work; "
+                      "keep exactly one item in_progress, and mark items completed as you finish them.",
         "parameters":{
             "type":"object",
             "properties":{
                 "todos":{
                     "type":"array",
-                    "description":"List of tasks, each with 'content' and 'status' (pending/in_progress/completed)",
+                    "description":"Full task list (replaces the previous one), each with 'content' and "
+                                  "'status' (pending/in_progress/completed)",
                     "items":{
                         "type":"object",
                         "properties":{
@@ -261,6 +391,17 @@ TOOLS=[{
                 "todos"
             ]
 
+        }
+    }
+
+},{
+    "type":"function",
+    "function":{
+        "name":"todo_read",
+        "description":"Read the current task list for this session.",
+        "parameters":{
+            "type":"object",
+            "properties":{}
         }
     }
 
@@ -491,18 +632,97 @@ TOOLS=[{
 
 }]
 
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"background_output",
+        "description":"Read a background task's output. Set wait=true to block until it finishes "
+                      "(or the timeout elapses).",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "bg_id":{
+                    "type":"string",
+                    "description":"Background task id, e.g. 'bg_0001'"
+                },
+                "wait":{
+                    "type":"boolean",
+                    "description":"Block until the task reaches a terminal state (default false)"
+                },
+                "timeout":{
+                    "type":"number",
+                    "description":"Max seconds to wait when wait=true (default 30, max 600)"
+                }
+            },
+            "required":[
+                "bg_id"
+            ]
+        }
+    }
+})
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"kill_background",
+        "description":"Request cancellation of a running background task and kill its process tree.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "bg_id":{
+                    "type":"string",
+                    "description":"Background task id, e.g. 'bg_0001'"
+                }
+            },
+            "required":[
+                "bg_id"
+            ]
+        }
+    }
+})
+
 BASH_TIMEOUT = 120
+BASH_BACKGROUND_TIMEOUT = 3600
+BASH_MAX_TIMEOUT = 3600
 
 
-def run_bash(command:str, cwd: str = None)->str:
+def _bash_timeout(timeout) -> float:
+    import background_task
+    if timeout is None:
+        return (BASH_BACKGROUND_TIMEOUT
+                if background_task.current_background_id.get()
+                else BASH_TIMEOUT)
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        raise ValueError('timeout must be a number of seconds') from None
+    if value <= 0 or value > BASH_MAX_TIMEOUT:
+        raise ValueError(f'timeout must be between 0 and {BASH_MAX_TIMEOUT} seconds')
+    return value
+
+
+def run_bash(command:str, cwd: str = None, timeout=None,
+             run_in_background: bool = False)->str:
     # 判定只有一处（策略层），第三份黑名单已删：teammate / 后台 worker / 任务 runner
     # 绕过 PreToolUse hook 直接走到这里，凭据缺失时按无头路径审批（远程队列，超时拒绝）。
-    denied = _gate().enforce_headless('bash', {'command': command})
+    workspace = _h().get_workdir()
+    try:
+        base_path = (resolve_tool_path(cwd, workspace=workspace)
+                     if cwd else Path(workspace).resolve())
+    except Exception as exc:
+        return f'Error: {exc}'
+    if not base_path.is_dir():
+        return f'Error: cwd does not exist: {base_path}'
+    base = str(base_path)
+    denied = _gate().enforce_headless('bash', {'command': command, 'cwd': base})
     if denied:
         return denied
+    try:
+        limit = _bash_timeout(timeout)
+    except ValueError as exc:
+        return f'Error: {exc}'
     proc = None
     try:
-        base = cwd or str(_h().get_workdir())
         # A descendant can keep a PIPE open after cmd.exe exits. A temporary
         # output file lets the timeout bound execution without waiting for EOF.
         with tempfile.TemporaryFile() as output:
@@ -510,11 +730,14 @@ def run_bash(command:str, cwd: str = None)->str:
             # 可写范围就是那个 worktree，而不是主工作区。
             proc = sandbox.spawn_shell(command, cwd=base, stdout=output,
                                        workspace=base)
+            import background_task
+            background_task.register_process(proc)
             try:
-                proc.wait(timeout=BASH_TIMEOUT)
+                proc.wait(timeout=limit)
             except subprocess.TimeoutExpired:
                 kill_process_tree(proc)
-                return f'Error: Command timeout({BASH_TIMEOUT}s); process termination requested.'
+                return (f'Error: Command timeout({limit:g}s); '
+                        'process termination requested.')
             except BaseException:
                 kill_process_tree(proc)
                 raise
@@ -534,7 +757,88 @@ def run_bash(command:str, cwd: str = None)->str:
     except (FileNotFoundError,OSError) as e:
         return f'Error:{e}'
     finally:
+        if proc is not None:
+            try:
+                import background_task
+                background_task.unregister_process(proc)
+            except Exception:
+                pass
         close_process(proc)
+
+
+def run_background_output(bg_id: str, wait: bool = False,
+                          timeout: float = 30) -> str:
+    """查看后台任务输出；wait=True 时最多阻塞 timeout 秒。"""
+    import background_task
+    if not isinstance(bg_id, str) or not bg_id.strip():
+        return 'Error: bg_id must be a non-empty string'
+    try:
+        wait_seconds = float(timeout if timeout is not None else 30)
+    except (TypeError, ValueError):
+        return 'Error: timeout must be a number of seconds'
+    if wait_seconds < 0:
+        return 'Error: timeout must be non-negative'
+    wait_seconds = min(wait_seconds, 600)
+    task = (background_task.wait_background(bg_id, wait_seconds)
+            if wait else background_task.background_snapshot(bg_id))
+    if task is None:
+        return f'Error: unknown background task {bg_id}'
+    status = task['status']
+    if status in ('running', 'queued'):
+        return (f'[{bg_id}] {status}: {task.get("command", "")}\n'
+                'call again with wait=true to block for completion')
+    task, output = background_task.read_background_result(bg_id)
+    if task is None:
+        return f'Error: unknown background task {bg_id}'
+    text = str(output if output is not None else task.get('result', ''))
+    if len(text) > 50000:
+        text = text[:50000] + '\n... (truncated)'
+    return (f'[{bg_id}] {status}\nCommand: {task.get("command", "")}\n'
+            f'Output:\n{text or "(no output)"}')
+
+
+def run_kill_background(bg_id: str) -> str:
+    import background_task
+    if not isinstance(bg_id, str) or not bg_id.strip():
+        return 'Error: bg_id must be a non-empty string'
+    task = background_task.kill_background(bg_id)
+    if task is None:
+        return f'Error: unknown background task {bg_id}'
+    status = task['status']
+    if status in ('completed', 'failed', 'cancelled'):
+        return f'[{bg_id}] already {status}'
+    return f'[{bg_id}] cancel requested; use background_output to confirm'
+
+
+def run_web_fetch(url: str, max_chars: int = 20000) -> str:
+    # 私网/本机地址在审批之前就拒掉：不给「批准一次 localhost 探测」的机会。
+    try:
+        web_access.check_url(url)
+    except web_access.WebAccessError as exc:
+        return f'Error: {exc}'
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        return 'Error: max_chars must be an integer'
+    max_chars = max(1, min(max_chars, 100000))
+    denied = _gate().enforce_headless('web_fetch', {'url': url})
+    if denied:
+        return denied
+    try:
+        result = web_access.fetch(url)
+    except web_access.WebAccessError as exc:
+        return f'Error: {exc}'
+    text = result['text']
+    header = (f'URL: {result["final_url"]}\n'
+              f'Content-Type: {result["content_type"]}\n\n')
+    if not text:
+        return header + '(empty response)'
+    if len(text) > max_chars:
+        omitted = len(text) - max_chars
+        text = text[:max_chars] + f'\n... (truncated; {omitted} chars omitted)'
+    if result['truncated']:
+        text += '\n... (response exceeded 2 MiB and was truncated)'
+    return header + text
 
 def safe_path(p: str, cwd: str = None) -> Path:
     """解析工具路径。
@@ -545,28 +849,264 @@ def safe_path(p: str, cwd: str = None) -> Path:
     """
     return resolve_tool_path(p, cwd=cwd, workspace=_h().get_workdir())
 
+
+class _BinaryFileError(ValueError):
+    pass
+
+
+_TEXT_BOMS = (
+    (codecs.BOM_UTF32_LE, 'utf-32'),
+    (codecs.BOM_UTF32_BE, 'utf-32'),
+    (codecs.BOM_UTF8, 'utf-8-sig'),
+    (codecs.BOM_UTF16_LE, 'utf-16'),
+    (codecs.BOM_UTF16_BE, 'utf-16'),
+)
+
+_BINARY_MAGIC = (
+    b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'GIF87a', b'GIF89a',
+    b'%PDF-', b'PK\x03\x04', b'\x7fELF', b'MZ',
+)
+
+
+def _looks_binary_text(text: str) -> bool:
+    sample = text[:4096]
+    if not sample:
+        return False
+    controls = sum(1 for ch in sample if ord(ch) < 32 and ch not in '\n\r\t')
+    return controls > max(8, len(sample) // 100)
+
+
+def _decode_text(data: bytes) -> tuple[str, str]:
+    """按 BOM → UTF-8 → GB18030 解码；二进制内容抛 _BinaryFileError。
+
+    文件工具对编码的判断必须一致：read 看到的中文、edit 回写的编码和 grep
+    搜索的内容都走这里，否则 Windows 上 GBK/UTF-16 文件会在不同工具间表现分裂。
+    """
+    for bom, encoding in _TEXT_BOMS:
+        if data.startswith(bom):
+            return data.decode(encoding), encoding
+    if data.startswith(_BINARY_MAGIC):
+        raise _BinaryFileError('binary file (not text)')
+    if b'\x00' in data:
+        raise _BinaryFileError('binary file (contains NUL bytes)')
+    try:
+        return data.decode('utf-8'), 'utf-8'
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = data.decode('gb18030')
+    except UnicodeDecodeError:
+        return data.decode('utf-8', errors='replace'), 'utf-8'
+    if _looks_binary_text(text):
+        raise _BinaryFileError('binary file (not text)')
+    return text, 'gb18030'
+
+
+def _detect_newline(text: str) -> str:
+    if '\r\n' in text:
+        return '\r\n'
+    if '\r' in text:
+        return '\r'
+    return '\n'
+
+
+def _read_text_file(path: Path) -> tuple[str, str, str]:
+    """返回 (统一为 \\n 的文本, 编码, 原换行符)。"""
+    text, encoding = _decode_text(path.read_bytes())
+    newline = _detect_newline(text)
+    return text.replace('\r\n', '\n').replace('\r', '\n'), encoding, newline
+
+
+def _encode_text(text: str, encoding: str, newline: str) -> bytes:
+    if newline != '\n':
+        text = text.replace('\r\n', '\n').replace('\n', newline)
+    return text.encode(encoding)
+
+
 def _capture_checkpoint(path: Path) -> None:
     """把「写入前」的内容交给当前活跃 checkpoint 节点；无活跃 manager 时静默跳过。"""
     manager = _h().active_checkpoint_manager()
     if manager is not None:
         manager.capture_pre_image(path)
 
-def run_read(path: str, limit: Optional[int] = None, cwd: str = None) -> str:
+
+class ImageResult:
+    """工具结果：给模型看的文本 + 需要以 user 多模态消息注入的图片。
+
+    图片本体不塞进 tool 结果（OpenAI Chat Completions 的 tool 消息对图片支持
+    并不一致），而是落盘成缓存文件，由 agent_core.expand_image_parts 在每次
+    请求前转成 data URI。消息历史里只留引用，压缩/转录不会被 base64 撑爆。
+    """
+
+    def __init__(self, text: str, images: list[dict] | None = None):
+        self.text = text
+        self.images = images or []
+
+
+_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_IMAGE_SIGNATURES = (
+    (b'\x89PNG\r\n\x1a\n', 'image/png', '.png'),
+    (b'\xff\xd8\xff', 'image/jpeg', '.jpg'),
+    (b'GIF87a', 'image/gif', '.gif'),
+    (b'GIF89a', 'image/gif', '.gif'),
+    (b'BM', 'image/bmp', '.bmp'),
+)
+
+
+def _image_type(data: bytes) -> tuple[str, str] | None:
+    for magic, mime, suffix in _IMAGE_SIGNATURES:
+        if data.startswith(magic):
+            return mime, suffix
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp', '.webp'
+    return None
+
+
+def _cache_image(data: bytes, suffix: str) -> Path:
+    """把图片落到工具缓存目录；同一内容只写一次。"""
+    h = _h()
+    base = getattr(h, 'TOOL_RESULTS_DIR', None)
+    directory = (Path(base) / 'images' if base is not None
+                 else Path(tempfile.gettempdir()) / 'harness-images')
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f'{hashlib.sha1(data).hexdigest()}{suffix}'
+    if not target.exists():
+        target.write_bytes(data)
+    return target
+
+
+def run_view_image(path: str, cwd: str = None) -> ImageResult | str:
+    denied = _gate_file('view_image', path, cwd)
+    if denied:
+        return denied
+    try:
+        file_path = safe_path(path, cwd)
+        if not file_path.is_file():
+            return f'Error: image not found: {path}'
+        data = file_path.read_bytes()
+        if len(data) > _IMAGE_MAX_BYTES:
+            return (f'Error: image is too large ({len(data)} bytes; max '
+                    f'{_IMAGE_MAX_BYTES}). Resize it first.')
+        image_type = _image_type(data)
+        if image_type is None:
+            return (f'Error: unsupported image format: {path} '
+                    '(supported: PNG, JPEG, GIF, WebP, BMP)')
+        mime, suffix = image_type
+        cached = _cache_image(data, suffix)
+        text = (f'Viewed image: {file_path.name} ({mime}, {len(data)} bytes). '
+                'The image is attached in the next user message; inspect it before '
+                'answering.')
+        return ImageResult(text, [{
+            'type': 'harness_image',
+            'path': str(cached),
+            'mime': mime,
+            'name': file_path.name,
+            'bytes': len(data),
+            'tokens': estimate_image_tokens(data),
+        }])
+    except _BinaryFileError as exc:
+        return f'Error: {exc}'
+    except Exception as exc:
+        return f'Error: {exc}'
+
+
+_DOCUMENT_SUFFIXES = frozenset({'.pdf', '.docx', '.pptx', '.xlsx',
+                                '.doc', '.ppt', '.xls'})
+
+
+def run_read_document(path: str, pages: str = None, sheets: str = None,
+                      cwd: str = None) -> str:
+    denied = _gate_file('read_document', path, cwd)
+    if denied:
+        return denied
+    try:
+        file_path = safe_path(path, cwd)
+        if not file_path.is_file():
+            return f'Error: document not found: {path}'
+        data = file_path.read_bytes()
+        return documents.extract_document(
+            data, file_path.name, pages=pages, sheets=sheets)
+    except documents.DocumentError as exc:
+        return f'Error: {exc}'
+    except Exception as exc:
+        return f'Error: {exc}'
+
+
+def run_render_document(path: str, pages: str = None, dpi: int = 110,
+                        cwd: str = None) -> ImageResult | str:
+    denied = _gate_file('render_document', path, cwd)
+    if denied:
+        return denied
+    try:
+        file_path = safe_path(path, cwd)
+        if not file_path.is_file():
+            return f'Error: document not found: {path}'
+        data = file_path.read_bytes()
+        rendered = document_render.render_document(
+            data, file_path.name, pages=pages, dpi=dpi)
+        if not rendered:
+            return f'Error: no pages rendered from {path}'
+        images = []
+        for number, png in rendered:
+            cached = _cache_image(png, '.png')
+            images.append({
+                'type': 'harness_image',
+                'path': str(cached),
+                'mime': 'image/png',
+                'name': f'{file_path.stem}-page{number}.png',
+                'bytes': len(png),
+                'tokens': estimate_image_tokens(png),
+            })
+        page_text = ', '.join(str(number) for number, _ in rendered)
+        total_kib = sum(len(png) for _, png in rendered) / 1024
+        text = (f'Rendered page(s) {page_text} of {file_path.name} at {dpi} dpi '
+                f'({len(images)} image(s), {total_kib:.0f} KiB). The images are '
+                'attached in the next user message; inspect layout, charts, tables, '
+                'and scanned text. Use read_document when you only need text.')
+        return ImageResult(text, images)
+    except document_render.RenderError as exc:
+        return f'Error: {exc}'
+    except Exception as exc:
+        return f'Error: {exc}'
+
+
+def run_read(path: str, limit: Optional[int] = None,
+             offset: int = 0, cwd: str = None) -> str:
     # 读默认放行，但秘密路径是硬拒；teammate 等无头路径不走 PreToolUse，
     # 边界上必须自己判一次。
     denied = _gate_file('read', path, cwd)
     if denied:
         return denied
     try:
-        lines = safe_path(path, cwd).read_text(encoding='utf-8', errors='replace').splitlines()
-        if limit is None and len(lines) > 500:
-            # 大文件没传 limit：自动截断，防止整文件灌进上下文
-            lines = lines[:200] + [f"... ({len(lines) - 200} more lines; use limit to read in chunks)"]
-        elif limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+        try:
+            offset = int(offset or 0)
+            limit = None if limit is None else int(limit)
+        except (TypeError, ValueError):
+            return 'Error: offset and limit must be integers'
+        if offset < 0 or (limit is not None and limit < 0):
+            return 'Error: offset and limit must be non-negative'
+        file_path = safe_path(path, cwd)
+        if file_path.suffix.lower() in _DOCUMENT_SUFFIXES:
+            return (f'Error: {file_path.suffix} is a document; use read_document '
+                    'to extract its text')
+        text, _encoding, _newline = _read_text_file(file_path)
+        lines = text.splitlines()
+        total = len(lines)
+        if offset >= total:
+            return f'(no lines at offset {offset}; file has {total} lines)'
+        end = total if limit is None else min(total, offset + limit)
+        if limit is None and total - offset > 500:
+            # 大文件没传 limit：从 offset 起只取 200 行，并给出下一次的 offset。
+            end = offset + 200
+        chunk = '\n'.join(lines[offset:end])
+        if end < total:
+            chunk += f'\n... ({total - end} more lines; use offset={end})'
+        return chunk if chunk else '(empty file)'
+    except _BinaryFileError as exc:
+        return f'Error: {exc}'
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_write(path: str, content: str, cwd: str = None) -> str:
     # read-only 档 / 无头路径（teammate、后台）的写改同样要在边界拦一道：
@@ -576,27 +1116,334 @@ def run_write(path: str, content: str, cwd: str = None) -> str:
         return denied
     try:
         file_path = safe_path(path, cwd)
+        encoding, newline = 'utf-8', '\n'
+        if file_path.is_file():
+            try:
+                _text, encoding, newline = _read_text_file(file_path)
+            except _BinaryFileError:
+                return f'Error: refusing to overwrite binary file: {path}'
         _capture_checkpoint(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding='utf-8')
+        file_path.write_bytes(_encode_text(content, encoding, newline))
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
-def run_edit(path: str, old_text: str, new_text: str, cwd: str = None) -> str:
+
+def run_edit(path: str, old_text: str, new_text: str,
+             replace_all: bool = False, cwd: str = None) -> str:
     denied = _gate_file('edit', path, cwd)
     if denied:
         return denied
     try:
+        if not old_text:
+            return 'Error: old_text must not be empty'
         file_path = safe_path(path, cwd)
-        text = file_path.read_text(encoding='utf-8', errors='replace')
-        if old_text not in text:
+        text, encoding, newline = _read_text_file(file_path)
+        count = text.count(old_text)
+        if count == 0:
             return f"Error: text not found in {path}"
+        if count > 1 and not replace_all:
+            return (f'Error: text appears {count} times in {path}; '
+                    'provide more context or set replace_all=true')
+        updated = text.replace(old_text, new_text) if replace_all \
+            else text.replace(old_text, new_text, 1)
         _capture_checkpoint(file_path)   # 确认能改再抓 pre-image，避免记下无意义的快照
-        file_path.write_text(text.replace(old_text, new_text, 1), encoding='utf-8')
+        file_path.write_bytes(_encode_text(updated, encoding, newline))
         return f"Edited {path}"
+    except _BinaryFileError as exc:
+        return f'Error: {exc}'
     except Exception as e:
         return f"Error: {e}"
+
+
+PATCH_BEGIN = '*** Begin Patch'
+PATCH_END = '*** End Patch'
+_PATCH_FILE_HEADER = re.compile(
+    r'^\*\*\* (Add File|Update File|Delete File):\s*(.+?)\s*$')
+_PATCH_MOVE_HEADER = re.compile(r'^\*\*\* Move to:\s*(.+?)\s*$')
+
+
+class PatchError(ValueError):
+    pass
+
+
+def _parse_hunk(raw: dict, path: str, number: int) -> dict:
+    old, new = [], []
+    for line in raw['lines']:
+        if line == '':
+            old.append('')
+            new.append('')
+        elif line[0] == ' ':
+            old.append(line[1:])
+            new.append(line[1:])
+        elif line[0] == '-':
+            old.append(line[1:])
+        elif line[0] == '+':
+            new.append(line[1:])
+    if not old and raw['hint'] is None:
+        raise PatchError(
+            f'{path}: hunk {number} needs context lines or a @@ anchor')
+    return {'hint': raw['hint'], 'old': old, 'new': new}
+
+
+def parse_patch(patch: str) -> list[dict]:
+    """解析 Codex 风格的 *** Begin Patch 文本，返回文件操作列表。
+
+    只做语法解析，不读盘、不判定路径；策略层用 patch_paths 取路径，
+    handler 用本函数的结果做两阶段（先规划、后写盘）应用。
+    """
+    if not isinstance(patch, str) or not patch.strip():
+        raise PatchError('empty patch')
+    lines = patch.splitlines()
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index >= len(lines) or lines[index].strip() != PATCH_BEGIN:
+        raise PatchError(f"patch must start with '{PATCH_BEGIN}'")
+    index += 1
+    ops = []
+    seen_end = False
+    while index < len(lines):
+        raw = lines[index]
+        if raw.strip() == PATCH_END:
+            seen_end = True
+            index += 1
+            break
+        if not raw.strip():
+            index += 1
+            continue
+        match = _PATCH_FILE_HEADER.match(raw)
+        if not match:
+            raise PatchError(
+                f'line {index + 1}: expected file header, got {raw[:60]!r}')
+        kind = match.group(1).lower().split()[0]
+        path = match.group(2)
+        index += 1
+        move_to = None
+        if kind == 'update':
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+            if index < len(lines) and lines[index].startswith('*** Move to:'):
+                move_match = _PATCH_MOVE_HEADER.match(lines[index])
+                if not move_match:
+                    raise PatchError(f'line {index + 1}: invalid move header')
+                move_to = move_match.group(1)
+                index += 1
+        if kind == 'delete':
+            ops.append({'kind': 'delete', 'path': path})
+            continue
+        if kind == 'add':
+            content = []
+            while index < len(lines) and not lines[index].startswith('*** '):
+                line = lines[index]
+                if line.startswith('\\'):
+                    index += 1
+                    continue
+                if line.startswith('+'):
+                    content.append(line[1:])
+                elif line == '':
+                    content.append('')
+                else:
+                    raise PatchError(
+                        f'line {index + 1}: added lines must start with "+"')
+                index += 1
+            if not content:
+                raise PatchError(f'add file {path!r} has no content')
+            text = '\n'.join(content)
+            ops.append({'kind': 'add', 'path': path,
+                        'content': text if text.endswith('\n') else text + '\n'})
+            continue
+        hunks = []
+        current = {'hint': None, 'lines': []}
+        while index < len(lines) and not lines[index].startswith('*** '):
+            line = lines[index]
+            if line.startswith('@@'):
+                if current['hint'] is not None or current['lines']:
+                    hunks.append(current)
+                current = {'hint': line[2:].strip() or None, 'lines': []}
+            elif line.startswith('\\'):
+                pass
+            elif line.startswith((' ', '+', '-')) or line == '':
+                current['lines'].append(line)
+            else:
+                raise PatchError(
+                    f'line {index + 1}: hunk lines must start with '
+                    '" ", "+" or "-"')
+            index += 1
+        if current['hint'] is not None or current['lines']:
+            hunks.append(current)
+        if not hunks and move_to is None:
+            raise PatchError(f'update file {path!r} has no hunks')
+        ops.append({'kind': 'update', 'path': path, 'move_to': move_to,
+                    'hunks': [_parse_hunk(hunk, path, number)
+                              for number, hunk in enumerate(hunks, 1)]})
+    if not seen_end:
+        raise PatchError(f"missing '{PATCH_END}'")
+    if any(line.strip() for line in lines[index:]):
+        raise PatchError(f'content after {PATCH_END}')
+    if not ops:
+        raise PatchError('patch affects no files')
+    return ops
+
+
+def patch_paths(patch: str) -> list[str]:
+    """补丁涉及的全部路径（含 move 目标），供策略层做整批路径判定。"""
+    paths = []
+    for op in parse_patch(patch):
+        paths.append(op['path'])
+        if op.get('move_to'):
+            paths.append(op['move_to'])
+    return paths
+
+
+def _apply_hunks(text: str, hunks: list[dict], path: str) -> str:
+    trailing_newline = text.endswith('\n')
+    lines = text.splitlines()
+    cursor = 0
+    for number, hunk in enumerate(hunks, 1):
+        old, new, hint = hunk['old'], hunk['new'], hunk['hint']
+        if hint is not None:
+            anchors = [i + 1 for i in range(cursor, len(lines))
+                       if lines[i] == hint or hint in lines[i]]
+            if not anchors:
+                raise PatchError(
+                    f'{path}: hunk {number}: anchor not found: {hint!r}')
+            if old:
+                matches = [anchor for anchor in anchors
+                           if lines[anchor:anchor + len(old)] == old]
+                if not matches:
+                    raise PatchError(
+                        f'{path}: hunk {number}: context not found after anchor')
+                if len(matches) > 1:
+                    raise PatchError(
+                        f'{path}: hunk {number}: context is ambiguous; '
+                        'add more context lines')
+                index = matches[0]
+            else:
+                if len(anchors) > 1:
+                    raise PatchError(
+                        f'{path}: hunk {number}: anchor is ambiguous')
+                index = anchors[0]
+        else:
+            matches = [i for i in range(cursor, len(lines) - len(old) + 1)
+                       if lines[i:i + len(old)] == old]
+            if not matches:
+                raise PatchError(f'{path}: hunk {number}: context not found')
+            if len(matches) > 1:
+                raise PatchError(
+                    f'{path}: hunk {number}: context is ambiguous; '
+                    'add more context lines')
+            index = matches[0]
+        lines[index:index + len(old)] = new
+        cursor = index + len(new)
+    result = '\n'.join(lines)
+    return result + '\n' if trailing_newline else result
+
+
+def _plan_patch(ops: list[dict], cwd: str | None) -> list[dict]:
+    plans = []
+    touched = set()
+
+    def reserve(path: Path, what: str) -> None:
+        key = os.path.normcase(str(path))
+        if key in touched:
+            raise PatchError(f'{what} touches the same file twice: {path}')
+        touched.add(key)
+
+    for op in ops:
+        source = safe_path(op['path'], cwd)
+        if op['kind'] == 'add':
+            reserve(source, 'add')
+            if source.exists():
+                raise PatchError(f'add file already exists: {source}')
+            plans.append({'kind': 'write', 'path': source,
+                          'data': _encode_text(op['content'], 'utf-8', '\n')})
+            continue
+        if not source.is_file():
+            raise PatchError(f'{op["kind"]} file not found: {source}')
+        text, encoding, newline = _read_text_file(source)
+        if op['kind'] == 'delete':
+            reserve(source, 'delete')
+            plans.append({'kind': 'delete', 'path': source})
+            continue
+        reserve(source, 'update')
+        updated = _apply_hunks(text, op['hunks'], str(source))
+        data = _encode_text(updated, encoding, newline)
+        move_to = op.get('move_to')
+        if not move_to:
+            plans.append({'kind': 'write', 'path': source, 'data': data})
+            continue
+        dest = safe_path(move_to, cwd)
+        reserve(dest, 'move target')
+        if dest.exists():
+            raise PatchError(f'move target already exists: {dest}')
+        plans.append({'kind': 'move', 'path': source, 'dest': dest, 'data': data})
+    return plans
+
+
+def _apply_plans(plans: list[dict]) -> None:
+    """写盘并保留回滚副本：任何一个文件失败，已改文件恢复原样。"""
+    backups = []
+    seen = set()
+    for plan in plans:
+        paths = ([plan['path'], plan['dest']]
+                 if plan['kind'] == 'move' else [plan['path']])
+        for path in paths:
+            key = os.path.normcase(str(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            _capture_checkpoint(path)
+            backups.append((path, path.read_bytes() if path.is_file() else None))
+    try:
+        for plan in plans:
+            if plan['kind'] == 'delete':
+                plan['path'].unlink()
+            elif plan['kind'] == 'write':
+                plan['path'].parent.mkdir(parents=True, exist_ok=True)
+                plan['path'].write_bytes(plan['data'])
+            else:
+                plan['dest'].parent.mkdir(parents=True, exist_ok=True)
+                plan['dest'].write_bytes(plan['data'])
+                plan['path'].unlink()
+    except Exception:
+        for path, old in reversed(backups):
+            try:
+                if old is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(old)
+            except OSError:
+                pass
+        raise
+
+
+def run_apply_patch(patch: str, cwd: str = None) -> str:
+    try:
+        ops = parse_patch(patch)
+    except PatchError as exc:
+        return f'Error: invalid patch: {exc}'
+    gate_args = {'patch': patch}
+    if cwd:
+        gate_args['cwd'] = cwd
+    denied = _gate().enforce_headless('apply_patch', gate_args)
+    if denied:
+        return denied
+    try:
+        plans = _plan_patch(ops, cwd)
+        _apply_plans(plans)
+    except PatchError as exc:
+        return f'Error: patch not applied: {exc}'
+    except Exception as exc:
+        return f'Error: patch not applied: {exc}'
+    updates = sum(1 for plan in plans if plan['kind'] == 'write')
+    adds = sum(1 for op in ops if op['kind'] == 'add')
+    deletes = sum(1 for op in ops if op['kind'] == 'delete')
+    moves = sum(1 for plan in plans if plan['kind'] == 'move')
+    return (f'Applied patch: {updates} updated, {adds} added, '
+            f'{deletes} deleted, {moves} moved')
+
 
 MAX_SEARCH_BYTES = 2 * 1024 * 1024
 _SEARCH_IGNORE = frozenset(checkpoints.DEFAULT_IGNORE) | {
@@ -669,6 +1516,115 @@ def run_glob(pattern: str, path: str = None, cwd: str = None) -> str:
         return f"Error: {e}"
 
 
+RG_TIMEOUT = 30.0
+_RG_GLOB_IGNORES = tuple(sorted(_SEARCH_IGNORE))
+
+
+def _rg_binary() -> str | None:
+    return shutil.which('rg')
+
+
+def _grep_with_ripgrep(pattern: str, root: Path, glob: str | None,
+                       case_insensitive: bool, limit: int) -> str | None:
+    """用 ripgrep 搜目录；不可用时返回 None，交给 Python 回退。
+
+    Python 正则与 rust-regex 语义不同、GBK 需要逐文件探测编码，所以
+    非 ASCII 模式直接走回退；rg 输出出现替换符也视为编码不适配。
+    """
+    if not pattern.isascii():
+        return None
+    binary = _rg_binary()
+    if not binary:
+        return None
+    command = [
+        binary, '--no-heading', '--line-number', '--color', 'never',
+        '-H', '--hidden', '--no-ignore', '--no-messages',
+        '--max-columns', '1000', '--max-columns-preview',
+        '--regexp', pattern,
+    ]
+    if case_insensitive:
+        command.append('-i')
+    for name in _RG_GLOB_IGNORES:
+        command += ['--glob', f'!{name}/**']
+    for secret in checkpoints.DEFAULT_SECRETS:
+        command += ['--glob', f'!{secret}']
+    command += ['--', '.']
+    timed_out = []
+
+    def stop():
+        timed_out.append(True)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    try:
+        proc = subprocess.Popen(
+            command, cwd=str(root), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding='utf-8',
+            errors='replace')
+    except OSError:
+        return None
+    timer = threading.Timer(RG_TIMEOUT, stop)
+    timer.start()
+    hits = []
+    fallback = False
+    truncated = False
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip('\r\n')
+            if not line:
+                continue
+            rel, _, rest = line.partition(':')
+            lineno, _, text = rest.partition(':')
+            rel = rel.replace('\\', '/')
+            if rel.startswith('./'):
+                rel = rel[2:]
+            candidate = root / rel
+            if not lineno.isdigit():
+                fallback = True
+                break
+            try:
+                if candidate.stat().st_size > MAX_SEARCH_BYTES:
+                    continue
+            except OSError:
+                continue
+            if _secret_file(candidate):
+                continue
+            if not _match_search_glob(candidate, root, glob):
+                continue
+            if '\ufffd' in text:
+                fallback = True
+                break
+            if len(text) > 400:
+                text = text[:400] + '…'
+            hits.append(f'{rel}:{lineno}: {text}')
+            if len(hits) >= limit:
+                truncated = True
+                break
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    if fallback:
+        return None
+    if timed_out:
+        note = f'\n(search timed out after {RG_TIMEOUT:g}s)'
+        return ('\n'.join(hits) + note) if hits else '(no matches)' + note
+    if truncated:
+        return '\n'.join(hits) + f'\n(truncated at {limit} matches)'
+    if proc.returncode not in (0, 1) and not hits:
+        return None
+    return '\n'.join(hits) if hits else "(no matches)"
+
+
 def run_grep(pattern: str, path: str = '.', glob: str = None,
              case_insensitive: bool = False, max_results: int = 100,
              cwd: str = None) -> str:
@@ -676,6 +1632,7 @@ def run_grep(pattern: str, path: str = '.', glob: str = None,
 
     只读工具：根路径走 read 的分区判定；目录遍历跳过秘密文件与常见忽略目录。
     二进制与超过 MAX_SEARCH_BYTES 的文件不搜，避免把一次检索变成整盘扫描。
+    目录搜索优先走 ripgrep；不可用或模式含非 ASCII 时回退到 Python 逐文件解码。
     """
     try:
         regex = re.compile(pattern, re.IGNORECASE if case_insensitive else 0)
@@ -687,6 +1644,10 @@ def run_grep(pattern: str, path: str = '.', glob: str = None,
     if not root.exists():
         return f'Error: path not found: {path}'
     limit = max(1, min(int(max_results), 1000))
+    if root.is_dir():
+        fast = _grep_with_ripgrep(pattern, root, glob, case_insensitive, limit)
+        if fast is not None:
+            return fast
     hits: list[str] = []
     try:
         for candidate in _search_files(root):
@@ -698,9 +1659,10 @@ def run_grep(pattern: str, path: str = '.', glob: str = None,
                 data = candidate.read_bytes()
             except OSError:
                 continue
-            if b'\x00' in data[:4096]:
+            try:
+                text, _encoding = _decode_text(data)
+            except _BinaryFileError:
                 continue
-            text = data.decode('utf-8', errors='replace')
             try:
                 display = str(candidate.relative_to(root)) \
                     if root.is_dir() else str(root)
@@ -747,6 +1709,29 @@ def run_ls(path: str = '.', all: bool = False, cwd: str = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+_TODO_MAX_ITEMS = 100
+_TODO_MAX_CHARS = 500
+_TODOS: dict[str, list[dict]] = {}
+_TODOS_LOCK = threading.Lock()
+
+
+def _todo_scope() -> str:
+    """todo 按会话分区；没有会话上下文时退回进程级（测试/单次调用）。"""
+    try:
+        return _gate().current_session_id() or '__global__'
+    except Exception:
+        return '__global__'
+
+
+def _todo_store():
+    """当前会话的事件流；manager 由 agent_loop 持有，拿不到就返回 None。"""
+    try:
+        manager = _h().active_checkpoint_manager()
+    except Exception:
+        return None
+    return getattr(manager, 'session_store', None)
+
+
 def _normalize_todos(todos):
     if isinstance(todos, str):
         try:
@@ -758,6 +1743,11 @@ def _normalize_todos(todos):
                 return None, "Error: todos must be a list or JSON array string"
     if not isinstance(todos, list):
         return None, "Error: todos must be a list"
+    if len(todos) > _TODO_MAX_ITEMS:
+        return None, f"Error: at most {_TODO_MAX_ITEMS} todos are supported"
+    normalized = []
+    seen = set()
+    active = []
     for i, t in enumerate(todos):
         if not isinstance(t, dict):
             return None, f"Error: todos[{i}] must be an object"
@@ -765,20 +1755,99 @@ def _normalize_todos(todos):
             return None, f"Error: todos[{i}] missing 'content' or 'status'"
         if t["status"] not in ("pending", "in_progress", "completed"):
             return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
-    return todos, None
+        content = str(t["content"]).strip()
+        if not content:
+            return None, f"Error: todos[{i}] content must not be empty"
+        if len(content) > _TODO_MAX_CHARS:
+            return None, (f"Error: todos[{i}] content is too long "
+                          f"(max {_TODO_MAX_CHARS} chars)")
+        if content in seen:
+            return None, f"Error: duplicate todo content: {content}"
+        seen.add(content)
+        if t["status"] == "in_progress":
+            active.append(i)
+        normalized.append({"content": content, "status": t["status"]})
+    if len(active) > 1:
+        return None, (f"Error: only one todo may be in_progress (got indexes "
+                      f"{', '.join(str(i) for i in active)})")
+    return normalized, None
+
+
+def _todo_stats(todos: list[dict]) -> str:
+    counts = {"completed": 0, "in_progress": 0, "pending": 0}
+    for t in todos:
+        counts[t["status"]] += 1
+    return (f"{counts['completed']}/{len(todos)} completed · "
+            f"{counts['in_progress']} in progress · {counts['pending']} pending")
+
+
+def _format_todos(todos: list[dict]) -> str:
+    icons = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+    return '\n'.join(f'{icons[t["status"]]} {t["content"]}' for t in todos)
+
+
+def _print_todos(todos: list[dict]) -> None:
+    print("\n\033[33m## Current Tasks\033[0m")
+    icons = {"pending": " ", "in_progress": "\033[36m▸\033[0m",
+             "completed": "\033[32m✓\033[0m"}
+    for t in todos:
+        print(f"  [{icons[t['status']]}] {t['content']}")
+    print(f"  \033[90m{_todo_stats(todos)}\033[0m")
+
+
+def restore_todos(session_store, scope: str | None = None) -> list[dict]:
+    """从事件流恢复最后一次 todo_write 的状态（会话重启后仍可读）。"""
+    if session_store is None:
+        return []
+    target = scope or session_store.session_id
+    try:
+        events = session_store.read_events()
+    except Exception:
+        return []
+    last = next((event for event in reversed(events)
+                 if event.get('type') == 'todos'
+                 and isinstance(event.get('todos'), list)), None)
+    if last is None:
+        return []
+    normalized, error = _normalize_todos(last['todos'])
+    if error:
+        return []
+    with _TODOS_LOCK:
+        _TODOS[target] = normalized
+    return normalized
+
 
 def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    todos, error = _normalize_todos(todos)
+    normalized, error = _normalize_todos(todos)
     if error:
         return error
-    CURRENT_TODOS = todos
-    lines = ["\n\033[33m## Current Tasks\033[0m"]
-    for t in CURRENT_TODOS:
-        icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
-        lines.append(f"  [{icon}] {t['content']}")
-    print("\n".join(lines))
-    return f"Updated {len(CURRENT_TODOS)} tasks"
+    scope = _todo_scope()
+    with _TODOS_LOCK:
+        _TODOS[scope] = normalized
+    store = _todo_store()
+    if store is not None:
+        try:
+            store.append('todos', todos=normalized)
+        except Exception:
+            pass   # 事件落盘失败不回滚内存里的计划
+    _print_todos(normalized)
+    if not normalized:
+        return "Task list cleared."
+    return (f"Updated {len(normalized)} tasks ({_todo_stats(normalized)}).\n"
+            + _format_todos(normalized))
+
+
+def run_todo_read() -> str:
+    scope = _todo_scope()
+    with _TODOS_LOCK:
+        todos = list(_TODOS.get(scope, []))
+    if not todos:
+        store = _todo_store()
+        if store is not None:
+            todos = restore_todos(store, scope)
+    if not todos:
+        return "No tasks. Use todo_write to create a task list."
+    return f"{_todo_stats(todos)}.\n{_format_todos(todos)}"
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: Optional[List[str]] = None) -> str:
@@ -890,13 +1959,75 @@ def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
-tool_registry={'bash':run_bash,'read':run_read,'write':run_write,'edit':run_edit,'glob':run_glob,'grep':run_grep,'ls':run_ls,'todo_write':run_todo_write,
+tool_registry={'bash':run_bash,'background_output':run_background_output,
+               'kill_background':run_kill_background,
+               'read':run_read,'write':run_write,'edit':run_edit,
+               'view_image':run_view_image,'read_document':run_read_document,
+               'render_document':run_render_document,
+               'apply_patch':run_apply_patch,
+               'web_fetch':run_web_fetch,
+               'glob':run_glob,'grep':run_grep,'ls':run_ls,'todo_write':run_todo_write,
+               'todo_read':run_todo_read,
                'create_task':run_create_task,'list_tasks':run_list_tasks,'get_task':run_get_task,
                'claim_task':run_claim_task,'complete_task':run_complete_task,
                'schedule_cron':run_schedule_cron,'list_crons':run_list_crons,'cancel_cron':run_cancel_cron,
                'spawn_teammate':run_spawn_teammate,'send_message':run_send_message,'check_inbox':run_check_inbox,
                'request_shutdown':run_request_shutdown,'request_plan':run_request_plan,'review_plan':run_review_plan,
                'create_worktree':create_worktree,'remove_worktree':remove_worktree,'keep_worktree':keep_worktree}
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"web_fetch",
+        "description":"Fetch a public http(s) URL and return readable text (HTML is converted). "
+                      "Requires the same outbound approval as curl; private/loopback addresses "
+                      "and redirects to them are blocked. Prefer this over curl for reading pages.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "url":{
+                    "type":"string",
+                    "description":"Absolute http(s) URL to fetch"
+                },
+                "max_chars":{
+                    "type":"integer",
+                    "description":"Maximum characters of extracted text to return (default 20000, max 100000)"
+                }
+            },
+            "required":[
+                "url"
+            ]
+        }
+    }
+})
+
+TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"apply_patch",
+        "description":"Apply a structured patch to one or more files. Supports add/update/delete/move "
+                      "and applies all changes atomically (rolls back on failure). Use this instead of "
+                      "multiple edit calls for multi-file changes.",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "patch":{
+                    "type":"string",
+                    "description":"Patch text framed by '*** Begin Patch' and '*** End Patch', using "
+                                  "'*** Add File:', '*** Update File:', '*** Delete File:' headers and "
+                                  "'*** Move to:' for renames. Hunk lines start with ' ', '+' or '-'."
+                },
+                "cwd":{
+                    "type":"string",
+                    "description":"Optional base directory for relative paths (default: workspace)"
+                }
+            },
+            "required":[
+                "patch"
+            ]
+        }
+    }
+})
 
 TOOLS.append({
     "type":"function",

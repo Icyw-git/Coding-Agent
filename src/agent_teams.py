@@ -202,14 +202,17 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
 
     handlers['bash'] = safe_bash
 
-    def safe_read(path: str, limit: int = None) -> str:
-        return harness.tool_registry['read'](path, limit, cwd=_wt_cwd())
+    def safe_read(path: str, limit: int = None, offset: int = 0) -> str:
+        return harness.tool_registry['read'](
+            path, limit, offset=offset, cwd=_wt_cwd())
 
     def safe_write(path: str, content: str) -> str:
         return harness.tool_registry['write'](path, content, cwd=_wt_cwd())
 
-    def safe_edit(path: str, old_text: str, new_text: str) -> str:
-        return harness.tool_registry['edit'](path, old_text, new_text, cwd=_wt_cwd())
+    def safe_edit(path: str, old_text: str, new_text: str,
+                  replace_all: bool = False) -> str:
+        return harness.tool_registry['edit'](
+            path, old_text, new_text, replace_all=replace_all, cwd=_wt_cwd())
 
     def safe_glob(pattern: str, path: str = None) -> str:
         return harness.tool_registry['glob'](pattern, path, cwd=_wt_cwd())
@@ -308,8 +311,10 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
 
             # 与主循环同一套压缩预处理（budget → snip → micro → 超限 LLM 摘要）
             messages, skip_micro_rounds = harness.pre_compact_messages(messages, skip_micro_rounds)
-            # 记忆注入：只往第一条 user 消息追加，副本不污染 messages
-            request_messages = harness.inject_memories(messages, memories_content)
+            # 记忆注入：只往第一条 user 消息追加，副本不污染 messages；
+            # 图片引用在这里展开成 data URI（历史里始终是轻量引用）。
+            request_messages = harness.expand_image_parts(
+                harness.inject_memories(messages, memories_content))
             try:
                 response = client.chat.completions.create(
                     model=os.getenv('LLM_MODEL_ID'),
@@ -337,14 +342,20 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
                 continue   # 关键：跳过工具执行段（本轮的 response 没有 tool_calls）
 
             results = []
+            attachments = []
             for tool_call in message.tool_calls:
                 # 复用主循环执行路径：hooks=False（teammate 无人交互，判定下移到工具
                 # 边界，run_bash / run_write 会按无头路径审批）；
                 # background=False（teammate 本身已是后台线程，不再嵌套后台任务）
-                _, _, tm = harness.exec_tool_call(tool_call, registry=sub_handlers,
-                                                  hooks=False, background=False)
+                _, _, tm, images = harness.exec_tool_call(
+                    tool_call, registry=sub_handlers,
+                    hooks=False, background=False)
                 results.append(tm)
+                if images:
+                    attachments.append(harness.image_attachment_message(images))
+            # tool 结果必须连续，图片附件统一排在整批之后
             messages.extend(results)   # extend：摊平成多条 tool 消息；append 会嵌套成一条
+            messages.extend(attachments)
 
         # 取最近一条非空 assistant 文本作为最终汇报（content 可能是 str 或 content blocks）
         summary = "Done."

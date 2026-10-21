@@ -50,19 +50,34 @@ def test_help_overview_keeps_flags_in_details_only():
     assert '--force' in format_command_help('rewind')
 
 
-def test_workspace_diff_reports_status_and_clean(monkeypatch, tmp_path):
+def test_workspace_diff_reports_status_and_line_changes(monkeypatch, tmp_path):
     import harness
+    import workspace_diff
 
-    monkeypatch.setattr(harness.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
-        returncode=0,
-        stdout=(' M src/app.py\n' if args[1] == 'status' else ' src/app.py | 2 +-\n'),
-    ))
+    def fake_git(args, **kwargs):
+        if 'rev-parse' in args:
+            return SimpleNamespace(returncode=0, stdout=f'{tmp_path}\n')
+        if 'status' in args:
+            return SimpleNamespace(returncode=0, stdout=' M src/app.py\0')
+        if 'diff' in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=('diff --git a/src/app.py b/src/app.py\n'
+                        '--- a/src/app.py\n+++ b/src/app.py\n'
+                        '@@ -1 +1 @@\n-old\n+new\n'))
+        raise AssertionError(f'unexpected git call: {args}')
+
+    monkeypatch.setattr(workspace_diff.subprocess, 'run', fake_git)
     output = harness.format_workspace_diff(tmp_path)
     assert 'src/app.py' in output and '文件状态' in output
+    assert '逐行改动' in output and '+new' in output and '-old' in output
 
-    monkeypatch.setattr(harness.subprocess, 'run', lambda args, **kwargs: SimpleNamespace(
-        returncode=0, stdout='',
-    ))
+    def clean_git(args, **kwargs):
+        if 'rev-parse' in args:
+            return SimpleNamespace(returncode=0, stdout=f'{tmp_path}\n')
+        return SimpleNamespace(returncode=0, stdout='')
+
+    monkeypatch.setattr(workspace_diff.subprocess, 'run', clean_git)
     assert '工作区干净' in harness.format_workspace_diff(tmp_path)
 
 

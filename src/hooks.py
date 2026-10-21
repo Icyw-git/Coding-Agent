@@ -31,16 +31,22 @@ import checkpoints
 from agent_core import register_hook
 from exec_policy import (
     ASK,
+    DENY,
+    PATH_INVALID,
+    PATH_OUTSIDE,
+    PATH_SECRET,
+    PATH_SYSTEM,
     PATH_WORKSPACE,
     READ_ONLY_FILE_TOOLS,
     READ_WRITE_TOOLS,
+    Decision,
     approval_class,
     classify_path,
     grant_key,
     load_policy,
     session_allow_key,
 )
-from tools import tool_registry
+from tools import PatchError, patch_paths, tool_registry
 
 
 def _h():
@@ -744,6 +750,15 @@ def permission_hook(tool:str,args:dict):
 # 批准一次后同会话内同名工具不再重复问。
 
 EXTERNAL_TOOLS: set[str] = set()
+# 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
+# 整批就按该分区判定，避免被同批的工作区内文件稀释。
+_PATH_ZONE_RANK = {
+    PATH_WORKSPACE: 0,
+    PATH_OUTSIDE: 1,
+    PATH_SYSTEM: 2,
+    PATH_INVALID: 3,
+    PATH_SECRET: 4,
+}
 
 
 def register_external_tools(names) -> None:
@@ -758,12 +773,23 @@ def evaluate_call(tool: str, args: dict, policy=None):
     一次；省略时按当前环境即时解析。
     """
     zone = PATH_WORKSPACE
-    if tool in READ_ONLY_FILE_TOOLS or tool in READ_WRITE_TOOLS:
+    eval_args = args
+    if tool == 'apply_patch':
+        try:
+            paths = patch_paths(str(args.get('patch') or ''))
+        except PatchError as exc:
+            # 解析不出版本/路径的补丁不能按「未知工具」放行：策略层对它
+            # 没有路径可判，硬拒比弹一次看不懂的审批更安全。
+            return Decision(DENY, 'invalid_patch', f'invalid patch ({exc})')
+        zones = [_path_zone(path, args.get('cwd')) for path in paths]
+        zone = max(zones, key=lambda item: _PATH_ZONE_RANK.get(item, 0))
+        eval_args = {**args, 'path': paths[0]}
+    elif tool in READ_ONLY_FILE_TOOLS or tool in READ_WRITE_TOOLS:
         # grep / ls / glob 的 path 缺省是工作区；用它参与分区判定，显式指向
         # 秘密文件时同样在策略层硬拒。
         zone = _path_zone(str(args.get('path') or '.'), args.get('cwd'))
     return (policy or load_policy()).evaluate(
-        tool, args,
+        tool, eval_args,
         deny_list=_h().DENY_LIST,
         destructive=_h().DESTRUCTIVE,
         secrets=checkpoints.DEFAULT_SECRETS,

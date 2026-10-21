@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from web_access import WebAccessError, validate_url
+
 ALLOW = 'allow'
 ASK = 'ask'
 DENY = 'deny'
@@ -119,9 +121,10 @@ _PATH_SPLIT = re.compile(r'[\\/]+')
 # bash 里 su""do 会被解析成 sudo，所以命令名要在「去引号」的副本上再取一次
 _STRIP_QUOTES = re.compile(r'["\'`]')
 
-READ_WRITE_TOOLS = ('write', 'edit')
+READ_WRITE_TOOLS = ('write', 'edit', 'apply_patch')
 # 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
-READ_ONLY_FILE_TOOLS = ('read', 'glob', 'grep', 'ls')
+READ_ONLY_FILE_TOOLS = ('read', 'view_image', 'read_document',
+                        'render_document', 'glob', 'grep', 'ls')
 
 # 外发命令：读已经按路径放开，「发得出去」就是这一轮新增的唯一能力面。
 # 这里不问「这个 GET 危不危险」，只保证本机内容离开本机必须经过人同意；
@@ -215,6 +218,8 @@ class Policy:
             decision = self._evaluate_file(tool, args, path_zone)
         elif tool in WORKTREE_TOOLS:
             decision = self._evaluate_worktree(tool, args)
+        elif tool == 'web_fetch':
+            decision = self._evaluate_web(args)
         elif tool in external_tools:
             decision = Decision(
                 ASK, 'external_tool',
@@ -372,6 +377,22 @@ class Policy:
             return Decision(ASK, 'outside_workspace_write',
                             f'write outside workspace needs approval ({path})')
         return Decision(ALLOW)
+
+    # ---------- 联网 ----------
+
+    def _evaluate_web(self, args: dict) -> Decision:
+        """外发请求与 curl 同语义：无论档位都要审批（exfiltration 是边界问题）。
+
+        这里只做语法校验，不解析 DNS：策略层保持纯函数，私网/重定向校验在
+        网络层（web_access.check_url）发出请求前完成。
+        """
+        url = str(args.get('url', '') or '')
+        try:
+            parsed = validate_url(url)
+        except WebAccessError as exc:
+            return Decision(DENY, 'invalid_url', f'invalid URL ({exc})')
+        return Decision(ASK, 'network_egress',
+                        f'outbound network request (web_fetch to {parsed.hostname})')
 
     # ---------- worktree ----------
 
@@ -1036,8 +1057,13 @@ def approval_class(tool: str, args) -> str:
     文件工具返回空串：一次「写 a.txt」的批准不该免审同会话的任意路径写入，
     尤其是越界写。按目录的范围授权需要先解析 cwd/工作区，留到路径范围化那一轮。
     """
-    if tool in ('read', 'write', 'edit'):
+    if tool in ('read', 'write', 'edit', 'apply_patch'):
         return ''
+    if tool == 'web_fetch':
+        try:
+            return f'web_fetch:{validate_url(str(args.get("url", "") or "")).hostname}'
+        except WebAccessError:
+            return ''
     if tool == 'bash':
         raw = args.get('command', '') if isinstance(args, dict) else args
         classes: set[str] = set()
@@ -1065,6 +1091,14 @@ def grant_key(tool: str, args: dict) -> str:
         cwd = str(args.get('cwd', '') or '').strip()
         suffix = f'{tool}:{str(args.get("path", "")).strip()}'
         return f'{suffix}@{cwd}' if cwd else suffix
+    if tool == 'apply_patch':
+        # 补丁内容本身就是授权范围；cwd 只在非空时参与，空串与缺省等价
+        # （handler 重建参数时会省略空的 cwd，两者必须得到同一个键）。
+        cwd = str(args.get('cwd', '') or '').strip()
+        suffix = f'apply_patch:{args.get("patch", "")}'
+        return f'{suffix}@{cwd}' if cwd else suffix
+    if tool == 'web_fetch':
+        return f'web_fetch:{str(args.get("url", "")).strip()}'
     if tool in WORKTREE_TOOLS:
         return f'{tool}:{str(args.get("name", args.get("path", ""))).strip()}'
     return f'{tool}:{sorted((str(k), str(v)) for k, v in args.items())}'

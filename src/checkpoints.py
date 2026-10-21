@@ -298,6 +298,44 @@ class CheckpointManager:
             'files': sorted(meta.get('files', {}).keys()),
         }
 
+    def changed_files_since(self, start_id: str | None) -> dict[str, str]:
+        """start_id 之后（不含它）的节点里，净内容发生变化的文件。
+
+        用于回合结束汇总，同时也是非 Git 工作区唯一能拿到改动清单的来源：
+        write/edit/apply_patch 的 pre-image 与 seal 后的 post hash 都在这里。
+        净变化为空的文件不会出现（写了又改回去）。
+        """
+        if self._active:
+            chain = self._chain_to_head(self._active)
+        elif start_id:
+            chain = self._chain_to_head(start_id)
+        else:
+            chain = [row['cp_id'] for row in self.list(limit=10_000)]
+        if start_id and chain and chain[-1] == start_id:
+            chain = chain[:-1]   # start 是上一回合的节点，不属于本回合
+        first: dict[str, str] = {}
+        last: dict[str, str] = {}
+        for node_id in reversed(chain):
+            try:
+                meta = self.get(node_id)
+            except CheckpointError:
+                continue
+            # 活跃节点还没 seal：post hash 现场算，别把「本回合正在改」当成没变
+            live = node_id == self._active
+            for key, record in (meta.get('files') or {}).items():
+                first.setdefault(key, record.get('pre_sha256') or '')
+                post = record.get('post_sha256')
+                if post is None and live:
+                    post = _sha256(self._abs_of(key))
+                last[key] = post or ''
+        changed: dict[str, str] = {}
+        for key, before in first.items():
+            after = last.get(key, '')
+            if before == after:
+                continue
+            changed[key] = 'A' if not before else ('D' if not after else 'M')
+        return changed
+
     def _write_meta(self, node_dir: Path, meta: dict) -> None:
         _atomic_write(node_dir / 'meta.json',
                       json.dumps(meta, ensure_ascii=False, indent=2,

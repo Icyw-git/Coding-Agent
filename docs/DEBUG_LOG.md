@@ -1272,3 +1272,93 @@ TTL 过期、未授权目录与失效时机；`test_session_workspace.py` 覆盖
 21. **审批归属必须先于审批决议**——消息入口要校验来源（只收单聊）、进程入口要校验身份（白名单缺失即拒启）、请求要按登记会话路由到唯一聊天；拿到 req_id 不等于有权决议，按钮和文本命令都必须回到「这条请求是否推给当前聊天」。
 22. **免审键要窄于被批准的动作**——外发请求只给 curl/wget 的普通读请求记 `命令:主机`，改方法/带请求体/多目标/裸主机名都不记；复合命令每段同类一致才记，否则批准 `ls && rm x` 会留下一个 `bash:ls` 的万能键。GET 也要审批：读放开后，出口边界问的是「东西能不能出去」，不是「这个请求危不危险」；摘要截断的命令同样不预授权。
 23. **可写位置只能放发现数据，不能放授权**——登记表、缓存、快捷列表可以住在 Agent 写得动的地方，但只能决定「展示什么/排序」；授权根必须来自进程启动配置，否则被约束者改一行 JSON 就能给自己扩权。
+
+## 基础工具补齐（P0–P2）
+
+对照 Codex 和其他 Agent 的基础工具面，按优先级补了以下能力：
+
+- **P0**：`read` 增加 `offset`/`limit`，大文件默认只取 200 行并提示下一次偏移；文件工具统一按
+  BOM → UTF-8 → GB18030 解码，拒绝二进制内容，写回保留原编码与换行符。`edit` 对多处匹配默认
+  报错，`replace_all` 显式全改。`bash` 增加 `cwd`、`timeout`、`run_in_background`，前台默认
+  120 秒、后台 3600 秒；新增 `background_output`（可等待）与 `kill_background`，结果收集后仍
+  保留历史供取回。
+- **P1**：新增 `apply_patch`，支持 Codex 风格 Add/Update/Delete/Move。先解析并规划全部目标，
+  再统一写盘；任一步失败按逆序回滚。多文件路径按最严格分区聚合审批，格式错误在策略层硬拒。
+  新增 `web_fetch`：仅 http/https、解析后所有地址必须是公网、重定向逐次复检、2 MiB/20 秒上限、
+  HTML 转文本；合法 URL 走 `network_egress` 审批，同类键按主机记。子代理改为每次启动时读取
+  实时工具注册表，并过滤控制类工具与 bash 后台开关。
+- **P2**：`grep` 增加 ripgrep 快路径。rg 只用于 ASCII 模式；非 ASCII、rg 缺失、输出出现替换符
+  或返回码异常时回落到内置遍历。两条路径共用秘密文件、忽略目录、glob 语义与结果上限的后置
+  过滤，避免「快路径悄悄放宽边界」。
+
+- **P3**：补齐多模态与工作区视图。`view_image` 按 magic 识别 PNG/JPEG/GIF/WebP/BMP，原图落到
+  工具缓存，历史里只留 `{"type": "harness_image", "path": ...}` 轻量引用；每次请求前
+  `expand_image_parts` 把引用读成 data URI，并作为**独立的 user 消息**排在整批 tool 结果之后
+  （部分 OpenAI 兼容接口不接受 tool 角色里的图片）。`todo_write` 改为按会话分区、校验状态与
+  唯一 `in_progress`、整表替换并写入 `todos` 事件；新增 `todo_read` 与 `restore_todos`，会话
+  重启后计划仍在。`/diff` 从文件状态升级为逐行统一 diff（含未跟踪文件与重命名来源），回合结束
+  时打印本轮改动清单并写入 `files_changed` 事件；Git 基线能捕捉 bash 造成的改动，非 Git
+  工作区回退到 checkpoint 的 pre/post hash。
+
+- **P4**：新增 `read_document`。PDF 走 `pypdf` 文本层（可选依赖），DOCX/PPTX/XLSX 用
+  `zipfile` + `ElementTree` 直接解析 OOXML，不引入 python-docx/pptx/openpyxl。`pages` /
+  `sheets` 支持 1-based 范围（`1-5,8`、`10-`、`all`），默认前 20 页 / 8 个工作表；输出保留
+  标题、列表、Markdown 表格和 PPT 演讲者备注；文档 64 MiB、单个 zip 成员 16 MiB、输出
+  20k 字符封顶。`read` 遇到文档后缀会提示改用 `read_document`，不再按文本读成乱码。扫描版
+  PDF 没有文本层时明确提示先转图片走 `view_image`，不做 OCR。
+
+  图片 token 估算从固定 1000 升级为按实际宽高和模型族计算：OpenAI 先缩进 2048²、短边 768，
+  再按 512 瓦片（85 + 170/片）；Claude 长边缩到 1568、按面积/750、上限 1600；Gemini 按
+  768 瓦片、每片 258；DeepSeek 官方只公布缩放后每图上限 1024、无公开公式，按 1024 保守计。
+  无法识别尺寸或旧消息引用使用固定兜底值，`HARNESS_IMAGE_TOKEN_ESTIMATE` 可调。估算只服务
+  上下文保护，不代表账单 token。
+
+  新增 `render_document`：PDF 用 pypdfium2 直接渲染页面；DOCX/PPTX 先由 LibreOffice
+  headless 转 PDF 再渲染，缺少 `soffice` 时明确报错而不是启动 Office 桌面程序。默认前 3 页、
+  单次最多 8 页、72–200 dpi，渲染结果复用 `harness_image` 引用与 user 附件通道。XLSX 不做
+  打印分页渲染，指向 `read_document`。
+
+**有意不做**：MCP 桥当前只暴露 tools，没有 resources 通道；NotebookEdit 对 Codex 对齐
+不是必需项，`.ipynb` 可以按 JSON 用 read/edit 处理。这两项等对应基础设施就绪后再补。
+
+验证：`tests/test_bash_controls.py`、`test_apply_patch.py`、`test_web_fetch.py`、
+`test_subagent_surface.py`、`test_grep_backend.py`、`test_view_image.py`、
+`test_todo_tools.py`、`test_workspace_diff.py`、`test_documents.py` 分别钉住上述边界；
+全量 `pytest` 940 passed，`ruff check harness.py src tests` 通过。
+
+- **多模态历史只存引用，不存 base64**：把 data URI 写进消息会让每次上下文压缩、转录落盘和
+  事件回放都搬运几百 KB；引用 + 请求前展开把成本压到一次读缓存文件，缓存丢了还能降级成
+  一条文本占位，而不是让整个请求 400。
+- **图片附件不能塞进 tool 消息**：Chat Completions 对 tool/system 角色里的 `image_url` 支持
+  不一致，兼容路径是「tool 结果放文字摘要 → 整批 tool 结果结束后补一条 user 多模态消息」；
+  还要求所有 tool 结果连续，否则并行 tool_calls 的配对会被判成孤儿。
+- **回合改动清单必须能看见 bash 的副作用**：只比较 `write`/`edit` 的 checkpoint 记录会漏掉
+  脚本、格式化器和 `git checkout` 改的文件；以回合开始时的 git status + 内容签名做基线，
+  再把 checkpoint 的净 hash 变化作为非 Git 工作区的回退，两条路径都排除 `.cache` 等内部目录。
+- **todo 的持久源是事件流，不是内存字典**：进程重启后 `_TODOS` 是空的，`todo_read` 必须能
+  从最后一个 `todos` 事件恢复；按会话分区则避免 A 会话的计划泄漏给 B 会话。
+- **多文件修改要两阶段**：先全部解析、校验、算出最终内容，再统一落盘；边解析边写的话，后一个
+  文件报错时前面的改动已经生效，回滚逻辑也会因为没有完整的 pre-image 而不可靠。
+- **新联网工具必须复用出口审批**：`web_fetch` 如果自己写一套 URL 校验就绕过了「本机要不要把
+  请求发出去」的人工决议；地址合法性（防 SSRF）和出口许可（防数据外传）是两道独立的闸。
+- **工具面必须是请求时的快照，不是 import 时的快照**：子代理在进程启动后动态注册/禁用工具时
+  仍要看到真实可用集合，否则要么拿到已删除的工具，要么漏掉新工具。
+- **固定图片 token 只能当兜底**：同样是 1024²，GPT-4o 高细节约 765、Claude 约 1399、
+  Gemini 约 1032；固定 1000 会低估 Claude，又高估小图。引用落盘时顺手算好 `tokens`，
+  压缩阈值才不会随图片尺寸和模型切换而失真；但也不能把它当计费值，provider 规则会变。
+- **文档输入优先本地抽取，不押注 provider 原生文件块**：Chat Completions 只有 PDF 有
+  file content part，DOCX/PPTX/XLSX 的支持随 provider 而异；本地抽成文本可保证换模型可用，
+  代价是丢版式、图片、公式和合并单元格细节，需要在工具描述里说清楚。
+- **OOXML 是不可信输入**：zip 本身可能带超大成员或大量条目，解析前先限制成员大小，
+  表格行列和最终输出也要裁剪；否则一份文档就能把内存或上下文打满。
+- **扫描 PDF 不是解析器能解决的问题**：没有文本层时返回明确提示并指向 `view_image`，
+  不要用空文本冒充内容；OCR 需要额外的渲染与识别链路，不应悄悄塞进读文件工具。
+- **排版和文字是两条通道**：`read_document` 给模型可检索的文字，`render_document` 给模型
+  版式、图表和扫描页；不要指望文本抽取保留列宽、合并单元格或艺术字。渲染图仍然走同一套
+  `harness_image` 缓存和 user 附件，历史里不会出现 base64。
+- **Office 渲染不要偷偷拉起见不得人的桌面进程**：Word/PowerPoint COM 自动化会启动完整
+  桌面程序、执行宏、留下孤儿进程；改用 LibreOffice headless，并把 `soffice` 缺失当成
+  可解释的能力缺口，而不是静默失败。宏文档在转换前直接拒绝。
+- **provider 的图片规则要按官方口径取保守值**：DeepSeek 只公布每图上限 1024、没有瓦片
+  公式，就按 1024 计；固定 1000 既不是它的账单值，也不该被当成精确值。图片只放 user
+  消息这一点与现有附件布局一致，不需要为 DeepSeek 单开一条消息通道。

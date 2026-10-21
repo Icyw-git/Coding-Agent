@@ -113,6 +113,9 @@ system 消息不保存在 compacted canonical history 中，由 `inject_memories
 <reminder>Update your todos.</reminder>
 ```
 
+todo 清单按会话隔离，`todo_write` 整表替换并写入 `todos` 事件；会话恢复时
+`restore_todos(session_store)` 从最后一个事件恢复内存状态，`todo_read` 读取当前清单。
+
 代码位置：[`harness.py:359-366`](harness.py:359)。
 
 ### 4.2 会话内 cron 拉取

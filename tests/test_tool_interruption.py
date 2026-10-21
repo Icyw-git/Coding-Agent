@@ -100,7 +100,7 @@ def test_gateway_reads_then_streams_legacy_broken_history(tmp_path):
 def test_malformed_tool_arguments_produce_a_tool_result(arguments):
     import harness
     tool = SimpleNamespace(id='bad', function=SimpleNamespace(name='bash', arguments=arguments))
-    _, _, result = harness.exec_tool_call(tool, registry={}, hooks=False)
+    _, _, result, _ = harness.exec_tool_call(tool, registry={}, hooks=False)
     assert result['tool_call_id'] == 'bad'
     assert 'invalid tool arguments' in result['content']
 

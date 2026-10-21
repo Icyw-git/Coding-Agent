@@ -22,11 +22,20 @@ _GENERIC_ACKS = {'go', 'ok', 'okay', 'yes', 'y', '嗯', '行', '好的',
 # '<reminder>Update your todos.</reminder>'）。
 _INJECTED_USER_PREFIXES = ('<reminder', '<task_notification', '<persisted-output',
                            '<recovery', '[scheduled]', '[compacted', '[reactive compact',
-                           '[snipped', '[background task', 'output token limit hit')
+                           '[snipped', '[background task', '[image attachment',
+                           'output token limit hit')
 
 
-def is_injected_user_content(text: str) -> bool:
-    """判断 user 消息是否为系统注入（前缀大小写不敏感）。"""
+def is_injected_user_content(text) -> bool:
+    """判断 user 消息是否为系统注入（前缀大小写不敏感）。
+
+    content 可能是多模态列表（图片附件）：只取文本块参与判断。
+    """
+    if isinstance(text, list):
+        text = ' '.join(
+            str(part.get('text') or '')
+            for part in text
+            if isinstance(part, dict) and part.get('type') == 'text')
     stripped = ' '.join(str(text or '').split()).casefold()
     return stripped.startswith(_INJECTED_USER_PREFIXES)
 
