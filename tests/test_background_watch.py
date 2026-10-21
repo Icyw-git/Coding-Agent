@@ -107,3 +107,32 @@ def test_watch_command_parsing():
     assert '用法' in background_watch.watch_command('bg_0001 --force', store)
     assert '秒数' in background_watch.watch_command('bg_0001 --timeout x', store)
     assert '大于 0' in background_watch.watch_command('bg_0001 --timeout 0', store)
+
+
+def test_watch_command_defaults_to_latest_task_without_id():
+    store = _Store(_task(status='completed', ended_at=101.0, result='latest'))
+
+    # 不需要输入编号：直接跟踪最新任务（已结束则立即输出全文）。
+    text = background_watch.watch_command('', store)
+
+    assert 'latest' in text and 'bg_0001' in text
+
+
+def test_watch_command_empty_store_prints_list_hint():
+    assert '没有后台任务' in background_watch.watch_command('', _Store())
+
+
+def test_watch_command_list_flag_shows_tasks():
+    store = _Store(_task(status='completed', ended_at=101.0, result='x'))
+
+    text = background_watch.watch_command('--list', store)
+
+    assert 'bg_0001' in text and 'completed' in text
+
+
+def test_watch_command_timeout_without_id():
+    store = _Store(_task())
+
+    text = background_watch.watch_command('--timeout 0.001', store)
+
+    assert '仍在 running' in text

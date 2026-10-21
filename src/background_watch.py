@@ -92,21 +92,47 @@ def watch(bg_id: str, store=None, *, timeout: float = DEFAULT_TIMEOUT,
                 '\n  用 /watch <bg_id> 继续。')
 
 
-def watch_command(argument: str, store=None) -> str:
-    """/watch 与 /watch <bg_id> [--timeout N] 的参数解析与输出。"""
+def _parse(argument: str):
+    """解析 [bg_id|--list] [--timeout 秒]；bg_id 可省略。"""
     tokens = argument.split()
-    if not tokens:
-        return format_tasks(store)
-    bg_id = tokens[0]
+    if tokens and tokens[0] in ('--list', '-l'):
+        return 'list', DEFAULT_TIMEOUT, None, None
+    bg_id = None
+    if tokens and not tokens[0].startswith('-'):
+        bg_id = tokens.pop(0)
     timeout = DEFAULT_TIMEOUT
-    rest = tokens[1:]
-    if rest:
-        if len(rest) != 2 or rest[0] != '--timeout':
-            return '  用法：/watch [bg_id] [--timeout 秒]'
+    while tokens:
+        flag = tokens.pop(0)
+        if flag != '--timeout':
+            return 'error', None, None, '  用法：/watch [bg_id|--list] [--timeout 秒]'
+        if not tokens:
+            return 'error', None, None, '  --timeout 缺少秒数。'
         try:
-            timeout = float(rest[1])
+            timeout = float(tokens.pop(0))
         except ValueError:
-            return '  --timeout 需要一个秒数。'
+            return 'error', None, None, '  --timeout 需要一个秒数。'
         if timeout <= 0:
-            return '  --timeout 必须大于 0。'
+            return 'error', None, None, '  --timeout 必须大于 0。'
+    return 'watch', timeout, bg_id, None
+
+
+def watch_command(argument: str, store=None) -> str:
+    """/watch 默认跟踪最新的后台任务，不需要记住编号。"""
+    store = _store(store)
+    action, timeout, bg_id, error = _parse(argument)
+    if error:
+        return error
+    if action == 'list':
+        return format_tasks(store)
+    if bg_id is None:
+        tasks = store.list_background_tasks()
+        if not tasks:
+            return format_tasks(store)
+        bg_id = tasks[0]['id']
+        running = sum(1 for task in tasks
+                      if task.get('status') in ('running', 'queued'))
+        if running > 1:
+            emit_extra = (f'  另有 {running - 1} 个任务在运行；'
+                          '用 /watch --list 查看。')
+            print(emit_extra)
     return watch(bg_id, store, timeout=timeout, emit=print)
