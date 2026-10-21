@@ -2457,3 +2457,31 @@ Textual 启动失败回退行式 REPL。总回归 1094 passed / 1 skipped，UI �
 **测试**：`test_ui.py` 新增 `/` 解析与提示文本用例、`run_test` 下
 「输入 `/he` 出现提示、提交 `/help` 不进入对话队列」；总回归 1094 passed /
 1 skipped，UI 测试 49 passed。
+## TUI 与行式 REPL 的行为对齐
+
+**问题**：main 上的「回合中排队输入、`@` 文件补全、输入历史、提示符状态」都只做在
+行式 REPL；Textual TUI 仍然是「忙时禁用输入、没有 @ 提示、没有历史、状态栏缺分支/档位」。
+用户体感就是之前的功能没有接进 UI。
+
+**做法**：
+
+- 排队：`on_input_submitted` 不再因 `_busy` 丢弃输入；消息进 `_user_input_q`，
+  worker 按顺序处理。`_set_input_busy` 不再禁用输入框，占位符显示
+  `正在处理当前消息…（已排队 N 条）`，状态行追加 `N queued`。
+- `@` 文件补全：输入框下方提示行在非 `/` 输入时改用 `file_mentions` 匹配；
+  `Tab` 由 `PromptInput` 绑定到 `complete_input()`（`/` 补命令名，`@` 补路径）；
+  文件索引按工作区缓存 5s。
+- 输入历史：`↑`/`↓` 绑定 `history_prev` / `history_next`，提交时记录（命令不入历史）。
+- 状态栏：`status` 事件补 `branch` 与 `sandbox`；`_pills` 在宽度允许时显示
+  `⎇ main` 与档位胶囊，和行式提示符的信息一致。
+
+**取舍**：
+
+- 仍是单行输入（Textual `Input`），没有做多行编辑；多行需要换 `TextArea` 并重做
+  提交键位，属于下一步。
+- `Tab` 只在有提示时改值，不抢占焦点切换；没有提示时行为不变。
+- 排队消息立即渲染在聊天区（与 Codex 一致），实际执行顺序由 worker 队列保证。
+
+**测试**：`test_ui.py` 新增 `@` 提示/补全、排队输入（不禁用、占位符与 `queued`
+状态）、历史前后翻阅；`tests/test_ui_bridge.py` 断言 `status` 事件带 branch/sandbox。
+总回归 1095 passed / 1 skipped，UI 测试 52 passed。

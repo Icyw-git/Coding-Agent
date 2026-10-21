@@ -736,3 +736,62 @@ def test_textual_input_shows_slash_hints_and_routes_commands():
             app._user_input_q.put(None)
 
     asyncio.run(scenario())
+
+
+def test_mention_hint_and_tab_completion():
+    pytest.importorskip('textual')
+    import ui_textual
+
+    files = ['src/app.py', 'src/apple.py', 'docs/readme.md']
+    assert 'src/app.py' in ui_textual.mention_hint_text('look @src/ap', files)
+    assert ui_textual.mention_hint_text('plain text', files) == ''
+    assert '没有匹配' in ui_textual.mention_hint_text('@zzz', files)
+
+    assert ui_textual.complete_mention_text('see @src/ap', files) == 'see @src/app.py'
+    assert ui_textual.complete_mention_text('plain', files) is None
+
+
+def test_textual_queues_input_while_busy():
+    from types import SimpleNamespace
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    app = ui_textual.CCApp([])
+    app._input = SimpleNamespace(value='', disabled=False, placeholder='',
+                                 cursor_position=0, focus=lambda: None)
+    app._command_hint = SimpleNamespace(update=lambda text: None)
+    app._refresh_status_line = lambda: None   # 无挂载：状态行由 run_test 用例覆盖
+    app._set_input_busy(True)
+
+    app.on_input_submitted(SimpleNamespace(value='second'))
+
+    assert app._user_input_q.qsize() == 1     # 回合中提交 → 排队
+    assert app._input.disabled is False       # 仍可继续输入
+    assert '已排队' in app._input.placeholder
+    assert 'queued' in app._queue_suffix()
+
+
+def test_textual_input_history_navigation():
+    import asyncio
+
+    pytest.importorskip('textual')
+    import ui_textual
+
+    async def scenario():
+        app = ui_textual.CCApp([])
+        async with app.run_test():
+            app._history = ['first', 'second']
+            app._history_index = len(app._history)
+            app.history_prev()
+            assert app._input.value == 'second'
+            app.history_prev()
+            assert app._input.value == 'first'
+            app.history_next()
+            assert app._input.value == 'second'
+            app.history_next()
+            assert app._input.value == ''
+            app._exiting = True
+            app._user_input_q.put(None)
+
+    asyncio.run(scenario())

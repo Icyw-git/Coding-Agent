@@ -498,7 +498,9 @@ python entrypoint.py
 `pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。TUI 输入 `/`
 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
 `/diff`、`/review`、`/cache` 等只存在于行式 REPL 的命令会明确提示改用
-`python harness.py --ui ansi`。
+`python harness.py --ui ansi`。TUI 与行式 REPL 行为对齐：回合进行中可以继续输入
+（消息排队，按顺序执行，状态行显示 `N queued`）；`@` 列出并补全工作区文件（Tab）；
+`↑`/`↓` 翻输入历史；状态栏显示模型、git 分支、执行档位与上下文占用。
 
 启动前检查本地配置和目录：
 

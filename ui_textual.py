@@ -23,10 +23,12 @@ import time
 from rich.markup import escape as markup_escape
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Collapsible, Input, Markdown, Static
 
+from file_mentions import format_mention, match_mentions, mention_token, workspace_files
 from ui_events import UIEvent, bus
 
 logger = logging.getLogger('harness.ui')
@@ -258,6 +260,48 @@ def command_hint_text(text: str, limit: int = 8) -> str:
     return '  ' + ' · '.join(matches)
 
 
+def mention_hint_text(text: str, files: list[str], limit: int = 8) -> str:
+    """输入 `@...` 时列出匹配文件；普通文本返回空串。"""
+    mention = mention_token(text or '')
+    if mention is None:
+        return ''
+    matches = match_mentions(files, mention[1], limit)
+    if not matches:
+        return '  （没有匹配的文件）'
+    return '  ' + ' · '.join(matches)
+
+
+def complete_mention_text(text: str, files: list[str]) -> str | None:
+    """把光标前的 @token 替换成文件路径；没有匹配时返回 None。"""
+    mention = mention_token(text or '')
+    if mention is None:
+        return None
+    start, _query = mention
+    matches = match_mentions(files, _query, 1)
+    if not matches:
+        return None
+    return f'{text[:start]}{format_mention(matches[0])}'
+
+
+class PromptInput(Input):
+    """输入框按键：Tab 补全 @ 文件/命令，↑↓ 翻历史。"""
+
+    BINDINGS = [
+        Binding('tab', 'complete', 'Complete', show=False),
+        Binding('up', 'history_prev', 'History', show=False),
+        Binding('down', 'history_next', 'History', show=False),
+    ]
+
+    def action_complete(self) -> None:
+        self.app.complete_input()
+
+    def action_history_prev(self) -> None:
+        self.app.history_prev()
+
+    def action_history_next(self) -> None:
+        self.app.history_next()
+
+
 class CCApp(App):
     TITLE = "harness"
     CSS = CSS
@@ -284,6 +328,11 @@ class CCApp(App):
         self._busy = False
         self._round_metrics = []      # 早到事件可能先于 on_mount
         self._background_tasks = {}
+        self._history: list[str] = []
+        self._history_index = 0
+        self._mention_files: list[str] = []
+        self._mention_root = None
+        self._mention_at = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static('', id="header-line")
@@ -293,8 +342,8 @@ class CCApp(App):
                 yield Static('', id='session-summary')
                 yield Static('', id='recent-tools')
         with Vertical(id="bottom-bar"):
-            yield Input(placeholder="输入消息，Enter 发送 · / 命令 · Ctrl+P 面板",
-                        id="input-line")
+            yield PromptInput(placeholder="输入消息，Enter 发送 · / 命令 · @ 文件 · Ctrl+P 面板",
+                              id="input-line")
             yield Static('', id="command-hint")
             with Horizontal(id="status-line"):
                 yield Static('', id="status-main")
@@ -383,12 +432,62 @@ class CCApp(App):
 
     def _update_command_hint(self, value: str) -> None:
         hint = getattr(self, '_command_hint', None)
-        if hint is not None:
-            hint.update(command_hint_text(value or ''))
+        if hint is None:
+            return
+        if (value or '').startswith('/'):
+            hint.update(command_hint_text(value))
+            return
+        hint.update(mention_hint_text(value, self._workspace_mention_files()))
+
+    def _workspace_mention_files(self) -> list[str]:
+        """@ 文件索引：按工作区缓存 5s，避免逐键遍历仓库。"""
+        import harness
+        root = harness.get_workdir()
+        now = time.monotonic()
+        if (root != self._mention_root
+                or now - self._mention_at > 5.0):
+            self._mention_files = workspace_files(root)
+            self._mention_root = root
+            self._mention_at = now
+        return self._mention_files
+
+    def complete_input(self) -> None:
+        """Tab：优先补全 / 命令，其次 @ 文件。"""
+        if not hasattr(self, '_input'):
+            return
+        value = self._input.value
+        if value.startswith('/'):
+            from cli_commands import COMMANDS
+            typed = value.strip().lower()
+            for command in COMMANDS:
+                names = (command.name, *command.aliases)
+                if any(name.startswith(typed) for name in names):
+                    self._input.value = command.name
+                    break
+        else:
+            completed = complete_mention_text(value, self._workspace_mention_files())
+            if completed is not None:
+                self._input.value = completed
+        self._input.cursor_position = len(self._input.value)
+
+    def history_prev(self) -> None:
+        if not self._history or not hasattr(self, '_input'):
+            return
+        self._history_index = max(0, self._history_index - 1)
+        self._input.value = self._history[self._history_index]
+        self._input.cursor_position = len(self._input.value)
+
+    def history_next(self) -> None:
+        if not self._history or not hasattr(self, '_input'):
+            return
+        self._history_index = min(len(self._history), self._history_index + 1)
+        self._input.value = ('' if self._history_index >= len(self._history)
+                             else self._history[self._history_index])
+        self._input.cursor_position = len(self._input.value)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Enter 提交：文本进队列交给 agent 线程，同时渲染为 user 消息。"""
-        if self._busy or self._exiting:
+        if self._exiting:
             return
         text = (event.value or '').strip()
         self._input.value = ''
@@ -399,9 +498,12 @@ class CCApp(App):
             self._update_command_hint('')
             self.execute_command(command)
             return
-        self._set_input_busy(True)
+        self._history.append(text)
+        self._history_index = len(self._history)
         self._event_queue.put(UIEvent('user_message', {'text': text[:2000]}))
         self._user_input_q.put(text)
+        # 回合中继续输入 → 排队，当前回合结束后按顺序执行（与行式 REPL 一致）
+        self._set_input_busy(True)
 
     def action_quit(self) -> None:
         """Ctrl+C / Ctrl+D：拒绝待审批并唤醒 agent 线程退出。"""
@@ -641,15 +743,22 @@ class CCApp(App):
         await self._chat.mount(Static(Text(text), classes='session-summary-line'))
 
     def _set_input_busy(self, busy: bool) -> None:
-        """只允许一条在途请求，保证聊天记录与实际执行顺序一致。"""
+        """忙碌时仍可输入：消息进队列，按顺序执行（Codex/Pi 的行为）。"""
+        queued = self._user_input_q.qsize()
+        busy = busy or bool(queued)
         self._busy = busy
         if not hasattr(self, '_input'):
             return
-        self._input.disabled = busy
-        self._input.placeholder = ('正在处理当前消息...' if busy
-                                   else '输入消息，Enter 发送 · Ctrl+C 退出')
+        self._input.disabled = False
+        if busy:
+            hint = f'（已排队 {queued} 条）' if queued else ''
+            self._input.placeholder = f'正在处理当前消息…{hint}'
+        else:
+            self._input.placeholder = (
+                '输入消息，Enter 发送 · / 命令 · @ 文件 · Ctrl+P 面板')
         if not busy and not self._exiting:
             self._input.focus()
+        self._refresh_status_line()
 
     async def _consume_events(self) -> None:
         while True:
@@ -987,7 +1096,7 @@ class CCApp(App):
             return
         line.update(f'{spin} [bold {PALETTE["accent"]}]Generating[/] {elapsed:4.1f}s'
                     f' [dim]{self._stream_chars} chars[/]'
-                    f'{("  " + base) if base else ""}')
+                    f'{("  " + base) if base else ""}{self._queue_suffix()}')
 
     def _update_status(self, payload: dict) -> None:
         """更新指标后重绘状态栏；活动态由 activity 事件统一驱动。"""
@@ -1176,6 +1285,10 @@ class CCApp(App):
             recent.append('\n')
         self._recent_tools_widget.update(recent)
 
+    def _queue_suffix(self) -> str:
+        queued = self._user_input_q.qsize()
+        return f'  [dim]{queued} queued[/]' if queued else ''
+
     def _refresh_status_line(self) -> None:
         line = self._status_line()
         if line is None:
@@ -1205,7 +1318,7 @@ class CCApp(App):
         base = self._pills(self._last_status, include_context=False)
         line.update(f'[bold {color}]{label}[/]'
                     f'{(" [dim]" + detail + "[/]") if detail else ""}'
-                    f'{("  " + base) if base else ""}')
+                    f'{("  " + base) if base else ""}{self._queue_suffix()}')
         self._refresh_context_line()
 
     def _refresh_context_line(self) -> None:
@@ -1230,6 +1343,11 @@ class CCApp(App):
         parts = []
         if payload.get('model') and width >= 58:
             parts.append(f"[{PALETTE['accent']} on {PALETTE['raised']}] {markup_escape(str(payload['model']))} [/]")
+        if payload.get('branch') and width >= 72:
+            parts.append(f"[dim]⎇ {markup_escape(str(payload['branch']))}[/]")
+        if payload.get('sandbox') and width >= 84:
+            parts.append(f"[{PALETTE['muted']} on {PALETTE['raised']}] "
+                         f"{markup_escape(str(payload['sandbox']))} [/]")
         ctx = payload.get('ctx_pct')
         if include_context and ctx is not None and width >= 44:
             marker = '' if payload.get('ctx_source') == 'confirmed' else '~'

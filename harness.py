@@ -700,9 +700,12 @@ def update_panel_status(messages=None, *, model=None, ctx_tokens=None,
     if ctx_tokens is None:
         ctx_tokens = estimate_size(messages) if messages else 0
         ctx_source = ctx_source or 'estimated'
-    ui_emit('status', **status_payload(
+    payload = status_payload(
         model=model, workdir=get_workdir(), ctx_tokens=int(ctx_tokens),
-        ctx_source=ctx_source or 'confirmed', window=_context_window(model)))
+        ctx_source=ctx_source or 'confirmed', window=_context_window(model))
+    payload['branch'] = current_branch(get_workdir())
+    payload['sandbox'] = load_policy().sandbox_mode
+    ui_emit('status', **payload)
 KEEP_RECENT=6
 PERSIST_THERSHOLD=10000
 TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）

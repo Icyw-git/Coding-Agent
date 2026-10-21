@@ -132,3 +132,27 @@ def test_repl_renderer_skips_channels_the_repl_prints(capsys):
 
     renderer.on_event(ui_events.UIEvent('error', {'msg': 'boom'}))
     assert 'boom' in capsys.readouterr().out
+
+
+def test_status_payload_carries_branch_and_sandbox(tmp_path, monkeypatch, capsys):
+    events = _collect()
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(role='assistant', content='hi',
+                                    tool_calls=None),
+            finish_reason='stop')],
+        usage=_usage())
+
+    monkeypatch.setattr(harness, '_stream_completion',
+                        lambda kwargs, hook: response)
+    store = harness.SessionEventStore(tmp_path, session_id='ui-status')
+    try:
+        harness.agent_loop([{'role': 'user', 'content': 'hello'}],
+                           session_store=store, housekeeping=False)
+    finally:
+        ui_events.bus.unsubscribe(events.append)
+
+    status = next(e for e in events if e.type == 'status')
+    assert 'branch' in status.payload and 'sandbox' in status.payload
