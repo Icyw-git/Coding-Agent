@@ -2325,3 +2325,27 @@ Textual 可见），以及 teammate 的工具事件会混进主会话聊天区�
 **测试**：`tests/test_ui_bridge.py` 补事件归属、Textual 会话过滤、
 `ReplRenderer` 通道过滤；`pytest tests/` 1085 passed / 1 skipped；
 根 UI 测试 49 passed，`ruff` 通过。
+## 子代理改用统一执行路径
+
+**问题**：子代理自己解析参数、调 `PreToolUse`、直接执行 handler、再 `PostToolUse`，
+等于维护了第三条工具执行路径（主循环 / teammate / 子代理）。后果是子代理的工具输出
+**不做入口截断**（30KB 输出原样进上下文），也没有 UI 事件、checkpoint 捕获与统一的
+异常兜底。
+
+**做法**：
+
+- `spawn_subagent` 的工具轮改为调用 `harness.exec_tool_call(..., hooks=True,
+  background=False)`：审批、`_bound_tool_output` 截断、图像结果、异常兜底、UI 事件
+  全部复用主循环那一份。
+- 用 `ui_bridge.agent_context('subagent')` 包住每次调用：子代理的工具块在 Textual
+  里可见，但 `agent` 字段标成 subagent，便于渲染层区分。
+- 图片附件仍排在整批 tool 结果之后（与主循环相同的消息布局约束）。
+
+**取舍**：
+
+- `background=False`：子代理本身是同步调用，再嵌套后台任务只会让结果更难收集。
+- `hooks=True`：子代理仍在主线程同步执行，审批可以和主循环一样走交互/无头门；
+  teammate 才是 `hooks=False`。
+
+**测试**：新增 `tests/test_subagent_loop.py`（统一路径与消息布局、事件归属、
+入口截断生效）；`pytest tests/` 1087 passed / 1 skipped。

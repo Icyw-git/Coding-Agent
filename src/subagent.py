@@ -1,11 +1,11 @@
 """子代理：精简版 agent loop，复用 harness 的 client / 提示词与 tools 的工具集。
 """
 import copy
-import json
 import os
 
 from agent_core import _extract_text, expand_image_parts, image_attachment_message, trigger_hooks
-from tools import TOOLS, ImageResult
+from tools import TOOLS
+from ui_bridge import agent_context
 
 # 子代理拿不到父代理的 loop 级能力与协作编排：这些工具要么没有 handler
 # （checkpoint/compact 由主循环特判），要么会把父子关系再展开一层
@@ -79,29 +79,15 @@ def spawn_subagent(description:str)->str:
         tool_messages = []
         attachments = []
         for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-
-            blocked = trigger_hooks("PreToolUse", name, args)
-            if blocked:
-                output = blocked
-            elif name not in sub_handlers:
-                output = f"Error: unknown tool {name}"
-            else:
-                output = sub_handlers[name](**args)
-                if isinstance(output, ImageResult):
-                    if output.images:
-                        attachments.append(
-                            image_attachment_message(output.images))
-                    output = output.text
-
-            trigger_hooks("PostToolUse", name, args, output)
-
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": output,
-            })
+            # 与主循环共用同一条执行路径：审批、入口截断、checkpoint、UI 事件
+            # 与后台判定都只在这里维护一份。子代理不再嵌套后台任务。
+            with agent_context('subagent'):
+                _, _, tool_message, images = _h().exec_tool_call(
+                    tool_call, registry=sub_handlers,
+                    hooks=True, background=False)
+            tool_messages.append(tool_message)
+            if images:
+                attachments.append(image_attachment_message(images))
 
         # 工具结果连续，图片附件排在整批之后（role=tool 里放图各家支持不一）
         messages.extend(tool_messages)
