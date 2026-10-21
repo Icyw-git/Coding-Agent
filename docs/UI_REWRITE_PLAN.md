@@ -23,6 +23,9 @@
   `/allow|deny|ask` 工具、`/help` 命令名；`/help <cmd>` 显示用法/可用性。
 - P5d：动态技能命令 `/skill:<name> [args]`（展开技能正文为 user 消息，同 Pi
   `_expandSkillCommand`）；技能自动进入补全/帮助/模糊建议。
+- P5e：把常用行式命令接进新 TUI：`/diff` `/cache` `/sandbox` `/review`
+  （后台+进度块）`/model`（选择器）`/expand` `/approvals`；参数补全覆盖
+  sandbox/cache。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21

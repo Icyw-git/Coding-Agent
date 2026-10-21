@@ -401,7 +401,7 @@ def test_help_with_argument_shows_command_details(monkeypatch):
             text = app.model.snapshot()[-1].payload['text']
             assert '/resume' in text and '恢复会话' in text
 
-            app.submit_text('/help review')
+            app.submit_text('/help rewind')
             await pilot.pause()
             text = app.model.snapshot()[-1].payload['text']
             assert '仅行式 REPL' in text
@@ -458,5 +458,100 @@ def test_unknown_skill_reports_error(monkeypatch):
             notice = app.model.snapshot()[-1]
             assert notice.kind == 'notice'
             assert 'Unknown skill' in notice.payload['text']
+
+    asyncio.run(scenario())
+
+
+def _no_agent(monkeypatch):
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda messages, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('command must not reach model')))
+
+
+def test_diff_and_sandbox_commands(monkeypatch):
+    _no_agent(monkeypatch)
+    monkeypatch.setattr(harness, 'format_workspace_diff',
+                        lambda color=False: ' M src/app.py')
+    monkeypatch.setattr(harness, 'apply_sandbox_tier',
+                        lambda arg: f'switched to {arg}')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/diff')
+            await pilot.pause()
+            assert 'M src/app.py' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text('/sandbox read-only')
+            await pilot.pause()
+            assert 'switched to read-only' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+
+
+def test_cache_command_delegates_to_tool_cache(monkeypatch):
+    _no_agent(monkeypatch)
+    calls = []
+    monkeypatch.setattr(harness.tool_cache, 'handle_cache_command',
+                        lambda root, sessions, argument: calls.append(
+                            (str(root), str(sessions), argument))
+                        or 'cache-report')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/cache gc 7')
+            await pilot.pause()
+            assert calls and calls[0][2] == 'gc 7'
+            assert app.model.snapshot()[-1].payload['text'] == 'cache-report'
+
+    asyncio.run(scenario())
+
+
+def test_model_picker_updates_env(monkeypatch):
+    _no_agent(monkeypatch)
+    monkeypatch.setattr(harness, 'MODEL_WINDOWS',
+                        {'alpha': 1000, 'beta': 2000})
+    monkeypatch.delenv('LLM_MODEL_ID', raising=False)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.open_model_picker()
+            await pilot.pause()
+            screen = app.screen
+            options = screen.query_one('#model-list')
+            assert options.option_count == 2
+            options.focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert harness.os.environ['LLM_MODEL_ID'] in ('alpha', 'beta')
+
+    asyncio.run(scenario())
+
+
+def test_review_runs_in_background_and_updates_block(monkeypatch):
+    import review
+
+    _no_agent(monkeypatch)
+
+    def fake_review(progress=None):
+        if progress:
+            progress('review: scanning')
+        return 'review: 1 issue found'
+
+    monkeypatch.setattr(review, 'run_review', fake_review)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/review')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                block = app.model.snapshot()[-1]
+                if '1 issue' in str(block.payload.get('text', '')):
+                    break
+            assert '1 issue' in app.model.snapshot()[-1].payload['text']
 
     asyncio.run(scenario())

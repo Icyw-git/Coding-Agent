@@ -2864,3 +2864,19 @@ args`
 
 **测试**：`test_harness_app.py` 技能展开（含参数）与未知技能；`test_ui_commands.py`
 动态注册/匹配；总回归 1138 passed / 1 skipped，旧 UI 64 passed。
+## TUI 重构 P5e：常用命令迁移
+
+- `/diff`、`/cache`、`/sandbox`：直接复用行式实现，输出写入对话块；sandbox 切换后
+  更新状态。
+- `/review`：后台线程执行，进度与最终结果写进同一块（`review.run_review(progress=)`），
+  不占对话回合；忙碌时提示先结束当前请求。
+- `/model`：新增 `ModelPickerModal`（OptionList），选择后写回 `LLM_MODEL_ID` 并刷新
+  footer；带参 `/model <name>` 直接切换。
+- `/expand` 切换最近工具块；`/approvals` 复用 `format_pending_approvals`。
+- 参数补全新增 `sandbox`（三档 + approvals）与 `cache`（gc/天数/--apply）。
+- 仍未迁移：checkpoints/rewind/undo/fork/archive/delete/watch/revoke/workspaces/
+  workspace/cd/new/compact/find/rename/more，命令注册表里继续标 `ported=False`，
+  帮助中单列并提示 `--ui ansi`。
+
+**测试**：新增 diff/sandbox、cache 委派、model picker、review 后台进度块用例；
+总回归 1142 passed / 1 skipped，旧 UI 64 passed。

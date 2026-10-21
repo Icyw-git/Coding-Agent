@@ -22,6 +22,7 @@ from file_mentions import workspace_files
 from ui import commands
 from ui.composer.completions import apply_suggestion, suggestions
 from ui.modals.approval import PermissionModal
+from ui.modals.models import ModelPickerModal
 from ui.modals.sessions import SessionPickerModal
 from ui.renderers.tools import tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
@@ -177,6 +178,9 @@ class HarnessApp(App):
                    border: round $accent; background: $boost; }
     #session-list { height: auto; max-height: 18; }
     #session-search { margin: 0 0 1 0; }
+    #model-box { width: 60; max-height: 20; padding: 1 2;
+                 border: round $accent; background: $boost; }
+    #model-list { height: auto; max-height: 14; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -605,7 +609,7 @@ class HarnessApp(App):
         elif verb == 'clear':
             self.model.clear()
             self._mark_dirty()
-        elif verb in ('status', 'model', 'pwd'):
+        elif verb in ('status', 'pwd'):
             state = self._display_status()
             lines = [f"model: {harness.os.getenv('LLM_MODEL_ID', '') or 'unset'}",
                      f'workspace: {harness.get_workdir()}']
@@ -614,6 +618,40 @@ class HarnessApp(App):
             if state.get('tokens'):
                 lines.append(f"tokens: {state['tokens']}")
             self._notice(chr(10).join(lines))
+        elif verb == 'model':
+            if argument:
+                self._set_model(argument.strip())
+            else:
+                self.open_model_picker()
+        elif verb == 'diff':
+            try:
+                self._notice(harness.format_workspace_diff(color=False))
+            except Exception as exc:
+                self._notice(f'Diff failed: {exc}', level='error')
+        elif verb == 'cache':
+            try:
+                self._notice(harness.tool_cache.handle_cache_command(
+                    harness.TOOL_RESULTS_DIR, harness.SESSIONS_DIR, argument))
+            except Exception as exc:
+                self._notice(f'Cache failed: {exc}', level='error')
+        elif verb == 'sandbox':
+            try:
+                if argument:
+                    message = harness.apply_sandbox_tier(argument)
+                    self._status['sandbox'] = argument.split()[0]
+                    self._refresh_footer()
+                else:
+                    message = harness.format_sandbox_tier()
+                self._notice(message)
+            except Exception as exc:
+                self._notice(f'Sandbox failed: {exc}', level='error')
+        elif verb == 'review':
+            self.start_review()
+        elif verb == 'expand':
+            self.toggle_last_tool()
+            self._notice('Toggled the most recent tool block.')
+        elif verb == 'approvals':
+            self._notice(harness.format_pending_approvals())
         elif verb == 'sessions':
             self.open_session_picker()
         elif verb == 'resume':
@@ -637,6 +675,60 @@ class HarnessApp(App):
 
     def _display_status(self) -> dict:
         return dict(self._status)
+
+    def open_model_picker(self) -> None:
+        import harness
+        current = harness.os.getenv('LLM_MODEL_ID', '')
+        models = sorted(set(harness.MODEL_WINDOWS) | ({current} if current else set()))
+        self.push_screen(ModelPickerModal(models, current), self._on_model_picked)
+
+    def _on_model_picked(self, model) -> None:
+        if model:
+            self._set_model(str(model))
+
+    def _set_model(self, model: str) -> None:
+        import harness
+        harness.os.environ['LLM_MODEL_ID'] = model
+        self._notice(f'model: {model}')
+        self._refresh_footer()
+
+    def start_review(self) -> None:
+        """`/review`：后台只读审阅，进度/结果写进同一块（不占对话回合）。"""
+        if self._busy:
+            self._notice('Cannot review while a request is running.')
+            return
+        block = self.model.append('notice', {'text': 'review: running…'})
+        self._mark_dirty()
+        threading.Thread(target=self._run_review,
+                         args=(block.id,), daemon=True).start()
+
+    def _run_review(self, block_id: str) -> None:
+        from review import run_review
+
+        def progress(text: str) -> None:
+            try:
+                self.call_from_thread(self._review_progress, block_id, text)
+            except Exception:
+                pass
+
+        try:
+            result = run_review(progress=progress)
+        except Exception as exc:
+            result = f'Review failed: {type(exc).__name__}: {exc}'
+        try:
+            self.call_from_thread(self._review_done, block_id, result)
+        except Exception:
+            pass
+
+    def _review_progress(self, block_id: str, text: str) -> None:
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=str(text))
+            self._mark_dirty()
+
+    def _review_done(self, block_id: str, text: str) -> None:
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=str(text))
+            self._mark_dirty()
 
     def open_session_picker(self) -> None:
         import harness

@@ -76,11 +76,25 @@ def _tool_arguments(prefix: str) -> list[tuple[str, str]]:
     return [(name, name) for name in names]
 
 
+def _sandbox_arguments(prefix: str) -> list[tuple[str, str]]:
+    values = ('read-only', 'workspace-write', 'danger-full-access',
+              'approvals untrusted', 'approvals on-request',
+              'approvals never')
+    return [(value, value) for value in values
+            if not prefix or value.startswith(prefix.casefold())]
+
+
+def _cache_arguments(prefix: str) -> list[tuple[str, str]]:
+    values = ('gc', 'gc 7', 'gc 30', 'gc 7 --apply')
+    return [(value, value) for value in values
+            if not prefix or value.startswith(prefix.casefold())]
+
+
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('help', '显示帮助', '[命令]', ('?',),
                 argument_completions=_help_arguments),
     CommandSpec('status', '查看当前会话与运行状态'),
-    CommandSpec('model', '查看当前模型',
+    CommandSpec('model', '选择/查看模型',
                 argument_completions=_model_arguments),
     CommandSpec('pwd', '查看当前工作区'),
     CommandSpec('sessions', '打开会话选择器', aliases=('transcripts',)),
@@ -96,10 +110,12 @@ COMMANDS: tuple[CommandSpec, ...] = (
                 argument_completions=_tool_arguments),
     CommandSpec('hotkeys', '显示快捷键'),
     CommandSpec('quit', '退出', aliases=('exit', 'q')),
-    CommandSpec('diff', '查看未提交改动', ported=False),
-    CommandSpec('review', '只读审阅未提交改动', ported=False),
-    CommandSpec('cache', '工具缓存统计/回收', ported=False),
-    CommandSpec('sandbox', '查看/切换执行档位', ported=False),
+    CommandSpec('diff', '查看未提交改动'),
+    CommandSpec('review', '只读审阅未提交改动'),
+    CommandSpec('cache', '工具缓存统计/回收', '[gc [天数] [--apply]]',
+                argument_completions=_cache_arguments),
+    CommandSpec('sandbox', '查看/切换执行档位', '[档位|approvals <档位>]',
+                argument_completions=_sandbox_arguments),
     CommandSpec('checkpoint', '创建快照', '[标签]', ported=False),
     CommandSpec('checkpoints', '列出快照', ported=False),
     CommandSpec('rewind', '回溯快照', ported=False),
@@ -108,8 +124,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('archive', '归档旧会话', ported=False),
     CommandSpec('delete', '删除已归档会话', ported=False),
     CommandSpec('watch', '跟踪后台任务', ported=False),
-    CommandSpec('expand', '展开被折叠的工具输出', ported=False),
-    CommandSpec('approvals', '查看待审批操作', ported=False),
+    CommandSpec('expand', '展开最近一个工具块'),
+    CommandSpec('approvals', '查看待审批操作'),
     CommandSpec('revoke', '撤销同类预授权', ported=False),
     CommandSpec('workspaces', '列出工作区', ported=False),
     CommandSpec('workspace', '维护工作区', ported=False),
