@@ -3063,3 +3063,25 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
 
 **测试**：流式内容不含 `**`/反引号、Markdown 代码无 black 背景、footer 不含占位
 标题且以 cwd 开头、工具 ANSI 剥离；总回归 1163 passed / 1 skipped，旧 UI 64 passed。
+## 审批全屏、复制与 Markdown 健壮性
+
+- **审批弹窗全屏**：`Screen { background: $background; }` 同样命中了 ModalScreen，
+  遮罩不透明且盒子默认左上角，看起来像“聊天记录没了”。现在
+  `ModalScreen { background: $background 60%; align: center middle; }`，
+  `#perm-box` 限制 `max-height: 80%`，对话在遮罩下仍可见。
+- **复制**：`Transcript` 支持 Textual 选择。Ctrl-C 有选中文本时复制、否则退出；
+  `Ctrl+Shift+C` 显式复制；`/copy` 复制最近一次工具输出的完整内容（不受展开
+  预览限制）。选择时点击不会顺带展开工具。
+- **畸形 Markdown**：Rich Markdown 对 `[x](`、未闭合代码围栏等多数畸形输入是
+  容错的；仍加 `_render_markdown` try/fallback，异常时退回纯文本，避免整帧崩溃。
+- **Profile**（本机）：
+  - `scripts/bench_ui.py 10000 100 100`：layout 30.1ms，scroll 0.95ms/frame，
+    streaming block update 1.8ms；
+  - 10k Markdown 文本渲染约 63ms，其中 `markdown_it.parse` ~28ms、
+    `rich.console.render_lines` ~34ms；流式已限制 120ms 重排一次，避免每 token
+    重排。
+  - 可继续优化：稳定前缀增量 Markdown、最终态复用流式渲染结果、把 Console
+    缓存已做；若输出超大，可降级为轻量纯文本渲染。
+
+**测试**：审批盒子尺寸、Ctrl-C 选中复制、/copy、畸形 Markdown fallback；总回归
+1167 passed / 1 skipped，旧 UI 64 passed。

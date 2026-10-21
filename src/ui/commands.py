@@ -125,6 +125,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('archive', '归档旧会话', ported=False),
     CommandSpec('delete', '删除已归档会话', ported=False),
     CommandSpec('watch', '跟踪后台任务', ported=False),
+    CommandSpec('copy', '复制最近一次工具输出'),
     CommandSpec('expand', '展开最近一个工具块'),
     CommandSpec('approvals', '查看待审批操作'),
     CommandSpec('revoke', '撤销同类预授权', ported=False),
@@ -217,7 +218,8 @@ HOTKEYS = (
     ('Alt+↑ / Alt+↓', '切换补全候选 / 无候选时 Alt+↑ 取回排队消息'),
     ('Esc', '关闭补全候选；回合中取消'),
     ('Ctrl+O', '展开最近工具块'),
-    ('Ctrl+C', '/quit', '退出'),
+    ('Ctrl+C', '/quit', '有选中文本时复制，否则退出'),
+    ('Ctrl+Shift+C', '/copy', '复制选中文本 / 最近工具输出'),
     ('Ctrl+Q', '/quit', '退出'),
 )
 

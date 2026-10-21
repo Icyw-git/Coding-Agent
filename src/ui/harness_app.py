@@ -75,10 +75,30 @@ MARKDOWN_THEME = Theme({
 
 
 
+def _render_markdown(text: str, width: int) -> list[Text]:
+    """Markdown 渲染兜底：畸形链接/超长表格等不能让整帧崩溃。"""
+    try:
+        return _render_lines(RichMarkdown(text), width)
+    except Exception:
+        return _render_lines(Text(text), width)
+
+
+_CONSOLES: dict[int, Console] = {}
+
+
+def _console_for(width: int) -> Console:
+    console = _CONSOLES.get(width)
+    if console is None:
+        console = Console(width=width, force_terminal=True,
+                          color_system='truecolor', legacy_windows=False,
+                          safe_box=True, theme=MARKDOWN_THEME)
+        _CONSOLES[width] = console
+    return console
+
+
 def _render_lines(renderable, width: int) -> list[Text]:
     """把 Rich renderable 渲染成固定宽度的 Text 行（虚拟视口用）。"""
-    console = Console(width=width, force_terminal=True, color_system='truecolor',
-                      legacy_windows=False, safe_box=True, theme=MARKDOWN_THEME)
+    console = _console_for(width)
     options = console.options.update(max_width=width, min_width=width)
     lines = console.render_lines(renderable, options, pad=False)
     result = []
@@ -224,12 +244,16 @@ class HarnessApp(App):
 
     # 子类 BINDINGS 会覆盖 App 默认绑定（默认里本来有 ctrl+c），必须显式写回。
     BINDINGS = [
-        Binding('ctrl+c', 'quit_app', 'Quit', show=False, priority=True),
+        Binding('ctrl+c', 'interrupt', 'Copy selection / quit', show=False,
+                priority=True),
         Binding('ctrl+q', 'quit_app', 'Quit', show=False, priority=True),
+        Binding('ctrl+shift+c', 'copy_selection', 'Copy', show=False,
+                priority=True),
     ]
 
     CSS = """
     Screen { background: $background; }
+    ModalScreen { background: $background 60%; align: center middle; }
     #pending { height: 1; padding: 0 2; color: #d7af5f;
                background: $surface; display: none; }
     #footer { height: 1; padding: 0 2; color: $text-muted;
@@ -240,8 +264,8 @@ class HarnessApp(App):
     #completions { position: absolute; overlay: screen; layer: overlay;
                    display: none; background: $surface; border: round $accent;
                    padding: 0 1; }
-    #perm-box { width: 76; padding: 2 3; border: round $warning;
-                background: $boost; }
+    #perm-box { width: 76; max-height: 80%; padding: 2 3;
+                border: round $warning; background: $boost; }
     #perm-box.risk-danger { border: round $error; }
     #session-box { width: 90; max-height: 28; padding: 1 2;
                    border: round $accent; background: $boost; }
@@ -313,6 +337,29 @@ class HarnessApp(App):
         self.set_interval(1.0, self._refresh_footer)
 
     def action_quit_app(self) -> None:
+        self.exit()
+
+    def _selected_text(self) -> str | None:
+        try:
+            return self.screen.get_selected_text()
+        except Exception:
+            return None
+
+    def action_copy_selection(self) -> None:
+        text = self._selected_text()
+        if text:
+            self.copy_to_clipboard(text)
+            self._notice(f'Copied {len(text)} chars to clipboard.')
+        else:
+            self._notice('Select transcript text first, or use /copy for the last tool output.')
+
+    def action_interrupt(self) -> None:
+        # 有选中文本时 Ctrl-C 复制，不再直接退出；无选中保持原来的退出行为。
+        text = self._selected_text()
+        if text:
+            self.copy_to_clipboard(text)
+            self._notice(f'Copied {len(text)} chars to clipboard.')
+            return
         self.exit()
 
     def on_unmount(self) -> None:
@@ -677,7 +724,7 @@ class HarnessApp(App):
                 return []
             # 流式也用 Markdown 渲染，避免先看到 `**源码**` 再“变成”正文；
             # Rich 能处理未闭合的标记，最后一块只是复用同一渲染路径。
-            return _render_lines(RichMarkdown(text), width)
+            return _render_markdown(text, width)
         if kind == 'tool':
             return _render_lines(tool_view(payload), width)
         if kind == 'diff':
@@ -700,6 +747,19 @@ class HarnessApp(App):
         self.model.set_expanded(block_id, not block.expanded)
         self._mark_dirty()
 
+    def copy_last_tool(self) -> None:
+        """`/copy`：复制最近一次工具输出的完整内容，便于粘贴。"""
+        for block in reversed(self.model.snapshot()):
+            if block.kind == 'tool':
+                output = str(block.payload.get('output') or '')
+                if output:
+                    self.copy_to_clipboard(output)
+                    self._notice(f'Copied {len(output)} chars from the last tool output.')
+                else:
+                    self._notice('The last tool block has no output yet.')
+                return
+        self._notice('No tool output to copy.', level='error')
+
     def toggle_last_tool(self) -> None:
         for block in reversed(self.model.snapshot()):
             if block.kind == 'tool':
@@ -707,6 +767,8 @@ class HarnessApp(App):
                 return
 
     def on_transcript_click(self, line_index: int) -> None:
+        if self._selected_text():
+            return          # 拖动选择时不要顺带展开工具
         block_id = self.doc_layout.block_at(line_index)
         if block_id:
             block = self.model.get(block_id)
@@ -820,6 +882,8 @@ class HarnessApp(App):
                 self._notice(f'Sandbox failed: {exc}', level='error')
         elif verb == 'review':
             self.start_review()
+        elif verb == 'copy':
+            self.copy_last_tool()
         elif verb == 'expand':
             self.toggle_last_tool()
             self._notice('Toggled the most recent tool block.')

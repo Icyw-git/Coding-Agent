@@ -961,3 +961,58 @@ def test_footer_starts_with_cwd_and_hides_placeholder_title(monkeypatch, tmp_pat
             assert '(main)' in footer
 
     asyncio.run(scenario())
+
+
+def test_copy_last_tool_output(monkeypatch):
+    copied = []
+    async def scenario():
+        app = HarnessApp([])
+        monkeypatch.setattr(app, 'copy_to_clipboard', copied.append)
+        async with app.run_test(size=(80, 20)) as pilot:
+            app._apply(UIEvent('tool_start', {
+                'name': 'bash', 'args': {'command': 'x'}, 'call_id': 'c1'}))
+            app._apply(UIEvent('tool_end', {
+                'name': 'bash', 'call_id': 'c1', 'outcome': 'completed',
+                'ok': True, 'output_preview': 'line1\nline2', 'duration_ms': 1}))
+            app.submit_text('/copy')
+            await pilot.pause()
+            assert copied == ['line1\nline2']
+            assert 'Copied' in app.model.snapshot()[-1].payload['text']
+    asyncio.run(scenario())
+
+
+def test_ctrl_c_copies_selection_instead_of_quitting(monkeypatch):
+    copied = []
+    async def scenario():
+        app = HarnessApp([])
+        monkeypatch.setattr(app, '_selected_text', lambda: 'selected text')
+        monkeypatch.setattr(app, 'copy_to_clipboard', copied.append)
+        async with app.run_test(size=(80, 20)) as pilot:
+            await pilot.press('ctrl+c')
+            await pilot.pause()
+            assert copied == ['selected text']
+            assert app.is_running
+    asyncio.run(scenario())
+
+
+def test_malformed_markdown_falls_back_to_text(monkeypatch):
+    from ui import harness_app as module
+
+    monkeypatch.setattr(module, 'RichMarkdown',
+                        lambda text: (_ for _ in ()).throw(ValueError('bad link')))
+    lines = module._render_markdown('[broken](', 40)
+    assert 'broken' in '\n'.join(str(line) for line in lines)
+
+
+def test_permission_modal_is_centered_box_not_fullscreen():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._apply(UIEvent('permission_request', {
+                'req_id': 'p', 'tool': 'bash',
+                'args': {'command': 'rm x'}, 'title': 'confirm'}))
+            await pilot.pause()
+            box = app.screen.query_one('#perm-box')
+            assert box.region.width < 100
+            assert box.region.height < 30
+    asyncio.run(scenario())

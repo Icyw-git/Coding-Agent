@@ -46,6 +46,10 @@
 - P5l：流式也用 Markdown 渲染，不再先显示 `**md 源码**`；Rich Markdown 增加
   dark 主题（代码块不再默认 cyan-on-black）；工具输出剥离 ANSI；流式重排限频
   120ms，最终回答强制刷新。
+- P5m：审批弹窗改为半透明遮罩+居中盒子（不再全屏盖住对话）；Markdown 渲染加
+  try/fallback，畸形链接不炸帧；支持选中文本 Ctrl-C/Ctrl+Shift+C 复制和 `/copy`
+  复制最近工具输出。Profile：10k 块布局约 30ms、滚动约 1ms；Markdown 10k 文本约
+  63ms，瓶颈在 markdown_it parse + rich render，已用 120ms 限频。
 下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
 目标分支：`feature/ui`
 调研日期：2026-10-21
