@@ -7,6 +7,7 @@ pytest.importorskip('textual')
 
 import harness  # noqa: E402
 import ui_events  # noqa: E402
+from ui import harness_app as app_module  # noqa: E402
 from ui.harness_app import HarnessApp  # noqa: E402
 from ui_events import UIEvent  # noqa: E402
 
@@ -29,8 +30,10 @@ def test_history_renders_through_virtual_transcript():
                 await asyncio.sleep(0.02)
                 if app.view.content_line_count:
                     break
-            assert len(app.model) == 300
-            assert app.view.content_line_count >= 300
+            loaded = min(len(messages), app_module.HISTORY_INITIAL_MESSAGES)
+            assert len(app.model) == loaded
+            assert app.view.content_line_count >= loaded
+            assert app.model.snapshot()[0].payload['text'] == f'history-{300 - loaded}'
             text = '\n'.join(_line_texts(app))
             assert 'history-299' in text
 
@@ -1689,22 +1692,26 @@ def test_history_starts_with_recent_window_and_loads_older_page():
         app = HarnessApp(messages)
         async with app.run_test(size=(80, 20)) as pilot:
             await pilot.pause()
+            initial_start = len(messages) - app_module.HISTORY_INITIAL_MESSAGES
+            page = app_module.HISTORY_PAGE_MESSAGES
             assert len(app._messages) == 1000
-            assert len(app.model) == 400
-            assert app.model.snapshot()[0].payload['text'] == 'history-600'
-            assert app._history_start == 600
+            assert len(app.model) == app_module.HISTORY_INITIAL_MESSAGES
+            assert app.model.snapshot()[0].payload['text'] == f'history-{initial_start}'
+            assert app._history_start == initial_start
 
             before = app.view.content_line_count
-            assert app.load_older_history() == 200
+            assert app.load_older_history() == min(page, initial_start)
             await pilot.pause()
-            assert app._history_start == 400
-            assert len(app.model) == 600
-            assert app.model.snapshot()[0].payload['text'] == 'history-400'
+            first_start = max(0, initial_start - page)
+            assert app._history_start == first_start
+            assert len(app.model) == 1000 - first_start
+            assert app.model.snapshot()[0].payload['text'] == f'history-{first_start}'
             assert app.view.content_line_count > before
-            assert app.load_older_history() == 200
+            assert app.load_older_history() == min(page, first_start)
             await pilot.pause()
-            assert app._history_start == 200
-            assert app.model.snapshot()[0].payload['text'] == 'history-200'
+            second_start = max(0, first_start - page)
+            assert app._history_start == second_start
+            assert app.model.snapshot()[0].payload['text'] == f'history-{second_start}'
 
     asyncio.run(scenario())
 
@@ -1724,15 +1731,18 @@ def test_scrolling_to_top_loads_older_history():
                 await asyncio.sleep(0.01)
                 if app._history_auto_armed and app._history_last_offset > 0:
                     break
-            assert app._history_start == 600
+            initial_start = len(messages) - app_module.HISTORY_INITIAL_MESSAGES
+            assert app._history_start == initial_start
             app.view.scroll_home(animate=False)
             for _ in range(80):
                 await pilot.pause()
                 await asyncio.sleep(0.01)
-                if app._history_start < 600:
+                if app._history_start < initial_start:
                     break
-            assert app._history_start == 400
-            assert len(app.model) == 600
+            expected_start = max(
+                0, initial_start - app_module.HISTORY_PAGE_MESSAGES)
+            assert app._history_start == expected_start
+            assert len(app.model) == len(messages) - expected_start
 
     asyncio.run(scenario())
 

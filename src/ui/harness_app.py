@@ -74,7 +74,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-HISTORY_INITIAL_MESSAGES = _env_int('HARNESS_HISTORY_INITIAL_MESSAGES', 400)
+HISTORY_INITIAL_MESSAGES = _env_int('HARNESS_HISTORY_INITIAL_MESSAGES', 200)
 HISTORY_PAGE_MESSAGES = _env_int('HARNESS_HISTORY_PAGE_MESSAGES', 200)
 # 流式 Markdown 每次都要重新解析累计全文。根据上一帧耗时动态选择下一帧
 # 间隔：短文本更快出字，长文本自动退让，避免固定 120ms 让小回复也显得迟滞。

@@ -57,8 +57,9 @@ async def _measure(label: str, limit: int, messages: list[dict]) -> dict:
 
 async def main_async(count: int) -> list[dict]:
     messages = _messages(count)
+    initial_messages = module.HISTORY_INITIAL_MESSAGES
     full = await _measure('full', 10 ** 9, messages)
-    paged = await _measure('paged', 400, messages)
+    paged = await _measure('paged', initial_messages, messages)
     return [full, paged]
 
 
