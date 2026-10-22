@@ -3464,3 +3464,18 @@ profile 显示最大会话（约 5 MB JSONL）完整读取事件峰值约 23 MB�
 HEAD `00e2683`）；当前 `.cache` 约 31 MB。验证：全量 **1271 passed / 1 skipped**
 （skip 为主机不支持 symlink；5 条 warning 均来自飞书 SDK 的 pkg_resources），
 新增流式重建/缓存边界测试通过，Ruff 与 diff 检查通过。
+
+## UI 布局行缓存对比实验
+
+基线（10000 块、每块 3 行、宽 100）：模型 5.8 MB，布局完整缓存 30000 行，
+布局后当前约 9.6 MB、峰值约 10.1 MB，首次 layout 约 67.6 ms，视口切片约 7.4 ms。
+
+改为有界缓存（默认 6000 行）后：离屏块保留 `height`、`lines=None`，`line_at`/
+`visible` 按需重渲染；当前约 7.5 MB（降低约 22%），首次 layout 约 70.5 ms，
+视口切片约 10.8 ms，峰值仍约 10.1 MB（首次仍要渲染所有块求高度）。10k 块基准
+`scripts/bench_ui.py` 仍远低于阈值。
+
+新增 `scripts/bench_layout.py` 同时跑 full/bounded 两种模式，避免只看单边数字；
+新增缓存淘汰/高度保持测试。验证：全量 **1272 passed / 1 skipped**，5 条 warning
+均来自飞书 SDK，Ruff 与 diff 检查通过。若后续继续压低峰值，需要把块高度也改为
+惰性估算，或参考 Codex 的分页 history / Pi 的 active-branch projection 做真正的窗口化。

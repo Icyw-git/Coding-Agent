@@ -101,6 +101,7 @@
 python scripts/profile_storage.py --session largest
 python scripts/profile_storage.py --json
 python scripts/profile_storage.py --shallow
+python scripts/bench_layout.py 10000 100
 ```
 
 `--session` 用 `tracemalloc` 统计读取事件、重建 OpenAI 历史和峰值；它只测量存储/历史层，不包含 Textual 界面渲染。
@@ -127,6 +128,17 @@ python scripts/profile_storage.py --shallow
 这借鉴 Codex 的“历史分页/按需读取”和 Pi 的“只投影当前 active branch”思路：
 保留 append-only 源数据，不把完整事件列表长期复制到内存。若 session 继续增长，
 下一步再考虑分页/压缩存储，而不是删除历史。
+
+TUI 布局同样不再长期保留所有块的行文本：`TranscriptLayout` 默认只缓存最近
+6000 行，离屏块保留高度、需要时重渲染。`scripts/bench_layout.py` 的 10k 块对比：
+
+| 模式 | model | 布局后 | 当前 | 峰值 | layout | visible | 缓存行 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 完整缓存 | 5.8 MB | 9.5 MB | 9.6 MB | 10.1 MB | 67.6 ms | 7.4 ms | 30000 |
+| 有界缓存 | 5.8 MB | 7.5 MB | **7.5 MB** | 10.1 MB | 70.5 ms | 10.8 ms | 6000 |
+
+稳定内存降低约 22%，代价是布局/滚动的少量重渲染；峰值仍出现在首次构建全部
+块高度的阶段，后续若要继续降低峰值，需要让块高度也可惰性计算。
 
 ## 6. 暂不采用
 

@@ -132,3 +132,22 @@ def test_virtual_transcript_renders_only_viewport():
             app._exiting = True
 
     asyncio.run(scenario())
+
+
+def test_line_cache_evicts_offscreen_blocks_but_keeps_heights():
+    from ui.transcript import ConversationModel, TranscriptLayout
+
+    model = ConversationModel()
+    for index in range(5):
+        model.append('user', {'text': f'block-{index}\nsecond'}, block_id=f'b{index}')
+    layout = TranscriptLayout(
+        lambda block, width: str(block.payload['text']).splitlines(),
+        line_cache_limit=2)
+    layout.update(model, 80)
+
+    assert layout.total_height == 10
+    assert layout.entries()[0].lines is None       # 只保留最近/有限的块
+    assert layout.line_at(0) == 'block-0'
+    assert layout.block_at(9) == 'b4'
+    assert [line for line in layout.visible(0, 4)] == [
+        'block-0', 'second', 'block-1', 'second']

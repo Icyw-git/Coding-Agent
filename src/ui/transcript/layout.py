@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -16,23 +17,26 @@ Line = str | Text
 RenderBlock = Callable[[Block, int], Sequence[Line]]
 
 
-@dataclass
+@dataclass(slots=True)
 class LayoutEntry:
     block_id: str
     version: int
     width: int
-    lines: list[Line]
+    lines: list[Line] | None
     start: int = 0
+    height: int = 0
 
-    @property
-    def height(self) -> int:
-        return len(self.lines)
+
+# 每块的行文本是模型 payload 之外的第二份副本；只保留最近访问的窗口，
+# 离屏块保留高度、需要时再渲染。这样 10k 块长会话不会把完整历史复制进布局。
+DEFAULT_LINE_CACHE_LINES = 6000
 
 
 class TranscriptLayout:
     """维护块的高度/起始行；支持按行切片与 block 命中测试。"""
 
-    def __init__(self, render_block: RenderBlock) -> None:
+    def __init__(self, render_block: RenderBlock,
+                 line_cache_limit: int = DEFAULT_LINE_CACHE_LINES) -> None:
         self._render_block = render_block
         self._entries: list[LayoutEntry] = []
         self._width = 0
@@ -40,6 +44,10 @@ class TranscriptLayout:
         self._render_calls = 0     # 诊断/基准用：确认没有整表重绘
         self._revision = -1
         self._index: dict[str, int] = {}
+        self._model: ConversationModel | None = None
+        self._recent: OrderedDict[str, None] = OrderedDict()
+        self._cached_lines = 0
+        self._line_cache_limit = max(0, int(line_cache_limit))
 
     @property
     def total_height(self) -> int:
@@ -56,6 +64,61 @@ class TranscriptLayout:
     def entries(self) -> list[LayoutEntry]:
         return list(self._entries)
 
+    def _entry(self, block: Block, width: int) -> LayoutEntry:
+        lines = list(self._render_block(block, width)) or ['']
+        self._render_calls += 1
+        self._cached_lines += len(lines)
+        return LayoutEntry(block.id, block.version, width, lines,
+                           height=len(lines))
+
+    def _touch(self, block_id: str) -> None:
+        self._recent.pop(block_id, None)
+        self._recent[block_id] = None
+
+    def _materialize(self, entry: LayoutEntry) -> list[Line]:
+        if entry.lines is not None:
+            self._touch(entry.block_id)
+            return entry.lines
+        block = self._model.get(entry.block_id) if self._model is not None else None
+        if block is None:
+            entry.lines = ['']
+            entry.height = 1
+        else:
+            entry.lines = list(self._render_block(block, entry.width)) or ['']
+            entry.version = block.version
+            entry.height = len(entry.lines)
+            self._render_calls += 1
+        self._cached_lines += entry.height
+        self._touch(entry.block_id)
+        return entry.lines
+
+    def _drop(self, entry: LayoutEntry) -> None:
+        if entry.lines is None:
+            return
+        self._cached_lines -= len(entry.lines)
+        entry.lines = None
+        self._recent.pop(entry.block_id, None)
+
+    def _trim_lines(self, protect: set[str] | None = None) -> None:
+        if self._cached_lines <= self._line_cache_limit:
+            return
+        protect = protect or set()
+        candidates = list(self._recent)
+        for block_id in candidates:
+            if self._cached_lines <= self._line_cache_limit:
+                break
+            if block_id in protect:
+                continue
+            entry = self._entries[self._index[block_id]]
+            self._drop(entry)
+        # 新布局尚未被访问时，从最旧块开始淘汰。
+        if self._cached_lines > self._line_cache_limit:
+            for entry in self._entries:
+                if self._cached_lines <= self._line_cache_limit:
+                    break
+                if entry.block_id not in protect:
+                    self._drop(entry)
+
     def update(self, model: ConversationModel, width: int) -> None:
         """同步模型：只重渲染新增/变更的块，滚动时不做任何重算。"""
         width = max(1, int(width))
@@ -65,6 +128,9 @@ class TranscriptLayout:
         if full:
             self._entries = []
             self._index = {}
+            self._recent.clear()
+            self._cached_lines = 0
+        self._model = model
         dirty = model.take_dirty()   # 无论是否全量都清空脏集合
         blocks = model.snapshot()
 
@@ -76,10 +142,9 @@ class TranscriptLayout:
                     block = blocks[index]
                     if self._entries[index].version == block.version:
                         continue
-                    lines = list(self._render_block(block, width))
-                    self._render_calls += 1
-                    self._entries[index] = LayoutEntry(
-                        block.id, block.version, width, lines or [''])
+                    self._cached_lines -= (self._entries[index].height
+                                            if self._entries[index].lines is not None else 0)
+                    self._entries[index] = self._entry(block, width)
                 self._revision = model.revision
                 self._rebuild_starts()
                 return
@@ -89,9 +154,7 @@ class TranscriptLayout:
             # 追加路径：模型只会在尾部新增，避免整表重建。
             new_blocks = blocks[len(self._entries):]
             for block in new_blocks:
-                lines = list(self._render_block(block, width))
-                self._render_calls += 1
-                entry = LayoutEntry(block.id, block.version, width, lines or [''])
+                entry = self._entry(block, width)
                 self._index[block.id] = len(self._entries)
                 self._entries.append(entry)
             # 同时可能有旧块被修改（append + 其它事件同帧）
@@ -101,10 +164,10 @@ class TranscriptLayout:
                     block = blocks[index]
                     if self._entries[index].version == block.version:
                         continue
-                    lines = list(self._render_block(block, width))
-                    self._render_calls += 1
-                    self._entries[index] = LayoutEntry(
-                        block.id, block.version, width, lines or [''])
+                    old = self._entries[index]
+                    if old.lines is not None:
+                        self._cached_lines -= old.height
+                    self._entries[index] = self._entry(block, width)
             self._width = width
             self._revision = model.revision
             self._rebuild_starts()
@@ -113,10 +176,7 @@ class TranscriptLayout:
         # 全量重建（宽度变化 / 清空 / 顺序变化）
         entries: list[LayoutEntry] = []
         for block in blocks:
-            lines = list(self._render_block(block, width))
-            self._render_calls += 1
-            entries.append(LayoutEntry(block.id, block.version, width,
-                                       lines or ['']))
+            entries.append(self._entry(block, width))
         self._entries = entries
         self._index = {entry.block_id: i for i, entry in enumerate(entries)}
         self._width = width
@@ -129,6 +189,7 @@ class TranscriptLayout:
             entry.start = start
             start += entry.height
         self._total = start
+        self._trim_lines()
 
     def visible(self, scroll_y: int, height: int,
                 overscan: int = 0) -> list[Line]:
@@ -143,7 +204,9 @@ class TranscriptLayout:
                 break
             lo = max(0, top - entry.start)
             hi = min(entry.height, bottom - entry.start)
-            lines.extend(entry.lines[lo:hi])
+            lines.extend(self._materialize(entry)[lo:hi])
+        self._trim_lines({entry.block_id for entry in self._entries
+                          if entry.start < bottom and entry.start + entry.height > top})
         return lines
 
     def block_at(self, line_index: int) -> str | None:
@@ -173,7 +236,9 @@ class TranscriptLayout:
         if index is None:
             return None
         entry = self._entries[index]
-        return entry.lines[line_index - entry.start]
+        lines = self._materialize(entry)
+        self._trim_lines({entry.block_id})
+        return lines[line_index - entry.start]
 
     def max_scroll(self, viewport_height: int) -> int:
         return max(0, self._total - max(0, int(viewport_height)))
