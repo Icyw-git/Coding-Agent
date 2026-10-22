@@ -25,12 +25,67 @@ def test_command_aliases_and_suggestions():
     assert commands.did_you_mean('zzzz') is None
 
 
-def test_help_lists_ported_and_line_only_commands():
+def test_help_lists_all_commands_as_ported():
     text = commands.help_text()
     assert 'TUI commands:' in text
-    assert '/sessions' in text
-    assert 'Only in line REPL' in text and '/review' in text
+    assert '/sessions' in text and '/review' in text
+    assert 'Only in line REPL' not in text
+    assert all(spec.ported for spec in commands.COMMANDS)
     assert 'Ctrl+O' in commands.hotkeys_text()
+
+
+def test_cleanup_and_workspace_argument_completions(monkeypatch):
+    archive = commands.argument_suggestions(commands.find('archive'), 're')
+    assert archive and archive[0][0] == 'restore'
+
+    actions = commands.argument_suggestions(commands.find('workspace'), 're')
+    assert any(value == 'remove' for value, _label in actions)
+
+    import harness
+    monkeypatch.setattr(harness, 'registered_workspaces', lambda: [
+        {'id': 'w1', 'name': 'demo', 'path': 'C:/demo'},
+    ])
+    items = commands.argument_suggestions(commands.find('workspace'),
+                                          'remove de')
+    assert items and items[0][0] == 'remove 1'
+
+
+def test_multi_token_argument_completions_keep_subcommand(tmp_path,
+                                                          monkeypatch):
+    import harness
+    from ui.composer.completions import apply_suggestion
+
+    (tmp_path / 'alpha').mkdir()
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'registered_workspaces', lambda: [
+        {'id': 'w1', 'name': 'demo', 'path': 'C:/demo'},
+    ])
+
+    add = commands.argument_suggestions(commands.find('workspace'), 'add al')
+    assert add and add[0][0].startswith('add alpha')
+    assert (apply_suggestion('/workspace add al', add[0][0])
+            == f'/workspace {add[0][0]}')
+
+    new = commands.argument_suggestions(commands.find('new'), '--ws ')
+    assert new and new[0][0] == '--ws 1'
+    assert apply_suggestion('/new --ws ', new[0][0]) == '/new --ws 1'
+
+    watch = commands.argument_suggestions(commands.find('watch'), 'bg_0001 ')
+    assert watch and watch[0][0] == 'bg_0001 --timeout 60'
+    assert (apply_suggestion('/watch bg_0001 ',
+                             watch[0][0]).endswith('bg_0001 --timeout 60'))
+
+
+def test_cd_argument_completion_lists_only_directories(tmp_path, monkeypatch):
+    import harness
+    (tmp_path / 'alpha').mkdir()
+    (tmp_path / 'afile.txt').write_text('x', encoding='utf-8')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    items = commands.argument_suggestions(commands.find('cd'),
+                                          str(tmp_path) + '/a')
+    values = [value for value, _label in items]
+    assert any('alpha' in value for value in values)
+    assert not any('afile' in value for value in values)
 
 
 def test_skill_commands_are_registered_dynamically():

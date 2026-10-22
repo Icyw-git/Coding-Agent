@@ -136,3 +136,35 @@ def test_watch_command_timeout_without_id():
     text = background_watch.watch_command('--timeout 0.001', store)
 
     assert '仍在 running' in text
+
+
+def test_watch_command_routes_progress_through_emit(monkeypatch):
+    store = _Store(_task())
+    captured = {}
+
+    def fake_watch(bg_id, store=None, **kwargs):
+        captured['emit'] = kwargs.get('emit')
+        kwargs['emit']('  ● bg_0001  running  00:01  pytest -q')
+        return '  [bg_0001] completed'
+
+    monkeypatch.setattr(background_watch, 'watch', fake_watch)
+    emitted = []
+
+    text = background_watch.watch_command('bg_0001 --timeout 5', store,
+                                          emit=emitted.append)
+
+    assert text == '  [bg_0001] completed'
+    assert emitted == ['  ● bg_0001  running  00:01  pytest -q']
+
+
+def test_watch_command_extra_running_note_uses_emit(monkeypatch):
+    class _MultiStore:
+        def list_background_tasks(self):
+            return [_task(), _task(id='bg_0002', command='sleep 5')]
+
+    monkeypatch.setattr(background_watch, 'watch', lambda *args, **kwargs: 'ok')
+    emitted = []
+
+    assert background_watch.watch_command('', _MultiStore(),
+                                          emit=emitted.append) == 'ok'
+    assert '另有 1 个任务在运行' in emitted[0]

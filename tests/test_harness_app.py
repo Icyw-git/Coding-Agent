@@ -477,7 +477,7 @@ def test_help_with_argument_shows_command_details(monkeypatch):
             app.submit_text('/help archive')
             await pilot.pause()
             text = app.model.snapshot()[-1].payload['text']
-            assert '仅行式 REPL' in text
+            assert '/archive' in text and '归档旧会话' in text
 
     asyncio.run(scenario())
 
@@ -1294,5 +1294,254 @@ def test_rewind_cancel_keeps_history(tmp_path, monkeypatch):
             await pilot.press('n')
             await pilot.pause()
             assert app._messages == before
+
+    asyncio.run(scenario())
+
+
+def _notice_texts(app):
+    return [str(block.payload.get('text', ''))
+            for block in app.model.snapshot()]
+
+
+def test_find_opens_result_picker_and_resumes(tmp_path, monkeypatch):
+    sessions = tmp_path / 'find-sessions'
+    current = harness.SessionEventStore(sessions, session_id='current')
+    current.append_message({'role': 'user', 'content': 'unrelated chat'})
+    target = harness.SessionEventStore(sessions, session_id='found-one')
+    target.append_message({'role': 'user', 'content': 'needle in haystack'})
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions)
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp(current.rebuild_openai_history(),
+                         session_id='current', session_store=current)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.submit_text('/find needle')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if type(app.screen).__name__ == 'ChoiceModal':
+                    break
+            assert type(app.screen).__name__ == 'ChoiceModal'
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if app.screen.query_one('#choice-list').option_count:
+                    break
+            assert app.screen.query_one('#choice-list').option_count == 1
+
+            await pilot.press('enter')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if app._session_id == 'found-one':
+                    break
+            assert app._session_id == 'found-one'
+            assert any('needle in haystack' in text
+                       for text in _notice_texts(app))
+
+    asyncio.run(scenario())
+
+
+def _cleanup_fakes(monkeypatch, calls, rows, action='archive'):
+    monkeypatch.setattr(harness, 'wait_for_housekeeping', lambda: None)
+    monkeypatch.setattr(harness, 'housekeeping_busy', lambda: False)
+    monkeypatch.setattr(harness, 'session_cleanup_plan',
+                        lambda command, argument, current, **kwargs: (object(), rows))
+    monkeypatch.setattr(
+        harness, 'apply_session_cleanup',
+        lambda archive, chosen, mode, current: (
+            calls.append(([row['id'] for row in chosen], mode)) or (1, [])))
+    _no_agent(monkeypatch)
+
+
+def _cleanup_rows(tmp_path):
+    return [{'id': 'old-one', 'title': 'Old task',
+             'workspace': str(tmp_path), 'updated': 0.0}]
+
+
+def test_archive_command_picker_and_confirmation(tmp_path, monkeypatch):
+    store = _temp_store(tmp_path)
+    rows = _cleanup_rows(tmp_path)
+    calls = []
+    _cleanup_fakes(monkeypatch, calls, rows)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.submit_text('/archive all')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if type(app.screen).__name__ == 'CleanupPickerModal':
+                    break
+            assert type(app.screen).__name__ == 'CleanupPickerModal'
+            picker = app.screen
+            picker.action_select_all()
+            await pilot.pause()
+            assert picker.selected == {'old-one'}
+
+            await pilot.press('enter')
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if type(app.screen).__name__ == 'ConfirmModal':
+                    break
+            assert type(app.screen).__name__ == 'ConfirmModal'
+            await pilot.press('y')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if any('已归档 1/1 个会话' in text
+                       for text in _notice_texts(app)):
+                    break
+            assert calls == [(['old-one'], 'archive')]
+            assert any('已归档 1/1 个会话' in text
+                       for text in _notice_texts(app))
+
+    asyncio.run(scenario())
+
+
+def test_delete_requires_typed_confirmation(tmp_path, monkeypatch):
+    store = _temp_store(tmp_path)
+    rows = _cleanup_rows(tmp_path)
+    calls = []
+    _cleanup_fakes(monkeypatch, calls, rows, action='delete')
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.submit_text('/delete')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if type(app.screen).__name__ == 'CleanupPickerModal':
+                    break
+            assert type(app.screen).__name__ == 'CleanupPickerModal'
+            app.screen.action_select_all()
+            await pilot.press('enter')
+
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if type(app.screen).__name__ == 'TypedConfirmModal':
+                    break
+            assert type(app.screen).__name__ == 'TypedConfirmModal'
+            modal = app.screen
+            typed = modal.query_one('#typed-input')
+            typed.focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app.screen is modal
+            assert '未执行改动' in str(modal.query_one('#typed-error').render())
+
+            typed.value = '删除'
+            await pilot.press('enter')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if calls:
+                    break
+            assert calls == [(['old-one'], 'delete')]
+
+    asyncio.run(scenario())
+
+
+def test_workspace_commands_and_cd(tmp_path, monkeypatch):
+    store = _temp_store(tmp_path)
+    target = tmp_path / 'switched'
+    target.mkdir()
+    switched = []
+    monkeypatch.setattr(harness, 'format_workspace_list',
+                        lambda: 'registered workspaces')
+    monkeypatch.setattr(
+        harness, 'remove_workspace_selector',
+        lambda selector: {'name': 'old', 'path': str(target)})
+    monkeypatch.setattr(harness, 'set_workspace',
+                        lambda path: switched.append(str(path)) or target)
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.submit_text('/workspaces')
+            await pilot.pause()
+            assert app.model.snapshot()[-1].payload['text'] == 'registered workspaces'
+
+            app.submit_text('/workspace remove 1')
+            await pilot.pause()
+            assert '已移除登记' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text(f'/cd "{target}"')
+            await pilot.pause()
+            assert switched == [str(target)]
+            assert app.model.snapshot()[-1].payload['text'] == f'工作区：{target}'
+            assert store.session_summary()['workspace'] == str(target)
+
+    asyncio.run(scenario())
+
+
+def test_new_ws_uses_registered_workspace(tmp_path, monkeypatch):
+    store = _temp_store(tmp_path)
+    target = tmp_path / 'other-project'
+    target.mkdir()
+    captured = {}
+
+    class FakeStore:
+        session_id = 'new-ws'
+
+        def session_summary(self):
+            return {'title': 'New workspace session'}
+
+    def fake_start_new(workspace=None, session_id=None):
+        captured['workspace'] = workspace
+        return FakeStore()
+
+    monkeypatch.setattr(harness, 'registered_workspaces',
+                        lambda: [{'id': 'ws-1', 'name': 'other',
+                                  'path': str(target)}])
+    monkeypatch.setattr(harness, 'start_new_session', fake_start_new)
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.submit_text('/new --ws 1')
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if app._session_id == 'new-ws':
+                    break
+            assert str(captured['workspace']) == str(target)
+            assert app._session_id == 'new-ws'
+
+    asyncio.run(scenario())
+
+
+def test_watch_command_updates_notice_block(monkeypatch):
+    import background_watch
+
+    def fake_watch(argument, emit=None):
+        emit('  ● bg_1  running  00:01  pytest -q')
+        return '  [bg_1] completed\n  Output:\nok'
+
+    monkeypatch.setattr(background_watch, 'watch_command', fake_watch)
+    _no_agent(monkeypatch)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/watch')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if any('Output:' in text for text in _notice_texts(app)):
+                    break
+            assert any('[bg_1] completed' in text
+                       for text in _notice_texts(app))
 
     asyncio.run(scenario())

@@ -504,7 +504,8 @@ python entrypoint.py
 `pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。旧实现保留为
 `HARNESS_UI=textual-legacy`，仅用于对照；`textual-next` 是 `textual` 的兼容别名。
 TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
-仍只存在于行式 REPL 的命令会提示改用 `python harness.py --ui ansi`。TUI 与行式
+命令注册表的 40 条命令均已接入新 TUI，行式命令及别名由兼容测试核对；
+真实终端验收与旧实现清理尚未完成，`textual-legacy` 保留用于对照。TUI 与行式
 REPL 行为对齐：回合进行中按 Enter 会 **steer**（下一轮请求前注入
 当前上下文），Alt+Enter 则作为 follow-up 等本回合结束再做；状态行显示
 `N queued`，`Alt+↑`/F2 或 `/dequeue` 可把 steering/follow-up 全部取回输入框。
@@ -517,14 +518,21 @@ git 分支，并显示模型、上下文占用、token 和缓存命中率；
 输入 `/` 或 `@` 时，输入框下方显示逐键
 候选列表：`Tab` 采用、`Alt+↑` / `Alt+↓` 切换；`Ctrl+R` 在 read-only 与
 workspace-write 之间切换执行档位。
-回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。`/checkpoint [标签]`、
+回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。任务运行时禁止切换
+会话或工作区；shell、压缩和会话清理期间输入的消息作为 follow-up 等待操作结束。
+`/checkpoint [标签]`、
 `/checkpoints`、`/rewind`、`/undo` 已接入新 TUI：`/rewind` 先显示文件/会话预览，
 确认弹窗按 `y`/Enter 才执行，`n`/Esc 不产生改动；`/undo` 等价于
-`/rewind last --yes`。TUI 的 `/sessions` 与
+`/rewind last --yes`。`/checkpoint-gc` 清理旧快照。TUI 的
 `/sessions` 打开会话选择器（搜索标题/工作区/ID，`↑↓` 选择、`Enter` 恢复、
 `Esc` 取消），`/resume <序号|ID前缀|标题>` 直接恢复，两者都使用会话事件流
-（与行式 `/resume` 同一份数据）。恢复大历史时只渲染最近 400 条并批量挂载，更早的消息
-折叠成一行提示：`/more` 继续加载，`/export` 导出全文；状态栏与工具块保持实时。
+（与行式 `/resume` 同一份数据）。`/find <关键词>` 在后台跨会话搜索，命中后弹出
+结果选择器，Enter 直接恢复；`/archive` `/delete` 打开多选清单（空格勾选、
+F2/Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspace remove` 不带
+选择器时弹出登记项选择器。`/watch` 的进度与终态输出写进对话区状态块，
+不覆盖 TUI；`/cd`、`/new --ws`、`/archive`、`/watch` 均带参数补全。
+新 TUI 启动时载入全部历史，`/more` 只提示无需加载；旧 `textual-legacy`
+仍按 400 条分页。
 交互模式启动时 MCP 在后台连接，界面先可用，首条消息前完成工具注册。
 状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
 可用 `LLM_PRICING_JSON` 覆盖价格（input/output/cached_input/cache_write，

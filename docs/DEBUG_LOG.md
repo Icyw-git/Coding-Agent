@@ -3183,3 +3183,70 @@ PowerShell / VS Code 终端）仍待人工验收。
 
 **测试**：`/checkpoint` 参数与 seal、`/rewind` 预览 + y 确认、n 取消保持历史、
 `/undo` 参数校验；命令注册表确认四条命令 `ported=True`。定向 56 passed。
+
+## TUI 迁移：剩余 slash 命令与 /tree 评估
+
+新 TUI 之前仍有 `/archive` `/delete` `/find` `/workspaces` `/workspace`
+`/cd` `/watch` `/revoke` `/more` 只能回 ANSI 使用。本次全部接入，注册表 39 条
+命令均为 `ported=True`：
+
+- **交互分层（对照 Pi）**：Pi 没有这些命令，但其 `ctx.ui.select` / 自定义
+  selector 的做法可以复用——命令只负责准备数据，选择/确认交给通用 modal：
+  - `ChoiceModal`：搜索 + 单选（`/find` 命中会话、`/workspace remove` 登记项）；
+  - `CleanupPickerModal`：多选归档/恢复/删除，空格勾选、F2/Ctrl+A 全选可见项、
+    Enter 确认；筛选后保留已勾选项；
+  - `TypedConfirmModal`：删除必须原样输入“删除”，空回车只提示、不执行。
+- **共享语义**：`session_cleanup_plan` / `apply_session_cleanup`、
+  `add_workspace_from_argument` / `remove_workspace_selector` 下沉到
+  `harness.py`；行式 REPL 与 TUI 共用，避免“同名命令两套行为”。
+- **线程边界**：归档/删除的扫描与执行、`/find` 搜索、`/watch` 跟踪都在后台
+  线程；扫描/执行期间 `redirect_stdout`，防止旧的 print 覆盖 Textual 屏幕。
+- **/watch**：`watch_command` 增加 `emit` 注入，REPL 仍传 `print`，TUI 把进度
+  写进同一个 notice 块（只保留最近 8 行），结束时替换为完整输出。
+- **/new --ws**：支持已登记工作区的序号/名称/路径；未登记的绝对或相对目录
+  仍可直接使用，和旧 REPL 一致。
+- **/tree 不实现**：项目真相源是 append-only 事件流，文件回滚由
+  checkpoint/rewind 负责，历史分叉由 `/fork` 负责；Pi 的消息树是另一套模型。
+  两套同时存在会让“当前历史”出现两个定义。保留 `/fork` 选择器 + `/rewind`
+  作为等价路径，结论写入 `docs/UI_REWRITE_PLAN.md`。
+
+**测试**：新增 `/find` 搜索→选择→恢复、`/archive` 全选→确认→执行、
+`/delete` 短语确认、`/workspaces` `/workspace remove` `/cd`、
+`/new --ws`、`/watch` emit 与 TUI 状态块测试；命令迁移相关 177 passed，
+全量 1188 passed / 1 skipped，`ruff check .` 通过。两条旧断言
+（“仍有命令仅在行式 REPL”）随 39 条全部迁移更新为“全部已迁移”。
+
+**刻意未做**：暂不删除 `ui_textual.py`（留一版真实终端对照，验收后再删）；
+不引入 `/tree`；未对 legacy 文件做整体格式化，遵守 `ruff.toml` 的增量格式化约定。
+
+## feature/ui 收尾审查：任务互斥、迟到结果与命令兼容
+
+检查已提交的 P6/快照迁移及工作区内尚未提交的剩余命令迁移，修复以下问题：
+
+- **任务期间切换上下文**：阻止 `/new`、`/resume`、`/sessions`、`/fork`、
+  `/clone`、`/cd` 改变活跃任务的会话与工作区；恢复回调也再次检查忙碌状态。
+  恢复工作区失败时保持原会话，切换成功后清理旧状态与文件补全缓存。
+- **本地操作期间的消息丢失/并发**：shell、压缩和会话清理标记独立操作类型，
+  此时普通输入进入 follow-up，不进入无人消费的 steering；操作结束或清理失败后
+  继续排队请求。清理确认时再次检查后台整理状态，阻止执行期间切换活跃会话。
+- **迟到选择器**：搜索/归档扫描的 notice 已随会话切换清除时，丢弃扫描结果；
+  清理扫描结束时若已有请求运行，提示稍后重试，不再弹出清理选择器。
+- **命令覆盖不完整**：补 `/checkpoint-gc`、`/resume last`、行式命令别名及
+  `/approvals <序号> y|n`；对比两套注册表的测试防止漏项。当前为 40 条 TUI 命令。
+- **交互收尾**：目录候选只回填；`/new --ws` 支持引号包围的路径；
+  多选 Ctrl+A 在搜索框中也可用，筛选保留勾选；用户标题按纯文本展示；
+  确认报告滚动显示，避免长预览挤掉提示；清空视图后 shell 结束仍能解除忙碌状态。
+- **后台 stdout**：归档扫描通过 `emit` 注入诊断输出，清理执行不重定向全局
+  stdout，避免与其他线程的输出重定向嵌套。行式 REPL 默认仍使用 print。
+
+回归覆盖真实 checkpoint 文件恢复、外部改动冲突、强制恢复、rewind 事件重放、
+清理成功/失败后队列处理、忙碌时切换拦截、过期扫描、多选筛选、长预览与目录补全。
+
+**验证**：主套件 1200 passed / 1 skipped（主机不支持 symlink），5 条 warning
+均为飞书 SDK 的 pkg_resources 弃用提示；入口/CLI/UI 集成/旧 UI/MCP 联合回归
+97 passed；Ruff 与 git diff --check 通过。联合回归发现非 TTY 输出测试依赖
+renderer 的导入顺序，已隔离事件渲染回调后复测通过。
+10k 块布局 27.3ms、滚动 0.797ms/帧、流式更新 1.694ms。
+
+**尚未完成**：Windows Terminal / PowerShell / VS Code 真实终端验收、P7 重复实现清理、
+合并 main。检查清单已写入 UI_REWRITE_PLAN；自动测试通过不代表这些步骤完成。

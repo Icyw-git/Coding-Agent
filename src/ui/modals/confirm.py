@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from rich.markup import escape as markup_escape
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
@@ -30,7 +30,8 @@ class ConfirmModal(ModalScreen):
             yield Static(f'[bold]{markup_escape(self.title)}[/]',
                          classes='modal-title')
             if self.body:
-                yield Static(markup_escape(self.body), classes='modal-hint')
+                with VerticalScroll(classes='confirmation-body'):
+                    yield Static(markup_escape(self.body), classes='modal-hint')
             yield Static(
                 f'[yellow]y[/]/[yellow]Enter[/] = {markup_escape(self.confirm_label)}    '
                 '[yellow]n[/]/[yellow]Esc[/] = Cancel',

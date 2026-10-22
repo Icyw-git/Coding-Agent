@@ -396,6 +396,28 @@ def _split_workspace_add(argument: str):
     return text, name
 
 
+def add_workspace_from_argument(argument: str) -> dict:
+    """`/workspace add` 的共享实现：解析路径与 `--name`，相对路径按当前工作区。"""
+    path, name = _split_workspace_add(argument)
+    if not path:
+        raise ValueError('用法：/workspace add <路径> [--name 名称]')
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = WORKDIR / candidate
+    return workspaces.add_workspace(candidate, name=name,
+                                    file=workspace_registry_path())
+
+
+def remove_workspace_selector(selector: str) -> dict:
+    """按序号/名称/id/路径移除登记项；只影响发现列表，不动任何文件。"""
+    selector = (selector or '').strip()
+    if not selector:
+        raise ValueError('用法：/workspace remove <序号|名称|路径>')
+    entry = find_workspace(registered_workspaces(), selector)
+    return workspaces.remove_workspace(entry['id'],
+                                       file=workspace_registry_path())
+
+
 def handle_workspace_command(command: str, argument: str) -> None:
     parts = argument.split(maxsplit=1)
     action = parts[0].lower() if parts else 'list'
@@ -403,30 +425,16 @@ def handle_workspace_command(command: str, argument: str) -> None:
         print(format_workspace_list())
         return
     if action == 'add':
-        path, name = _split_workspace_add(parts[1] if len(parts) > 1 else '')
-        if not path:
-            print('  用法：/workspace add <路径> [--name 名称]')
-            return
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = WORKDIR / candidate
         try:
-            entry = workspaces.add_workspace(candidate, name=name,
-                                             file=workspace_registry_path())
+            entry = add_workspace_from_argument(parts[1] if len(parts) > 1 else '')
         except (OSError, ValueError) as exc:
             print(f'  [workspace] {exc}')
             return
         print(f"  已登记工作区：{entry['name']}  {entry['path']}")
         return
     if action == 'remove':
-        selector = parts[1].strip() if len(parts) > 1 else ''
-        if not selector:
-            print('  用法：/workspace remove <序号|名称|路径>')
-            return
         try:
-            entry = find_workspace(registered_workspaces(), selector)
-            removed = workspaces.remove_workspace(entry['id'],
-                                                  file=workspace_registry_path())
+            removed = remove_workspace_selector(parts[1] if len(parts) > 1 else '')
         except (KeyError, OSError, ValueError) as exc:
             print(f'  [workspace] {exc}')
             return
@@ -453,6 +461,47 @@ def format_session_list(limit: int = 20) -> str:
     if not rows:
         return '  (no saved sessions)'
     return '\n\n'.join(session_label(row) for row in rows)
+
+
+def session_cleanup_plan(command: str, argument: str, current_id: str, *, emit=print):
+    """`/archive`、`/delete` 的候选集合：返回 (SessionArchive, rows)。
+
+    归档候选按天数/empty/all 过滤，删除与恢复只看已归档项；当前会话永远
+    排除。确认与执行由 UI 负责，这里只做只读扫描，便于 TUI 放到后台线程。
+    """
+    from session_cleanup import SessionArchive, cleanup_candidates
+
+    archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
+    deleting = command == 'delete'
+    restoring = argument == 'restore'
+    if restoring or deleting:
+        rows = archive.list(emit=emit)
+    else:
+        rows = cleanup_candidates(
+            session_rows(limit=None, include_empty=True), current_id,
+            days=int(argument) if argument.isdigit() else 30,
+            empty_only=argument == 'empty')
+        if argument == 'all':
+            rows = session_rows(limit=None, include_empty=True)
+    return archive, [row for row in rows if row['id'] != current_id]
+
+
+def apply_session_cleanup(archive, rows, action: str, current_id: str):
+    """执行已确认的归档/恢复/删除，返回 (completed, [(row, error), ...])。"""
+    completed = 0
+    failures = []
+    for row in rows:
+        try:
+            if action == 'delete':
+                archive.delete(row, current_id)
+            elif action == 'restore':
+                archive.restore(row['id'])
+            else:
+                archive.archive(row, current_id)
+            completed += 1
+        except (OSError, ValueError) as exc:
+            failures.append((row, str(exc)))
+    return completed, failures
 
 
 # ---------- 转录导出（Textual / 命令面板共用）----------
@@ -1414,24 +1463,17 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command in ('/archive', '/delete'):
         from cli_input import choose_cleanup_sessions
-        from session_cleanup import SessionArchive, cleanup_candidates
 
         # 先等本进程的后台写入落盘，再移动会话日志。
         wait_for_housekeeping()
-        with _housekeeping_lock:
-            if any(thread.is_alive() for thread in _housekeeping_threads):
-                print('  会话后台整理尚未结束，请稍后再清理。')
-                return
-        archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
+        if housekeeping_busy():
+            print('  会话后台整理尚未结束，请稍后再清理。')
+            return
         deleting = command == '/delete'
         restoring = argument == 'restore'
-        rows = (archive.list() if restoring or deleting else cleanup_candidates(
-            session_rows(limit=None, include_empty=True), session_store.session_id,
-            days=int(argument) if argument.isdigit() else 30,
-            empty_only=argument == 'empty'))
-        if argument == 'all' and not deleting:
-            rows = session_rows(limit=None, include_empty=True)
-        rows = [row for row in rows if row['id'] != session_store.session_id]
+        action_key = 'delete' if deleting else 'restore' if restoring else 'archive'
+        archive, rows = session_cleanup_plan(command.lstrip('/'), argument,
+                                             session_store.session_id)
         selected = choose_cleanup_sessions(rows, restore=restoring, delete=deleting)
         selected_rows = [row for row in rows if row['id'] in selected]
         if not selected_rows:
@@ -1451,18 +1493,10 @@ def handle_command(line:str,messages:list,session_store)->None:
         if not confirmed:
             print('  已取消，未执行改动。')
             return
-        completed = 0
-        for row in selected_rows:
-            try:
-                if deleting:
-                    archive.delete(row, session_store.session_id)
-                elif restoring:
-                    archive.restore(row['id'])
-                else:
-                    archive.archive(row, session_store.session_id)
-                completed += 1
-            except (OSError, ValueError) as exc:
-                print(f"  未处理 {row['title']}：{exc}")
+        completed, failures = apply_session_cleanup(
+            archive, selected_rows, action_key, session_store.session_id)
+        for row, error in failures:
+            print(f"  未处理 {row['title']}：{error}")
         print(f'  已{action} {completed} 个会话。' + (
             '记录及关联快照不可恢复，项目文件未改动。' if deleting else
             '用 /archive restore 可恢复；项目文件未改动。' if not restoring else '可用 /resume 继续会话。'))
@@ -1564,6 +1598,12 @@ def wait_for_housekeeping(timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     for thread in list(_housekeeping_threads):
         thread.join(timeout=max(0.0, deadline - time.time()))
+
+
+def housekeeping_busy() -> bool:
+    """后台整理是否仍在写会话日志；清理会话前必须为 False。"""
+    with _housekeeping_lock:
+        return any(thread.is_alive() for thread in _housekeeping_threads)
 
 
 def _fmt_tokens(n: int) -> str:

@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from functools import partial
+from pathlib import Path
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -28,6 +29,8 @@ from file_mentions import workspace_files
 from ui import commands
 from ui.composer.completions import apply_suggestion, suggestions
 from ui.modals.approval import PermissionModal
+from ui.modals.choices import ChoiceModal
+from ui.modals.cleanup import CleanupPickerModal, TypedConfirmModal
 from ui.modals.confirm import ConfirmModal
 from ui.modals.forks import ForkPickerModal
 from ui.modals.models import ModelPickerModal
@@ -305,8 +308,20 @@ class HarnessApp(App):
     #model-box { width: 60; max-height: 20; padding: 1 2;
                  border: round $accent; background: $boost; }
     #model-list { height: auto; max-height: 14; }
+    .confirmation-body { height: auto; max-height: 10; }
     #confirm-box { width: 78; max-height: 28; padding: 1 2;
                    border: round $warning; background: $boost; }
+    #choice-box { width: 90; max-height: 28; padding: 1 2;
+                  border: round $accent; background: $boost; }
+    #choice-search { margin: 0 0 1 0; }
+    #choice-list { height: auto; max-height: 18; }
+    #cleanup-box { width: 90; max-height: 28; padding: 1 2;
+                   border: round $accent; background: $boost; }
+    #cleanup-search { margin: 0 0 1 0; }
+    #cleanup-list { height: auto; max-height: 18; }
+    #typed-box { width: 78; max-height: 28; padding: 1 2;
+                 border: round $error; background: $boost; }
+    #typed-input { margin: 1 0 0 0; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -328,6 +343,8 @@ class HarnessApp(App):
         self._tool_blocks: dict[str, str] = {}
         self._dirty = True
         self._busy = False
+        self._operation = 'agent'
+        self._cleanup_block_id = None
         self._exiting = False
         self._status: dict = {}
         self._footer = None
@@ -879,7 +896,11 @@ class HarnessApp(App):
             return True
         verb = spec.name
         if not spec.ported:
-            self._notice(f'/{verb} 暂未迁移到 textual-next；请用 --ui ansi。')
+            self._notice(f'/{verb} 暂未迁移到新 TUI；请用 --ui ansi。')
+            return True
+
+        if self._busy and verb in ('new', 'resume', 'sessions', 'fork', 'clone', 'cd'):
+            self._notice('当前任务尚未结束，请结束后再切换会话或工作区。')
             return True
 
         import harness
@@ -899,6 +920,8 @@ class HarnessApp(App):
         elif verb == 'clear':
             self.model.clear()
             self._mark_dirty()
+        elif verb == 'more':
+            self._notice('新 TUI 启动时已加载全部历史，无需 /more。')
         elif verb in ('status', 'pwd'):
             state = self._display_status()
             lines = [f"model: {harness.os.getenv('LLM_MODEL_ID', '') or 'unset'}",
@@ -942,6 +965,8 @@ class HarnessApp(App):
                 self._notice(f'Sandbox failed: {exc}', level='error')
         elif verb == 'review':
             self.start_review()
+        elif verb == 'watch':
+            self.start_watch(argument)
         elif verb == 'copy':
             self.copy_last_tool()
         elif verb == 'dequeue':
@@ -950,7 +975,35 @@ class HarnessApp(App):
             self.toggle_last_tool()
             self._notice('Toggled the most recent tool block.')
         elif verb == 'approvals':
-            self._notice(harness.format_pending_approvals())
+            error = harness.command_error('/approvals', argument)
+            if error:
+                self._notice(error, level='error')
+            elif argument:
+                index, choice = argument.split()
+                pending = harness.hooks.GATE.pending()
+                if not 1 <= int(index) <= len(pending):
+                    self._notice('没有该序号的待审批操作；先运行 /approvals 查看列表。')
+                else:
+                    req = pending[int(index) - 1]
+                    record = harness.hooks.GATE.resolve(req.req_id, choice == 'y', by='cli')
+                    self._notice(f'已决议：{record.status} · {req.tool}')
+            else:
+                self._notice(harness.format_pending_approvals())
+        elif verb == 'revoke':
+            import hooks
+            count = hooks.GATE.revoke_session(
+                self._session_id or hooks.current_session_id() or None)
+            self._notice(f'已撤销 {count} 条当前会话预授权。')
+        elif verb == 'workspaces':
+            self.show_workspaces()
+        elif verb == 'workspace':
+            self.handle_workspace(argument)
+        elif verb == 'cd':
+            self.change_workspace(argument)
+        elif verb == 'find':
+            self.start_find(argument)
+        elif verb in ('archive', 'delete'):
+            self.start_cleanup(verb, argument)
         elif verb == 'new':
             self.start_new_session(argument)
         elif verb == 'rename':
@@ -966,6 +1019,19 @@ class HarnessApp(App):
             self.create_checkpoint(argument)
         elif verb == 'checkpoints':
             self.show_checkpoints()
+        elif verb == 'checkpoint-gc':
+            if self._busy:
+                self._notice('当前任务尚未结束，请结束后再清理快照。')
+            elif not self._store:
+                self._notice('No session context.', level='error')
+            elif argument:
+                self._notice('/checkpoint-gc 不接受参数。', level='error')
+            else:
+                try:
+                    removed = harness.get_checkpoint_manager(self._store).gc()
+                    self._notice(f'已清理 {len(removed)} 个旧快照。' if removed else '无需清理快照。')
+                except Exception as exc:
+                    self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
         elif verb == 'rewind':
             self.start_rewind(argument)
         elif verb == 'undo':
@@ -1053,25 +1119,429 @@ class HarnessApp(App):
             self.model.update(block_id, text=str(text))
             self._mark_dirty()
 
+    # ---------- 工作区 ----------
+
+    def show_workspaces(self) -> None:
+        import harness
+        self._notice(harness.format_workspace_list())
+
+    def handle_workspace(self, argument: str) -> None:
+        """`/workspace [list|add <路径> [--name 名称]|remove [选择器]]`。"""
+        import harness
+        parts = (argument or '').split(maxsplit=1)
+        action = parts[0].lower() if parts else 'list'
+        if action in ('', 'list'):
+            self.show_workspaces()
+            return
+        if action == 'add':
+            try:
+                entry = harness.add_workspace_from_argument(
+                    parts[1] if len(parts) > 1 else '')
+            except (OSError, ValueError) as exc:
+                self._notice(f'[workspace] {exc}', level='error')
+                return
+            self._notice(f"已登记工作区：{entry['name']}  {entry['path']}")
+            return
+        if action == 'remove':
+            selector = parts[1].strip() if len(parts) > 1 else ''
+            if not selector:
+                self.open_workspace_remover()
+                return
+            try:
+                removed = harness.remove_workspace_selector(selector)
+            except (KeyError, OSError, ValueError) as exc:
+                self._notice(f'[workspace] {exc}', level='error')
+                return
+            self._notice(f"已移除登记：{removed['name']}  {removed['path']}")
+            return
+        self._notice('用法：/workspaces；/workspace add <路径> [--name 名称]；'
+                     '/workspace remove [序号|名称|路径]', level='error')
+
+    def open_workspace_remover(self) -> None:
+        import harness
+        entries = harness.registered_workspaces()
+        if not entries:
+            self._notice('尚未登记工作区。')
+            return
+        rows = [{'value': entry['id'],
+                 'label': f"{index}. {entry['name']}  {entry['path']}",
+                 'search': f"{entry['name']} {entry['path']} {entry['id']}"}
+                for index, entry in enumerate(entries, 1)]
+        self.push_screen(
+            ChoiceModal('Remove workspace', rows,
+                        hint='Enter 移除登记 · Esc 取消'),
+            self._on_workspace_remove_picked)
+
+    def _on_workspace_remove_picked(self, workspace_id) -> None:
+        if not workspace_id:
+            return
+        import harness
+        try:
+            removed = harness.workspaces.remove_workspace(
+                str(workspace_id), file=harness.workspace_registry_path())
+        except (KeyError, OSError, ValueError) as exc:
+            self._notice(f'[workspace] {exc}', level='error')
+            return
+        self._notice(f"已移除登记：{removed['name']}  {removed['path']}")
+
+    def change_workspace(self, argument: str) -> None:
+        """`/cd [路径]`：只切 Agent 工作区，不改进程 cwd（同旧 REPL）。"""
+        import harness
+        argument = (argument or '').strip()
+        if not argument:
+            self._notice(f'工作区：{harness.get_workdir()}')
+            return
+        path = argument
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+            path = path[1:-1]
+        try:
+            workspace = harness.set_workspace(path)
+            if self._store is not None:
+                self._store.record_workspace(workspace)
+        except (OSError, ValueError) as exc:
+            self._notice(f'[workspace] {exc}', level='error')
+            return
+        self._mention_root = None      # @ 文件索引跟随工作区重扫
+        self._refresh_footer()
+        self._notice(f'工作区：{workspace}')
+
+    # ---------- 跨会话搜索 ----------
+
+    def start_find(self, argument: str) -> None:
+        import harness
+        argument = (argument or '').strip()
+        error = harness.command_error('/find', argument)
+        if error:
+            self._notice(error, level='error')
+            return
+        block = self.model.append('notice',
+                                  {'text': f'find: 搜索「{argument}」…'})
+        self._mark_dirty()
+        threading.Thread(target=self._run_find,
+                         args=(block.id, argument), daemon=True).start()
+
+    def _run_find(self, block_id: str, query: str) -> None:
+        import harness
+        try:
+            rows = harness.SessionEventStore.search_all(
+                harness.SESSIONS_DIR, query, limit=8)
+            error = ''
+        except Exception as exc:
+            rows = []
+            error = f'{type(exc).__name__}: {exc}'
+        try:
+            self.call_from_thread(self._find_done, block_id, query, rows, error)
+        except Exception:
+            pass
+
+    def _find_done(self, block_id: str, query: str, rows: list,
+                   error: str = '') -> None:
+        if self.model.get(block_id) is None:
+            return
+        from turn_progress import relative_time
+        if self.model.get(block_id) is not None:
+            if error:
+                text = f'find: {error}'
+            elif rows:
+                text = f'find: {len(rows)} 个会话命中「{query}」。'
+            else:
+                text = f'没有包含「{query}」的会话。'
+            self.model.update(block_id, text=text,
+                              level='error' if error else 'info')
+            self._mark_dirty()
+        if error or not rows:
+            return
+        self._find_rows = {row['id']: row for row in rows}
+        choices = [{
+            'value': row['id'],
+            'label': (f"{row['title']}  ·  {relative_time(row.get('updated'))}"
+                      f"  ·  {row['id'][:8]}"),
+            'search': ' '.join(str(row.get(key) or '') for key in
+                               ('title', 'workspace', 'id', 'matched')),
+        } for row in rows]
+        self.push_screen(
+            ChoiceModal('Find sessions', choices,
+                        hint='Enter 恢复会话 · Esc 关闭'),
+            self._on_find_picked)
+
+    def _on_find_picked(self, session_id) -> None:
+        if not session_id:
+            return
+        row = getattr(self, '_find_rows', {}).get(str(session_id))
+        if row is not None:
+            asyncio.create_task(self._resume_session_row(row))
+
+    # ---------- 后台任务 ----------
+
+    def start_watch(self, argument: str) -> None:
+        """`/watch`：后台线程轮询，进度与最终输出写进同一块。"""
+        block = self.model.append('notice', {'text': 'watch: 等待后台任务…'})
+        self._mark_dirty()
+        threading.Thread(target=self._run_watch,
+                         args=(block.id, argument), daemon=True).start()
+
+    def _run_watch(self, block_id: str, argument: str) -> None:
+        from background_watch import watch_command
+        lines = []
+
+        def progress(text: str) -> None:
+            lines.append(str(text))
+            try:
+                self.call_from_thread(self._watch_progress, block_id, list(lines))
+            except Exception:
+                pass
+
+        try:
+            result = watch_command(argument, emit=progress)
+        except Exception as exc:
+            result = f'Watch failed: {type(exc).__name__}: {exc}'
+        try:
+            self.call_from_thread(self._watch_done, block_id, result)
+        except Exception:
+            pass
+
+    def _watch_progress(self, block_id: str, lines: list) -> None:
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id,
+                              text='watch:' + chr(10) + chr(10).join(lines[-8:]))
+            self._mark_dirty()
+
+    def _watch_done(self, block_id: str, result: str) -> None:
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=str(result))
+            self._mark_dirty()
+
+    # ---------- 会话归档 / 删除 ----------
+
+    def start_cleanup(self, command: str, argument: str) -> None:
+        """`/archive`、`/delete`：后台扫描候选，再打开多选与确认。"""
+        import harness
+        if self._busy:
+            self._notice('Cannot clean up sessions while a request is running.')
+            return
+        if not self._store:
+            self._notice('No session context.', level='error')
+            return
+        error = harness.command_error('/' + command, argument)
+        if error:
+            self._notice(error, level='error')
+            return
+        mode = ('delete' if command == 'delete'
+                else 'restore' if argument == 'restore' else 'archive')
+        block = self.model.append('notice',
+                                  {'text': f'cleanup: 扫描{mode}候选…'})
+        self._mark_dirty()
+        threading.Thread(target=self._scan_cleanup,
+                         args=(block.id, command, argument), daemon=True).start()
+
+    def _scan_cleanup(self, block_id: str, command: str, argument: str) -> None:
+        import harness
+        try:
+            harness.wait_for_housekeeping()
+            if harness.housekeeping_busy():
+                raise RuntimeError('会话后台整理尚未结束，请稍后再清理。')
+            archive, rows = harness.session_cleanup_plan(
+                command, argument, self._session_id, emit=lambda text: None)
+        except Exception as exc:
+            try:
+                self.call_from_thread(
+                    self._cleanup_failed, block_id,
+                    f'{type(exc).__name__}: {exc}')
+            except Exception:
+                pass
+            return
+        try:
+            self.call_from_thread(self._cleanup_scan_done, block_id,
+                                  archive, rows, command, argument)
+        except Exception:
+            pass
+
+    def _cleanup_failed(self, block_id: str, message: str) -> None:
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=f'[cleanup] {message}',
+                              level='error')
+            self._mark_dirty()
+        if self._cleanup_block_id == block_id:
+            self._cleanup_block_id = None
+            self._finish_local_operation()
+
+    def _cleanup_scan_done(self, block_id: str, archive, rows: list,
+                           command: str, argument: str) -> None:
+        if self.model.get(block_id) is None:
+            return
+        mode = ('delete' if command == 'delete'
+                else 'restore' if argument == 'restore' else 'archive')
+        if self._busy:
+            self._cleanup_failed(block_id, '当前任务尚未结束，请稍后重新清理。')
+            return
+        if self.model.get(block_id) is not None:
+            if rows:
+                text = f'[cleanup] {len(rows)} 个会话可{self._cleanup_action(mode)}。'
+            elif mode in ('delete', 'restore'):
+                text = '[cleanup] 没有已归档的会话。'
+            else:
+                text = '[cleanup] 没有符合条件的会话。'
+            self.model.update(block_id, text=text)
+            self._mark_dirty()
+        if not rows:
+            return
+        self.push_screen(
+            CleanupPickerModal(rows, mode=mode),
+            partial(self._on_cleanup_selected,
+                    archive=archive, rows=rows, mode=mode))
+
+    @staticmethod
+    def _cleanup_action(mode: str) -> str:
+        return {'delete': '永久删除', 'restore': '恢复'}.get(mode, '归档')
+
+    def _on_cleanup_selected(self, selected, archive, rows: list,
+                             mode: str) -> None:
+        if not selected:
+            self._notice('已取消，未执行改动。')
+            return
+        chosen_ids = set(selected)
+        chosen = [row for row in rows if row['id'] in chosen_ids]
+        action = self._cleanup_action(mode)
+        detail = chr(10).join(
+            f"  {row.get('title') or '未命名任务'} · "
+            f"{row.get('workspace') or '目录未记录'}"
+            for row in chosen)
+        body = (f'将{action}以下 {len(chosen)} 个会话（含关联快照）：'
+                + chr(10) + detail)
+        if mode == 'delete':
+            body += chr(10) + '记录及关联快照不可恢复；项目文件不受影响。'
+            self.push_screen(
+                TypedConfirmModal('Delete archived sessions?', body,
+                                  phrase='删除'),
+                partial(self._execute_cleanup,
+                        archive=archive, rows=chosen, mode=mode))
+            return
+        label = 'Restore' if mode == 'restore' else 'Archive'
+        self.push_screen(
+            ConfirmModal(f'{action}会话?', body, label),
+            partial(self._execute_cleanup,
+                    archive=archive, rows=chosen, mode=mode))
+
+    def _execute_cleanup(self, confirmed, archive, rows: list,
+                         mode: str) -> None:
+        import harness
+        if not confirmed:
+            self._notice('已取消，未执行改动。')
+            return
+        if self._busy or harness.housekeeping_busy():
+            self._notice('当前任务或后台整理尚未结束，请稍后重新清理。')
+            return
+        self._busy = True
+        self._operation = 'cleanup'
+        self._turn_started = time.monotonic()
+        block = self.model.append(
+            'notice', {'text': f'[cleanup] {self._cleanup_action(mode)}中…'})
+        self._cleanup_block_id = block.id
+        self._mark_dirty()
+        threading.Thread(target=self._run_cleanup,
+                         args=(block.id, archive, rows, mode),
+                         daemon=True).start()
+
+    def _run_cleanup(self, block_id: str, archive, rows: list,
+                     mode: str) -> None:
+        import harness
+        try:
+            completed, failures = harness.apply_session_cleanup(
+                archive, rows, mode, self._session_id)
+        except Exception as exc:
+            try:
+                self.call_from_thread(
+                    self._cleanup_failed, block_id,
+                    f'{type(exc).__name__}: {exc}')
+            except Exception:
+                pass
+            return
+        try:
+            self.call_from_thread(self._cleanup_done, block_id,
+                                  completed, len(rows), failures, mode)
+        except Exception:
+            pass
+
+    def _cleanup_done(self, block_id: str, completed: int, total: int,
+                      failures: list, mode: str) -> None:
+        action = self._cleanup_action(mode)
+        lines = [f'[cleanup] 已{action} {completed}/{total} 个会话。']
+        if mode == 'delete':
+            lines.append('记录及关联快照不可恢复，项目文件未改动。')
+        elif mode == 'restore':
+            lines.append('可用 /resume 继续会话。')
+        else:
+            lines.append('用 /archive restore 可恢复；项目文件未改动。')
+        for row, error in failures:
+            lines.append(f"未处理 {row.get('title') or row['id']}：{error}")
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id, text=chr(10).join(lines),
+                              level='error' if failures else 'info')
+            self._mark_dirty()
+            self._refresh_footer()
+        if self._cleanup_block_id == block_id:
+            self._cleanup_block_id = None
+            self._finish_local_operation()
+
+    def _finish_local_operation(self) -> None:
+        self._busy = False
+        self._operation = 'agent'
+        self._refresh_footer()
+        if self._pending.snapshot():
+            self._start_worker()
+
     def _adopt_session(self, store, messages: list, title: str = '') -> None:
         self._store = store
         self._session_id = store.session_id
         self._messages = list(messages)
-        self._title = title or self._title
+        self._title = title
+        self._status.clear()
+        self._tool_blocks.clear()
+        self._mention_root = None
         self.model.clear()
         self._load_history(messages)
         self._refresh_footer()
         self._mark_dirty()
 
     def start_new_session(self, argument: str = '') -> None:
-        """`/new`：在当前工作区新建会话（Pi `/new` / newSession）。"""
+        """`/new [--ws <序号|名称|路径>|会话ID]`（对齐旧 REPL 与 Pi `/new`）。"""
         import harness
-        if argument and not argument.replace('-', '').replace('_', '').isalnum():
-            self._notice('用法：/new [会话ID]', level='error')
-            return
+        requested = (argument or '').strip()
+        target = harness.get_workdir()
+        session_id = None
+        lowered = requested.lower()
+        if lowered.startswith('--'):
+            if lowered != '--ws' and not lowered.startswith('--ws '):
+                self._notice('用法：/new [--ws <序号|名称|路径>|会话ID]',
+                             level='error')
+                return
+            selector = requested[4:].strip()
+            if len(selector) >= 2 and selector[0] == selector[-1] and selector[0] in ('"', "'"):
+                selector = selector[1:-1]
+            if not selector:
+                self._notice('用法：/new --ws <序号|名称|路径>', level='error')
+                return
+            try:
+                target = harness.find_workspace(
+                    harness.registered_workspaces(), selector)['path']
+            except ValueError as exc:
+                # 未登记的目录也允许直接使用，和旧 REPL 保持一致。
+                candidate = Path(selector).expanduser()
+                if not candidate.is_absolute():
+                    candidate = harness.get_workdir() / candidate
+                if not candidate.is_dir():
+                    self._notice(f'[workspace] {exc}', level='error')
+                    return
+                target = candidate.resolve()
+        elif requested:
+            if not requested.replace('-', '').replace('_', '').isalnum():
+                self._notice('用法：/new [--ws <序号|名称|路径>|会话ID]',
+                             level='error')
+                return
+            session_id = requested
         try:
-            store = harness.start_new_session(workspace=harness.get_workdir(),
-                                              session_id=argument or None)
+            store = harness.start_new_session(workspace=target,
+                                              session_id=session_id)
             summary = store.session_summary()
         except Exception as exc:
             self._notice(f'New session failed: {exc}', level='error')
@@ -1288,6 +1758,8 @@ class HarnessApp(App):
             self._notice('当前会话没有可压缩的内容。')
             return
         self._busy = True
+        self._operation = 'compact'
+        self._turn_started = time.monotonic()
         block = self.model.append('notice', {'text': 'compact: running…'})
         self._mark_dirty()
         threading.Thread(target=self._run_compact,
@@ -1318,6 +1790,7 @@ class HarnessApp(App):
             self.model.update(block_id, text=text)
         self._mark_dirty()
         self._refresh_footer()
+        self._operation = 'agent'
         if self._pending.snapshot() and not self._busy:
             self._start_worker()
 
@@ -1340,7 +1813,9 @@ class HarnessApp(App):
             self._notice('No saved sessions.')
             return
         selected = None
-        if argument.isdigit():
+        if argument.casefold() == 'last':
+            selected = rows[0]
+        elif argument.isdigit():
             index = int(argument)
             if 1 <= index <= len(rows):
                 selected = rows[index - 1]
@@ -1360,6 +1835,9 @@ class HarnessApp(App):
 
     async def _resume_session_row(self, row: dict) -> None:
         import harness
+        if self._busy:
+            self._notice('当前任务尚未结束，请结束后再恢复会话。')
+            return
         try:
             store = harness.SessionEventStore.open(
                 harness.resolve_session_path(row['id']))
@@ -1368,14 +1846,14 @@ class HarnessApp(App):
         except Exception as exc:
             self._notice(f'Unable to resume: {exc}', level='error')
             return
-        if summary.get('workspace'):
-            harness.set_workspace(summary['workspace'])
-        self._store = store
-        self._messages = list(messages)
-        self._session_id = store.session_id
-        self.model.clear()
-        self._load_history(messages)
-        self._refresh_footer()
+        try:
+            if summary.get('workspace'):
+                harness.set_workspace(summary['workspace'])
+        except (OSError, ValueError) as exc:
+            self._notice(f'Unable to resume workspace: {exc}', level='error')
+            return
+        self._mention_root = None
+        self._adopt_session(store, messages, summary.get('title', ''))
         self._notice(f"Resumed {summary['title']}.")
 
     def cancel_turn(self) -> None:
@@ -1390,6 +1868,12 @@ class HarnessApp(App):
 
     def submit_shell(self, command: str) -> None:
         """`!cmd`：直接执行 shell，输出按工具块展示，不进入模型上下文。"""
+        if self._busy:
+            self._notice('当前任务尚未结束，请结束后再执行 shell 命令。')
+            return
+        self._busy = True
+        self._operation = 'shell'
+        self._turn_started = time.monotonic()
         block = self.model.append('tool', {
             'name': 'bash', 'args': {'command': command},
             'state': 'running', 'output': '', 'expanded': False})
@@ -1419,18 +1903,26 @@ class HarnessApp(App):
 
     def _finish_shell(self, block_id: str, output: str, duration_ms: int) -> None:
         failed = str(output).lstrip().startswith(('Error', 'Permission denied'))
-        self.model.update(block_id,
-                          state='failed' if failed else 'complete',
-                          output=str(output), duration_ms=duration_ms)
+        if self.model.get(block_id) is not None:
+            self.model.update(block_id,
+                              state='failed' if failed else 'complete',
+                              output=str(output), duration_ms=duration_ms)
         self._mark_dirty()
+        self._finish_local_operation()
 
     def submit_composer(self, followup: bool = False) -> None:
         """Enter 的统一入口：候选优先采用，命令候选随后执行。"""
         if self._composer is None:
             return
         if self.has_suggestions():
+            original = self._composer.text
             self.accept_suggestion()
             text = self._composer.text
+            # 目录候选只回填，让用户继续补子目录或 --name，再显式提交。
+            name, _, argument = original.lstrip('/').partition(' ')
+            if name in ('cd', 'workspace') and (
+                    name == 'cd' or argument.lstrip().startswith('add ')):
+                return
             if text.lstrip().startswith('/'):
                 self._programmatic_text = ''
                 self._composer.text = ''
@@ -1455,6 +1947,8 @@ class HarnessApp(App):
         self._send_user(text, mode=mode)
 
     def _send_user(self, text: str, mode: str = 'steer') -> None:
+        if self._busy and self._operation != 'agent':
+            mode = 'followup'
         if self._busy and mode != 'followup':
             # steer 先只进队列；等 agent_loop 真正注入时再由 user_message 事件落块。
             self._steering.put(text)
@@ -1485,6 +1979,7 @@ class HarnessApp(App):
         self._send_user(content)
 
     def _start_worker(self) -> None:
+        self._operation = 'agent'
         self._busy = True
         self._turn_started = time.monotonic()
         self._refresh_footer()

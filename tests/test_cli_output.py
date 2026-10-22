@@ -149,9 +149,11 @@ def test_exec_tool_call_prints_activity_line_on_tty(monkeypatch):
     assert '• read' in output and 'a.py' in output and '✓' in output
 
 
-def test_exec_tool_call_is_silent_without_a_tty(capsys):
+def test_exec_tool_call_is_silent_without_a_tty(capsys, monkeypatch):
     import harness
 
+    # Check direct tool output independently of renderers imported by other UI tests.
+    monkeypatch.setattr(harness, 'ui_emit', lambda *args, **kwargs: None)
     tool_call = SimpleNamespace(
         id='call-1',
         function=SimpleNamespace(name='read', arguments='{"path":"a.py"}'))

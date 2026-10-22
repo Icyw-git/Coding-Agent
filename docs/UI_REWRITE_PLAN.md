@@ -1,6 +1,6 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：P6 已切换默认 Textual 入口，待真实终端验收
+状态：命令迁移已补齐，正在收尾检查；真实终端验收、P7 清理与合并 main 尚未完成
 进展：
 - P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
 - P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、
@@ -55,8 +55,26 @@
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
   `textual-legacy`，`textual-next` 作为兼容别名。
 - P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
-  `ConfirmModal` 确认后才落盘；`/undo` = `last --yes`。下一步是真实终端
-  checklist 与 `/archive` `/delete`、`/tree` 评估。
+  `ConfirmModal` 确认后才落盘；`/undo` = `last --yes`。
+- P6b：迁移剩余命令 `/archive` `/delete` `/find` `/workspaces` `/workspace`
+  `/cd` `/watch` `/revoke` `/more`，并补 `/new --ws` 与参数补全。交互按 Pi
+  `ctx.ui.select` 的思路抽成通用 modal：`ChoiceModal`（搜索+单选）、
+  `CleanupPickerModal`（多选，F2/Ctrl+A 全选）、`TypedConfirmModal`（删除需
+  输入“删除”）。归档/删除的扫描与执行在后台线程，扫描诊断通过 `emit` 回调
+  传递，避免修改进程级 stdout；`/find` 命中后弹选择器，Enter 直接恢复；`/watch` 通过
+  `emit` 回调把进度写进状态块，不再直接 print。清理计划/执行、工作区增删等
+  共享语义下沉到 `harness.py`，行式 REPL 与 TUI 使用同一份实现。
+  注册表 40 条命令全部 `ported=True`；补齐 `/checkpoint-gc`、行式命令别名和
+  `/resume last`，由测试对比两套命令注册表，避免仅凭 `ported` 标记判断迁移完成。
+- P6c 收尾检查：任务期间禁止切换会话/工作区；shell、压缩和清理串行执行，
+  此时提交的消息排入 follow-up，操作成功或失败后继续处理。已切换会话的后台
+  搜索/清理结果不再弹出旧选择器。确认报告可滚动；目录候选只回填，避免提前切换。
+  新增真实文件回滚、冲突拒绝、强制恢复与 rewind 事件持久化回归测试。
+- `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
+  checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
+  分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
+  维护成本。等价路径：`/fork` 选择器分叉、`/rewind` 回滚、`/sessions` 切换。
+  结论同步记录在 `docs/DEBUG_LOG.md`。
 目标分支：`feature/ui`
 调研日期：2026-10-21
 
@@ -224,7 +242,7 @@ src/ui/
 | P4 展示层 | tool renderers + diff + footer + 状态 | 新展示层 | 快照对比；工具/审批/中断回归 |
 | P5 选择器 | sessions/models/commands/search 重做 | 新 modals | 键盘路径全覆盖 |
 | P6 切换 | ✅ `HARNESS_UI=textual` 指向新 app；legacy 保留 | 双实现对照 | 真实终端 checklist 待验收 |
-| P7 清理 | 删除旧 `ui_textual.py`/`cc_ui` 中重复逻辑 | 单一实现 | 文档更新、全量回归 |
+| P7 清理 | 尚未完成；命令迁移与兼容检查已补齐，legacy 仍保留 | 单一实现 | 真实终端验收后处理重复实现、更新文档 |
 
 预估（单人）：P1 1–2 天，P2 3–5 天，P3 2–3 天，P4 3–4 天，P5 2–3 天，
 P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike。
@@ -241,7 +259,16 @@ P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike�
   - 10k blocks 连续滚动 100 帧；
   - 50k 字符流式输出总 CPU；
   - 会话切换（搜索+恢复）。
-- 真实终端 checklist：Windows Terminal / PowerShell / VS Code 终端各一轮。
+- 真实终端 checklist（尚未验收；Windows Terminal / PowerShell / VS Code 终端各一轮）：
+  - [ ] 中文输入法、换行、粘贴及目录补全。
+  - [ ] Enter steer、Alt+Enter follow-up、Alt+↑/F2 取回与 Esc 取消。
+  - [ ] 审批遮罩、允许同类、拒绝，以及退出后的终端恢复。
+  - [ ] 鼠标选中复制、Ctrl-C / Ctrl+Shift+C、`/copy`。
+  - [ ] 流式 Markdown、长会话滚动、窗口缩放与工具展开。
+  - [ ] 会话恢复、搜索、归档恢复及删除短语确认（使用测试会话）。
+  - [ ] checkpoint 回滚预览、取消、冲突提示及文件恢复（使用临时工作区）。
+
+通过上述验收后再处理 P7 与合并；自动化 `run_test` 结果不能代替真实终端验收。
 
 ## 7. 风险与对策
 
@@ -249,7 +276,7 @@ P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike�
 |---|---|
 | 自定义虚拟列表复杂、易出滚动 bug | 先做 spike；保留“限量 400 条”作为降级路径 |
 | 行渲染丢失 Textual 的选择/复制能力 | 保留 `Ctrl+A`/鼠标选择方案在 spike 验证；必要时对可见区挂 Markdown widget |
-| Markdown 在行模型中重排成本高 | 流式用纯文本行，结束时一次性渲染 Markdown 行并缓存 |
+| Markdown 在行模型中重排成本高 | 流式与完成态统一 Markdown，120ms 限频并缓存渲染结果 |
 | CJK/emoji 宽字符错位 | 复用 Textual `cell_len`/`rich.cells`；补宽度测试 |
 | 双实现维护成本 | 新实现走 feature flag；legacy 只保留 1 个版本周期 |
 | 浮层与 IME/焦点冲突 | 浮层不抢焦点，键位由 editor 统一分发；补 IME 手动测试 |
