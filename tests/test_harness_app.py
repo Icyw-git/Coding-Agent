@@ -1050,7 +1050,8 @@ def test_copy_last_tool_output(monkeypatch):
             app.submit_text('/copy')
             await pilot.pause()
             assert copied == ['line1\nline2']
-            assert 'Copied' in app.model.snapshot()[-1].payload['text']
+            assert app.model.snapshot()[-1].payload['text'] == (
+                'Copied 10 non-whitespace chars from the last tool output.')
     asyncio.run(scenario())
 
 

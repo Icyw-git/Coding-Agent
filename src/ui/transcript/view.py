@@ -39,7 +39,8 @@ class VirtualTranscript(ScrollView):
         """模型或宽度变化后重算布局并刷新；保持“贴底”行为。"""
         follow = self.follow_end and self.is_vertical_scroll_end
         width = self._content_width()
-        if self.transcript_layout.width != width and self.text_selection is not None:
+        if (self.is_attached and self.transcript_layout.width != width
+                and self.text_selection is not None):
             # 选区坐标属于已渲染的行；换宽后清除，避免复制到重排后的其他文字。
             self.screen.clear_selection()
         self.transcript_layout.update(self.model, width)

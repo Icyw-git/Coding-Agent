@@ -271,7 +271,8 @@ class Transcript(VirtualTranscript):
             self.call_after_refresh(self._copy_selection)
 
     def _copy_selection(self) -> None:
-        if self.text_selection is not None and self.app._selected_text():
+        if (self.is_attached and self.text_selection is not None
+                and self.app._selected_text()):
             self.app.action_copy_selection()
 
     def on_click(self, event: events.Click) -> None:
@@ -402,11 +403,16 @@ class HarnessApp(App):
         except Exception:
             return None
 
+    def _copy_text(self, text: str, *, destination: str = 'to clipboard') -> None:
+        # 显示字符数不含布局填充、代码缩进或换行；复制内容保留原有结构。
+        count = sum(not char.isspace() for char in text)
+        self.copy_to_clipboard(text)
+        self._notice(f'Copied {count} non-whitespace chars {destination}.')
+
     def action_copy_selection(self) -> None:
         text = self._selected_text()
         if text:
-            self.copy_to_clipboard(text)
-            self._notice(f'Copied {len(text)} chars to clipboard.')
+            self._copy_text(text)
         else:
             self._notice('Select transcript text first, or use /copy for the last tool output.')
 
@@ -414,8 +420,7 @@ class HarnessApp(App):
         # 有选中文本时 Ctrl-C 复制，不再直接退出；无选中保持原来的退出行为。
         text = self._selected_text()
         if text:
-            self.copy_to_clipboard(text)
-            self._notice(f'Copied {len(text)} chars to clipboard.')
+            self._copy_text(text)
             return
         self.exit()
 
@@ -839,8 +844,7 @@ class HarnessApp(App):
             if block.kind == 'tool':
                 output = str(block.payload.get('output') or '')
                 if output:
-                    self.copy_to_clipboard(output)
-                    self._notice(f'Copied {len(output)} chars from the last tool output.')
+                    self._copy_text(output, destination='from the last tool output')
                 else:
                     self._notice('The last tool block has no output yet.')
                 return

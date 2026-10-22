@@ -36,7 +36,8 @@ def test_markdown_mouse_selection_copies_unicode_without_quitting(monkeypatch, r
             await pilot.pause()
             assert app.screen.get_selected_text() == '中文 🙂'
             assert copied == ['中文 🙂']  # 松开鼠标即复制，无需快捷键。
-            assert app.model.snapshot()[-1].payload['text'] == 'Copied 4 chars to clipboard.'
+            assert app.model.snapshot()[-1].payload['text'] == (
+                'Copied 3 non-whitespace chars to clipboard.')
             highlighted = app.view.render_line(y)
             assert any(segment.style and segment.style.bgcolor == app.view.selection_style.bgcolor
                        for segment in highlighted if '中' in segment.text)
@@ -104,8 +105,9 @@ def test_code_selection_removes_padding_and_preserves_indent(monkeypatch):
             expected = '\n'.join(line.rstrip(' ') for line in lines)
             assert copied == [expected]
             assert '\n    ' in expected
+            count = sum(not char.isspace() for char in expected)
             assert app.model.snapshot()[-1].payload['text'] == (
-                f'Copied {len(expected)} chars to clipboard.')
+                f'Copied {count} non-whitespace chars to clipboard.')
             # 单击与只选择行尾填充，都不覆盖剪贴板。
             await pilot.click(app.view, offset=(0, y))
             await pilot.pause()
@@ -115,6 +117,32 @@ def test_code_selection_removes_padding_and_preserves_indent(monkeypatch):
             await pilot.mouse_up(app.view, offset=(80, y))
             await pilot.pause()
             assert copied == [expected]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('width', [60, 100])
+def test_centered_heading_count_excludes_layout_whitespace(monkeypatch, width):
+    async def scenario():
+        copied = []
+        app = HarnessApp([{'role': 'assistant', 'content': '# Heading'}])
+        monkeypatch.setattr(app, 'copy_to_clipboard', copied.append)
+        async with app.run_test(size=(width, 20)) as pilot:
+            await pilot.pause()
+            app.view.scroll_home(animate=False)
+            await pilot.pause()
+            row = next(i for i in range(app.view.content_line_count)
+                       if 'Heading' in str(app.doc_layout.line_at(i)))
+            y = row - app.view.scroll_offset.y
+            await pilot.mouse_down(app.view, offset=(0, y))
+            await pilot.hover(app.view, offset=(width - 3, y))
+            await pilot.mouse_up(app.view, offset=(width - 3, y))
+            await pilot.pause()
+            assert len(copied) == 1
+            assert copied[0].strip() == 'Heading'
+            assert len(copied[0]) > 7
+            assert app.model.snapshot()[-1].payload['text'] == (
+                'Copied 7 non-whitespace chars to clipboard.')
 
     asyncio.run(scenario())
 
