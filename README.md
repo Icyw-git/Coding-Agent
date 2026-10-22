@@ -677,11 +677,14 @@ python -m pytest --basetemp /tmp/harness-pytest
 
 ## 分支说明
 
-- `main`：主开发分支，包含可合并和发布的基础功能。
-- `feature/ui`：终端 UI、会话指标和可视化相关功能。
-- `feature/cd-support`：持久化 `cd` 和当前工作目录支持。
+- `main`：稳定集成分支，核心功能与 UI 最终都合入这里；从 main 创建短期功能或修复分支，验证后合回。
+- `feature/ui`：本次 Textual 重构的临时收尾分支，只继续终端验收、缺陷修复、性能与运行时接线收尾；验收后合入 main，再删除分支。
+- 独立核心功能（模型、MCP、工具、沙箱、API 等）从 main 拉短期分支；跨 UI 与核心的大重构尽量等本次 UI 合并后再做。
+- 紧急修复先合入 main，再同步到 feature/ui，避免两边重复实现。
 
-建议从 `main` 创建功能分支，完成测试后通过 Pull Request 合并。
+具体分工、同步与合并条件见 [开发流程](docs/DEVELOPMENT_WORKFLOW.md)，
+本次人工验收见 [UI 终端验收记录](docs/UI_TERMINAL_ACCEPTANCE.md)。
+合入 main 与切换程序总体默认 UI 分开处理；目前总体默认仍为 `ansi`。
 
 ## 推送到 GitHub
 
