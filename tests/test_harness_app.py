@@ -1114,13 +1114,16 @@ def test_steering_queue_and_dequeue_all(monkeypatch):
                 await asyncio.sleep(0.01)
                 if started.is_set():
                     break
-            app.submit_text('steer me')
+            app.submit_text('steer me', mode='steer')
             app.submit_text('follow up', mode='followup')
             await pilot.pause()
             assert app._steering.snapshot() == ['steer me']
             assert app._pending.snapshot() == ['follow up']
-            # Alt+Up 应把 steering + follow-up 一起取回，而不是只取最后一条
+            # 多条时 Alt+Up 打开选择器，F2 取回全部
             await pilot.press('alt+up')
+            await pilot.pause()
+            assert type(app.screen).__name__ == 'QueueModal'
+            await pilot.press('f2')
             await pilot.pause()
             assert not app._steering.snapshot()
             assert not app._pending.snapshot()
@@ -1173,7 +1176,7 @@ def test_steering_does_not_render_until_agent_consumes_it():
         app = HarnessApp([])
         async with app.run_test(size=(80, 20)) as pilot:
             app._busy = True
-            app.submit_text('steer now')
+            app.submit_text('steer now', mode='steer')
             await pilot.pause()
             assert app._steering.snapshot() == ['steer now']
             assert not any(block.kind == 'user' for block in app.model.snapshot())

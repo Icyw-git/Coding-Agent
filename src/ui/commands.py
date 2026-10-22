@@ -274,7 +274,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('watch', '跟踪后台任务', '[bg_id|--list] [--timeout 秒]',
                 argument_completions=_watch_arguments),
     CommandSpec('copy', '复制最近一次工具输出'),
-    CommandSpec('dequeue', '取回排队/steering 消息'),
+    CommandSpec('dequeue', '管理排队消息：取回单条/全部或删除', aliases=()),
     CommandSpec('expand', '展开最近一个工具块'),
     CommandSpec('approvals', '查看待审批操作', '[序号 y|n]', ('perms',)),
     CommandSpec('revoke', '撤销同类预授权'),
@@ -365,16 +365,17 @@ def help_text() -> str:
 
 
 HOTKEYS = (
-    ('Enter', '发送消息；有候选时先采用（命令直接执行）'),
+    ('Enter', '发送消息；忙时进入下回合队列（有候选时先采用）'),
     ('Ctrl+J', '换行'),
     ('Tab', '采用补全'),
     ('↑ / ↓', '有候选时切换；否则移动光标'),
-    ('Alt+↑ / Alt+↓', '切换补全候选 / 无候选时 Alt+↑ 取回排队消息'),
-    ('Esc', '关闭补全候选；回合中取消'),
-    ('Ctrl+O', '展开最近工具块'),
+    ('Alt+↑ / Alt+↓', '切换补全候选 / 无候选时 Alt+↑ 打开队列选择器'),
+    ('Alt+Enter', '忙时立即进入当前回合队列（steer），空闲时直接发送'),
+    ('Esc', '关闭补全候选；回合中取消并取回全部排队消息'),
     ('Ctrl+C', '/quit', '有选中文本时复制，否则退出'),
-    ('Ctrl+Shift+C', '/copy', '复制选中文本 / 最近工具输出'),
-    ('Alt+↑ / F2', '/dequeue', '取回 steering 与 follow-up'),
+    ('Ctrl+Shift+C', '/copy', '复制选中文本（/copy 复制最近工具输出）'),
+    ('Alt+↑ / F2', '/dequeue', '打开队列选择器：↑↓ 选择、Enter 取回、Delete 删除、F2 取回全部'),
+    ('Ctrl+O', '展开最近工具块'),
     ('Ctrl+Q', '/quit', '退出'),
 )
 

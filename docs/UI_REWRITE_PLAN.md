@@ -52,6 +52,8 @@
   63ms，瓶颈在 markdown_it parse + rich render，已用 120ms 限频。
 - P5n：队列语义对齐 Pi：Enter 运行中=steer，Alt+Enter=follow-up；Alt+↑/F2 或
   `/dequeue` 取回全部；Esc 取消时把队列内容退回编辑器。
+  （P6d 已按用户反馈调换：Enter=下回合队列，Alt+Enter=当前回合 steering；
+  F2 改为选择器，支持单条取回与删除。）
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
   `textual-legacy`，`textual-next` 作为兼容别名。
 - P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
@@ -70,6 +72,11 @@
   此时提交的消息排入 follow-up，操作成功或失败后继续处理。已切换会话的后台
   搜索/清理结果不再弹出旧选择器。确认报告可滚动；目录候选只回填，避免提前切换。
   新增真实文件回滚、冲突拒绝、强制恢复与 rewind 事件持久化回归测试。
+- P6d 队列交互：按用户反馈把 Enter 与 Alt+Enter 对调——Enter 忙时进入下回合队列，
+  Alt+Enter 立即进入当前回合 steering（空闲时两者都直接发送）。F2/Alt+↑/`/dequeue`
+  改为队列选择器：↑↓ 选择、Enter 取回单条、F2 取回全部、Delete/Ctrl+D 删除选中项
+  （二次确认）、Esc 关闭；单条时 F2 直接取回。取消息时校验预期文本，Agent 已消费
+  的旧行不会误取到下一条；Esc 取消仍取回全部。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
@@ -193,8 +200,8 @@ src/ui/
 - 补全浮层：Textual 8.2 `overlay` + `offset` 绝对定位到输入框上方；
   输入焦点保持在 editor；`↑↓` 选择、`Tab/Enter` 采用、`Esc` 关闭；
   数据源 `/` 命令（fuzzy）、`@` 文件（复用 `file_mentions`）。
-- 队列条：editor 上方一行显示待发送消息；`Alt+↑` 取回编辑、`Alt+↓` 删除；
-  发送后进入队列，回合结束按序执行（当前已有队列逻辑，补 UI）。
+- 队列条：editor 上方一行显示待发送消息；F2/Alt+↑ 打开选择器单条取回或
+  删除，F2 在选择器内取回全部；发送后进入队列，回合结束按序执行。
 - 工作状态嵌入 editor 顶边框（Pi 的 `embedWorkingStatus`）：spinner + 阶段 +
   已用时 + 队列数；不再单独占一行 status。
 
@@ -261,7 +268,7 @@ P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike�
   - 会话切换（搜索+恢复）。
 - 真实终端 checklist（尚未验收；Windows Terminal / PowerShell / VS Code 终端各一轮）：
   - [ ] 中文输入法、换行、粘贴及目录补全。
-  - [ ] Enter steer、Alt+Enter follow-up、Alt+↑/F2 取回与 Esc 取消。
+  - [ ] Enter 进下回合队列、Alt+Enter 立即进入当前回合、F2 选择器取回/删除、Esc 取消。
   - [ ] 审批遮罩、允许同类、拒绝，以及退出后的终端恢复。
   - [ ] 鼠标选中复制、Ctrl-C / Ctrl+Shift+C、`/copy`。
   - [ ] 流式 Markdown、长会话滚动、窗口缩放与工具展开。

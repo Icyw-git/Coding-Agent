@@ -506,9 +506,11 @@ python entrypoint.py
 TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
 命令注册表的 40 条命令均已接入新 TUI，行式命令及别名由兼容测试核对；
 真实终端验收与旧实现清理尚未完成，`textual-legacy` 保留用于对照。TUI 与行式
-REPL 行为对齐：回合进行中按 Enter 会 **steer**（下一轮请求前注入
-当前上下文），Alt+Enter 则作为 follow-up 等本回合结束再做；状态行显示
-`N queued`，`Alt+↑`/F2 或 `/dequeue` 可把 steering/follow-up 全部取回输入框。
+REPL 行为对齐：回合进行中按 Enter 把消息放进下回合队列（本回合结束后执行），
+Alt+Enter 则立即进入当前回合的 steering（Agent 下一次消费时注入）；空闲时两者
+都直接发送。状态行显示 `N queued`；`Alt+↑`/F2 或 `/dequeue` 打开队列选择器：
+`↑↓` 选择、Enter 取回选中一条、F2 取回全部、Delete/Ctrl+D 删除选中项（二次确认）、
+Esc 关闭；`Esc` 取消当前回合并把全部未消费消息取回输入框。
 `@` 列出并补全工作区文件（Tab）；`↑`/`↓` 翻输入历史；状态栏常驻当前目录与
 git 分支，并显示模型、上下文占用、token 和缓存命中率；
 输入框支持多行：`Enter` 发送、`Ctrl-J` 换行（高度随内容增长，最多 8 行）。

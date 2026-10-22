@@ -34,6 +34,7 @@ from ui.modals.cleanup import CleanupPickerModal, TypedConfirmModal
 from ui.modals.confirm import ConfirmModal
 from ui.modals.forks import ForkPickerModal
 from ui.modals.models import ModelPickerModal
+from ui.modals.queue import QueueModal
 from ui.modals.sessions import SessionPickerModal
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
@@ -152,6 +153,16 @@ class PendingQueue:
             self._items.pop()
             return item
 
+    def take_at(self, index: int, expected: str | None = None) -> str | None:
+        """按位置取走一条；expected 不匹配说明队列已被消费，拒绝误取。"""
+        with self._lock:
+            if not 0 <= index < len(self._items):
+                return None
+            item = self._items[index]
+            if item is None or (expected is not None and item != expected):
+                return None
+            return self._items.pop(index)
+
     def snapshot(self) -> list[str]:
         with self._lock:
             return [item for item in self._items if item is not None]
@@ -168,15 +179,15 @@ class PendingQueue:
 
 
 class Composer(TextArea):
-    """多行输入：Enter 发送、Ctrl-J 换行、Tab 补全、Alt+↑ 取回队列。"""
+    """多行输入：Enter 排队/发送、Ctrl-J 换行、Alt+Enter 立即插队、F2 管理队列。"""
 
     BINDINGS = [
         Binding('enter', 'submit', 'Send', show=False, priority=True),
         Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
         Binding('tab', 'complete', 'Complete', show=False),
-        Binding('alt+up', 'queued_prev', 'Dequeue', show=False),
+        Binding('alt+up', 'queued_prev', 'Manage queue', show=False),
         Binding('alt+down', 'queued_next', 'Next', show=False),
-        Binding('alt+enter', 'submit_followup', 'Follow-up', show=False,
+        Binding('alt+enter', 'submit_now', 'Send now', show=False,
                 priority=True),
         Binding('f2', 'dequeue', 'Dequeue', show=False, priority=True),
         Binding('up', 'suggest_prev', 'Prev', show=False),
@@ -187,12 +198,12 @@ class Composer(TextArea):
     ]
 
     def action_submit(self) -> None:
-        # 有候选时 Enter 先采用候选：命令候选采用后直接执行，路径/@ 候选只回填。
-        self.app.submit_composer()
+        # 忙时 Enter 只排队到本回合结束；空闲时直接发送。
+        self.app.submit_composer(mode='followup')
 
-    def action_submit_followup(self) -> None:
-        # Alt+Enter：当前回合结束后再处理，不打断正在进行的回答。
-        self.app.submit_composer(followup=True)
+    def action_submit_now(self) -> None:
+        # Alt+Enter：忙时进入 steering，Agent 下一次消费时注入当前回合。
+        self.app.submit_composer(mode='steer')
 
     def action_newline(self) -> None:
         self.insert(chr(10))
@@ -216,14 +227,14 @@ class Composer(TextArea):
         if self.app.has_suggestions():
             self.app.cycle_suggestion(-1)
         else:
-            self.app.dequeue_all()
+            self.app.open_queue_picker()
 
     def action_queued_next(self) -> None:
         if self.app.has_suggestions():
             self.app.cycle_suggestion(1)
 
     def action_dequeue(self) -> None:
-        self.app.dequeue_all()
+        self.app.open_queue_picker()
 
     def action_escape(self) -> None:
         if self.app.has_suggestions():
@@ -332,6 +343,10 @@ class HarnessApp(App):
     #typed-box { width: 78; max-height: 28; padding: 1 2;
                  border: round $error; background: $boost; }
     #typed-input { margin: 1 0 0 0; }
+    #queue-box { width: 90; max-height: 28; padding: 1 2;
+                 border: round $accent; background: $boost; }
+    #queue-search { margin: 0 0 1 0; }
+    #queue-list { height: auto; max-height: 18; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -351,6 +366,7 @@ class HarnessApp(App):
         self._pending = PendingQueue()
         self._steering = PendingQueue()
         self._tool_blocks: dict[str, str] = {}
+        self._queue_row_cache: dict[str, dict] = {}
         self._dirty = True
         self._busy = False
         self._operation = 'agent'
@@ -597,13 +613,20 @@ class HarnessApp(App):
         self._refresh_queue()
 
     def dequeue_all(self) -> None:
-        """Alt+Up / F2 / Esc：把 steering 和 follow-up 全部取回输入框。"""
+        """Esc / 选择器 F2：把 steering 和 follow-up 全部取回输入框。"""
         if self._composer is None:
             return
         items = self._steering.drain() + self._pending.drain()
         items = [item for item in items if item]
         if not items:
             self._notice('No queued messages to restore.')
+            return
+        self._restore_to_composer(items)
+        self._notice(f'Restored {len(items)} queued message(s) to editor.')
+
+    def _restore_to_composer(self, items: list[str]) -> None:
+        """保留当前草稿，把消息按顺序接在后面，并同步队列状态。"""
+        if self._composer is None:
             return
         current = self._composer.text.strip()
         text = chr(10).join(items)
@@ -614,7 +637,77 @@ class HarnessApp(App):
         self._composer.cursor_location = (0, len(text))
         self._composer.focus()
         self._refresh_queue()
-        self._notice(f'Restored {len(items)} queued message(s) to editor.')
+
+    def _queued_rows(self) -> list[dict]:
+        """合并两个队列：值带队列名和位置，另存预期文本防消费后误取。"""
+        rows = []
+        for name, pending, prefix in (
+                ('steer', self._steering, 'steer'),
+                ('next', self._pending, 'next')):
+            for index, text in enumerate(pending.snapshot()):
+                preview = text.replace(chr(10), ' ')[:60]
+                rows.append({
+                    'value': f'{name}:{index}', 'queue': name,
+                    'index': index, 'text': text,
+                    'label': f'{prefix}  {preview}',
+                    'search': text,
+                })
+        return rows
+
+    def open_queue_picker(self) -> None:
+        """F2 / Alt+↑ / `/dequeue`：单条直接取回，多条用选择器管理。"""
+        rows = self._queued_rows()
+        if not rows:
+            self._notice('No queued messages to restore.')
+            return
+        if len(rows) == 1:
+            self._restore_queue_row(rows[0])
+            return
+        self._queue_row_cache = {row['value']: row for row in rows}
+        self.push_screen(QueueModal(rows), self._on_queue_action)
+
+    def _queue_for(self, row: dict):
+        return self._steering if row['queue'] == 'steer' else self._pending
+
+    def _restore_queue_row(self, row: dict) -> None:
+        text = self._queue_for(row).take_at(row['index'], expected=row['text'])
+        if text is None:
+            self._notice('队列已变化（消息可能已被消费），请重新打开。')
+            return
+        self._restore_to_composer([text])
+        self._notice('Restored 1 queued message to editor.')
+
+    def _on_queue_action(self, result) -> None:
+        if not result:
+            return
+        action, value = result
+        if action == 'all':
+            self.dequeue_all()
+            return
+        row = self._queue_row_cache.get(value)
+        if row is None:
+            self._notice('队列已变化，请重新打开。')
+            return
+        if action == 'restore':
+            self._restore_queue_row(row)
+            return
+        if action == 'delete':
+            body = ('将删除这条排队消息，不会发送：' + chr(10) * 2
+                    + row['text'])
+            self.push_screen(
+                ConfirmModal('Delete queued message?', body, 'Delete'),
+                partial(self._delete_queue_row, row=row))
+
+    def _delete_queue_row(self, confirmed, row: dict) -> None:
+        if not confirmed:
+            return
+        text = self._queue_for(row).take_at(row['index'], expected=row['text'])
+        if text is None:
+            self._notice('队列已变化（消息可能已被消费），请重新打开。')
+            return
+        self._refresh_queue()
+        preview = text.replace(chr(10), ' ')[:40]
+        self._notice(f'Deleted queued message: {preview}')
 
     def _refresh_queue(self) -> None:
         if self._queue_widget is None:
@@ -632,7 +725,7 @@ class HarnessApp(App):
             for index, item in enumerate(items[:3]))
         more = f' … +{len(items) - 3}' if len(items) > 3 else ''
         self._queue_widget.update(f'⏳ {len(items)} queued: {preview}{more} '
-                                  '· Alt+↑/F2 取回')
+                                  '· F2 管理')
         self._queue_widget.display = True
 
     # ---------- 状态 ----------
@@ -983,7 +1076,7 @@ class HarnessApp(App):
         elif verb == 'copy':
             self.copy_last_tool()
         elif verb == 'dequeue':
-            self.dequeue_all()
+            self.open_queue_picker()
         elif verb == 'expand':
             self.toggle_last_tool()
             self._notice('Toggled the most recent tool block.')
@@ -1923,8 +2016,12 @@ class HarnessApp(App):
         self._mark_dirty()
         self._finish_local_operation()
 
-    def submit_composer(self, followup: bool = False) -> None:
-        """Enter 的统一入口：候选优先采用，命令候选随后执行。"""
+    def submit_composer(self, mode: str = 'followup') -> None:
+        """Enter 的统一入口：候选优先采用，命令候选随后执行。
+
+        忙时 Enter 传 followup（本回合结束后处理），Alt+Enter 传 steer
+        （Agent 下一次消费时注入当前回合）；空闲时两者都直接发送。
+        """
         if self._composer is None:
             return
         if self.has_suggestions():
@@ -1939,14 +2036,14 @@ class HarnessApp(App):
             if text.lstrip().startswith('/'):
                 self._programmatic_text = ''
                 self._composer.text = ''
-                self.submit_text(text, mode='followup' if followup else 'steer')
+                self.submit_text(text, mode=mode)
             return
         text = self._composer.text
         self._programmatic_text = ''
         self._composer.text = ''
-        self.submit_text(text, mode='followup' if followup else 'steer')
+        self.submit_text(text, mode=mode)
 
-    def submit_text(self, text: str, mode: str = 'steer') -> None:
+    def submit_text(self, text: str, mode: str = 'followup') -> None:
         text = (text or '').strip()
         if not text or self._exiting:
             return
@@ -1959,11 +2056,11 @@ class HarnessApp(App):
             return
         self._send_user(text, mode=mode)
 
-    def _send_user(self, text: str, mode: str = 'steer') -> None:
+    def _send_user(self, text: str, mode: str = 'followup') -> None:
         if self._busy and self._operation != 'agent':
             mode = 'followup'
         if self._busy and mode != 'followup':
-            # steer 先只进队列；等 agent_loop 真正注入时再由 user_message 事件落块。
+            # Alt+Enter 的 steer：先只进队列；agent_loop 注入时再由 user_message 落块。
             self._steering.put(text)
             self._refresh_queue()
             return
@@ -1971,7 +2068,7 @@ class HarnessApp(App):
         self._mark_dirty()
         self._flush_layout(force=True)      # 先画出用户消息，不必等 50ms 定时器
         if self._busy:
-            # Alt+Enter：本回合结束后再处理，不打断正在进行的回答。
+            # Enter：进入下回合队列，不打断正在进行的回答。
             self._pending.put(text)
             self._refresh_queue()
             return

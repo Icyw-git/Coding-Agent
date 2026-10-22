@@ -3296,3 +3296,30 @@ non-whitespace chars，使用 Unicode isspace 排除空白，复制内容保留�
 新增 60/100 列居中标题真实拖选回归，确保提示恒为 7，同时验证工具复制口径。
 回归还暴露退出期间视口脱离 screen 后读取选区导致 NoScreen，增加挂载检查。
 验证：选区/新 TUI/生命周期/布局 80 passed；增量 Ruff 通过。
+
+## TUI 队列交互：Enter/Alt+Enter 对调与选择器管理
+
+用户提出队列需要可选的取回与删除，并把 Enter 定义为“进入队列”、Alt+Enter
+定义为“立刻入队”。据此明确交互契约：
+
+- 忙时 Enter 进入 follow-up 队列，本回合结束后处理；Alt+Enter 进入 steering，
+  Agent 下一次消费时注入当前回合。空闲时两者都直接发送，不额外排队。
+- F2、Alt+↑ 或 `/dequeue` 打开 `QueueModal`：↑↓ 选择、Enter 取回单条、
+  F2 取回全部、Delete/Ctrl+D 删除选中项（ConfirmModal 二次确认）、Esc 关闭。
+  只有一条消息时 F2 直接取回，省去一次确认。
+- 取回把消息追加到现有草稿之后并保留多行内容；删除只移除队列项，不写入历史。
+- Esc 取消回合仍取回全部未消费消息，行为和之前一致。
+
+实现上，`PendingQueue.take_at(index, expected=text)` 在锁内校验预期文本再弹出。
+弹窗打开后 Agent 可能消费 steering，队列位置会前移；如果不校验，旧行可能误取
+到下一条消息。`QueueModal` 只返回动作和值，App 再用打开时的行快照核对。
+删除键不绑定裸字母 `d`，避免搜索框无法输入；列表获得焦点后使用 Delete/Ctrl+D。
+
+新增 `tests/test_ui_queue.py`：Enter/Alt+Enter 分流、单条直接取回、选择器
+↑↓ 单条取回、删除确认/取消、已消费行的过期保护。同时更新旧队列测试以打开
+选择器后按 F2 取回全部。
+
+验证：队列/新 TUI/生命周期/命令/补全定向回归 95 passed；随后队列 7 passed；
+完整 UI 回归 188 passed；全量 1214 passed / 1 skipped（主机不支持 symlink），
+5 条 warning 均为飞书 SDK 弃用提示；增量 Ruff 通过。
+真实终端中的 F2、Delete 与 Alt+Enter 仍需按验收表检查。
