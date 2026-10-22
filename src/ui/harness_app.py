@@ -412,6 +412,7 @@ class HarnessApp(App):
         self._turn_started = 0.0
         self._last_stream_render = 0.0
         self._stream_interval = STREAM_DEFAULT_INTERVAL
+        self._stream_render_cache = None
 
     # ---------- 布局 ----------
 
@@ -468,6 +469,7 @@ class HarnessApp(App):
         self.exit()
 
     def on_unmount(self) -> None:
+        self._stream_render_cache = None
         self._exiting = True
         bus.unsubscribe(self._on_event)
         self._pending.put(None)
@@ -941,6 +943,7 @@ class HarnessApp(App):
             self.model.append(kind, payload)
 
     def _load_history(self, messages: list) -> None:
+        self._stream_render_cache = None
         self._history_messages = list(messages)
         self._history_start = max(0, len(messages) - HISTORY_INITIAL_MESSAGES)
         self._history_loading = False
@@ -989,9 +992,20 @@ class HarnessApp(App):
             text = str(payload.get('text', ''))
             if not text:
                 return []
-            # 流式也用 Markdown 渲染，避免先看到 `**源码**` 再“变成”正文；
-            # Rich 能处理未闭合的标记，最后一块只是复用同一渲染路径。
-            return _render_markdown(text, width)
+            if not payload.get('streaming'):
+                cached = self._stream_render_cache
+                if cached is not None:
+                    block_id, cached_width, source, lines = cached
+                    if block_id == block.id and cached_width == width and source == text:
+                        self._stream_render_cache = None
+                        return lines
+            # 流式中间帧不做缓存查找；只保存最近一帧供 assistant_end 复用。
+            # 不拼接 Markdown 段落，内容/宽度变化照常完整渲染。
+            self._stream_render_cache = None
+            lines = _render_markdown(text, width)
+            if payload.get('streaming') and len(text) <= 100_000 and len(lines) <= 10_000:
+                self._stream_render_cache = (block.id, width, text, lines)
+            return lines
         if kind == 'tool':
             return _render_lines(tool_view(payload), width)
         if kind == 'diff':
@@ -1107,6 +1121,7 @@ class HarnessApp(App):
         elif verb == 'hotkeys':
             self._notice(commands.hotkeys_text())
         elif verb == 'clear':
+            self._stream_render_cache = None
             self.model.clear()
             self._history_messages = []
             self._history_start = 0

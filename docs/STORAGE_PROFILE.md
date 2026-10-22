@@ -118,6 +118,7 @@ python scripts/bench_history.py 10000
 | `project_context._cache` | 256 个工作区说明 |
 | TUI Markdown Console | 16 个宽度 |
 | `VirtualTranscript._line_cache` | 4000 行 |
+| 流式 Markdown 最后一帧 | 仅 1 个 assistant block；正文 ≤100k 字符且渲染 ≤10000 行；完成/切换历史后释放 |
 | `TranscriptLayout` | 按块版本/宽度缓存，宽度变化重建 |
 | 审批历史/审查官缓存 | 固定上限，撤销时连带清空 |
 

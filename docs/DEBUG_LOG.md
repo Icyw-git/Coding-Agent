@@ -3582,3 +3582,27 @@ pre-image 能力，不引入 Pi 的树模型；`turn` 默认化，`last` 保留�
 快照只读预览：22 个会话、191 个节点，keep=10 时可回收 4 个节点、13361 字节；
 未执行删除。Markdown 稳定前缀缓存及真实终端回合回退验收留作后续独立工作，
 没有用自动测试冒充人工验收。
+
+## 流式 Markdown：稳定前缀实验与最后一帧复用
+
+用户要求提速且不能拖慢现有输出。先用 `scripts/bench_markdown_prefix.py` 测段落、
+列表、代码围栏、表格/纯文本前缀拼接，逐行比对 Rich `Text.plain` 和 styles。结果发现
+Rich 段落间距/嵌套列表不是简单可组合的行片段；朴素拼接出现不等价，安全版需要对
+完整文本再渲染做校验，反而约慢 1.8–2 倍，故未引入前缀拼接。
+
+采用低风险单帧复用：
+
+- streaming assistant 的全量 Rich Markdown 输出保留为最多 1 个活动块的最后帧；
+- `block_id + width + exact source text` 全等才复用，否则先释放旧帧再全量渲染；
+- 限制单块 ≤100k 字符、≤10000 行；assistant 最终化命中后清空，历史重载/clear/卸载也清空；
+- 正常首帧与内容变化仍执行一次原全量渲染，不拆 Markdown、不延后首 token、不降低排版质量。
+
+对比脚本覆盖 plain、paragraph、list、fenced code、table：first/changed phase 的输出文本和
+Rich spans 必须完全相等，应用路径只做一次全量解析；不同形状的计时受 Rich/解释器预热影响，
+没有可证明的普遍加速，因此不把它宣称为流式 FPS 提升。unchanged final phase 命中缓存，
+约 4k–20k 字符的样本复用耗时约 0.01ms，而重新解析约 10–400ms；收益只在 finalization，且不增加
+正常流式帧的渲染工作。
+
+新增 `tests/test_stream_frame_cache.py` 覆盖多种 Markdown 内容的 styles 相等、文本/宽度/块 id
+变化失效、超限不缓存、重载释放。稳定前缀拼接仅留实验脚本，不进入产品。
+验证：全量 **1298 passed / 1 skipped**，5 条 warning 均来自飞书 SDK；Ruff 与 diff 检查通过。
