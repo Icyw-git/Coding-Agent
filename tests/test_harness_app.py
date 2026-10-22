@@ -1738,7 +1738,9 @@ def test_scrolling_to_top_loads_older_history():
 
 
 def test_streaming_render_interval_adapts_to_frame_cost(monkeypatch):
-    import time as clock
+    from types import SimpleNamespace
+
+    from ui import harness_app as module
 
     async def scenario():
         app = HarnessApp([])
@@ -1746,11 +1748,14 @@ def test_streaming_render_interval_adapts_to_frame_cost(monkeypatch):
             app._busy = True
             app.model.append('assistant', {'text': 'stream', 'streaming': True},
                              block_id='stream-test')
-            monkeypatch.setattr(app.view, 'refresh_layout',
-                                lambda: clock.sleep(0.03))
             app._dirty = True
-            app._flush_layout(force=True)
-            assert 0.055 <= app._stream_interval <= 0.065
+            # 真实 sleep 会受 Windows 调度影响；用确定时钟验证帧耗时策略。
+            ticks = iter((100.0, 100.03))
+            with monkeypatch.context() as patch:
+                patch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+                patch.setattr(app.view, 'refresh_layout', lambda: None)
+                app._flush_layout(force=True)
+            assert app._stream_interval == pytest.approx(0.06)
             app._busy = False
 
     asyncio.run(scenario())

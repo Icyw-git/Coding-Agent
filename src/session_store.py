@@ -101,6 +101,10 @@ class SessionEventStore:
         # 必须在 _read_last_seq() 之前就位——它会触发第一次 read_events。
         self._events_cache = None
         self._summary_cache = None
+        # 紧凑序列化投影与少量新增事件；不复制完整的可变事件树。
+        self._history_cache = None
+        self._history_has_rewind = False
+        self._history_partial_tail = False
         self._next_seq = self._read_last_seq() + 1
         # 锁在初始化时解析一次（每次 append 都 resolve 约 10ms 开销）；
         # 同路径的多实例仍从类级 _locks 取到同一把锁
@@ -154,7 +158,8 @@ class SessionEventStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         with self._lock:
             # Re-read under the path lock so separate store instances cannot reuse a sequence number.
-            current_size = self.path.stat().st_size if self.path.exists() else 0
+            previous_stat = self.path.stat() if self.path.exists() else None
+            current_size = previous_stat.st_size if previous_stat else 0
             if current_size != self._known_size:
                 self._next_seq = self._read_last_seq() + 1
             next_seq = self._next_seq
@@ -172,8 +177,9 @@ class SessionEventStore:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            encoded_size = len(encoded.encode('utf-8'))
             self._next_seq = next_seq + 1
-            self._known_size = current_size + len(encoded.encode('utf-8'))
+            self._known_size = current_size + encoded_size
             # 追加后把新事件扩进缓存（deepcopy 隔离，调用方改动不污染缓存），
             # 免掉每回合 2-3 次的全量重解析；缓存口径不符时简单失效。
             cache = self._events_cache
@@ -187,6 +193,24 @@ class SessionEventStore:
                     and self._known_size > _event_cache_limit()):
                 self._events_cache = None
             self._summary_cache = None
+            projection = self._history_cache
+            if projection is not None:
+                signature, encoded_history, pending, pending_bytes = projection
+                unchanged = (previous_stat is not None and signature ==
+                             (previous_stat.st_size, previous_stat.st_mtime_ns))
+                if (not unchanged or event_type in (
+                        'compaction', 'history_snipped', 'tool_compacted',
+                        'rewind', 'tool_recovery') or len(pending) >= 256
+                        or pending_bytes + encoded_size >
+                        DEFAULT_EVENT_CACHE_MAX_BYTES - len(encoded_history)):
+                    self._history_cache = None
+                else:
+                    if event_type == 'message':
+                        pending.append(copy.deepcopy(event))
+                    stat = self.path.stat()
+                    self._history_cache = (
+                        (stat.st_size, stat.st_mtime_ns), encoded_history, pending,
+                        pending_bytes + encoded_size)
         return event
 
     def append_message(self, message: dict) -> dict:
@@ -439,6 +463,8 @@ class SessionEventStore:
                     event = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     if allow_partial_tail and handle.tell() >= size:
+                        self._history_cache = None
+                        self._history_partial_tail = True
                         return
                     raise SessionReplayError(
                         f"invalid JSONL event at line {line_no}") from exc
@@ -472,6 +498,7 @@ class SessionEventStore:
             except json.JSONDecodeError as exc:
                 if allow_partial_tail and index == len(lines) - 1:
                     partial_tail = True   # 文件写入中：不缓存，下次重读
+                    self._history_partial_tail = True
                     break
                 raise SessionReplayError(f"invalid JSONL event at line {index + 1}") from exc
             if not isinstance(event, dict):
@@ -532,12 +559,61 @@ class SessionEventStore:
 
     def rebuild_openai_history(self, *, recover_pending: bool = False,
                                repair_gaps: bool = False) -> list[dict]:
+        """本实例正常追加走增量投影；压缩/回溯或外部写入走完整回放。"""
+        stat = self.path.stat() if self.path.exists() else None
+        signature = (stat.st_size, stat.st_mtime_ns) if stat else None
+        cached = self._history_cache
+        if cached is not None and cached[0] == signature and not repair_gaps:
+            messages = json.loads(cached[1])
+            for event in cached[2]:
+                message = event.get('message')
+                if not isinstance(message, dict) or 'role' not in message:
+                    raise SessionReplayError(
+                        f"invalid message event at seq {event.get('seq')}")
+                messages.append(copy.deepcopy(message))
+            if recover_pending:
+                recovered = self.close_interrupted_tools(messages)
+                self.validate_openai_history(recovered)
+                if recovered != messages:
+                    self.append('tool_recovery')
+                    messages = recovered
+                    stat = self.path.stat()
+                    signature = (stat.st_size, stat.st_mtime_ns)
+            self.validate_openai_history(messages, allow_pending=True)
+        else:
+            self._history_cache = None
+            messages = self._replay_openai_history(
+                recover_pending=recover_pending, repair_gaps=repair_gaps)
+            stat = self.path.stat() if self.path.exists() else None
+            after = (stat.st_size, stat.st_mtime_ns) if stat else None
+            if signature != after:
+                # 外部写入或恢复事件改变文件；本次返回原有回放结果，下次重新扫描。
+                return messages
+
+        # 回溯依赖外部 snapshot；每次回放都验证，不掩盖快照缺失。
+        if (not repair_gaps and not self._history_has_rewind
+                and not self._history_partial_tail):
+            encoded = json.dumps(messages, ensure_ascii=False,
+                                 separators=(',', ':')).encode('utf-8')
+            if len(encoded) <= DEFAULT_EVENT_CACHE_MAX_BYTES:
+                self._history_cache = (signature, encoded, [], 0)
+            else:
+                self._history_cache = None
+        return messages
+
+    def _replay_openai_history(self, *, recover_pending: bool = False,
+                              repair_gaps: bool = False) -> list[dict]:
         """Rebuild the current compacted OpenAI history from the append-only event stream.
 
         大文件走流式扫描（两遍：先取占位表，再构建），不把完整事件列表长期
         留在内存；小文件仍使用 read_events 缓存，保持原有性能。
         """
+        self._history_partial_tail = False
         size = self.path.stat().st_size if self.path.exists() else 0
+        if size:
+            with self.path.open('rb') as handle:
+                handle.seek(-1, os.SEEK_END)
+                self._history_partial_tail = handle.read(1) != b'\n'
         if size > _event_cache_limit():
             # 第一遍只收集 tool_compacted 占位，第二遍才构造 messages。
             placeholders = {
@@ -555,6 +631,7 @@ class SessionEventStore:
                             for e in events
                             if e.get('type') == 'tool_compacted'
                             and e.get('tool_call_id') and e.get('placeholder')}
+        self._history_has_rewind = False
         messages = []
         for event in events:
             event_type = event.get("type")
@@ -611,6 +688,7 @@ class SessionEventStore:
                             and entry.get('tool_call_id') in placeholders):
                         entry['content'] = placeholders[entry['tool_call_id']]
             elif event_type == "rewind":
+                self._history_has_rewind = True
                 messages = self._rewound_history(event)
             elif event_type == "tool_recovery":
                 messages = self.close_interrupted_tools(messages)
