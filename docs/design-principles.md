@@ -74,7 +74,7 @@ load_skill）用 4 线程池并行，批内含任一可变工具则整批串行�
 与第三方工具永不并行（同文件冲突、前像顺序、副作用未知）。线程内
 `contextvars.copy_context()` 传播 checkpoint 上下文。结果原序写回（见不变式）。
 
-远程权限审批走 `hooks.PermissionGate`：超时默认 300s、fail-safe deny、
+远程权限审批走 `approval.PermissionGate`：超时默认 300s、fail-safe deny、
 已决议历史自动淘汰。工具执行统一经过 PreToolUse/PostToolUse hooks 与
 入口截断；hooks 拿到的是全量输出，历史存的是截断形态。
 

@@ -3120,3 +3120,28 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
   （解释器、外发请求等）不显示 `a`，服务端也会丢弃这类请求伪造的 scope。
 - **测试**：卡片 `y`/`n`/`a`、无同类键按 `a` 无效、`request_scoped` 的 scope 过滤；
   全量回归 1175 passed / 1 skipped，旧 UI + 新 UI 定向 127 passed。
+
+## 结构拆分：策略文本分析 / 文档格式 / 审批
+
+三个千行级模块按职责拆开，行为不变，导入点保持兼容：
+
+- `exec_policy.py` → `policy_bash.py`（bash 文本分析：包装器、只读判定、外发目标、
+  `approval_class` / `grant_key` / `session_allow_key`）。命令文本判定不依赖路径分区，
+  独立后 `exec_policy` 只保留决策矩阵与路径分类，并 re-export 公开名字。
+- `documents.py` → `document_formats.py`（DOCX/PPTX/XLSX 解析与共享 zip/XML 工具）；
+  入口只留格式识别、PDF 解析与分发。解析器读的上限常量在 `document_formats`，
+  测试补丁点随之调整（`documents.MAX_ZIP_MEMBER_BYTES` 只是兼容 re-export）。
+- `hooks.py` → `approval.py`（`PermissionGate`、超时、UI 分流）与 `approval_judge.py`
+  （LLM 审查官）。审批门不 import `hooks`：会话 id 与凭据清理由 hooks 构造 `GATE` 时
+  以回调注入；审查官运行期通过 hooks 的公共入口取 `GATE` / `evaluate_call` /
+  `current_session_id`，避免复制状态造成两条路径漂移。`hooks` 继续持有会话 ContextVar、
+  凭据、策略判定与 hook 注册，并 re-export 公开名字。
+
+模块导入、普通构造器仍不启动线程/网络；`_h()` 与审查官对 hooks 的引用保持懒加载，
+既避开循环导入，也不破坏测试对 `hooks.*` 的 monkeypatch。
+
+**测试**：拆分前后对移动的定义做 AST 源片段比对（仅预期改动：`PermissionGate`
+构造注入、审查官懒加载、`GATE` 组装）；全量 1175 passed / 1 skipped，
+`ruff check .` 通过。**刻意未做**：对 `exec_policy` / `documents` / `hooks` 整体
+`ruff format` —— 保持移动代码逐字不变，且符合 `ruff.toml` 的增量格式化约定；
+新文件按需在后续改动中逐步收敛。

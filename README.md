@@ -642,14 +642,19 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_tasks.py` | 任务与 cron 工具：封装 task_system/cron_scheduler 并统一输出 |
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |
 | `src/tool_documents.py` | `view_image`/`read_document`/`render_document`：图片缓存与文档渲染引用 |
+| `src/documents.py` | 文档文本抽取入口：格式识别、PDF 解析与页选择 |
+| `src/document_formats.py` | DOCX/PPTX/XLSX 解析：OOXML zip/XML 工具与成员读取上限 |
 | `src/tool_search.py` | `glob`/`grep`/`ls`：只读边界、秘密文件过滤与 ripgrep 快路径 |
 | `src/tool_files.py` | `read`/`write`/`edit` 实现：边界门、编码保留与二进制保护（依赖注入） |
 | `src/tool_patch.py` | `apply_patch` 解析、规划与原子回滚；路径解析/审批/checkpoint 由 tools 注入 |
 | `src/tool_text.py` | 文件文本 BOM/编码探测、二进制拒绝与换行符保留 |
 | `src/tool_cache.py` | `/cache`：`.cache/tool_results` 统计与引用保护回收 |
-| `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
+| `src/exec_policy.py` | 执行策略层：档位、黑名单、路径分区与决策矩阵（纯判定，不做 OS 强制） |
+| `src/policy_bash.py` | bash 命令文本分析：包装器、只读判定、外发目标与「同类」授权键（启发式，不是安全边界） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
-| `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |
+| `src/hooks.py` | PreToolUse 闸门、会话上下文与审批凭据；组装 `GATE` |
+| `src/approval.py` | 审批门：请求登记、控制台/远程/UI 决议、会话白名单与 fail-safe 超时 |
+| `src/approval_judge.py` | LLM 审查官：ASK 命令的单条与批量复核（fail-closed） |
 | `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
 | `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
 | `tests/` | 自动化测试与测试辅助程序 |
