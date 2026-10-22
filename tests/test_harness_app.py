@@ -1653,3 +1653,27 @@ def test_markdown_console_cache_is_bounded():
         assert len(module._CONSOLES) <= 16
     finally:
         module._CONSOLES.clear()
+
+
+def test_textual_run_swaps_ansi_renderer_and_restores_it(monkeypatch):
+    from renderer import default_renderer
+    from ui import harness_app as module
+    from ui_events import bus
+
+    while default_renderer.on_event in bus._subs:
+        bus.unsubscribe(default_renderer.on_event)
+    bus.subscribe(default_renderer.on_event)
+    seen = []
+
+    class FakeApp:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            seen.append(default_renderer.on_event in bus._subs)
+
+    monkeypatch.setattr(module, 'HarnessApp', FakeApp)
+    module.run([])
+
+    assert seen == [False]
+    assert default_renderer.on_event in bus._subs

@@ -225,6 +225,26 @@ def test_prompt_text_includes_git_branch(tmp_path, monkeypatch):
     assert harness.prompt_text().strip() == f'{tmp_path.name} (main) [rw] >'
 
 
+def test_default_repl_uses_textual_when_tty(tmp_path, monkeypatch):
+    import sys
+
+    import cli_input
+    import harness
+    import ui.harness_app
+
+    calls = []
+    monkeypatch.delenv('HARNESS_UI', raising=False)
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(ui.harness_app, 'run',
+                        lambda messages, **kwargs: calls.append((messages, kwargs)))
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
+    store = harness.SessionEventStore(tmp_path, session_id='default-ui')
+
+    harness.run_repl([{'role': 'user', 'content': 'hi'}], store)
+
+    assert calls and calls[0][1]['session_id'] == 'default-ui'
+
+
 def test_folded_tool_output_can_be_expanded(monkeypatch):
     import io
     import sys

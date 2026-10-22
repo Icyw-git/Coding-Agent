@@ -76,18 +76,17 @@ def test_doctor_reports_optional_document_extras(monkeypatch):
     assert entrypoint.harness._document_extras_status() == 'installed'
 
 
-def test_interactive_lock_is_skipped_for_textual(monkeypatch):
+def test_interactive_lock_defaults_to_textual_and_respects_ansi(monkeypatch):
     import contextlib
+
+    monkeypatch.delenv('HARNESS_UI', raising=False)
+    assert isinstance(entrypoint._interactive_lock(), contextlib.nullcontext)
 
     monkeypatch.setenv('HARNESS_UI', 'textual')
     ctx = entrypoint._interactive_lock()
     assert isinstance(ctx, contextlib.nullcontext)
 
     monkeypatch.setenv('HARNESS_UI', 'textual-next')
-    ctx = entrypoint._interactive_lock()
-    assert isinstance(ctx, contextlib.nullcontext)
-
-    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
     ctx = entrypoint._interactive_lock()
     assert isinstance(ctx, contextlib.nullcontext)
 
@@ -111,11 +110,11 @@ def test_textual_failure_falls_back_to_line_repl(tmp_path, monkeypatch, capsys):
 
     import cli_input
     import harness
-    import ui_textual
+    from ui import harness_app
 
-    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
+    monkeypatch.setenv('HARNESS_UI', 'textual')
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
-    monkeypatch.setattr(ui_textual, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(
+    monkeypatch.setattr(harness_app, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError('no driver')))
     monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
     store = harness.SessionEventStore(tmp_path, session_id='ui-fallback')

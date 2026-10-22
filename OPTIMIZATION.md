@@ -15,7 +15,7 @@ D:\harness-agent
 ├── task_system.py / cron_scheduler.py / agent_teams.py / team_protocols.py           # 任务/定时/协作
 ├── worktree.py / MCPclient.py / mcp_bridge.py / mock_mcp_server.py                   # 沙箱/外部接入
 ├── memory.py / config.py                                                             # 记忆/配置
-├── cc_ui.py / ui_textual.py / ui_events.py / renderer.py / permission_gate.py        # UI 层
+├── cc_ui.py / src/ui/harness_app.py / ui_events.py / renderer.py                  # UI 层
 ├── test_*.py（6 个，平铺在根目录）                                                   # 测试
 ├── _orig_harness.py（重构前的单体遗留）                                               # 遗留
 ├── DEBUG_LOG.md（开发实录/面试向文档）                                                # 文档
@@ -44,7 +44,7 @@ harness_agent/
 │   ├── core/       (agent_loop, agent_core, harness, recovery)
 │   ├── tools/      (tools.py → 按领域拆分)
 │   ├── subsystems/ (task_system, cron_scheduler, memory, worktree, mcp, teams)
-│   ├── ui/         (cc_ui, ui_textual, ui_events, renderer)
+│   ├── ui/         (harness_app, cc_ui, ui_events, renderer)
 │   └── config.py
 ├── tests/                    # 与 src 对应的测试目录
 └── scripts/                  # 入口脚本（原 __main__/main）
@@ -65,15 +65,15 @@ harness_agent/
 
 ### 3. 统一 UI 层，明确「渲染器 vs 事件总线」边界
 
-当前 UI 相关有 `cc_ui.py`（1143 行）、`ui_textual.py`（428 行，且未跟踪）、`renderer.py`、
-`ui_events.py`。功能重叠，边界模糊。
+当前 UI 相关有 `cc_ui.py`、`src/ui/harness_app.py`、`renderer.py`、`ui_events.py`。
+（历史分析写于统一为单一 Textual 实现之前；旧 `ui_textual.py` 已移除。）
 
 建议：
 - 确立分层：`ui_events.py`（事件总线，纯数据）→ `renderer.py`（把事件渲染成文本/ANSI）→
   `ui_textual.py` / `cc_ui.py`（具体前端适配器，二选一收敛）。
 - 把 `cc_ui.py` 中 1143 行里属于「业务逻辑」的部分（如权限判定、命令处理）下沉到 core，
   让 UI 只做展示。
-- 决定 textual 是主前端还是 fallback，未跟踪的 `ui_textual.py` 尽快纳入版本控制或删除。
+- 已决定 Textual 作为默认前端，ANSI 作为降级；旧 `ui_textual.py` 已删除。
 
 ### 4. 清理遗留与临时文件
 

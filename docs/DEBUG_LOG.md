@@ -3417,3 +3417,27 @@ Ruff 与 diff 检查通过。
 未完成项保留在文档中：三种真实终端的人工验收、P7 legacy 清理、默认 UI 从 ansi
 切换到 textual 的独立决策。feature/ui 暂保留作验收回退，验收完成后再删除；
 后续修复从 main 拉 `fix/ui-*`，不再在 feature/ui 上继续开发。
+
+## P7：移除 legacy TUI 并切换默认 Textual 入口
+
+P7 执行内容：
+
+- 删除旧实现 `src/ui/app.py`（1614 行）和兼容壳 `ui_textual.py`；删除 `textual-legacy`
+  的 CLI choice、`_interactive_lock` 分支和 `run_repl` 路由；`textual-next` 仅保留为
+  旧环境变量的兼容别名。
+- 默认交互入口改为 Textual（`HARNESS_UI` 未设置时），非 TTY、缺少 Textual 或驱动
+  启动失败时回退 ANSI；`--ui ansi` / `HARNESS_UI=ansi` 仍可显式降级。
+- 删除旧专属测试与旧实现断言：legacy TUI 端到端测试、旧 `CCApp` 测试、旧 session
+  过滤测试；保留并迁移 cc_ui/事件桥/新 App 测试。`test_ui.py` 现在只保留 ANSI
+  渲染测试。
+- `run_repl` 的 ANSI 路径统一在 `agent_lock` 内运行，fallback 不再绕过锁；
+  `agent_lock` 改为 RLock，允许入口与降级路径在同一线程安全重入。
+- 新 Textual `run()` 在启动前取消订阅 ANSI 默认渲染器，退出时恢复，避免后台事件
+  同时打印到屏幕；这也修复了全量测试顺序中 ANSI 渲染器泄漏导致 agent_loop 重复
+  输出最终文本的问题（`on_delta` 存在时不再额外 print 正文）。
+- 更新 README、开发流程、重构计划和验收记录的默认入口与 P7 状态。
+
+验证：全量 `tests/` + 根目录 ANSI 测试 + MCP 回归 **1269 passed / 1 skipped**
+（skip 为主机不支持 symlink；5 条 warning 均来自飞书 SDK 的 pkg_resources），
+Ruff 与 diff 检查通过。ANSI 回退、Textual 默认入口、RLock 重入、renderer 切换和
+旧测试删除后的顺序依赖均已覆盖。

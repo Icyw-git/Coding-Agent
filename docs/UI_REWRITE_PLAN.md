@@ -1,6 +1,6 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：已合并到 main（bd99673）；真实终端验收与 P7 清理尚未完成
+状态：已合并到 main（bd99673）；P7 legacy 清理和默认 Textual 入口已完成；真实终端验收仍待执行
 进展：
 - P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
 - P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、
@@ -80,6 +80,8 @@
   改为队列选择器：↑↓ 选择、Enter 取回单条、Ctrl+R 取回全部、Delete/Ctrl+D 删除选中项
   （二次确认）、Esc 关闭；单条时 Ctrl+G 直接取回。取消息时校验预期文本，Agent 已消费
   的旧行不会误取到下一条；Esc 取消仍取回全部。
+- P7：`src/ui/app.py`、`ui_textual.py` 和 `textual-legacy` 路由已删除；
+  默认交互入口改为 Textual，`ansi` 保留为显式降级；旧专属测试已删除或迁到新 App。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
@@ -252,7 +254,7 @@ src/ui/
 | P4 展示层 | tool renderers + diff + footer + 状态 | 新展示层 | 快照对比；工具/审批/中断回归 |
 | P5 选择器 | sessions/models/commands/search 重做 | 新 modals | 键盘路径全覆盖 |
 | P6 切换 | ✅ `HARNESS_UI=textual` 指向新 app；legacy 保留 | 双实现对照 | 真实终端 checklist 待验收 |
-| P7 清理 | 尚未完成；命令迁移与兼容检查已补齐，legacy 仍保留 | 单一实现 | 真实终端验收后处理重复实现、更新文档 |
+| P7 清理 | ✅ 旧 Textual 实现、legacy 入口和专属测试已删除；默认入口已切 Textual | 单一实现 | 保留 ANSI 降级；真实终端验收仍待执行 |
 
 预估（单人）：P1 1–2 天，P2 3–5 天，P3 2–3 天，P4 3–4 天，P5 2–3 天，
 P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike。
@@ -317,7 +319,7 @@ P6/P7 1–2 天；合计约 2–3 周。P2 是关键路径，建议先做 spike�
 ## 9. 已确定的后续安排
 
 - `feature/ui` 仅继续本次验收与修复，验收通过后合入 main 并删除分支。
-- 行式 REPL 继续作为默认入口与降级路径（`HARNESS_UI=ansi`）；更改默认入口单独验证。
+- 默认交互入口已切到 Textual；行式 REPL 保留为 `HARNESS_UI=ansi` 降级路径。
 - 合并时保留 legacy 一个过渡版本，P7 核对引用与重复实现，后续短期分支完成删除。
 - 图片内嵌显示不纳入本次收尾；后续按独立需求评估。
 - 核心与 UI 共同以 main 为集成目标，后续功能使用短期分支，详见开发流程。

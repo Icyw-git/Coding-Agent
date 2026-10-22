@@ -1,16 +1,6 @@
 import asyncio
 
-import pytest
-
 from MCPclient import MCPclient
-
-
-def test_ccapp_initializes_metrics_before_events():
-    pytest.importorskip('textual')
-    from ui_textual import CCApp
-    app = CCApp([])
-    assert app._round_metrics == []
-    assert app._background_tasks == {}
 
 
 def test_mcp_session_entry_and_exit_stay_in_one_task(monkeypatch):

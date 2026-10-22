@@ -18,19 +18,20 @@
 
 ## 本次合并状态与后续
 
-`feature/ui` 已于 `bd99673` 合并到 main。合并前检查确认 main 无独有提交、
-无冲突，合并后全量 1228 passed / 1 skipped。未完成的收尾：
+`feature/ui` 已于 `bd99673` 合并到 main，旧 Textual 实现已按 P7 删除，默认入口
+已切到 Textual；合并前检查确认 main 无独有提交、无冲突，合并后全量回归通过。
+未完成的收尾：
 
 1. 按 [终端验收记录](UI_TERMINAL_ACCEPTANCE.md) 完成三种真实终端检查；
    代码已合并，但这份人工验收仍未执行。
 2. 从 main 创建 `fix/ui-*` 修复验收问题，并补必要回归；修改后重测受影响项。
-3. P7 仍保留 `textual-legacy` 一个过渡版本；验收稳定后从 main 创建清理分支，
-   删除 legacy 入口、旧实现和专属测试，验证 ANSI 回退、新 Textual 及兼容别名。
-4. 上述完成后确认远端 main 仍包含验收修复，再删除 `feature/ui`。
-5. 总体默认入口仍为 `ansi`；是否切换默认 UI 是独立变更。
+3. P7 已完成：旧实现、`textual-legacy` 入口和专属测试已删除；默认入口为 Textual，
+   `HARNESS_UI=ansi` 保留为降级路径，`textual-next` 仅兼容别名。
+4. 上述验收完成后确认远端 main 仍包含修复，再删除 `feature/ui`。
+5. 默认入口已切换；ANSI 降级仍需在真实终端验证。
 
 当前流程已确定，人工验收尚无通过记录，不能仅凭自动测试宣称可合并。
-代码合入 main 不改变总体默认 UI。默认从 ansi 切到 textual 应作为单独变更验证。
+默认入口已切到 Textual；ANSI 降级仍需在真实终端验证，不能仅凭自动测试认定可用。
 
 ## 同步 main 的修复
 

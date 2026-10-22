@@ -1,6 +1,6 @@
 # UI 真实终端验收记录
 
-状态：代码已合并到 main（bd99673），人工验收仍待执行。自动化 Textual run_test 不代表本表通过。
+状态：代码已合并到 main，P7 清理和默认 Textual 入口已完成；人工验收仍待执行。自动化 Textual run_test 不代表本表通过。
 流程见 [开发流程](DEVELOPMENT_WORKFLOW.md)，设计与自动检查见 [重构计划](UI_REWRITE_PLAN.md)。
 
 ## 环境与启动
@@ -20,7 +20,8 @@
 在仓库目录使用已配置的模型启动：
 
 ```powershell
-& 'D:/Anaconda_envs/envs/aitest01_py310/python.exe' harness.py --ui textual
+& 'D:/Anaconda_envs/envs/aitest01_py310/python.exe' harness.py
+# 需要行式降级时：harness.py --ui ansi
 ```
 
 用 `/cd` 切到仓库外的临时工作区；在该目录新建测试会话和可丢弃文件。

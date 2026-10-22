@@ -1,7 +1,7 @@
 """新 TUI（P2/P3）：行模型 + 虚拟视口 + 浮层补全 + 队列条。
 
-入口：`HARNESS_UI=textual`（`textual-next` 为兼容别名）。
-旧实现保留为 `HARNESS_UI=textual-legacy`，仅用于对照。
+入口：交互模式默认由 `HARNESS_UI=textual` 启动（`textual-next` 为兼容别名）；
+非 TTY 或 Textual 不可用时自动回退 ANSI。
 """
 from __future__ import annotations
 
@@ -2215,5 +2215,13 @@ class HarnessApp(App):
 
 def run(messages: list | None = None, session_id: str | None = None,
         title: str = '', session_store=None) -> None:
-    HarnessApp(messages or [], session_id=session_id, title=title,
-               session_store=session_store).run()
+    # Textual 自己渲染事件；ANSI 默认渲染器若继续订阅会把同样的工具/文本
+    # 打印到屏幕，盖住 TUI。退出时恢复，保证随后回退 ANSI 仍能正常输出。
+    from renderer import default_renderer
+
+    bus.unsubscribe(default_renderer.on_event)
+    try:
+        HarnessApp(messages or [], session_id=session_id, title=title,
+                   session_store=session_store).run()
+    finally:
+        bus.subscribe(default_renderer.on_event)

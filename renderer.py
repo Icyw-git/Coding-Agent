@@ -148,6 +148,6 @@ class ReplRenderer(AnsiRenderer):
 
 
 # 默认 attach：import renderer 即生效；业务代码无需感知渲染后端。
-# Textual 模式切换时（ui_textual.run）会 unsubscribe default_renderer。
+# Textual 模式切换时（ui.harness_app.run）会 unsubscribe default_renderer。
 default_renderer = AnsiRenderer()
 bus.subscribe(default_renderer.on_event)

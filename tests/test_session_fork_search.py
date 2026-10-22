@@ -90,11 +90,23 @@ def test_agent_loop_streams_without_duplicate_print(tmp_path, monkeypatch, capsy
         tcm.make_text_response('[]'),
     ])
     monkeypatch.setattr(harness.client.chat.completions, 'create', fake.create)
-    seen = []
-    harness.agent_loop([{'role': 'user', 'content': 'do it'}],
-                       session_store=store,
-                       on_delta=lambda part: seen.append(part))
-    harness.wait_for_housekeeping(30)
+    # This is a direct agent_loop test: it supplies its own delta sink, so the
+    # process-wide ANSI renderer (subscribed by earlier REPL tests) must not
+    # print the same final text. Restore it afterwards for later tests.
+    from renderer import default_renderer
+    from ui_events import bus
+    renderer_attached = default_renderer.on_event in bus._subs
+    if renderer_attached:
+        bus.unsubscribe(default_renderer.on_event)
+    try:
+        seen = []
+        harness.agent_loop([{'role': 'user', 'content': 'do it'}],
+                           session_store=store,
+                           on_delta=lambda part: seen.append(part))
+        harness.wait_for_housekeeping(30)
+    finally:
+        if renderer_attached:
+            bus.subscribe(default_renderer.on_event)
     assert seen == ['task done']      # 流式增量把回复交付一次（非流式客户端降级）
     out = capsys.readouterr().out
     assert 'task done' not in out     # 最终打印被抑制，无双份

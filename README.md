@@ -385,9 +385,9 @@ LLM_MODEL_ID=your-model-id
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 
-# 可选：ansi（默认）| textual（新全屏 TUI）| textual-legacy（旧 TUI 对照）
+# 可选：textual（默认全屏 TUI）| ansi（原生 scrollback 降级）
 # textual-next 是 textual 的兼容别名
-HARNESS_UI=ansi
+HARNESS_UI=textual
 
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
@@ -502,13 +502,13 @@ python -m pip install -r requirements.txt
 python entrypoint.py
 ```
 
-首次启动时，程序会进入交互式 Agent 会话。默认是 ANSI 行式界面；设置
-`HARNESS_UI=textual`（或 `--ui textual`）启用新的 Textual 全屏 TUI（需要
-`pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。旧实现保留为
-`HARNESS_UI=textual-legacy`，仅用于对照；`textual-next` 是 `textual` 的兼容别名。
+首次启动时，程序会进入交互式 Agent 会话。默认进入 Textual 全屏 TUI（需要 `pip install textual`，依赖见
+`pyproject.toml` 的 `ui` extra）。非 TTY、未安装 Textual 或终端驱动不可用时
+自动回退 ANSI；也可显式设置 `HARNESS_UI=ansi`（或 `--ui ansi`）保留原生 scrollback。
+`textual-next` 仅作为旧环境变量兼容别名。
 TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
-命令注册表的 40 条命令均已接入新 TUI，行式命令及别名由兼容测试核对；
-真实终端验收与旧实现清理尚未完成，`textual-legacy` 保留用于对照。TUI 与行式
+命令注册表的 40 条命令均已接入 TUI，行式命令及别名由兼容测试核对；
+P7 已移除旧 Textual 实现和 legacy 入口；真实终端验收仍待执行。TUI 与行式
 REPL 行为对齐：回合进行中按 Enter 把消息放进下回合队列（本回合结束后执行），
 Alt+Enter 则立即进入当前回合的 steering（Agent 下一次消费时注入）；空闲时两者
 都直接发送。状态行显示 `N queued`；`Alt+↑`/`Ctrl+G` 或 `/dequeue` 打开队列选择器：
@@ -539,8 +539,7 @@ workspace-write 之间切换执行档位。
 Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspace remove` 不带
 选择器时弹出登记项选择器。`/watch` 的进度与终态输出写进对话区状态块，
 不覆盖 TUI；`/cd`、`/new --ws`、`/archive`、`/watch` 均带参数补全。
-新 TUI 启动时载入全部历史，`/more` 只提示无需加载；旧 `textual-legacy`
-仍按 400 条分页。
+TUI 启动时载入全部历史，`/more` 只提示无需加载。
 对话区支持拖选 Markdown 渲染后的文本（含中文、跨行与滚动后的内容），
 松开鼠标后自动复制选区，也可用 `Ctrl+Shift+C` 再次复制；
 `Ctrl+C` 有选区时复制、没有选区时退出，`Ctrl+Q` 始终退出。

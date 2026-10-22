@@ -2122,8 +2122,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     ctx_tokens += estimate_size([messages[-1]])
                 continue
             if message.content:
-                if streamed_parts:
-                    print()   # 流式已逐段输出到终端，只补换行
+                if on_delta is not None or streamed_parts:
+                    print()   # 调用方已逐段交付文本，只补换行，避免重复打印
                 else:
                     print(message.content)
             if turn_tokens:
@@ -2424,13 +2424,11 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
-    ui_mode = os.getenv('HARNESS_UI', 'ansi')
-    if ui_mode in ('textual', 'textual-next', 'textual-legacy') and sys.stdin.isatty():
-        # textual 已是新实现；textual-next 保留为兼容别名，textual-legacy 仅用于对照。
-        module_name = ('ui_textual' if ui_mode == 'textual-legacy'
-                       else 'ui.harness_app')
+    ui_mode = os.getenv('HARNESS_UI', 'textual')
+    if ui_mode in ('textual', 'textual-next') and sys.stdin.isatty():
+        # textual 是默认入口；textual-next 保留为旧环境变量兼容别名。
         try:
-            module = __import__(module_name, fromlist=['run'])
+            module = __import__('ui.harness_app', fromlist=['run'])
         except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
             print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
         else:
@@ -2444,6 +2442,11 @@ def run_repl(initial_messages:list, session_store=None):
                 print(f'[ui] Textual 运行失败，回退行式 REPL：'
                       f'{type(exc).__name__}: {exc}')
 
+    with agent_lock:
+        _run_line_repl(messages, session_store)
+
+
+def _run_line_repl(messages, session_store):
     _attach_repl_renderer()
     policy = load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "

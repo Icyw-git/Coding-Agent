@@ -18,7 +18,7 @@ class CronJob:
 scheduled_jobs:dict[str,CronJob]={} # id -> job
 cron_queue:list[CronJob]=[] #任务队列
 cron_lock=threading.RLock() # 任务队列锁，用于保护任务队列
-agent_lock=threading.Lock() # 代理锁，用于保护代理状态
+agent_lock=threading.RLock() # 代理锁；允许同一线程在 REPL 入口与降级路径重复获取
 _last_fired:dict[str,str]={} # id -> last fired time
 DURABLE_PATH=Path(__file__).resolve().parents[1]/'.cache'/'crons.json'
 

@@ -112,14 +112,14 @@ def test_events_carry_session_and_agent_tags(monkeypatch):
 
 
 def test_textual_filters_events_from_other_sessions():
-    import ui_textual
+    from ui.harness_app import HarnessApp
 
-    app = ui_textual.CCApp([], session_id='s-mine')
+    app = HarnessApp([], session_id='s-mine')
     app._on_event(ui_events.UIEvent('status', {'session_id': 's-other'}))
     app._on_event(ui_events.UIEvent('status', {'session_id': 's-mine'}))
     app._on_event(ui_events.UIEvent('status', {}))   # 未打标（测试/旧事件）仍可见
 
-    assert app._event_queue.qsize() == 2
+    assert app._events.qsize() == 2
 
 
 def test_repl_renderer_skips_channels_the_repl_prints(capsys):
