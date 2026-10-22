@@ -1549,3 +1549,80 @@ def test_watch_command_updates_notice_block(monkeypatch):
                        for text in _notice_texts(app))
 
     asyncio.run(scenario())
+
+
+def test_checkpoint_gc_reports_other_sessions(tmp_path, monkeypatch):
+    import harness
+    from checkpoints import CheckpointManager
+
+    root = tmp_path / 'checkpoints'
+    store = _temp_store(tmp_path)
+    current = CheckpointManager(root, tmp_path, store.session_id, max_nodes=20)
+    other = CheckpointManager(root, tmp_path, 'other', max_nodes=20)
+    for index in range(3):
+        current.begin_turn([{'role': 'user', 'content': f'c{index}'}])
+    for index in range(2):
+        other.begin_turn([{'role': 'user', 'content': f'o{index}'}])
+    current.seal()
+    other.seal()
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', root)
+    monkeypatch.setattr(harness, 'CHECKPOINT_MAX_NODES', 20)
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.submit_text('/checkpoint-gc')
+            await pilot.pause()
+            text = app.model.snapshot()[-1].payload['text']
+            assert '当前会话无需清理' in text
+            assert '其他会话还有 2 个快照' in text
+            assert len(current.list(limit=100)) == 3
+
+    asyncio.run(scenario())
+
+
+def test_checkpoint_gc_all_previews_confirms_and_cleans(tmp_path, monkeypatch):
+    import harness
+    from checkpoints import CheckpointManager
+
+    root = tmp_path / 'checkpoints'
+    store = _temp_store(tmp_path)
+    current = CheckpointManager(root, tmp_path, store.session_id, max_nodes=2)
+    other = CheckpointManager(root, tmp_path, 'other', max_nodes=2)
+    for index in range(4):
+        current.begin_turn([{'role': 'user', 'content': f'c{index}'}])
+    for index in range(3):
+        other.begin_turn([{'role': 'user', 'content': f'o{index}'}])
+    current.seal()
+    other.seal()
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', root)
+    monkeypatch.setattr(harness, 'CHECKPOINT_MAX_NODES', 2)
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.submit_text('/checkpoint-gc --all')
+            await pilot.pause()
+            assert app.screen.query_one('#confirm-box') is not None
+            await pilot.press('n')
+            await pilot.pause()
+            assert len(current.list(limit=100)) == 4
+            assert len(other.list(limit=100)) == 3
+
+            app.submit_text('/checkpoint-gc --all')
+            await pilot.pause()
+            await pilot.press('y')
+            await pilot.pause()
+            assert len(current.list(limit=100)) == 2
+            assert len(other.list(limit=100)) == 2
+            assert '已清理 3 个快照' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text('/checkpoint-gc --all --keep')
+            await pilot.pause()
+            assert '--keep' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())

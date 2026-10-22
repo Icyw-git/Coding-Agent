@@ -1130,14 +1130,8 @@ class HarnessApp(App):
                 self._notice('当前任务尚未结束，请结束后再清理快照。')
             elif not self._store:
                 self._notice('No session context.', level='error')
-            elif argument:
-                self._notice('/checkpoint-gc 不接受参数。', level='error')
             else:
-                try:
-                    removed = harness.get_checkpoint_manager(self._store).gc()
-                    self._notice(f'已清理 {len(removed)} 个旧快照。' if removed else '无需清理快照。')
-                except Exception as exc:
-                    self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
+                self.start_checkpoint_gc(argument)
         elif verb == 'rewind':
             self.start_rewind(argument)
         elif verb == 'undo':
@@ -1773,6 +1767,47 @@ class HarnessApp(App):
             self._notice(f'Created checkpoint {cp_id}. Use /rewind head to restore.')
         except Exception as exc:
             self._notice(f'Checkpoint failed: {exc}', level='error')
+
+    def start_checkpoint_gc(self, argument: str) -> None:
+        """`/checkpoint-gc [--all] [--keep N]`：当前会话直接回收，全局先确认。"""
+        import harness
+        try:
+            manager = harness.get_checkpoint_manager(self._store)
+            preview = harness.checkpoint_gc_preview(manager, argument)
+        except ValueError as exc:
+            self._notice(str(exc), level='error')
+            return
+        except Exception as exc:
+            self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
+            return
+        summary = harness.format_checkpoint_gc(preview)
+        if not preview['removed']:
+            self._notice(summary)
+            return
+        if preview['mode'] != 'all':
+            self._finish_checkpoint_gc(argument)
+            return
+        self.push_screen(
+            ConfirmModal('Clean old checkpoints?', summary, 'Clean'),
+            partial(self._confirm_checkpoint_gc, argument=argument))
+
+    def _confirm_checkpoint_gc(self, confirmed, argument: str) -> None:
+        if not confirmed:
+            self._notice('已取消，未删除任何快照。')
+            return
+        if self._busy:
+            self._notice('当前任务尚未结束，请结束后再清理快照。')
+            return
+        self._finish_checkpoint_gc(argument)
+
+    def _finish_checkpoint_gc(self, argument: str) -> None:
+        import harness
+        try:
+            result = harness.checkpoint_gc_execute(
+                harness.get_checkpoint_manager(self._store), argument)
+            self._notice(harness.format_checkpoint_gc(result, done=True))
+        except Exception as exc:
+            self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
 
     def start_rewind(self, argument: str) -> None:
         """`/rewind`：先预览，再确认；`--yes` 跳过确认，`/undo` 即 last --yes。"""

@@ -72,6 +72,9 @@
   此时提交的消息排入 follow-up，操作成功或失败后继续处理。已切换会话的后台
   搜索/清理结果不再弹出旧选择器。确认报告可滚动；目录候选只回填，避免提前切换。
   新增真实文件回滚、冲突拒绝、强制恢复与 rewind 事件持久化回归测试。
+- P6e：`/checkpoint-gc` 默认清理当前会话并提示其他会话待清理量；`--all` 先预览、
+  确认后按每会话保留上限清理所有会话，`--keep N` 覆盖默认 20；行式 REPL 与 TUI 共用
+  `checkpoints.gc_plan/gc_all_checkpoints`，dry-run 不落盘。
 - P6d 队列交互：按用户反馈把 Enter 与 Alt+Enter 对调——Enter 忙时进入下回合队列，
   Alt+Enter 立即进入当前回合 steering（空闲时两者都直接发送）。Ctrl+G/Alt+↑/`/dequeue`
   改为队列选择器：↑↓ 选择、Enter 取回单条、Ctrl+R 取回全部、Delete/Ctrl+D 删除选中项

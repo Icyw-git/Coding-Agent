@@ -525,7 +525,9 @@ workspace-write 之间切换执行档位。
 `/checkpoint [标签]`、
 `/checkpoints`、`/rewind`、`/undo` 已接入新 TUI：`/rewind` 先显示文件/会话预览，
 确认弹窗按 `y`/Enter 才执行，`n`/Esc 不产生改动；`/undo` 等价于
-`/rewind last --yes`。`/checkpoint-gc` 清理旧快照。TUI 的
+`/rewind last --yes`。`/checkpoint-gc` 默认只清理当前会话超过保留上限（20）的旧快照，
+其余会话的待清理数量会一并提示；`/checkpoint-gc --all` 先预览再确认清理所有会话，
+`--keep N` 覆盖每个会话的保留数量。TUI 的
 `/sessions` 打开会话选择器（搜索标题/工作区/ID，`↑↓` 选择、`Enter` 恢复、
 `Esc` 取消），`/resume <序号|ID前缀|标题>` 直接恢复，两者都使用会话事件流
 （与行式 `/resume` 同一份数据）。`/find <关键词>` 在后台跨会话搜索，命中后弹出

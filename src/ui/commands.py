@@ -66,6 +66,12 @@ def _model_arguments(prefix: str) -> list[tuple[str, str]]:
     return items
 
 
+def _checkpoint_gc_arguments(prefix: str) -> list[tuple[str, str]]:
+    items = [('--all', '--all  清理所有会话的旧快照'),
+             ('--keep ', '--keep N  覆盖每个会话的保留数量')]
+    needle = (prefix or '').strip().casefold()
+    return [item for item in items if item[0].casefold().startswith(needle)]
+
 def _tool_arguments(prefix: str) -> list[tuple[str, str]]:
     try:
         import harness
@@ -263,7 +269,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
                 argument_completions=_sandbox_arguments),
     CommandSpec('checkpoint', '创建快照', '[标签]', ('cp',)),
     CommandSpec('checkpoints', '列出当前会话快照', aliases=('cps',)),
-    CommandSpec('checkpoint-gc', '清理旧快照'),
+    CommandSpec('checkpoint-gc', '清理旧快照', '[--all] [--keep N]',
+                argument_completions=_checkpoint_gc_arguments),
     CommandSpec('rewind', '回溯快照', '[ID|last|head] [--force] [--session] [--yes]'),
     CommandSpec('undo', '撤销最近一回合'),
     CommandSpec('fork', '从用户消息分叉', '[事件序号]'),

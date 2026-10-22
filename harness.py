@@ -1295,6 +1295,129 @@ def format_checkpoint_list(manager)->str:
     return '\n'.join(lines)
 
 
+def parse_checkpoint_gc(argument: str) -> tuple[bool, int]:
+    """解析 `/checkpoint-gc [--all] [--keep N]`，返回 (all, keep)。"""
+    all_sessions = False
+    keep = CHECKPOINT_MAX_NODES
+    tokens = (argument or '').split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--all':
+            all_sessions = True
+        elif token == '--keep':
+            index += 1
+            if index >= len(tokens):
+                raise ValueError('--keep 需要一个正整数')
+            token = tokens[index]
+            if not token.isdigit() or not 1 <= int(token) <= 10_000:
+                raise ValueError('--keep 需要 1～10000 之间的整数')
+            keep = int(token)
+        elif token.startswith('--keep='):
+            value = token.split('=', 1)[1]
+            if not value.isdigit() or not 1 <= int(value) <= 10_000:
+                raise ValueError('--keep 需要 1～10000 之间的整数')
+            keep = int(value)
+        else:
+            raise ValueError('用法：/checkpoint-gc [--all] [--keep N]')
+        index += 1
+    return all_sessions, keep
+
+
+def checkpoint_gc_preview(manager, argument: str) -> dict:
+    """只读预览；TUI 先弹确认，行式 REPL 打印后再执行。"""
+    all_sessions, keep = parse_checkpoint_gc(argument)
+    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
+    current_id = manager.session_id
+    current_nodes = counts.get(current_id, 0)
+    other_nodes = sum(count for session, count in counts.items()
+                      if session != current_id)
+    if all_sessions:
+        summary = checkpoints.gc_all_checkpoints(
+            CHECKPOINT_DIR, max_nodes=keep,
+            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=True)
+        summary.update({'mode': 'all', 'keep': keep,
+                        'current_nodes': current_nodes,
+                        'other_nodes': other_nodes,
+                        'sessions_total': len(counts)})
+        return summary
+
+    plan = manager.gc_plan(max_nodes=keep)
+    size = sum(item['bytes'] for item in plan)
+    return {
+        'mode': 'current', 'keep': keep, 'dry_run': True,
+        'removed': len(plan), 'bytes': size,
+        'details': [{'session_id': current_id, 'removed': len(plan),
+                     'bytes': size}] if plan else [],
+        'current_nodes': current_nodes, 'other_nodes': other_nodes,
+        'sessions_total': len(counts),
+    }
+
+
+def checkpoint_gc_execute(manager, argument: str) -> dict:
+    """执行已确认的回收；返回与预览同形的统计。调用方负责先预览。"""
+    all_sessions, keep = parse_checkpoint_gc(argument)
+    if all_sessions:
+        summary = checkpoints.gc_all_checkpoints(
+            CHECKPOINT_DIR, max_nodes=keep,
+            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=False)
+        summary.update({'mode': 'all', 'keep': keep,
+                        'sessions_total': summary.get('sessions', 0)})
+        return summary
+
+    current_id = manager.session_id
+    plan = manager.gc_plan(max_nodes=keep)
+    removed = manager.gc(max_nodes=keep)
+    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
+    other_nodes = sum(count for session, count in counts.items()
+                      if session != current_id)
+    size = sum(item['bytes'] for item in plan)
+    return {
+        'mode': 'current', 'keep': keep, 'dry_run': False,
+        'removed': len(removed), 'bytes': size,
+        'details': [{'session_id': current_id,
+                     'removed': len(removed), 'bytes': size}] if removed else [],
+        'current_nodes': counts.get(current_id, 0),
+        'other_nodes': other_nodes, 'sessions_total': len(counts),
+    }
+
+
+def format_checkpoint_gc(summary: dict, *, done: bool = False) -> str:
+    """把预览/执行结果格式化成 TUI 通知和行式 REPL 共用的一段文字。"""
+    keep = summary.get('keep', CHECKPOINT_MAX_NODES)
+    removed = summary.get('removed', 0)
+    size = tool_cache.human_size(summary.get('bytes', 0))
+    mode = summary.get('mode', 'current')
+    if mode == 'all':
+        sessions_total = summary.get('sessions_total', summary.get('sessions', 0))
+        scope = (f"所有 {sessions_total} 个会话" if sessions_total
+                 else '所有会话')
+    else:
+        scope = '当前会话'
+    if removed:
+        prefix = '已清理' if done else '可清理'
+        lines = [f'  {prefix} {removed} 个快照（约 {size}）。']
+        if mode == 'all':
+            sessions = summary.get('sessions', 0)
+            affected = len(summary.get('details', [])) or sessions
+            total = summary.get('sessions_total', sessions)
+            lines.append(f'  涉及 {affected}/{total} 个会话；'
+                         f'每个会话保留最新 {keep} 个、head 与带标签快照。')
+        else:
+            current_nodes = summary.get('current_nodes', 0)
+            lines.append(f'  当前会话共 {current_nodes} 个快照，保留上限 {keep}。')
+        if not done:
+            lines.append('  删除后旧快照不可恢复。')
+    else:
+        lines = [f'  {scope}无需清理：没有超过保留上限 {keep} 的可回收快照。']
+    if mode == 'current' and summary.get('other_nodes'):
+        other_nodes = summary['other_nodes']
+        lines.append(f'  其他会话还有 {other_nodes} 个快照；'
+                     '/checkpoint-gc --all 可统一清理。')
+    return '\n'.join(lines)
+
+
+
 def format_restore_report(plan:dict)->str:
     scope = '仅会话' if plan.get('scope') == 'session' else '会话与文件'
     lines = [f"  回溯预览：{plan.get('label') or plan['cp_id']} · {scope}"]
@@ -1558,8 +1681,19 @@ def handle_command(line:str,messages:list,session_store)->None:
                          force=force,scope=scope,report=False)
 
     elif command=='/checkpoint-gc':
-        removed=manager.gc()
-        print(f"  已清理 {len(removed)} 个旧快照。" if removed else '  无需清理快照。')
+        try:
+            preview = checkpoint_gc_preview(manager, argument)
+        except ValueError as exc:
+            print(f'  {exc}')
+            return
+        print(format_checkpoint_gc(preview))
+        if not preview['removed']:
+            return
+        if preview['mode'] == 'all' and not _confirm('确认清理这些旧快照？'):
+            print('  已取消，未删除任何快照。')
+            return
+        result = checkpoint_gc_execute(manager, argument)
+        print(format_checkpoint_gc(result, done=True))
 
     else:
         print(f"  unknown command: {command}")

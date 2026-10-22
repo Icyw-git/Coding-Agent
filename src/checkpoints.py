@@ -40,6 +40,66 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _tree_bytes(path: Path) -> int:
+    """节点目录占用的字节数；删除预览和回收统计共用。"""
+    try:
+        return sum(item.stat().st_size for item in path.rglob('*')
+                   if item.is_file())
+    except OSError:
+        return 0
+
+
+def _session_dirs(base_dir) -> list[Path]:
+    base = Path(base_dir)
+    if not base.is_dir():
+        return []
+    return sorted(entry for entry in base.iterdir()
+                  if entry.is_dir() and (entry / 'index.jsonl').is_file())
+
+
+def checkpoint_counts(base_dir) -> dict[str, int]:
+    """每个会话仍有效的节点数；用于区分“当前会话无需清理”和全局未处理量。"""
+    counts = {}
+    for entry in _session_dirs(base_dir):
+        manager = CheckpointManager(base_dir, entry, entry.name)
+        counts[entry.name] = len(manager.list(limit=10_000))
+    return counts
+
+
+def gc_all_checkpoints(base_dir, *, max_nodes: int = 20,
+                       keep_labeled: bool = True,
+                       dry_run: bool = True) -> dict:
+    """按每个会话自己的保留策略回收旧节点；dry_run 只返回计划。
+
+    全局清理不会删除会话事件流，只删 checkpoint 节点及其 pre-image；
+    这是不可逆的，调用方必须在 dry_run 后取得用户确认。
+    """
+    keep = max(1, int(max_nodes))
+    summary = {'sessions': 0, 'nodes': 0, 'removed': 0, 'bytes': 0,
+               'details': [], 'dry_run': bool(dry_run)}
+    for entry in _session_dirs(base_dir):
+        manager = CheckpointManager(base_dir, entry, entry.name,
+                                    max_nodes=keep,
+                                    keep_labeled=keep_labeled)
+        rows = manager.list(limit=10_000)
+        plan = manager.gc_plan()
+        summary['sessions'] += 1
+        summary['nodes'] += len(rows)
+        if not plan:
+            continue
+        summary['removed'] += len(plan)
+        summary['bytes'] += sum(item['bytes'] for item in plan)
+        summary['details'].append({
+            'session_id': entry.name,
+            'nodes': len(rows),
+            'removed': len(plan),
+            'bytes': sum(item['bytes'] for item in plan),
+        })
+        if not dry_run:
+            manager.gc()
+    return summary
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     with perf_segment('cp.write'):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -566,21 +626,37 @@ class CheckpointManager:
 
     # ---------- 保留策略 ----------
 
-    def gc(self) -> list[str]:
+    def gc_plan(self, max_nodes: int | None = None) -> list[dict]:
+        """列出会被 gc 删除的节点（最旧优先），不改动磁盘。"""
+        limit = self.max_nodes if max_nodes is None else max(1, int(max_nodes))
+        rows = self.list(limit=10_000)
+        head = self.head()
+        removals = []
+        remaining = len(rows)
+        for row in reversed(rows):  # 最旧优先
+            if remaining <= limit:
+                break
+            cp_id = row['cp_id']
+            if cp_id == head or (self.keep_labeled and row.get('label')):
+                continue
+            removals.append({
+                'session_id': self.session_id,
+                'cp_id': cp_id,
+                'label': row.get('label', ''),
+                'bytes': _tree_bytes(self._node_dir(cp_id)),
+            })
+            remaining -= 1
+        return removals
+
+    def gc(self, max_nodes: int | None = None) -> list[str]:
         """删除最旧的、非 head、非 label 的节点；返回被删 cp_id。
 
         注意：删除会切断更早节点的回溯链，之后回滚到被回收节点之前的节点时，
         文件侧退化为「只用目标节点自己的 pre-image」（见设计文档 §12.8）。
         """
-        rows = self.list(limit=10_000)
-        head = self.head()
         removed = []
-        for row in reversed(rows):  # 最旧优先
-            if len(rows) - len(removed) <= self.max_nodes:
-                break
-            cp_id = row['cp_id']
-            if cp_id == head or (self.keep_labeled and row.get('label')):
-                continue
+        for item in self.gc_plan(max_nodes):
+            cp_id = item['cp_id']
             shutil.rmtree(self._node_dir(cp_id), ignore_errors=True)
             self._append_index({'cp_id': cp_id, 'gc': True, 'gc_at': time.time()})
             removed.append(cp_id)

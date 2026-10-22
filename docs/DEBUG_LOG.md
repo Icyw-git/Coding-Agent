@@ -3324,3 +3324,33 @@ non-whitespace chars，使用 Unicode isspace 排除空白，复制内容保留�
 完整 UI 回归 188 passed；全量 1214 passed / 1 skipped（主机不支持 symlink），
 5 条 warning 均为飞书 SDK 弃用提示；增量 Ruff 通过。
 真实终端中的 Ctrl+G、Delete 与 Alt+Enter 仍需按验收表检查。
+
+## checkpoint-gc 全局回收与试运行
+
+用户反馈 `/checkpoint-gc` 显示“无需清理”。检查后确认不是删除失败：`gc()` 只扫描
+当前会话目录，且只在节点数超过 `CHECKPOINT_MAX_NODES=20` 时删除最旧的非 head、
+非 label 节点；本机 `.cache/checkpoints` 实际有 21 个会话、1243 个节点，旧会话
+从未被这条命令覆盖。当前会话不足 20 个节点时提示“无需清理”是正确的，但缺少
+“其他会话还有多少”的上下文。
+
+实现调整：
+
+- `CheckpointManager.gc_plan()` 只计算计划并给出节点体积，`gc()` 复用计划删除；
+  `gc(max_nodes=N)` 允许命令层覆盖保留上限，不改变 manager 的长期配置。
+- `checkpoints.gc_all_checkpoints(dry_run=True)` 遍历每个会话目录，按同样的
+  head/label 规则试运行，返回会话数、节点数、待删数量、释放字节和明细；
+  `dry_run=False` 才真正删除。`checkpoint_counts()` 用于报告其他会话存量。
+- `/checkpoint-gc` 默认只处理当前会话，并提示其他会话待清理量；
+  `/checkpoint-gc --all` 先展示预览，TUI 弹 `ConfirmModal`、行式 REPL 用 `_confirm`，
+  确认后才执行；`--keep N` 覆盖每会话保留上限。命令参数校验同步到
+  `cli_commands` 与 TUI 命令元数据。
+- 不做隐式自动清理；删除旧 checkpoint 会切断旧回溯链，必须由用户确认。
+
+本机只读 dry-run：21 个会话、1243 个节点，按每会话保留 20 个可回收 931 个
+（约 92.99MB），其中 12 个会话有可回收项，耗时约 1 秒。没有执行删除。
+
+新增测试：`gc_plan` 不改盘、全局 dry-run/执行、跨会话按保留上限、label 保留、
+`--keep` 解析与错误、TUI `--all` 取消/确认/校验、格式化中的其他会话提示。
+验证：checkpoint/TUI/生命周期/命令/补全定向 134 passed；随后 checkpoint 45 passed
+（含行式 REPL 的 --all 取消/确认）；全量 1220 passed / 1 skipped，5 条 warning
+均为飞书 SDK 弃用提示；增量 Ruff 通过。
