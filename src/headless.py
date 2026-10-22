@@ -1,17 +1,16 @@
-"""One-shot headless execution with an optional JSONL event stream.
+"""一次性无头执行，可选 JSONL 事件流。
 
-The transport contract is intentionally narrow: stdout carries only the final
-answer (plain mode) or JSON Lines (``--json``); every diagnostic, hook log and
-tool banner is redirected to stderr. No cron/queue threads or post-turn
-housekeeping are started, so the process exits as soon as the turn finishes.
+传输契约刻意收窄：stdout 只放最终答案（plain 模式）或 JSON Lines（``--json``），
+诊断、hook 日志和工具横幅全部改道 stderr。这里不启动 cron/队列线程，也不做
+回合后 housekeeping，所以回合结束进程即可退出。
 
-JSONL events emitted by this module (all objects have ``type``):
+本模块发出的 JSONL 事件（每个对象都有 ``type``）：
     session         session_id / workspace / resumed
     turn.started
     tool.started    name / call_id / arguments
     tool.completed  name / call_id / status / output / images
-    delta           text  (assistant streaming chunks)
-    message         content  (the final assistant answer)
+    delta           text（assistant 流式片段）
+    message         content（最终 assistant 回答）
     turn.completed  session_id / content / usage / files_changed
     error           code / message
 """
@@ -35,7 +34,7 @@ EXIT_INTERRUPT = 130
 
 
 class HeadlessError(Exception):
-    """A usage/config problem that should exit with a specific status."""
+    """用法/配置错误，按指定的退出码结束进程。"""
 
     def __init__(self, message: str, exit_code: int = EXIT_USAGE) -> None:
         super().__init__(message)
@@ -43,7 +42,7 @@ class HeadlessError(Exception):
 
 
 class JsonlEmitter:
-    """Thread-safe JSONL writer; tool batches may emit from worker threads."""
+    """线程安全的 JSONL 写入器；工具批次可能从工作线程发事件。"""
 
     def __init__(self, stream, enabled: bool) -> None:
         self._stream = stream
@@ -56,23 +55,20 @@ class JsonlEmitter:
         event = {'type': event_type}
         if payload:
             event.update(payload)
-        line = json.dumps(event, ensure_ascii=False, separators=(',', ':'),
-                          default=str)
+        line = json.dumps(event, ensure_ascii=False, separators=(',', ':'), default=str)
         with self._lock:
             self._stream.write(line + '\n')
             self._stream.flush()
 
 
 def resolve_prompt(prompt: str | None, stdin=None) -> str:
-    """Take the prompt from argv, ``-``, or piped stdin; never block on a TTY."""
+    """从 argv、``-`` 或管道 stdin 取提示词；TTY 上绝不阻塞等待。"""
     source = stdin if stdin is not None else sys.stdin
     if prompt == '-':
         prompt = source.read() if source is not None else ''
     elif prompt is None:
         if source is None or getattr(source, 'isatty', lambda: False)():
-            raise HeadlessError(
-                'a prompt is required: pass it as an argument, use -p, '
-                'or pipe it on stdin')
+            raise HeadlessError('a prompt is required: pass it as an argument, use -p, or pipe it on stdin')
         prompt = source.read()
     text = str(prompt or '').strip()
     if not text:
@@ -80,9 +76,8 @@ def resolve_prompt(prompt: str | None, stdin=None) -> str:
     return text
 
 
-def _prepare_session(runtime, session_id: str | None,
-                     workspace: str | None) -> tuple[str, bool]:
-    """Resume when the session exists, otherwise create it with that ID."""
+def _prepare_session(runtime, session_id: str | None, workspace: str | None) -> tuple[str, bool]:
+    """会话已存在则恢复，否则用该 ID 新建。"""
     workspace_path = None
     if workspace is not None:
         candidate = Path(workspace).expanduser()
@@ -110,11 +105,10 @@ def _prepare_session(runtime, session_id: str | None,
 
 
 def _image_attachments(paths, workspace: Path) -> list[dict]:
-    """Load explicit --image files through the same gate as view_image.
+    """显式 --image 文件走与 view_image 相同的闸门。
 
-    Only cached references enter the session; expand_image_parts later turns
-    them into data URIs for the provider. A denied/invalid image aborts before
-    the turn so the model cannot silently answer without the requested input.
+    只把缓存引用写进会话，稍后由 expand_image_parts 转成 provider 的 data URI。
+    被拒或无效的图片在回合开始前就失败，避免模型悄悄跳过用户要求的输入。
     """
     attachments: list[dict] = []
     if not paths:
@@ -129,8 +123,7 @@ def _image_attachments(paths, workspace: Path) -> list[dict]:
             # 显式图片也走工作区边界：无头进程没有交互审批可等，越界请求
             # 若交给策略层排队只会挂到超时，这里直接快速失败。
             if not candidate.is_relative_to(workspace):
-                raise HeadlessError(
-                    f'cannot attach image {raw}: outside the workspace {workspace}')
+                raise HeadlessError(f'cannot attach image {raw}: outside the workspace {workspace}')
             result = tools.run_view_image(str(candidate))
             if isinstance(result, str):
                 raise HeadlessError(f'cannot attach image {raw}: {result}')
@@ -139,9 +132,8 @@ def _image_attachments(paths, workspace: Path) -> list[dict]:
 
 
 def _turn_metadata(store, prior_seq: int) -> tuple[dict, list[dict]]:
-    """Aggregate usage/files_changed events written by this turn."""
-    usage = {'prompt': 0, 'completion': 0, 'cached': 0, 'total': 0,
-             'calls': 0, 'cached_seen': False}
+    """汇总本回合写入的 usage / files_changed 事件。"""
+    usage = {'prompt': 0, 'completion': 0, 'cached': 0, 'total': 0, 'calls': 0, 'cached_seen': False}
     files: list[dict] = []
     model = ''
     for event in store.read_events():
@@ -170,16 +162,15 @@ def _run(args, runtime, stdout, emitter: JsonlEmitter) -> int:
     session_id, resumed = _prepare_session(runtime, args.session, args.workspace)
     workspace = Path(runtime.get_workspace(session_id))
     attachments = _image_attachments(args.image or (), workspace)
-    emitter.emit('session', {'session_id': session_id,
-                             'workspace': str(workspace),
-                             'resumed': resumed})
+    emitter.emit('session', {'session_id': session_id, 'workspace': str(workspace), 'resumed': resumed})
     emitter.emit('turn.started', {'session_id': session_id})
     store = runtime.open_session(session_id)
     prior_seq = store.last_seq
     on_delta = (lambda text: emitter.emit('delta', {'text': text})) if args.json else None
     on_event = (lambda kind, payload: emitter.emit(kind, payload)) if args.json else None
     result = runtime.send(
-        session_id, prompt,
+        session_id,
+        prompt,
         on_delta=on_delta,
         attachments=attachments or None,
         on_event=on_event,
@@ -188,12 +179,15 @@ def _run(args, runtime, stdout, emitter: JsonlEmitter) -> int:
     usage, files = _turn_metadata(store, prior_seq)
     if args.json:
         emitter.emit('message', {'content': result.content})
-        emitter.emit('turn.completed', {
-            'session_id': session_id,
-            'content': result.content,
-            'usage': usage,
-            'files_changed': files,
-        })
+        emitter.emit(
+            'turn.completed',
+            {
+                'session_id': session_id,
+                'content': result.content,
+                'usage': usage,
+                'files_changed': files,
+            },
+        )
     else:
         stdout.write(result.content or '')
         stdout.write('\n')
@@ -202,10 +196,10 @@ def _run(args, runtime, stdout, emitter: JsonlEmitter) -> int:
 
 
 def run(args, *, runtime=None, stdout=None, stderr=None) -> int:
-    """Execute one headless turn; returns a process exit code.
+    """执行一个无头回合，返回进程退出码。
 
-    ``args`` needs ``prompt``, ``session``, ``workspace``, ``image`` and
-    ``json`` attributes (the entrypoint parser supplies them).
+    ``args`` 需要 ``prompt``、``session``、``workspace``、``image`` 与 ``json``
+    属性（由入口解析器提供）。
     """
     real_stdout = stdout if stdout is not None else sys.stdout
     error_stream = stderr if stderr is not None else sys.stderr

@@ -7,6 +7,7 @@
 注入，harness / 网关 / SDK 各自负责采集。这样它可以独立导入和测试，也不会
 把 CLI 的全局变量带进其他入口；`_prompt_cache` 是模块自身的执行上下文缓存。
 """
+
 from __future__ import annotations
 
 import json
@@ -23,16 +24,16 @@ def project_prompt_section(workspace) -> str:
     return project_context.format_project_instructions(instructions)
 
 
-PROMPT_SECTIONS={
-    'identity_main':(
+PROMPT_SECTIONS = {
+    'identity_main': (
         'You are a coding agent working on Windows at {workdir}. '
         'Use the bash tool to execute shell commands (Windows cmd syntax works, e.g. dir instead of ls). '
     ),
-    'identity_sub':(
+    'identity_sub': (
         'You are a focused sub-agent working at {workdir} on behalf of a parent agent. '
         'Complete the task you are given and return a concise final answer to the parent agent. '
     ),
-    'rules_main':(
+    'rules_main': (
         'Rules: '
         '(1) If the user denies or rejects an operation, STOP permanently. Do NOT retry it and do NOT find alternative '
         'commands or workarounds (del/rm/Remove-Item/powershell/etc.) to achieve the same result. '
@@ -51,7 +52,7 @@ PROMPT_SECTIONS={
         'one per turn — they will run in parallel. Calls whose input depends on an earlier result '
         'must stay sequential. '
     ),
-    'rules_sub':(
+    'rules_sub': (
         'Rules: '
         '(1) Stay strictly within the workspace; use only relative paths under {workdir}. '
         '(2) Prefer safe commands (dir, type, findstr) and the read/glob tools for inspection. '
@@ -64,9 +65,8 @@ PROMPT_SECTIONS={
         '(6) Keep the final answer short and structured: what you did, what you found, any issues. '
         'Do not re-plan the parent task and do not spawn further sub-agents. '
     ),
-    'skills_usage':(
-        'Skills available:\n{catalog}\n'
-        'Use load_skill to load a skill. E.g. load_skill("file-summarizer")'
+    'skills_usage': (
+        'Skills available:\n{catalog}\nUse load_skill to load a skill. E.g. load_skill("file-summarizer")'
     ),
 }
 
@@ -98,8 +98,7 @@ def get_system_prompt(context: dict) -> str:
     cached = _prompt_cache.get()
     if cached is not None and cached[0] == key:
         if os.getenv('HARNESS_DEBUG') == '1':
-            print("  \033[90m[cache hit] system prompt unchanged\033[0m",
-                  file=sys.stderr)
+            print('  \033[90m[cache hit] system prompt unchanged\033[0m', file=sys.stderr)
         return cached[1]
     prompt = assemble_system_prompt(context)
     _prompt_cache.set((key, prompt))
@@ -109,8 +108,7 @@ def get_system_prompt(context: dict) -> str:
     if context.get('project_instructions'):
         loaded.append('project')
     if os.getenv('HARNESS_DEBUG') == '1':
-        print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m",
-              file=sys.stderr)
+        print(f'  \033[32m[assembled] sections: {", ".join(loaded)}\033[0m', file=sys.stderr)
     return prompt
 
 
@@ -129,8 +127,7 @@ def collect_context(*, workdir, tool_names, skills) -> dict:
 
 def build_system(*, workdir, tool_names, skills) -> str:
     """返回完整的 system prompt（外部调用 / 调试用）。"""
-    return assemble_system_prompt(
-        collect_context(workdir=workdir, tool_names=tool_names, skills=skills))
+    return assemble_system_prompt(collect_context(workdir=workdir, tool_names=tool_names, skills=skills))
 
 
 def build_sub_system(*, workdir, skills) -> str:
@@ -142,6 +139,5 @@ def build_sub_system(*, workdir, skills) -> str:
     project = project_prompt_section(workdir)
     if project:
         sections.append(project)
-    sections.append(
-        PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
+    sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
     return '\n\n'.join(sections)

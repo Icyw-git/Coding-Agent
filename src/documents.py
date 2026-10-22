@@ -7,6 +7,7 @@
 - 输出有字符预算；读取方（工具层）还会做入口截断与落盘，两层职责不混。
 - 所有 zip 成员读取都设上限，避免文档炸弹把内存/上下文撑爆。
 """
+
 from __future__ import annotations
 
 import io
@@ -32,8 +33,7 @@ _A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 _X = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 _R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
-_DATE_FORMAT_IDS = (set(range(14, 23)) | set(range(27, 37))
-                    | {45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58})
+_DATE_FORMAT_IDS = set(range(14, 23)) | set(range(27, 37)) | {45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58}
 
 
 class DocumentError(ValueError):
@@ -69,7 +69,7 @@ def detect_kind(data: bytes) -> str | None:
     if data.startswith(b'%PDF-'):
         return 'pdf'
     if data.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'):
-        return 'ole'   # 旧版 .doc/.xls/.ppt 的 OLE 复合文档
+        return 'ole'  # 旧版 .doc/.xls/.ppt 的 OLE 复合文档
     if not data.startswith(b'PK\x03\x04'):
         return None
     try:
@@ -118,8 +118,7 @@ def _xml(data: bytes, part: str) -> ET.Element:
 
 def _clean_text(text: str) -> str:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    text = ''.join(ch for ch in text
-                   if ch in '\n\t' or ord(ch) >= 32)
+    text = ''.join(ch for ch in text if ch in '\n\t' or ord(ch) >= 32)
     text = '\n'.join(line.rstrip() for line in text.split('\n'))
     return re.sub(r'\n{3,}', '\n\n', text).strip()
 
@@ -127,8 +126,7 @@ def _clean_text(text: str) -> str:
 def _clip(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
-    return (text[:MAX_OUTPUT_CHARS].rstrip()
-            + '\n... [output truncated; narrow the page/sheet selection]')
+    return text[:MAX_OUTPUT_CHARS].rstrip() + '\n... [output truncated; narrow the page/sheet selection]'
 
 
 def _parse_pages(spec, total: int, *, label: str = 'page') -> tuple[list[int], bool]:
@@ -160,8 +158,7 @@ def _parse_pages(spec, total: int, *, label: str = 'page') -> tuple[list[int], b
             elif token.isdigit():
                 start = end = int(token)
             else:
-                raise DocumentError(
-                    f'invalid {label} selection: {token!r} (use e.g. 1-5,8)')
+                raise DocumentError(f'invalid {label} selection: {token!r} (use e.g. 1-5,8)')
             if start < 1 or end < 1:
                 raise DocumentError(f'{label} numbers are 1-based: {token!r}')
             if start > total:
@@ -177,8 +174,7 @@ def _parse_pages(spec, total: int, *, label: str = 'page') -> tuple[list[int], b
     return selected[:MAX_SELECTED_PAGES], truncated
 
 
-def _header(kind: str, filename: str, summary: str, body: str,
-            notes: list[str] | None = None) -> str:
+def _header(kind: str, filename: str, summary: str, body: str, notes: list[str] | None = None) -> str:
     head = f'{kind}: {filename} · {summary} · {len(body)} chars'
     if notes:
         head += '\n' + ' '.join(note for note in notes if note)
@@ -190,8 +186,8 @@ def _pdf_text(data: bytes, filename: str, pages) -> str:
         from pypdf import PdfReader
     except ImportError as exc:
         raise DocumentError(
-            'PDF extraction requires pypdf; install it with '
-            '`pip install -r requirements-docs.txt`') from exc
+            'PDF extraction requires pypdf; install it with `pip install -r requirements-docs.txt`'
+        ) from exc
     try:
         reader = PdfReader(io.BytesIO(data))
         if reader.is_encrypted:
@@ -224,14 +220,18 @@ def _pdf_text(data: bytes, filename: str, pages) -> str:
     notes = []
     if default_selection:
         if total > len(selected):
-            notes.append(f'only the first {len(selected)} of {total} pages are included; '
-                         f'use pages={len(selected) + 1}-{min(total, len(selected) * 2)} '
-                         'for the rest.')
+            notes.append(
+                f'only the first {len(selected)} of {total} pages are included; '
+                f'use pages={len(selected) + 1}-{min(total, len(selected) * 2)} '
+                'for the rest.'
+            )
     elif clipped:
         notes.append(f'only the first {len(selected)} selected pages are included.')
     if selected and empty == len(selected):
-        notes.append('no text layer found; this may be a scanned PDF. '
-                     'pypdf cannot OCR - convert/render pages to images and use view_image.')
+        notes.append(
+            'no text layer found; this may be a scanned PDF. '
+            'pypdf cannot OCR - convert/render pages to images and use view_image.'
+        )
     summary = f'{total} pages · extracted {len(selected)} page(s)'
     return _header('PDF', filename, summary, body, notes)
 
@@ -264,8 +264,7 @@ def _docx_style_names(archive: zipfile.ZipFile) -> dict[str, str]:
     return names
 
 
-def _docx_paragraph_prefix(paragraph: ET.Element,
-                           style_names: dict[str, str]) -> str:
+def _docx_paragraph_prefix(paragraph: ET.Element, style_names: dict[str, str]) -> str:
     properties = paragraph.find(_w('pPr'))
     if properties is None:
         return ''
@@ -310,8 +309,7 @@ def _docx_table(table: ET.Element) -> tuple[list[str], bool]:
 def _docx_text(data: bytes, filename: str) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            root = _xml(_read_member(archive, 'word/document.xml'),
-                        'word/document.xml')
+            root = _xml(_read_member(archive, 'word/document.xml'), 'word/document.xml')
             style_names = _docx_style_names(archive)
     except zipfile.BadZipFile as exc:
         raise DocumentError(f'cannot open DOCX: {exc}') from exc
@@ -375,8 +373,7 @@ def _join_zip_path(base: str, target: str) -> str:
 
 
 def _pptx_slide_paths(archive: zipfile.ZipFile) -> list[str]:
-    presentation = _xml(_read_member(archive, 'ppt/presentation.xml'),
-                        'ppt/presentation.xml')
+    presentation = _xml(_read_member(archive, 'ppt/presentation.xml'), 'ppt/presentation.xml')
     relationships = _relationships(archive, 'ppt/_rels/presentation.xml.rels')
     names = set(archive.namelist())
     paths = []
@@ -389,8 +386,9 @@ def _pptx_slide_paths(archive: zipfile.ZipFile) -> list[str]:
             paths.append(path)
     if not paths:
         pattern = re.compile(r'ppt/slides/slide(\d+)\.xml$')
-        paths = sorted((name for name in names if pattern.fullmatch(name)),
-                       key=lambda name: int(pattern.fullmatch(name).group(1)))
+        paths = sorted(
+            (name for name in names if pattern.fullmatch(name)), key=lambda name: int(pattern.fullmatch(name).group(1))
+        )
     return paths
 
 
@@ -449,19 +447,17 @@ def _pptx_slide_text(archive: zipfile.ZipFile, path: str) -> str:
         if not text:
             continue
         properties = paragraph.find(_a('pPr'))
-        bullet = (properties is not None
-                  and (properties.find(_a('buChar')) is not None
-                       or properties.find(_a('buAutoNum')) is not None))
+        bullet = properties is not None and (
+            properties.find(_a('buChar')) is not None or properties.find(_a('buAutoNum')) is not None
+        )
         blocks.append(('- ' if bullet else '') + text)
     return '\n'.join(blocks)
 
 
 def _pptx_notes(archive: zipfile.ZipFile, slide_path: str) -> str:
     base_dir = slide_path.rpartition('/')[0]
-    relationships = _relationships(
-        archive, f'{base_dir}/_rels/{slide_path.rpartition("/")[2]}.rels')
-    target = next((value for value in relationships.values()
-                   if 'notesSlide' in value), None)
+    relationships = _relationships(archive, f'{base_dir}/_rels/{slide_path.rpartition("/")[2]}.rels')
+    target = next((value for value in relationships.values() if 'notesSlide' in value), None)
     if target:
         name = _join_zip_path(base_dir, target)
     else:
@@ -476,9 +472,8 @@ def _pptx_notes(archive: zipfile.ZipFile, slide_path: str) -> str:
     lines = []
     for shape in root.iter(_p('sp')):
         placeholder = next(shape.iter(_p('ph')), None)
-        if placeholder is not None and placeholder.get('type') in (
-                'sldNum', 'sldImg', 'hdr', 'ftr', 'dt'):
-            continue   # 页码/缩略图/页眉页脚不是演讲者备注
+        if placeholder is not None and placeholder.get('type') in ('sldNum', 'sldImg', 'hdr', 'ftr', 'dt'):
+            continue  # 页码/缩略图/页眉页脚不是演讲者备注
         for paragraph in shape.iter(_a('p')):
             text = _drawing_text(paragraph)
             if not text or text.lower().startswith('click to '):
@@ -508,9 +503,11 @@ def _pptx_text(data: bytes, filename: str, pages) -> str:
     notes = []
     if pages is None or not str(pages).strip():
         if len(paths) > len(selected):
-            notes.append(f'only the first {len(selected)} of {len(paths)} slides are included; '
-                         f'use pages={len(selected) + 1}-'
-                         f'{min(len(paths), len(selected) * 2)} for the rest.')
+            notes.append(
+                f'only the first {len(selected)} of {len(paths)} slides are included; '
+                f'use pages={len(selected) + 1}-'
+                f'{min(len(paths), len(selected) * 2)} for the rest.'
+            )
     elif clipped:
         notes.append(f'only the first {len(selected)} selected slides are included.')
     summary = f'{len(paths)} slides · extracted {len(selected)}'
@@ -531,8 +528,9 @@ def _xlsx_sheets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     if sheets:
         return sheets
     pattern = re.compile(r'xl/worksheets/sheet(\d+)\.xml$')
-    paths = sorted((name for name in names if pattern.fullmatch(name)),
-                   key=lambda name: int(pattern.fullmatch(name).group(1)))
+    paths = sorted(
+        (name for name in names if pattern.fullmatch(name)), key=lambda name: int(pattern.fullmatch(name).group(1))
+    )
     return [(f'Sheet{index}', path) for index, path in enumerate(paths, 1)]
 
 
@@ -574,8 +572,7 @@ def _date_styles(archive: zipfile.ZipFile) -> list[bool]:
                 fmt_id = int(item.get('numFmtId') or 0)
             except ValueError:
                 fmt_id = 0
-            styles.append(fmt_id in _DATE_FORMAT_IDS
-                          or _is_date_format(custom.get(fmt_id, '')))
+            styles.append(fmt_id in _DATE_FORMAT_IDS or _is_date_format(custom.get(fmt_id, '')))
     return styles
 
 
@@ -601,8 +598,7 @@ def _column_index(reference: str) -> int:
     return index
 
 
-def _xlsx_cell_value(cell: ET.Element, shared: list[str],
-                     date_styles: list[bool], date1904: bool) -> str:
+def _xlsx_cell_value(cell: ET.Element, shared: list[str], date_styles: list[bool], date1904: bool) -> str:
     kind = cell.get('t') or ''
     raw = cell.find(_x('v'))
     if kind == 'inlineStr':
@@ -667,8 +663,9 @@ def _select_sheets(spec, sheets: list[tuple[str, str]]) -> tuple[list[tuple[str,
     return selected[:MAX_SELECTED_SHEETS], truncated
 
 
-def _xlsx_sheet_text(archive: zipfile.ZipFile, path: str, shared: list[str],
-                     date_styles: list[bool], date1904: bool) -> tuple[str, int, bool]:
+def _xlsx_sheet_text(
+    archive: zipfile.ZipFile, path: str, shared: list[str], date_styles: list[bool], date1904: bool
+) -> tuple[str, int, bool]:
     root = _xml(_read_member(archive, path), path)
     lines = []
     truncated = False
@@ -706,24 +703,22 @@ def _xlsx_text(data: bytes, filename: str, sheets) -> str:
             date_styles = _date_styles(archive)
             workbook = _xml(_read_member(archive, 'xl/workbook.xml'), 'xl/workbook.xml')
             properties = workbook.find(_x('workbookPr'))
-            date1904 = (properties is not None
-                        and (properties.get('date1904') or '') in ('1', 'true'))
+            date1904 = properties is not None and (properties.get('date1904') or '') in ('1', 'true')
             sections = []
             any_truncated = False
             for name, path in selected:
-                text, rows, row_truncated = _xlsx_sheet_text(
-                    archive, path, shared, date_styles, date1904)
+                text, rows, row_truncated = _xlsx_sheet_text(archive, path, shared, date_styles, date1904)
                 any_truncated = any_truncated or row_truncated
-                sections.append(f'--- sheet: {name} ({rows} rows shown) ---\n'
-                                + (text or '[empty sheet]'))
+                sections.append(f'--- sheet: {name} ({rows} rows shown) ---\n' + (text or '[empty sheet]'))
     except zipfile.BadZipFile as exc:
         raise DocumentError(f'cannot open XLSX: {exc}') from exc
     body = _clip('\n\n'.join(sections))
     notes = []
     if sheets is None or not str(sheets).strip():
         if len(all_sheets) > len(selected):
-            notes.append(f'only the first {len(selected)} of {len(all_sheets)} sheets are included; '
-                         'use sheets= to choose.')
+            notes.append(
+                f'only the first {len(selected)} of {len(all_sheets)} sheets are included; use sheets= to choose.'
+            )
     elif clipped:
         notes.append(f'only the first {len(selected)} selected sheets are included.')
     if any_truncated:
@@ -735,16 +730,14 @@ def _xlsx_text(data: bytes, filename: str, sheets) -> str:
 def extract_document(data: bytes, filename: str, *, pages=None, sheets=None) -> str:
     """识别并抽取文档文本；失败时抛出 DocumentError。"""
     if len(data) > MAX_DOC_BYTES:
-        raise DocumentError(
-            f'document is too large ({len(data)} bytes; max {MAX_DOC_BYTES})')
+        raise DocumentError(f'document is too large ({len(data)} bytes; max {MAX_DOC_BYTES})')
     kind = detect_kind(data)
     if kind is None:
-        raise DocumentError(
-            'unsupported document format (supported: PDF, DOCX, PPTX, XLSX)')
+        raise DocumentError('unsupported document format (supported: PDF, DOCX, PPTX, XLSX)')
     if kind == 'ole':
         raise DocumentError(
-            'legacy or encrypted Office binary is not supported; '
-            'save/decrypt it as PDF, DOCX, PPTX, or XLSX')
+            'legacy or encrypted Office binary is not supported; save/decrypt it as PDF, DOCX, PPTX, or XLSX'
+        )
     if kind == 'pdf':
         return _pdf_text(data, filename, pages)
     if kind == 'docx':

@@ -13,6 +13,11 @@ extend-exclude = [
     "visualizer",
 ]
 
+[format]
+# 代码库既有字符串统一用单引号；保持默认双引号会让增量 format 把每个改动文件
+# 整体重写一遍，与 ruff.toml 顶部“保护全库 blame”的约定冲突。
+quote-style = "single"
+
 [lint]
 select = [
     "E", "W", "F",                # pycodestyle / pyflakes 基线

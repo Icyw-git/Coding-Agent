@@ -1416,7 +1416,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         from cli_input import choose_cleanup_sessions
         from session_cleanup import SessionArchive, cleanup_candidates
 
-        # Finish this process's background writes before moving a session log.
+        # 先等本进程的后台写入落盘，再移动会话日志。
         wait_for_housekeeping()
         with _housekeeping_lock:
             if any(thread.is_alive() for thread in _housekeeping_threads):
@@ -2460,8 +2460,7 @@ def run_repl(initial_messages:list, session_store=None):
 
 
 if __name__ == '__main__':
-    # Keep ``python harness.py`` working while the real process entrypoint lives
-    # in a module that can be tested and reused independently.
+    # 保留 python harness.py 入口；真正的进程入口放在可测试、可独立复用的模块里。
     from entrypoint import main
 
     main()

@@ -7,6 +7,7 @@
 PDF 用 pypdfium2（PDFium，Apache-2.0）直接渲染。DOCX/PPTX 先转 PDF：优先
 LibreOffice headless（跨平台），没有则明确报错，不启动 Office 桌面程序。
 """
+
 from __future__ import annotations
 
 import io
@@ -50,9 +51,7 @@ def _select_pages(spec, total: int, label: str = 'page') -> list[int]:
         return list(range(1, min(total, DEFAULT_RENDER_PAGES) + 1))
     selected, _ = documents._parse_pages(spec, total, label=label)
     if len(selected) > MAX_RENDER_PAGES:
-        raise RenderError(
-            f'at most {MAX_RENDER_PAGES} {label}s can be rendered per call; '
-            f'got {len(selected)}')
+        raise RenderError(f'at most {MAX_RENDER_PAGES} {label}s can be rendered per call; got {len(selected)}')
     return selected
 
 
@@ -61,8 +60,8 @@ def _render_pdf(data: bytes, pages, dpi: int) -> list[tuple[int, bytes]]:
         import pypdfium2 as pdfium
     except ImportError as exc:
         raise RenderError(
-            'PDF rendering requires pypdfium2; install it with '
-            '`pip install -r requirements-docs.txt`') from exc
+            'PDF rendering requires pypdfium2; install it with `pip install -r requirements-docs.txt`'
+        ) from exc
     try:
         pdf = pdfium.PdfDocument(data)
     except Exception as exc:
@@ -85,8 +84,8 @@ def _render_pdf(data: bytes, pages, dpi: int) -> list[tuple[int, bytes]]:
                 # pypdfium2.to_pil() 才需要 Pillow；把它当成安装提示上报，
                 # 而不是让 “No module named 'PIL'” 混进通用渲染错误。
                 raise RenderError(
-                    'PDF rendering requires Pillow; install it with '
-                    '`pip install -r requirements-docs.txt`') from exc
+                    'PDF rendering requires Pillow; install it with `pip install -r requirements-docs.txt`'
+                ) from exc
             buffer = io.BytesIO()
             image.save(buffer, format='PNG', optimize=True)
             rendered.append((number, buffer.getvalue()))
@@ -108,9 +107,10 @@ def _find_soffice() -> str | None:
         if found:
             return found
     if os.name == 'nt':
-        for root in (os.environ.get('PROGRAMFILES', r'C:\Program Files'),
-                     os.environ.get('PROGRAMFILES(X86)',
-                                    r'C:\Program Files (x86)')):
+        for root in (
+            os.environ.get('PROGRAMFILES', r'C:\Program Files'),
+            os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)'),
+        ):
             candidate = Path(root) / 'LibreOffice' / 'program' / 'soffice.exe'
             if candidate.is_file():
                 return str(candidate)
@@ -125,8 +125,8 @@ def _check_no_macros(data: bytes, filename: str) -> None:
         raise RenderError(f'cannot open {filename}: {exc}') from exc
     if any(name.lower().endswith('vbaproject.bin') for name in names):
         raise RenderError(
-            'macro-enabled Office documents are not rendered; '
-            'remove macros or export the document to PDF first')
+            'macro-enabled Office documents are not rendered; remove macros or export the document to PDF first'
+        )
 
 
 def _office_to_pdf(data: bytes, suffix: str) -> bytes:
@@ -134,23 +134,33 @@ def _office_to_pdf(data: bytes, suffix: str) -> bytes:
     if not soffice:
         raise RenderError(
             'rendering DOCX/PPTX requires LibreOffice (soffice); for text only '
-            'use read_document, or export the document to PDF first')
+            'use read_document, or export the document to PDF first'
+        )
     _check_no_macros(data, suffix)
     with tempfile.TemporaryDirectory(prefix='harness-render-') as tmp:
         source = Path(tmp) / f'source{suffix}'
         source.write_bytes(data)
         profile = Path(tmp) / 'lo-profile'
         command = [
-            soffice, '--headless', '--norestore',
+            soffice,
+            '--headless',
+            '--norestore',
             f'-env:UserInstallation={profile.as_uri()}',
-            '--convert-to', 'pdf', '--outdir', tmp, str(source),
+            '--convert-to',
+            'pdf',
+            '--outdir',
+            tmp,
+            str(source),
         ]
         try:
             proc = subprocess.run(
-                command, capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=CONVERT_TIMEOUT,
-                creationflags=(subprocess.CREATE_NO_WINDOW
-                               if os.name == 'nt' else 0),
+                command,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=CONVERT_TIMEOUT,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RenderError(f'LibreOffice conversion failed: {exc}') from exc
@@ -158,16 +168,15 @@ def _office_to_pdf(data: bytes, suffix: str) -> bytes:
         if not candidates:
             detail = (proc.stderr or proc.stdout or '').strip()[-500:]
             raise RenderError(
-                f'LibreOffice did not produce a PDF (exit {proc.returncode})'
-                + (f': {detail}' if detail else ''))
+                f'LibreOffice did not produce a PDF (exit {proc.returncode})' + (f': {detail}' if detail else '')
+            )
         pdf = candidates[0].read_bytes()
     if not pdf.startswith(b'%PDF-'):
         raise RenderError('LibreOffice produced an invalid PDF')
     return pdf
 
 
-def render_document(data: bytes, filename: str, *, pages=None,
-                    dpi=DEFAULT_DPI) -> list[tuple[int, bytes]]:
+def render_document(data: bytes, filename: str, *, pages=None, dpi=DEFAULT_DPI) -> list[tuple[int, bytes]]:
     """返回 [(页码, PNG bytes)]；失败抛 RenderError。
 
     只接受 PDF/DOCX/PPTX。XLSX 的打印分页和表格布局差异太大，建议用
@@ -175,9 +184,7 @@ def render_document(data: bytes, filename: str, *, pages=None,
     """
     size = _dpi(dpi)
     if len(data) > documents.MAX_DOC_BYTES:
-        raise RenderError(
-            f'document is too large ({len(data)} bytes; '
-            f'max {documents.MAX_DOC_BYTES})')
+        raise RenderError(f'document is too large ({len(data)} bytes; max {documents.MAX_DOC_BYTES})')
     kind = documents.detect_kind(data)
     if kind == 'pdf':
         return _render_pdf(data, pages, size)
@@ -186,12 +193,8 @@ def render_document(data: bytes, filename: str, *, pages=None,
         return _render_pdf(pdf, pages, size)
     if kind == 'xlsx':
         raise RenderError(
-            'XLSX rendering is not supported; use read_document for cells, '
-            'or print the workbook to PDF and render that')
+            'XLSX rendering is not supported; use read_document for cells, or print the workbook to PDF and render that'
+        )
     if kind == 'ole':
-        raise RenderError(
-            'legacy or encrypted Office binary is not supported; '
-            'save/decrypt it as PDF, DOCX, or PPTX')
-    raise RenderError(
-        'unsupported document format for rendering '
-        '(supported: PDF, DOCX, PPTX)')
+        raise RenderError('legacy or encrypted Office binary is not supported; save/decrypt it as PDF, DOCX, or PPTX')
+    raise RenderError('unsupported document format for rendering (supported: PDF, DOCX, PPTX)')
