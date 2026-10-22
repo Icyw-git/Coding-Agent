@@ -3145,3 +3145,22 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
 `ruff check .` 通过。**刻意未做**：对 `exec_policy` / `documents` / `hooks` 整体
 `ruff format` —— 保持移动代码逐字不变，且符合 `ruff.toml` 的增量格式化约定；
 新文件按需在后续改动中逐步收敛。
+## P6：textual 默认切到新 TUI
+
+`HARNESS_UI=textual` 过去仍加载旧 `ui_textual.py`，新 `src/ui/harness_app.py` 只能靠
+`textual-next` 试验。现在路由反过来：
+
+| 值 | 实现 |
+|---|---|
+| `ansi`（默认） | 行式 REPL |
+| `textual` | `src/ui/harness_app.py`（行模型 + 虚拟视口） |
+| `textual-next` | 同上，兼容旧脚本/配置 |
+| `textual-legacy` | `ui_textual.py` 旧实现，仅对照 |
+
+`entrypoint._interactive_lock()` 对三种 Textual 模式都释放交互锁，避免 worker 与
+cron 争锁；`--ui` 的 choices 同步增加 `textual-legacy`。新 app 启动/渲染失败仍会
+捕获异常回退 ANSI，不会把终端留在半初始化状态。
+
+**验证**：`tests/test_entrypoint.py` 覆盖三种模式的锁、`tests/test_cli_output.py`
+确认 `textual` 进入新 app；定向 76 passed。真实终端 checklist（Windows Terminal /
+PowerShell / VS Code 终端）仍待人工验收。

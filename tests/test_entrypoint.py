@@ -87,6 +87,10 @@ def test_interactive_lock_is_skipped_for_textual(monkeypatch):
     ctx = entrypoint._interactive_lock()
     assert isinstance(ctx, contextlib.nullcontext)
 
+    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
     monkeypatch.setenv('HARNESS_UI', 'ansi')
     assert entrypoint._interactive_lock() is entrypoint.harness.agent_lock
 
@@ -109,7 +113,7 @@ def test_textual_failure_falls_back_to_line_repl(tmp_path, monkeypatch, capsys):
     import harness
     import ui_textual
 
-    monkeypatch.setenv('HARNESS_UI', 'textual')
+    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(ui_textual, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError('no driver')))

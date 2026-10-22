@@ -265,7 +265,7 @@ def test_bang_runs_shell_without_calling_the_agent(tmp_path, monkeypatch, capsys
     assert 'shell:echo hi' in capsys.readouterr().out
 
 
-def test_textual_next_flag_runs_new_app(tmp_path, monkeypatch):
+def test_textual_flag_runs_new_app(tmp_path, monkeypatch):
     import sys
 
     import cli_input
@@ -273,7 +273,7 @@ def test_textual_next_flag_runs_new_app(tmp_path, monkeypatch):
     import ui.harness_app
 
     calls = []
-    monkeypatch.setenv('HARNESS_UI', 'textual-next')
+    monkeypatch.setenv('HARNESS_UI', 'textual')
     monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(ui.harness_app, 'run',
                         lambda messages, **kwargs: calls.append((messages, kwargs)))

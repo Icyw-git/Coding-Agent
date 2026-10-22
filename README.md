@@ -385,7 +385,8 @@ LLM_MODEL_ID=your-model-id
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 
-# 可选：ansi（默认）| textual（现有全屏 TUI）| textual-next（行模型+虚拟视口，试验）
+# 可选：ansi（默认）| textual（新全屏 TUI）| textual-legacy（旧 TUI 对照）
+# textual-next 是 textual 的兼容别名
 HARNESS_UI=ansi
 
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
@@ -499,11 +500,12 @@ python entrypoint.py
 ```
 
 首次启动时，程序会进入交互式 Agent 会话。默认是 ANSI 行式界面；设置
-`HARNESS_UI=textual`（或 `--ui textual`）可启用 Textual 全屏 TUI（需要
-`pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。TUI 输入 `/`
-会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
-`/diff`、`/review`、`/cache` 等只存在于行式 REPL 的命令会明确提示改用
-`python harness.py --ui ansi`。TUI 与行式 REPL 行为对齐：回合进行中按 Enter 会 **steer**（下一轮请求前注入
+`HARNESS_UI=textual`（或 `--ui textual`）启用新的 Textual 全屏 TUI（需要
+`pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。旧实现保留为
+`HARNESS_UI=textual-legacy`，仅用于对照；`textual-next` 是 `textual` 的兼容别名。
+TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
+仍只存在于行式 REPL 的命令会提示改用 `python harness.py --ui ansi`。TUI 与行式
+REPL 行为对齐：回合进行中按 Enter 会 **steer**（下一轮请求前注入
 当前上下文），Alt+Enter 则作为 follow-up 等本回合结束再做；状态行显示
 `N queued`，`Alt+↑`/F2 或 `/dequeue` 可把 steering/follow-up 全部取回输入框。
 `@` 列出并补全工作区文件（Tab）；`↑`/`↓` 翻输入历史；状态栏常驻当前目录与
@@ -524,7 +526,7 @@ workspace-write 之间切换执行档位。
 状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
 可用 `LLM_PRICING_JSON` 覆盖价格（input/output/cached_input/cache_write，
 单位均为每 1M tokens；reasoning 视为 output 的子集，不会再重复计费）。
-textual-next 的 footer 常驻 `目录 (分支)`，并显示 `ctx 25% 50k/200k`、
+新 TUI 的 footer 常驻 `目录 (分支)`，并显示 `ctx 25% 50k/200k`、
 `↑输入 ↓输出 R缓存读 W缓存写`、`cache 50%`（最近一次请求的缓存命中率）和成本；
 未知缓存字段不显示，避免把“未知”当成 0。
 

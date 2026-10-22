@@ -1,6 +1,6 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：实施中（P1 完成、P0 虚拟化原型完成）
+状态：P6 已切换默认 Textual 入口，待真实终端验收
 进展：
 - P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
 - P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、
@@ -10,7 +10,7 @@
 - P2 起步：`VirtualTranscript(ScrollView)` 用 `virtual_size + render_line`
   只画可见行；滚动不重算布局，视口外不创建 widget。
 - P2 骨架：`src/ui/harness_app.py` 打通事件→块模型→视口（历史/流式/工具/
-  提交），以 `HARNESS_UI=textual-next` 提供试验入口，默认仍是旧实现。
+  提交），`HARNESS_UI=textual` 已指向新实现，旧实现保留为 `textual-legacy`。
 - P3：补全浮层（overlay，Tab/Alt+↑↓/Esc）、待发送队列条（Alt+↑ 取回）、
   editor 边框内嵌 Working 状态、footer 基础指标（分支/ctx/tokens/cost）。
 - P4：工具块 renderer（调用/结果/diff 着色/预览/展开）；harness 为
@@ -52,7 +52,9 @@
   63ms，瓶颈在 markdown_it parse + rich render，已用 120ms 限频。
 - P5n：队列语义对齐 Pi：Enter 运行中=steer，Alt+Enter=follow-up；Alt+↑/F2 或
   `/dequeue` 取回全部；Esc 取消时把队列内容退回编辑器。
-下一步：把 `TranscriptLayout` 接到自绘视口（VirtualTranscript），再迁移历史/流式渲染。
+- P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
+  `textual-legacy`，`textual-next` 作为兼容别名。下一步是真实终端 checklist 与
+  `/rewind`、`/undo` 等剩余命令。
 目标分支：`feature/ui`
 调研日期：2026-10-21
 
@@ -219,7 +221,7 @@ src/ui/
 | P3 输入区 | Composer + 补全浮层 + 队列条 + 边框状态 | 新输入区 | 键位矩阵测试；队列可编辑 |
 | P4 展示层 | tool renderers + diff + footer + 状态 | 新展示层 | 快照对比；工具/审批/中断回归 |
 | P5 选择器 | sessions/models/commands/search 重做 | 新 modals | 键盘路径全覆盖 |
-| P6 切换 | `HARNESS_UI=textual` 指向新 app；保留 legacy 一版 | 双实现对照 | 真实终端 checklist 通过 |
+| P6 切换 | ✅ `HARNESS_UI=textual` 指向新 app；legacy 保留 | 双实现对照 | 真实终端 checklist 待验收 |
 | P7 清理 | 删除旧 `ui_textual.py`/`cc_ui` 中重复逻辑 | 单一实现 | 文档更新、全量回归 |
 
 预估（单人）：P1 1–2 天，P2 3–5 天，P3 2–3 天，P4 3–4 天，P5 2–3 天，

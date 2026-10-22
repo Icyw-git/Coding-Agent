@@ -1,5 +1,5 @@
 """Textual TUI 实现。
 
-`app.py` 是当前入口（从根目录 `ui_textual.py` 迁入，迁移期保留同名壳）。
-后续按 `docs/UI_REWRITE_PLAN.md` 拆出 transcript / composer / chrome / modals。
+`harness_app.py` 是新 TUI 入口；`app.py` 是旧实现（`textual-legacy`）。
+结构与阶段见 `docs/UI_REWRITE_PLAN.md`。
 """

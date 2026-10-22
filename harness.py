@@ -2227,9 +2227,10 @@ def run_repl(initial_messages:list, session_store=None):
         if workspace:
             set_workspace(workspace)
     ui_mode = os.getenv('HARNESS_UI', 'ansi')
-    if ui_mode in ('textual', 'textual-next') and sys.stdin.isatty():
-        module_name = ('ui.harness_app' if ui_mode == 'textual-next'
-                       else 'ui_textual')
+    if ui_mode in ('textual', 'textual-next', 'textual-legacy') and sys.stdin.isatty():
+        # textual 已是新实现；textual-next 保留为兼容别名，textual-legacy 仅用于对照。
+        module_name = ('ui_textual' if ui_mode == 'textual-legacy'
+                       else 'ui.harness_app')
         try:
             module = __import__(module_name, fromlist=['run'])
         except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL

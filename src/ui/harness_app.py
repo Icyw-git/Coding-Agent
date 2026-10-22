@@ -1,6 +1,7 @@
 """新 TUI（P2/P3）：行模型 + 虚拟视口 + 浮层补全 + 队列条。
 
-feature flag：`HARNESS_UI=textual-next`。旧 `ui/app.py` 仍是默认实现。
+入口：`HARNESS_UI=textual`（`textual-next` 为兼容别名）。
+旧实现保留为 `HARNESS_UI=textual-legacy`，仅用于对照。
 """
 from __future__ import annotations
 
