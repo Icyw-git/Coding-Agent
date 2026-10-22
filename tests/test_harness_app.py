@@ -1735,3 +1735,22 @@ def test_scrolling_to_top_loads_older_history():
             assert len(app.model) == 600
 
     asyncio.run(scenario())
+
+
+def test_streaming_render_interval_adapts_to_frame_cost(monkeypatch):
+    import time as clock
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)):
+            app._busy = True
+            app.model.append('assistant', {'text': 'stream', 'streaming': True},
+                             block_id='stream-test')
+            monkeypatch.setattr(app.view, 'refresh_layout',
+                                lambda: clock.sleep(0.03))
+            app._dirty = True
+            app._flush_layout(force=True)
+            assert 0.055 <= app._stream_interval <= 0.065
+            app._busy = False
+
+    asyncio.run(scenario())

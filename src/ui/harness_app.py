@@ -76,6 +76,11 @@ def _env_int(name: str, default: int) -> int:
 
 HISTORY_INITIAL_MESSAGES = _env_int('HARNESS_HISTORY_INITIAL_MESSAGES', 400)
 HISTORY_PAGE_MESSAGES = _env_int('HARNESS_HISTORY_PAGE_MESSAGES', 200)
+# 流式 Markdown 每次都要重新解析累计全文。根据上一帧耗时动态选择下一帧
+# 间隔：短文本更快出字，长文本自动退让，避免固定 120ms 让小回复也显得迟滞。
+STREAM_MIN_INTERVAL = 0.05
+STREAM_MAX_INTERVAL = 0.30
+STREAM_DEFAULT_INTERVAL = 0.12
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
 # TUI 的 Rich Markdown 主题：避免默认的 “cyan on black” 代码块在深色终端上
@@ -406,6 +411,7 @@ class HarnessApp(App):
         self._mention_at = 0.0
         self._turn_started = 0.0
         self._last_stream_render = 0.0
+        self._stream_interval = STREAM_DEFAULT_INTERVAL
 
     # ---------- 布局 ----------
 
@@ -472,15 +478,21 @@ class HarnessApp(App):
     def _flush_layout(self, force: bool = False) -> None:
         if not self._dirty:
             return
-        if not force and self._busy:
-            streaming = any(block.kind == 'assistant'
-                            and block.payload.get('streaming')
-                            for block in reversed(self.model.snapshot()[-3:]))
-            if streaming and time.monotonic() - self._last_stream_render < 0.12:
-                return      # 流式 Markdown 很贵；保持 dirty，下个 tick 再整体重排
-        self._last_stream_render = time.monotonic()
+        streaming = any(block.kind == 'assistant'
+                        and block.payload.get('streaming')
+                        for block in reversed(self.model.snapshot()[-3:]))
+        if not force and streaming:
+            if time.monotonic() - self._last_stream_render < self._stream_interval:
+                return      # 保留 dirty，下个 tick 再合并重排
+        started = time.monotonic()
+        self._last_stream_render = started
         self._dirty = False
         self.view.refresh_layout()
+        if streaming:
+            cost = time.monotonic() - started
+            self._stream_interval = min(
+                STREAM_MAX_INTERVAL,
+                max(STREAM_MIN_INTERVAL, cost * 2))
         # 首次贴底布局完成后才允许自动上翻，避免启动瞬间 offset 仍为 0
         # 时把历史页连续加载进来。
         if (not self._history_auto_armed
