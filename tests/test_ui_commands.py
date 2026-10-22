@@ -105,3 +105,35 @@ def test_snapshot_commands_are_ported_to_tui():
         assert spec is not None and spec.ported
     text = commands.help_text()
     assert '/rewind' in text and '/undo' in text
+
+
+def test_compound_checkpoint_gc_completions_keep_previous_args():
+    from ui.composer.completions import apply_suggestion
+
+    spec = commands.find('checkpoint-gc')
+    all_done = commands.argument_suggestions(spec, '--all ')
+    assert all_done
+    assert all_done[0][0].startswith('--all --keep ')
+    assert all(value.startswith('--all ') for value, _ in all_done)
+    assert not any(value == '--all' for value, _ in all_done)
+
+    kept = commands.argument_suggestions(spec, '--all --keep 1')
+    assert any(value == '--all --keep 10' for value, _ in kept)
+    assert all(value.startswith('--all --keep ') for value, _ in kept)
+    assert (apply_suggestion('/checkpoint-gc --all ', all_done[0][0])
+            == f'/checkpoint-gc {all_done[0][0]}')
+
+    after_keep = commands.argument_suggestions(spec, '--keep 10 ')
+    assert after_keep and after_keep[0][0] == '--keep 10 --all'
+    assert commands.argument_suggestions(spec, '--all --keep 10 ') == []
+
+
+def test_compound_cache_and_watch_completions():
+    cache = commands.argument_suggestions(commands.find('cache'), 'gc 30 ')
+    assert cache and cache[0][0] == 'gc 30 --apply'
+
+    watch = commands.argument_suggestions(commands.find('watch'),
+                                         'bg_1 --timeout ')
+    values = [value for value, _ in watch]
+    assert 'bg_1 --timeout 30' in values
+    assert 'bg_1 --timeout 300' in values

@@ -57,7 +57,7 @@ COMMANDS = (
     Command('/rewind', (), '[ID|last|head] [--force] [--session] [--yes]',
             '预览并确认回溯；--session 仅恢复会话，--force 允许覆盖冲突', '快照'),
     Command('/checkpoint-gc', (), '[--all] [--keep N]',
-            '清理当前会话旧快照；--all 清理所有会话，--keep 覆盖保留上限', '快照'),
+            '手动清理当前会话旧快照；--all 清理所有会话，--keep 覆盖本次保留上限', '快照'),
     Command('/quit', ('/exit',), '', '退出；会话自动保存', '常用'),
 )
 

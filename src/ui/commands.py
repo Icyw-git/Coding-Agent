@@ -67,10 +67,50 @@ def _model_arguments(prefix: str) -> list[tuple[str, str]]:
 
 
 def _checkpoint_gc_arguments(prefix: str) -> list[tuple[str, str]]:
-    items = [('--all', '--all  清理所有会话的旧快照'),
-             ('--keep ', '--keep N  覆盖每个会话的保留数量')]
-    needle = (prefix or '').strip().casefold()
-    return [item for item in items if item[0].casefold().startswith(needle)]
+    """复合参数补全：保留已输入的前缀，再补下一个参数。
+
+    apply_suggestion 会替换整个参数，因此候选必须带上前面的 `--all`/`--keep`。
+    """
+    text = prefix or ''
+    tokens = text.split()
+    ends_space = bool(text) and text[-1].isspace()
+    if ends_space:
+        base, current = tokens, ''
+    elif tokens:
+        base, current = tokens[:-1], tokens[-1]
+    else:
+        base, current = [], ''
+
+    has_all = '--all' in base
+    keep_at = base.index('--keep') if '--keep' in base else -1
+    if keep_at >= 0 and keep_at + 1 == len(base):
+        # `--keep` 已经输入，只等数字；给出常用值，并保留当前前缀。
+        values = (10, 20, 50, 100)
+        result = []
+        for number in values:
+            if current and not str(number).startswith(current):
+                continue
+            result.append((f"{' '.join(base)} {number}",
+                           f'--keep {number}  每个会话保留 {number} 个'))
+        if current.isdigit() and 1 <= int(current) <= 10_000:
+            value = ' '.join(base) + ' ' + current
+            result.insert(0, (value, f'--keep {current}  每个会话保留 {current} 个'))
+        return result
+
+    candidates = []
+    if not has_all:
+        candidates.append((['--all'], '--all  清理所有会话的旧快照'))
+    if keep_at < 0:
+        for number in (10, 20, 50, 100):
+            candidates.append((['--keep', str(number)],
+                               f'--keep {number}  每个会话保留 {number} 个'))
+    result = []
+    for added, label in candidates:
+        if current and not added[0].startswith(current):
+            continue
+        result.append((' '.join([*base, *added]), label))
+    return result
+
 
 def _tool_arguments(prefix: str) -> list[tuple[str, str]]:
     try:
@@ -93,9 +133,18 @@ def _sandbox_arguments(prefix: str) -> list[tuple[str, str]]:
 
 
 def _cache_arguments(prefix: str) -> list[tuple[str, str]]:
+    text = prefix or ''
     values = ('gc', 'gc 7', 'gc 30', 'gc 7 --apply')
-    return [(value, value) for value in values
-            if not prefix or value.startswith(prefix.casefold())]
+    items = [(value, value) for value in values
+             if not text or value.startswith(text.casefold())]
+    # `gc 30 ` 之后继续补 --apply；候选保留前面的天数。
+    parts = text.split()
+    if (len(parts) >= 2 and parts[0] == 'gc' and parts[1].isdigit()
+            and text.endswith(' ') and '--apply' not in parts
+            and len(parts) == 2):
+        items.append((f'{text.rstrip()} --apply',
+                      f'{text.rstrip()} --apply  执行回收'))
+    return items
 
 
 def _directory_arguments(prefix: str) -> list[tuple[str, str]]:
@@ -215,10 +264,18 @@ def _watch_arguments(prefix: str) -> list[tuple[str, str]]:
             return [item for item in items
                     if needle in item[0].casefold()
                     or needle in item[1].casefold()]
-        if len(parts) == 1 or (len(parts) == 2 and parts[1].startswith('-')
+        if len(parts) == 1 or (len(parts) == 2 and not text.endswith(' ')
+                               and parts[1].startswith('-')
                                and '--timeout'.startswith(parts[1])):
             return [(f'{task} --timeout 60',
                      '--timeout 60  最多等待 60 秒')]
+        if parts[1] == '--timeout' or '--timeout'.startswith(parts[1]):
+            current = parts[2] if len(parts) > 2 else ''
+            values = (30, 60, 300)
+            return [(f'{task} --timeout {value}',
+                     f'--timeout {value}  最多等待 {value} 秒')
+                    for value in values
+                    if not current or str(value).startswith(current)]
         return []
     items = _watch_targets()
     needle = text.casefold()
@@ -269,7 +326,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
                 argument_completions=_sandbox_arguments),
     CommandSpec('checkpoint', '创建快照', '[标签]', ('cp',)),
     CommandSpec('checkpoints', '列出当前会话快照', aliases=('cps',)),
-    CommandSpec('checkpoint-gc', '清理旧快照', '[--all] [--keep N]',
+    CommandSpec('checkpoint-gc', '手动清理旧快照', '[--all] [--keep N]',
                 argument_completions=_checkpoint_gc_arguments),
     CommandSpec('rewind', '回溯快照', '[ID|last|head] [--force] [--session] [--yes]'),
     CommandSpec('undo', '撤销最近一回合'),

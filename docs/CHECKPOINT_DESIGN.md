@@ -348,7 +348,7 @@ turn 节点记录一次 `git status --porcelain` 与 `git rev-parse HEAD` 作为
 /rewind <cp_id> --force              冲突时强制覆盖
 /rewind <cp_id> --yes                跳过确认（脚本化用）
 /checkpoint-gc                       按保留策略清理当前会话旧节点，并提示其他会话待清理量
-/checkpoint-gc --all [--keep N]     预览并确认后清理所有会话；--keep 覆盖每个会话的保留上限
+/checkpoint-gc --all [--keep N]     预览并确认后清理所有会话；--keep 仅覆盖本次命令的保留上限
 /exit, /quit                         结束会话
 ```
 
@@ -402,7 +402,8 @@ CHECKPOINT_MANAGER = None          # 活跃 manager；tools 的 write/edit 通�
 
 - 回收只删「最旧、非当前 head、非 label」的节点，由 `/checkpoint-gc` 显式触发（不在每轮自动跑）。
   默认只处理当前会话；`--all` 遍历所有会话目录，先 dry-run 统计数量/体积，确认后才删除，
-  `--keep N` 覆盖每个会话的保留上限。每个会话的 head 与带 label 节点仍然保留。
+  `--keep N` 仅覆盖本次命令的保留上限（不改变默认策略，也不会自动执行）。
+  每个会话的 head 与带 label 节点仍然保留。
   代价是删除会切断更早节点的回溯链，之后回滚到更早节点时文件侧退化为单节点语义（§12.8）。
 - 删除节点目录后，往 `index.jsonl` 追加一行 `{"cp_id":..., "gc":true}`；`list()` 折叠索引时按标记过滤，
   保持 append-only 不变。

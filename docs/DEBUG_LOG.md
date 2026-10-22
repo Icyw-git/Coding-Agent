@@ -3354,3 +3354,8 @@ non-whitespace chars，使用 Unicode isspace 排除空白，复制内容保留�
 验证：checkpoint/TUI/生命周期/命令/补全定向 134 passed；随后 checkpoint 45 passed
 （含行式 REPL 的 --all 取消/确认）；全量 1220 passed / 1 skipped，5 条 warning
 均为飞书 SDK 弃用提示；增量 Ruff 通过。
+
+补充：`--keep` 只影响当次命令，清理不会自动执行，也不改变默认保留策略。
+参数补全改为上下文感知：`--all ` 继续提示 `--keep 10/20/50/100`，`--keep `
+提示数字并保留前面的参数；同时补 `/cache gc <天数> ` 的 `--apply` 和
+`/watch <id> --timeout ` 的 30/60/300。新增复合参数补全测试，全量 1223 passed。
