@@ -77,6 +77,8 @@ def load_project_instructions(workspace, *, max_bytes: int = MAX_PROJECT_CONTEXT
             return None
         result = ProjectInstructions(source=path.name, text=text, truncated=truncated, limit=max_bytes)
         _cache[str(resolved)] = (signature, result)
+        while len(_cache) > 256:
+            _cache.pop(next(iter(_cache)))
         return result
     return None
 

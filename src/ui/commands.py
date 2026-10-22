@@ -134,7 +134,7 @@ def _sandbox_arguments(prefix: str) -> list[tuple[str, str]]:
 
 def _cache_arguments(prefix: str) -> list[tuple[str, str]]:
     text = prefix or ''
-    values = ('gc', 'gc 7', 'gc 30', 'gc 7 --apply')
+    values = ('profile', 'gc', 'gc 7', 'gc 30', 'gc 7 --apply')
     items = [(value, value) for value in values
              if not text or value.startswith(text.casefold())]
     # `gc 30 ` 之后继续补 --apply；候选保留前面的天数。
@@ -320,7 +320,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('quit', '退出', aliases=('exit', 'q')),
     CommandSpec('diff', '查看未提交改动'),
     CommandSpec('review', '只读审阅未提交改动'),
-    CommandSpec('cache', '工具缓存统计/回收', '[gc [天数] [--apply]]',
+    CommandSpec('cache', '存储 profile / 工具缓存回收', '[profile|gc [天数] [--apply]]',
                 argument_completions=_cache_arguments),
     CommandSpec('sandbox', '查看/切换执行档位', '[档位|approvals <档位>]',
                 argument_completions=_sandbox_arguments),

@@ -3359,3 +3359,50 @@ non-whitespace chars，使用 Unicode isspace 排除空白，复制内容保留�
 参数补全改为上下文感知：`--all ` 继续提示 `--keep 10/20/50/100`，`--keep `
 提示数字并保留前面的参数；同时补 `/cache gc <天数> ` 的 `--apply` 和
 `/watch <id> --timeout ` 的 30/60/300。新增复合参数补全测试，全量 1223 passed。
+
+## Agent 存储/内存 profile 与清理边界调研
+
+**问题**：`.cache` 同时放会话、快照、工具大输出、transcript、记忆、任务、API 日志和
+未知目录；已有 `/cache gc`、`/checkpoint-gc`、`/archive`、`/delete` 四条清理路径，
+但没有一个总览能回答“哪里占空间、哪些真的可删、哪些不能动”。直接做全量自动 GC
+又会把恢复源和派生缓存混在一起。
+
+**调研**：
+
+- Pi（本机 v1.3.0）：session 是 append-only JSONL；恢复选择器只扫描 header；
+  `Ctrl+D` 删除优先调用 `trash`，失败才 `unlink`；compaction 追加摘要并保留原始
+  entries；图片默认按约 2000×2000 / 4.5 MiB 编码上限缩放；prompt cache warming
+  是供应商缓存策略，不是磁盘 GC；没有启动时自动删旧会话。
+- Codex CLI（本机 0.162.1）：活动 `sessions/` 与 `archived_sessions/` 分开；提供
+  显式 `codex archive/unarchive/delete`；rollout 可为 `.jsonl.zst`，历史可迁移为
+  分页 SQLite thread history；SQLite 使用 WAL/`auto_vacuum=INCREMENTAL`；
+  `codex doctor` 报告 rollout 文件数/字节、DB 完整性和一致性，但不自动删除。
+- 两者共同点：**历史保留与派生缓存分离，删除显式化，先诊断后操作**。
+
+**做法**：
+
+- 新增 `src/storage_profile.py`：把 `.cache` 分为源数据（sessions/memories/tasks/
+  os_tasks/导出）、派生缓存（tool_results/checkpoints）、临时/诊断目录和未识别目录；
+  统计文件数/字节/最早时间，工具缓存调用 `tool_cache.plan_cleanup` 计算引用保护后的
+  可回收量，快照调用 `gc_all_checkpoints(dry_run=True)` 计算按会话保留策略的可回收量。
+- `/cache profile` 输出完整 profile；`/cache gc` 保持原有“工具缓存按天 + 引用保护”的
+  预览/执行语义；`/checkpoint-gc` 保持按会话保留策略；会话仍只通过 `/archive`、
+  `/delete` 处理。未识别目录只报告，不自动删除。
+- `--doctor` 增加 storage 摘要（浅扫描，不计算引用/快照计划）。
+- `scripts/profile_storage.py` 支持 `--json` 和 `--session largest`：用 `tracemalloc`
+  测量读取事件、重建 OpenAI 历史的当前/峰值内存。
+- 内存缓存加界：session summary 512、project instructions 256、Markdown Console 16 个宽度；
+  TUI 行缓存和审批缓存沿用已有上限。
+
+**本机只读 profile**：`.cache` 约 75 MB；可识别 29.0 MB（sessions 9.0 MB / 46 文件、
+checkpoints 17.2 MB / 177 节点、transcripts 1.8 MB 等），未识别 42.4 MB
+（`dsh-im-reference`，只报告）。最大 session 约 4.9 MB：读取约 88 ms、重建历史约 152 ms，
+当前约 11.7 MB、峰值约 22.9 MB。此前 `--keep 10` 使 21 个会话各保留 10 个节点；
+默认仍是每会话 20，故当前快照可回收量为 0。
+
+**暂不做**：不自动删除会话/记忆/导出/未知目录；不在启动时全量 GC；不按目录年龄删除
+无引用证据的数据；暂不引入 rollout zstd 压缩或分页存储，先用真实 profile 决定是否需要。
+
+验证：storage/TUI/命令/tool_cache 定向 82 passed；全量 1228 passed / 1 skipped，
+5 条 warning 均为飞书 SDK 弃用提示；`harness.py --doctor` 已输出 storage 摘要；
+Ruff 与 diff 检查通过。

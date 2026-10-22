@@ -258,6 +258,7 @@ def list_session_paths(limit: int | None = 20) -> list[Path]:
 
 
 _session_summary_cache = {}
+_SESSION_SUMMARY_CACHE_MAX = 512
 
 
 def _session_catalog():
@@ -277,6 +278,8 @@ def _session_catalog():
             if cached is None or cached[0] != signature:
                 summary = SessionEventStore.open(path).session_summary()
                 _session_summary_cache[key] = (signature, summary)
+                while len(_session_summary_cache) > _SESSION_SUMMARY_CACHE_MAX:
+                    _session_summary_cache.pop(next(iter(_session_summary_cache)))
             rows.append(dict(_session_summary_cache[key][1]))
         except (OSError, SessionReplayError) as exc:
             _session_summary_cache.pop(key, None)
@@ -650,6 +653,19 @@ def format_pending_approvals() -> str:
     return '\n'.join(lines)
 
 
+def storage_profile_data(*, deep: bool = True) -> dict:
+    """扫描工作区 .cache；TUI、行式 REPL 与 --doctor 共用同一份口径。"""
+    import storage_profile
+    return storage_profile.scan(
+        WORKDIR / '.cache', sessions_dir=SESSIONS_DIR,
+        checkpoint_keep=CHECKPOINT_MAX_NODES, deep=deep)
+
+
+def format_storage_profile(*, deep: bool = True) -> str:
+    import storage_profile
+    return storage_profile.format_profile(storage_profile_data(deep=deep))
+
+
 def run_doctor() -> int:
     """Report startup prerequisites without contacting the model provider."""
     checks = [
@@ -677,6 +693,11 @@ def run_doctor() -> int:
     cache = tool_cache.scan(TOOL_RESULTS_DIR)
     print(f"[cache] tool_results: {cache['files']} files, "
           f"{tool_cache.human_size(cache['bytes'])} (use /cache gc)")
+    try:
+        import storage_profile
+        print(storage_profile.format_summary(storage_profile_data(deep=False)))
+    except Exception as exc:
+        print(f'[storage] unavailable: {exc}')
     return 0 if all(passed for _, passed in checks) else 1
 
 
@@ -1511,8 +1532,11 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(format_workspace_diff(color=sys.stdout.isatty()))
 
     elif command == '/cache':
-        print(tool_cache.handle_cache_command(
-            TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
+        if argument.strip().lower() == 'profile':
+            print(format_storage_profile())
+        else:
+            print(tool_cache.handle_cache_command(
+                TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
 
     elif command == '/review':
         from review import run_review

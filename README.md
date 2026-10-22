@@ -431,8 +431,11 @@ HARNESS_PERF=1
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
 展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一次快照）、`/revoke`
-（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。`/cache gc` 默认只预览，
-按文件名匹配会话事件里的引用，宁可少删也不误删；被清理的图片在恢复旧会话时降级为文本。
+（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
+`/cache profile` 查看完整存储占用（源数据、派生缓存、未识别目录和可回收量）；
+`/cache gc` 默认只预览，按文件名匹配会话事件里的引用，宁可少删也不误删；
+被清理的图片在恢复旧会话时降级为文本。存储策略与调研见
+[存储 profile](docs/STORAGE_PROFILE.md)。
 每个回合正常结束时，若本轮
 改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
 事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
@@ -676,6 +679,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_patch.py` | `apply_patch` 解析、规划与原子回滚；路径解析/审批/checkpoint 由 tools 注入 |
 | `src/tool_text.py` | 文件文本 BOM/编码探测、二进制拒绝与换行符保留 |
 | `src/tool_cache.py` | `/cache`：`.cache/tool_results` 统计与引用保护回收 |
+| `src/storage_profile.py` | `/cache profile`：源数据/派生缓存/未识别目录分类与可回收量 |
 | `src/exec_policy.py` | 执行策略层：档位、黑名单、路径分区与决策矩阵（纯判定，不做 OS 强制） |
 | `src/policy_bash.py` | bash 命令文本分析：包装器、只读判定、外发目标与「同类」授权键（启发式，不是安全边界） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |

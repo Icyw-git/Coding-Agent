@@ -104,6 +104,9 @@ _CONSOLES: dict[int, Console] = {}
 def _console_for(width: int) -> Console:
     console = _CONSOLES.get(width)
     if console is None:
+        # 拖动窗口会不断产生新宽度；缓存只保留最近用过的少量 Console。
+        if len(_CONSOLES) >= 16:
+            _CONSOLES.clear()
         console = Console(width=width, force_terminal=True,
                           color_system='truecolor', legacy_windows=False,
                           safe_box=True, theme=MARKDOWN_THEME)
@@ -1054,8 +1057,11 @@ class HarnessApp(App):
                 self._notice(f'Diff failed: {exc}', level='error')
         elif verb == 'cache':
             try:
-                self._notice(harness.tool_cache.handle_cache_command(
-                    harness.TOOL_RESULTS_DIR, harness.SESSIONS_DIR, argument))
+                if argument.strip().lower() == 'profile':
+                    self._notice(harness.format_storage_profile())
+                else:
+                    self._notice(harness.tool_cache.handle_cache_command(
+                        harness.TOOL_RESULTS_DIR, harness.SESSIONS_DIR, argument))
             except Exception as exc:
                 self._notice(f'Cache failed: {exc}', level='error')
         elif verb == 'sandbox':

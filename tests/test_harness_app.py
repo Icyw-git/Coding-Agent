@@ -1626,3 +1626,30 @@ def test_checkpoint_gc_all_previews_confirms_and_cleans(tmp_path, monkeypatch):
             assert '--keep' in app.model.snapshot()[-1].payload['text']
 
     asyncio.run(scenario())
+
+
+def test_cache_profile_command_uses_storage_profile(monkeypatch):
+    _no_agent(monkeypatch)
+    monkeypatch.setattr(harness, 'format_storage_profile',
+                        lambda: 'storage-profile-report')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('/cache profile')
+            await pilot.pause()
+            assert app.model.snapshot()[-1].payload['text'] == 'storage-profile-report'
+
+    asyncio.run(scenario())
+
+
+def test_markdown_console_cache_is_bounded():
+    from ui import harness_app as module
+
+    module._CONSOLES.clear()
+    try:
+        for width in range(800, 820):
+            module._console_for(width)
+        assert len(module._CONSOLES) <= 16
+    finally:
+        module._CONSOLES.clear()

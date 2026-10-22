@@ -137,3 +137,8 @@ def test_compound_cache_and_watch_completions():
     values = [value for value, _ in watch]
     assert 'bg_1 --timeout 30' in values
     assert 'bg_1 --timeout 300' in values
+
+
+def test_cache_completion_includes_profile():
+    items = commands.argument_suggestions(commands.find('cache'), 'pro')
+    assert items and items[0][0] == 'profile'
