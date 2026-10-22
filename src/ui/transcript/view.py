@@ -62,11 +62,13 @@ class VirtualTranscript(ScrollView):
                   if end is not None else self.content_line_count)
         lines = []
         for index, line in enumerate(self.transcript_layout.visible(top, bottom - top), top):
-            text = line.plain if isinstance(line, Text) else str(line)
+            # Rich 的代码块/表格会把行补齐到面板宽度；复制时去掉行尾填充，
+            # 保留代码缩进、正文内部空格与跨行换行。
+            text = (line.plain if isinstance(line, Text) else str(line)).rstrip(' \t')
             left = max(0, start.x) if start is not None and index == start.y else 0
             right = max(0, end.x) if end is not None and index == end.y else len(text)
             lines.append(text[left:right])
-        return '\n'.join(lines), '\n'
+        return '\n'.join(lines).rstrip('\n'), '\n'
 
     def _strip_for(self, line_index: int, width: int) -> Strip:
         selection = self.text_selection

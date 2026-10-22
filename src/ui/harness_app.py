@@ -263,7 +263,16 @@ class CompletionPopup(Static):
 
 
 class Transcript(VirtualTranscript):
-    """点击视口：把屏幕 y 转成内容行，再交给 App 做 block 命中。"""
+    """点击命中工具块；拖选结束后自动复制显示文本。"""
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if event.button == 1:
+            # 等 Screen 应用最终选区后再取文字，避免复制到拖动的倒数一帧。
+            self.call_after_refresh(self._copy_selection)
+
+    def _copy_selection(self) -> None:
+        if self.text_selection is not None and self.app._selected_text():
+            self.app.action_copy_selection()
 
     def on_click(self, event: events.Click) -> None:
         y = event.y + int(self.scroll_offset.y)
