@@ -721,26 +721,15 @@ def snip_compact(messages, max_messages=None, info=None):
         max_messages = max(50, h.CONTEXT_LIMIT // 4000)
     if len(messages) <= max_messages:
         return messages
-    # 头部：保留前 3 条；不能切断"assistant 带多个工具"的分组（否则 dangling）
-    head_end = 3
-    if head_end > 0 and head_end < len(messages):
-        # 情况 A：头部以 assistant-with-tool_calls 结尾 → 并入其工具结果
-        if _message_has_tool_use(messages[head_end - 1]):
-            while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
-                head_end += 1
-        # 情况 B：头部切断在分组中间（前后都是工具结果）→ 并入剩余工具结果
-        while (head_end < len(messages)
-               and _is_tool_result_message(messages[head_end - 1])
-               and _is_tool_result_message(messages[head_end])):
-            head_end += 1
-    # 尾部预算：head + 1 条 marker + tail <= max_messages
+    # 头部/尾部边界统一归一化：不能切断 assistant 带多个 tool_calls 的分组。
+    from session_store import normalize_snip_bounds
+    head_end, _ = normalize_snip_bounds(messages, 3, len(messages))
     keep_tail = max_messages - head_end - 1
     if keep_tail <= 1:
         return messages   # 窗口小到放不下头部+marker：放弃截断（安全阀不能丢掉全部现场）
     tail_start = len(messages) - keep_tail
-    # 裁剪点不能落在工具结果上（其 assistant 已被裁掉=孤儿），推进到非工具消息
-    while tail_start < len(messages) and _is_tool_result_message(messages[tail_start]):
-        tail_start += 1
+    head_end, tail_start = normalize_snip_bounds(
+        messages, head_end, tail_start)
     if head_end >= tail_start:
         return messages
     if info is not None:

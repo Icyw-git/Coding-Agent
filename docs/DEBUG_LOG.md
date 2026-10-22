@@ -3496,5 +3496,27 @@ Pi 的 active-branch 投影一致：恢复源保留完整历史，但 UI 不应�
 对比：10,000 条消息初始只加载 400 条后，就绪约 **0.57 s**、当前约 **2.3 MB**、
 峰值约 **6.2 MB**；加载更早的 200 条后块数为 600。分页减少的是 UI/布局首屏成本，
 不改 `_messages` 的 Agent 上下文，也不删除源历史。新增测试覆盖初始窗口、手动
-前插两页和滚到顶部自动加载。验证：全量 **1275 passed / 1 skipped**，5 条 warning
+前插两页和滚到顶部自动加载。验证：全量 **1276 passed / 1 skipped**，5 条 warning
 均来自飞书 SDK，Ruff 与 diff 检查通过。
+
+## 历史 snip 切断工具组导致会话无法恢复
+
+现场错误：`Unable to resume: orphan tool result 'call_01_...' at message 4`。
+定位到 `session_5b68...` 的 `history_snipped` 事件：`head_end=3, tail_start=6`
+以及后续 `head_end=3, tail_start=11`，后者落在同一个 assistant 的 tool 结果组中间。
+旧的回放代码直接执行
+`messages[:head_end] + marker + messages[tail_start:]`，于是第二个 tool 结果
+没有对应的 assistant tool_calls，`validate_openai_history` 报 orphan。
+
+根因不是会话文件损坏，而是**历史压缩边界没有对工具组做回放级校验**。修复：
+
+- 新增 `normalize_snip_bounds()`：头部若切在 assistant tool_calls 或工具结果
+  组中间，向前并入完整组；尾部若落在无主工具结果上，向后跳过整组。
+- 生成 `snip_compact` 和回放 `history_snipped` 共用该归一化，旧索引事件也能恢复。
+- `snipped` marker 使用归一化后的实际数量。
+- 新增历史坏边界回放测试，并验证受影响会话重新 `rebuild_openai_history()` 成功
+  （该会话得到 247 条消息）。
+
+这是“持久化压缩决策必须同时是恢复边界”的教训：只保证生成时合法不够，旧事件/
+旧实现留下的索引在重放时也必须修复或拒绝。受影响会话重新回放得到 247 条消息；
+新增坏边界测试，全量 **1276 passed / 1 skipped**。

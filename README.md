@@ -392,6 +392,10 @@ HARNESS_UI=textual
 # 可选：长会话事件缓存上限（默认 2 MiB；0 表示不缓存，改为按需重读）
 HARNESS_EVENT_CACHE_MAX_BYTES=2097152
 
+# 可选：TUI 历史窗口/分页大小；设为很大的初始值可用于全量加载对比
+HARNESS_HISTORY_INITIAL_MESSAGES=400
+HARNESS_HISTORY_PAGE_MESSAGES=200
+
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
 

@@ -155,7 +155,9 @@ TUI 布局同样不再长期保留所有块的行文本：`TranscriptLayout` 默
 | 初始 400 + 分页 | 400 | **约 0.57 s** | **2.3 MB** | **6.2 MB** | 9600 |
 
 分页显著减少首次布局和 UI 内存，但不会减少 `_messages` 中供模型使用的完整历史；
-它解决的是长会话进入界面时的首屏成本。
+它解决的是长会话进入界面时的首屏成本。可用
+`HARNESS_HISTORY_INITIAL_MESSAGES` / `HARNESS_HISTORY_PAGE_MESSAGES` 改变窗口大小，
+做真实终端对比。
 
 ## 6. 暂不采用
 

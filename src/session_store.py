@@ -54,6 +54,33 @@ def is_injected_user_content(text) -> bool:
     return stripped.startswith(_INJECTED_USER_PREFIXES)
 
 
+def normalize_snip_bounds(messages: list[dict], head_end: int,
+                          tail_start: int) -> tuple[int, int]:
+    """修正历史 snip 的切片点，避免把工具结果从它的 assistant 切走。
+
+    旧会话里可能已经存了落在工具结果中间的 head/tail；回放时不能直接信任。
+    头部向前并入完整工具组；尾部若落在工具结果上则向后跳过整组。返回值
+    可能略大于 max_messages，但保证 OpenAI 历史的 tool_call/tool 配对完整。
+    """
+    size = len(messages)
+    head = max(0, min(int(head_end), size))
+    if 0 < head < size:
+        previous = messages[head - 1]
+        if previous.get('role') == 'assistant' and previous.get('tool_calls'):
+            while head < size and messages[head].get('role') == 'tool':
+                head += 1
+        while (head < size and messages[head - 1].get('role') == 'tool'
+               and messages[head].get('role') == 'tool'):
+            head += 1
+
+    tail = max(head, min(int(tail_start), size))
+    # 尾部落在无主工具结果上时向后跳过整组；这样既不会产生孤儿，
+    # 也不会为了回退 assistant 而突破消息数上限。
+    while tail < size and messages[tail].get('role') == 'tool':
+        tail += 1
+    return head, tail
+
+
 class SessionEventStore:
     """The recovery source of truth; transcript snapshots remain separate exports."""
 
@@ -562,10 +589,12 @@ class SessionEventStore:
                 # snip_compact 的持久化决策。索引版（head_end/tail_start/snipped）：
                 # 与触发时相同的切片表达式，内存形态 == 重建形态是结构性保证。
                 if 'head_end' in event:
-                    he, ts = int(event['head_end']), int(event['tail_start'])
+                    he, ts = normalize_snip_bounds(
+                        messages, int(event['head_end']),
+                        int(event['tail_start']))
                     messages = (messages[:he]
                                 + [{"role": "user",
-                                    "content": f"[snipped {int(event.get('snipped') or 0)} messages]"}]
+                                    "content": f"[snipped {max(0, ts - he)} messages]"}]
                                 + messages[ts:])
                 else:
                     # 旧版 head/tail 全量副本事件：逐字还原 head + marker + 保留段

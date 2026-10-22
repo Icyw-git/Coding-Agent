@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
 import queue
 import re
 import threading
@@ -66,8 +67,15 @@ SUGGESTION_LIMIT = 6
 # 首次只把最近一段历史转成 UI 块；完整消息仍保留在 _messages 供 Agent 使用。
 # 滚动到顶部或 /more 时按页向前补，和 Codex 的分页 history、Pi 的 active
 # branch 投影一样，避免启动时把整份长历史渲染进内存。
-HISTORY_INITIAL_MESSAGES = 400
-HISTORY_PAGE_MESSAGES = 200
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+HISTORY_INITIAL_MESSAGES = _env_int('HARNESS_HISTORY_INITIAL_MESSAGES', 400)
+HISTORY_PAGE_MESSAGES = _env_int('HARNESS_HISTORY_PAGE_MESSAGES', 200)
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
 # TUI 的 Rich Markdown 主题：避免默认的 “cyan on black” 代码块在深色终端上

@@ -230,3 +230,26 @@ def test_streaming_rebuild_applies_compaction_and_placeholders(tmp_path, monkeyp
     assert history[2] == {'role': 'tool', 'tool_call_id': 'call-1',
                           'content': '<omitted tool output>'}
     assert history[3] == {'role': 'user', 'content': 'continue'}
+
+
+def test_replay_repairs_historical_snip_cutting_tool_group(tmp_path):
+    store = SessionEventStore(tmp_path, session_id='bad-snip')
+    store.append_message({'role': 'user', 'content': 'start'})
+    store.append_message({'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'c0', 'type': 'function',
+         'function': {'name': 'bash', 'arguments': '{}'}},
+        {'id': 'c1', 'type': 'function',
+         'function': {'name': 'bash', 'arguments': '{}'}},
+    ]})
+    store.append_message({'role': 'tool', 'tool_call_id': 'c0', 'content': 'a'})
+    store.append_message({'role': 'tool', 'tool_call_id': 'c1', 'content': 'b'})
+    store.append_message({'role': 'user', 'content': 'continue'})
+    # 旧版本可能把 tail_start 落在工具结果组中间；回放必须修复，而不是报孤儿。
+    store.append_history_snip(head_end=2, tail_start=3, snipped=1)
+
+    history = store.rebuild_openai_history()
+
+    assert history[0]['content'] == 'start'
+    assert any(str(m.get('content', '')).startswith('[snipped') for m in history)
+    assert history[-1]['content'] == 'continue'
+    SessionEventStore.validate_openai_history(history)
