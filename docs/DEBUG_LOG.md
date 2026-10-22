@@ -3406,3 +3406,14 @@ checkpoints 17.2 MB / 177 节点、transcripts 1.8 MB 等），未识别 42.4 MB
 验证：storage/TUI/命令/tool_cache 定向 82 passed；全量 1228 passed / 1 skipped，
 5 条 warning 均为飞书 SDK 弃用提示；`harness.py --doctor` 已输出 storage 摘要；
 Ruff 与 diff 检查通过。
+
+## 合并 feature/ui 到 main
+
+合并前检查：main 无独有提交，feature/ui 领先 82 个提交，main 是共同祖先，
+无冲突；工作区干净。以 `--no-ff` 生成合并提交 `bd99673`，把 Textual UI、
+运行时接线、审批/策略/文档解析拆分、checkpoint 全局回收和存储 profile 一起合入。
+合并后全量 1228 passed / 1 skipped，5 条 warning 均为飞书 SDK 弃用提示。
+
+未完成项保留在文档中：三种真实终端的人工验收、P7 legacy 清理、默认 UI 从 ansi
+切换到 textual 的独立决策。feature/ui 暂保留作验收回退，验收完成后再删除；
+后续修复从 main 拉 `fix/ui-*`，不再在 feature/ui 上继续开发。

@@ -1,6 +1,6 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：命令迁移已补齐，正在收尾检查；真实终端验收、P7 清理与合并 main 尚未完成
+状态：已合并到 main（bd99673）；真实终端验收与 P7 清理尚未完成
 进展：
 - P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
 - P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、
@@ -85,7 +85,7 @@
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
   维护成本。等价路径：`/fork` 选择器分叉、`/rewind` 回滚、`/sessions` 切换。
   结论同步记录在 `docs/DEBUG_LOG.md`。
-目标分支：`feature/ui`
+目标分支：`feature/ui`（已于 bd99673 合并到 `main`）
 调研日期：2026-10-21
 
 ## 1. 调研结论（先看证据）
