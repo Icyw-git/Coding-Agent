@@ -533,6 +533,11 @@ F2/Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspac
 不覆盖 TUI；`/cd`、`/new --ws`、`/archive`、`/watch` 均带参数补全。
 新 TUI 启动时载入全部历史，`/more` 只提示无需加载；旧 `textual-legacy`
 仍按 400 条分页。
+对话区支持拖选 Markdown 渲染后的文本（含中文、跨行与滚动后的内容），
+`Ctrl+Shift+C` 复制选区；`Ctrl+C` 有选区时复制、没有选区时退出，`Ctrl+Q` 始终退出。
+复制的是显示文本，换宽重排后选区清除；`/copy` 复制最近一次完整工具输出。
+系统剪贴板由终端通过 OSC 52 接收，成功与否需粘贴到外部编辑器核对。
+输入框可使用终端粘贴快捷键（如 Windows Terminal 的 `Ctrl+Shift+V`）。
 交互模式启动时 MCP 在后台连接，界面先可用，首条消息前完成工具注册。
 状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
 可用 `LLM_PRICING_JSON` 覆盖价格（input/output/cached_input/cache_write，

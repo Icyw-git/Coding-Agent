@@ -3250,3 +3250,25 @@ renderer 的导入顺序，已隔离事件渲染回调后复测通过。
 
 **尚未完成**：Windows Terminal / PowerShell / VS Code 真实终端验收、P7 重复实现清理、
 合并 main。检查清单已写入 UI_REWRITE_PLAN；自动测试通过不代表这些步骤完成。
+
+## TUI 自绘视口选区修复
+
+用户反馈 Markdown 显示后无法拖选。根因不是 Markdown 格式，而是自绘
+`VirtualTranscript.render_line` 绕过了默认渲染管线：没有给 strip 添加文本 offset
+元数据，也没有根据 text_selection 绘制高亮或实现 get_selection。
+此前 Ctrl-C 回归 mock 了 _selected_text，不能证明鼠标选择链路有效。
+
+修复：每个真实内容段通过 Strip.apply_offsets 标记文档行和字符偏移，沿用
+Textual 对终端 cell 与 Unicode 字符的映射；选中行按字符范围叠加主题高亮，
+从布局行提取纯文本，不复制 Markdown 标记或终端补齐空白。
+普通行继续缓存，选中状态不写入缓存，清除选区后不会留下旧高亮。
+窗口换宽后清除基于旧布局的选区，防止复制错位。
+
+新增真实鼠标 down/move/up 回归，覆盖中文与 emoji 正反向拖选、选区高亮及清除、
+滚动后的代码块跨行复制、Ctrl-C 不退出、Ctrl-Shift-C、越界与换宽。
+复制出口仍用测试回调捕获，系统剪贴板通过 OSC 52 的实际写入仍待终端验收。
+
+验证：对话/生命周期/布局/选区/UI 集成定向回归 79 passed；旧 UI/MCP 回归
+67 passed；增量 Ruff 通过。
+10k 块布局 25.5ms、滚动 0.685ms/帧、流式更新 1.448ms。
+该基准测布局计算，不代表真实终端选区渲染或系统剪贴板性能。
