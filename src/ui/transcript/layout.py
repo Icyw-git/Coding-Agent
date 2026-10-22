@@ -139,25 +139,36 @@ class TranscriptLayout:
         blocks = model.snapshot()
 
         if not full and len(blocks) == len(self._entries):
-            changed = [bid for bid in dirty if bid in self._index]
+            changed = [block_id for block_id in dirty if block_id in self._index]
             if len(changed) == len(dirty):
+                changed_indexes = []
                 for block_id in changed:
                     index = self._index[block_id]
                     block = blocks[index]
                     if self._entries[index].version == block.version:
                         continue
-                    self._cached_lines -= (self._entries[index].height
-                                            if self._entries[index].lines is not None else 0)
-                    self._entries[index] = self._entry(block, width)
+                    changed_indexes.append(index)
+                    old_entry = self._entries[index]
+                    self._cached_lines -= (old_entry.height
+                                           if old_entry.lines is not None else 0)
+                    entry = self._entry(block, width)
+                    entry.start = old_entry.start
+                    self._entries[index] = entry
+                    if self._cached_lines > self._line_cache_limit:
+                        self._trim_lines()
                 self._revision = model.revision
-                self._rebuild_starts()
+                if changed_indexes:
+                    self._reindex_from(min(changed_indexes))
+                else:
+                    self._trim_lines()
                 return
             full = True
 
         if not full:
             # 追加路径：模型只会在尾部新增，避免整表重建。
-            new_blocks = blocks[len(self._entries):]
-            for block in new_blocks:
+            old_count = len(self._entries)
+            changed_indexes = []
+            for block in blocks[old_count:]:
                 entry = self._entry(block, width)
                 self._index[block.id] = len(self._entries)
                 self._entries.append(entry)
@@ -165,20 +176,24 @@ class TranscriptLayout:
                     self._trim_lines()
             # 同时可能有旧块被修改（append + 其它事件同帧）
             for block_id in dirty:
-                if block_id in self._index:
-                    index = self._index[block_id]
-                    block = blocks[index]
-                    if self._entries[index].version == block.version:
-                        continue
-                    old = self._entries[index]
-                    if old.lines is not None:
-                        self._cached_lines -= old.height
-                    self._entries[index] = self._entry(block, width)
-                    if self._cached_lines > self._line_cache_limit:
-                        self._trim_lines()
+                if block_id not in self._index:
+                    continue
+                index = self._index[block_id]
+                block = blocks[index]
+                if self._entries[index].version == block.version:
+                    continue
+                changed_indexes.append(index)
+                old = self._entries[index]
+                if old.lines is not None:
+                    self._cached_lines -= old.height
+                entry = self._entry(block, width)
+                entry.start = old.start
+                self._entries[index] = entry
+                if self._cached_lines > self._line_cache_limit:
+                    self._trim_lines()
             self._width = width
             self._revision = model.revision
-            self._rebuild_starts()
+            self._reindex_from(min(changed_indexes) if changed_indexes else old_count)
             return
 
         # 全量重建（宽度变化 / 清空 / 顺序变化）；边建边淘汰，避免峰值
@@ -192,11 +207,18 @@ class TranscriptLayout:
         self._index = {entry.block_id: i for i, entry in enumerate(entries)}
         self._width = width
         self._revision = model.revision
-        self._rebuild_starts()
+        self._reindex_from(0)
 
-    def _rebuild_starts(self) -> None:
-        start = 0
-        for entry in self._entries:
+    def _reindex_from(self, index: int = 0) -> None:
+        """只从变更位置重算 starts；流式更新尾部块时避免每次 O(n)。"""
+        if index >= len(self._entries):
+            return
+        if index:
+            previous = self._entries[index - 1]
+            start = previous.start + previous.height
+        else:
+            start = 0
+        for entry in self._entries[index:]:
             entry.start = start
             start += entry.height
         self._total = start

@@ -36,6 +36,12 @@ def run(blocks: int, width: int, limit: int | None) -> dict:
         layout.visible(0, 40, 40)
         layout.visible(layout.max_scroll(40), 40, 40)
         visible_ms = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
+        tail_id = f'b{blocks - 1}'
+        for _ in range(200):
+            model.append_text(tail_id, 'x')
+            layout.update(model, width)
+        stream_tail_ms = (time.perf_counter() - started) * 1000 / 200
         current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -47,6 +53,7 @@ def run(blocks: int, width: int, limit: int | None) -> dict:
         'peak_mb': peak / 1048576,
         'layout_ms': layout_ms,
         'visible_ms': visible_ms,
+        'stream_tail_ms': stream_tail_ms,
         'cached_lines': layout._cached_lines,
     }
 
@@ -61,12 +68,12 @@ def main() -> int:
         rows.append((label, row))
     print(f'blocks={blocks} width={width}')
     print(f"{'mode':<8} {'model':>7} {'after':>7} {'current':>8} {'peak':>7} "
-          f"{'layout':>8} {'visible':>8} {'lines':>7}")
+          f"{'layout':>8} {'visible':>8} {'stream':>8} {'lines':>7}")
     for label, row in rows:
         print(f"{label:<8} {row['model_mb']:6.1f}M {row['after_update_mb']:6.1f}M "
               f"{row['current_mb']:7.1f}M {row['peak_mb']:6.1f}M "
               f"{row['layout_ms']:7.1f}ms {row['visible_ms']:7.1f}ms "
-              f"{row['cached_lines']:7d}")
+              f"{row['stream_tail_ms']:7.3f}ms {row['cached_lines']:7d}")
     return 0
 
 

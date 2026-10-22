@@ -151,3 +151,20 @@ def test_line_cache_evicts_offscreen_blocks_but_keeps_heights():
     assert layout.block_at(9) == 'b4'
     assert [line for line in layout.visible(0, 4)] == [
         'block-0', 'second', 'block-1', 'second']
+
+
+def test_stream_update_keeps_starts_and_total_height():
+    from ui.transcript import ConversationModel, TranscriptLayout
+
+    model = ConversationModel()
+    for index in range(3):
+        model.append('assistant', {'text': 'a\nb\nc'}, block_id=f'b{index}')
+    layout = TranscriptLayout(
+        lambda block, width: str(block.payload['text']).splitlines())
+    layout.update(model, 80)
+
+    model.append_text('b2', 'x')
+    layout.update(model, 80)
+
+    assert layout.total_height == 9
+    assert [entry.start for entry in layout.entries()] == [0, 3, 6]

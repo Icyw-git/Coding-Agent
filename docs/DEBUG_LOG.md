@@ -3473,9 +3473,10 @@ HEAD `00e2683`）；当前 `.cache` 约 31 MB。验证：全量 **1271 passed / 
 改为有界缓存（默认 6000 行）后：离屏块保留 `height`、`lines=None`，`line_at`/
 `visible` 按需重渲染；当前约 7.5 MB（降低约 22%）。进一步让全量构建边建边淘汰
 （游标避免 O(n²)），峰值从约 10.1 MB 降到 **8.1 MB**，首次 layout 约 81.7 ms，
-视口切片约 7.9 ms。10k 块基准 `scripts/bench_ui.py` 仍远低于阈值。
+视口切片约 7.9 ms。流式更新改为从变更块重算 starts：旧的全表重排约 1.2 ms/次，
+尾部流式块约 0.05 ms/次。10k 块基准 `scripts/bench_ui.py` 仍远低于阈值。
 
 新增 `scripts/bench_layout.py` 同时跑 full/bounded 两种模式，避免只看单边数字；
-新增缓存淘汰/高度保持测试。验证：全量 **1272 passed / 1 skipped**，5 条 warning
-均来自飞书 SDK，Ruff 与 diff 检查通过。若后续继续压低峰值，需要把块高度也改为
+新增缓存淘汰/高度保持测试、流式尾部更新 starts 回归；验证：全量
+**1273 passed / 1 skipped**，5 条 warning 均来自飞书 SDK，Ruff 与 diff 检查通过。若后续继续压低峰值，需要把块高度也改为
 惰性估算，或参考 Codex 的分页 history / Pi 的 active-branch projection 做真正的窗口化。
