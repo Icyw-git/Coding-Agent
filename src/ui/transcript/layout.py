@@ -47,6 +47,7 @@ class TranscriptLayout:
         self._model: ConversationModel | None = None
         self._recent: OrderedDict[str, None] = OrderedDict()
         self._cached_lines = 0
+        self._trim_scan = 0
         self._line_cache_limit = max(0, int(line_cache_limit))
 
     @property
@@ -111,11 +112,13 @@ class TranscriptLayout:
                 continue
             entry = self._entries[self._index[block_id]]
             self._drop(entry)
-        # 新布局尚未被访问时，从最旧块开始淘汰。
+        # 新布局尚未被访问时，从最旧块开始淘汰。游标避免全量构建时
+        # 每个新块都从第 0 项重新扫描，导致 O(n^2)。
         if self._cached_lines > self._line_cache_limit:
-            for entry in self._entries:
-                if self._cached_lines <= self._line_cache_limit:
-                    break
+            while (self._cached_lines > self._line_cache_limit
+                   and self._trim_scan < len(self._entries)):
+                entry = self._entries[self._trim_scan]
+                self._trim_scan += 1
                 if entry.block_id not in protect:
                     self._drop(entry)
 
@@ -130,6 +133,7 @@ class TranscriptLayout:
             self._index = {}
             self._recent.clear()
             self._cached_lines = 0
+            self._trim_scan = 0
         self._model = model
         dirty = model.take_dirty()   # 无论是否全量都清空脏集合
         blocks = model.snapshot()
@@ -157,6 +161,8 @@ class TranscriptLayout:
                 entry = self._entry(block, width)
                 self._index[block.id] = len(self._entries)
                 self._entries.append(entry)
+                if self._cached_lines > self._line_cache_limit:
+                    self._trim_lines()
             # 同时可能有旧块被修改（append + 其它事件同帧）
             for block_id in dirty:
                 if block_id in self._index:
@@ -168,16 +174,21 @@ class TranscriptLayout:
                     if old.lines is not None:
                         self._cached_lines -= old.height
                     self._entries[index] = self._entry(block, width)
+                    if self._cached_lines > self._line_cache_limit:
+                        self._trim_lines()
             self._width = width
             self._revision = model.revision
             self._rebuild_starts()
             return
 
-        # 全量重建（宽度变化 / 清空 / 顺序变化）
+        # 全量重建（宽度变化 / 清空 / 顺序变化）；边建边淘汰，避免峰值
+        # 暂时堆出整份历史的所有行。
         entries: list[LayoutEntry] = []
+        self._entries = entries
         for block in blocks:
             entries.append(self._entry(block, width))
-        self._entries = entries
+            if self._cached_lines > self._line_cache_limit:
+                self._trim_lines()
         self._index = {entry.block_id: i for i, entry in enumerate(entries)}
         self._width = width
         self._revision = model.revision

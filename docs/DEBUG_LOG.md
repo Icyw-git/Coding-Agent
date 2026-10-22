@@ -3471,9 +3471,9 @@ HEAD `00e2683`）；当前 `.cache` 约 31 MB。验证：全量 **1271 passed / 
 布局后当前约 9.6 MB、峰值约 10.1 MB，首次 layout 约 67.6 ms，视口切片约 7.4 ms。
 
 改为有界缓存（默认 6000 行）后：离屏块保留 `height`、`lines=None`，`line_at`/
-`visible` 按需重渲染；当前约 7.5 MB（降低约 22%），首次 layout 约 70.5 ms，
-视口切片约 10.8 ms，峰值仍约 10.1 MB（首次仍要渲染所有块求高度）。10k 块基准
-`scripts/bench_ui.py` 仍远低于阈值。
+`visible` 按需重渲染；当前约 7.5 MB（降低约 22%）。进一步让全量构建边建边淘汰
+（游标避免 O(n²)），峰值从约 10.1 MB 降到 **8.1 MB**，首次 layout 约 81.7 ms，
+视口切片约 7.9 ms。10k 块基准 `scripts/bench_ui.py` 仍远低于阈值。
 
 新增 `scripts/bench_layout.py` 同时跑 full/bounded 两种模式，避免只看单边数字；
 新增缓存淘汰/高度保持测试。验证：全量 **1272 passed / 1 skipped**，5 条 warning
