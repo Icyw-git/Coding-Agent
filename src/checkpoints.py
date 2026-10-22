@@ -233,10 +233,36 @@ class CheckpointManager:
             raise CheckpointError('no checkpoint available')
         if ref in ('head', 'latest', ''):
             return rows[0]['cp_id']
-        if ref in ('last', 'undo'):
+        if ref == 'last':
+            return next((row['cp_id'] for row in rows if row.get('files')), rows[0]['cp_id'])
+        if ref in ('turn', 'undo'):
+            for row in rows:
+                if self._is_turn_start(row):
+                    return row['cp_id']
+            # 老会话没有 turn_start 元数据、也读不到快照最后一条时，
+            # 退化为旧的“最近文件改动”语义，避免恢复入口直接失效。
             return next((row['cp_id'] for row in rows if row.get('files')), rows[0]['cp_id'])
         self.get(ref)  # 不存在时抛 CheckpointError
         return ref
+
+    def _is_turn_start(self, row: dict) -> bool:
+        if 'turn_start' in row:
+            return bool(row.get('turn_start'))
+        try:
+            path = self._node_dir(row['cp_id']) / 'messages.jsonl'
+            if not path.is_file():
+                return False
+            with path.open('rb') as handle:
+                handle.seek(max(0, path.stat().st_size - 65536))
+                lines = handle.read().splitlines()
+            for raw in reversed(lines):
+                if not raw.strip():
+                    continue
+                message = json.loads(raw)
+                return message.get('role') == 'user'
+        except (OSError, ValueError, TypeError):
+            return False
+        return False
 
     # ---------- 节点生命周期 ----------
 
@@ -256,6 +282,8 @@ class CheckpointManager:
             'cp_id': cp_id,
             'label': label,
             'trigger': trigger,
+            'turn_start': (trigger == 'turn' and bool(messages)
+                           and messages[-1].get('role') == 'user'),
             'session_id': self.session_id,
             'workspace': str(self.workspace),
             'through_seq': getattr(session_store, 'last_seq', None),
@@ -350,6 +378,7 @@ class CheckpointManager:
             'cp_id': meta['cp_id'],
             'label': meta.get('label', ''),
             'trigger': meta.get('trigger', ''),
+            'turn_start': bool(meta.get('turn_start')),
             'session_id': meta.get('session_id', ''),
             'through_seq': meta.get('through_seq'),
             'parent_id': meta.get('parent_id'),

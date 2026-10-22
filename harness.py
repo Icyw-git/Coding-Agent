@@ -1309,9 +1309,10 @@ def format_checkpoint_list(manager)->str:
         label = row.get('label') or ('手动快照' if row['trigger'] == 'manual' else '任务快照')
         status = ' · 尚未完成' if row['status'] == 'open' else ''
         current = ' · 当前' if mark == '*' else ''
+        turn = ' · 回合起点' if row.get('turn_start') else ''
         # 时间锚点：没有它无法分辨快照是「刚才」还是「两小时前」的
         when = f" · {relative_time(row.get('created_at'))}" if row.get('created_at') else ''
-        lines.append(f"  {label}{current}{status} · {len(row['files'])} 个文件{when}\n"
+        lines.append(f"  {label}{current}{turn}{status} · {len(row['files'])} 个文件{when}\n"
                      f"    /rewind {row['cp_id']}")
     return '\n'.join(lines)
 
@@ -1503,7 +1504,7 @@ def handle_command(line:str,messages:list,session_store)->None:
     """REPL 里的 /命令；回溯需要调用方已持有 agent_lock。"""
     command, argument = parse_command(line)
     if command == '/undo':
-        command, argument = '/rewind', 'last --yes'
+        command, argument = '/rewind', 'turn --yes'
     error = command_error(command, argument)
     if error:
         print(f'  {error}')
@@ -1676,7 +1677,7 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f"  已创建快照{('：' + label) if label else ''}。用 /rewind head 回溯。")
 
     elif command=='/rewind':
-        ref=next((p for p in parts[1:] if not p.startswith('--')),'last')
+        ref=next((p for p in parts[1:] if not p.startswith('--')),'turn')
         force='--force' in parts
         scope='session' if '--session' in parts else 'all'
         try:

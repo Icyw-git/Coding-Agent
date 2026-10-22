@@ -1229,7 +1229,7 @@ class HarnessApp(App):
             if argument:
                 self._notice('用法：/undo（不带参数）', level='error')
             else:
-                self.start_rewind('last --yes')
+                self.start_rewind('turn --yes')
         elif verb == 'compact':
             self.start_compact(argument)
         elif verb == 'sessions':
@@ -1901,7 +1901,7 @@ class HarnessApp(App):
             self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
 
     def start_rewind(self, argument: str) -> None:
-        """`/rewind`：先预览，再确认；`--yes` 跳过确认，`/undo` 即 last --yes。"""
+        """`/rewind`：先预览，再确认；`--yes` 跳过确认，`/undo` 即 turn --yes。"""
         import harness
         if self._busy:
             self._notice('Cannot rewind while a request is running.')
@@ -1915,7 +1915,7 @@ class HarnessApp(App):
             self._notice(error, level='error')
             return
         parts = argument.split()
-        ref = next((part for part in parts if not part.startswith('--')), 'last')
+        ref = next((part for part in parts if not part.startswith('--')), 'turn')
         force = '--force' in parts
         scope = 'session' if '--session' in parts else 'all'
         try:

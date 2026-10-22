@@ -149,7 +149,7 @@ turn_completed 分支
 ### 5.2 回溯流程
 
 ```text
-用户输入 /rewind <cp_id|last>
+用户输入 /rewind <cp_id|turn|last>
   ↓
 获取 agent_lock（避免与进行中的 turn / cron turn 并发）
   ↓
@@ -341,7 +341,9 @@ turn 节点记录一次 `git status --porcelain` 与 `git rev-parse HEAD` 作为
 ```text
 /checkpoints                         列出节点：id、label、触发方式、文件数、时间、是否当前 head
 /checkpoint [label]                  手动打一个节点（等价于模型调用 checkpoint 工具）
-/rewind last                         预览 → 确认 → 回溯到「最近一个有文件改动的节点」
+/rewind                             预览 → 确认 → 回溯到最近一个用户回合开始前（默认 turn）
+/rewind turn                        回到最近一个用户回合开始前
+/rewind last                        只回溯到「最近一个有文件改动的节点」
 /rewind head                         回溯到最新节点（可能只回滚会话）
 /rewind <cp_id>                      回溯到指定节点
 /rewind <cp_id> --session            只回滚会话，不动文件
@@ -376,7 +378,8 @@ turn 节点记录一次 `git status --porcelain` 与 `git rev-parse HEAD` 作为
 
 | 引用                     | 指向                                                                | 适用                                     |
 | ------------------------ | ------------------------------------------------------------------- | ---------------------------------------- |
-| `last`（`/rewind` 默认） | 最近一个 `files` 非空的节点；没有任何节点记录过文件时退化为最新节点 | 「把刚才改坏的文件还原」，日常用法       |
+| `turn`（`/rewind` 默认，`/undo`） | 最近一个用户回合的起始节点；没有该元数据时按快照最后一条 user 消息判定 | 「回到上一轮对话开始前」，推荐日常用法   |
+| `last` | 最近一个 `files` 非空的节点；没有任何节点记录过文件时退化为最新节点 | 只撤销最近文件改动，可能落在回合中间     |
 | `head` / `latest`        | 最新节点，不保证带文件改动                                          | 想精确回到「最后一次回答之前」的会话状态 |
 
 `/checkpoints` 输出里的 `files=N` 就是判断依据：`files=0` 的节点不带任何 pre-image，
@@ -466,7 +469,7 @@ CHECKPOINT_MANAGER = None          # 活跃 manager；tools 的 write/edit 通�
 验收标准：
 
 - 一轮对话结束后，`/checkpoints` 能看到本轮节点及改动文件清单；
-- 对一次「改坏文件」的操作执行 `/rewind last`，文件内容与对话历史同时回到上一轮开始的状态；
+- 对一次「改坏文件」的操作执行 `/rewind`（默认 `turn`），文件内容与对话历史同时回到上一轮开始的状态；
 - 冲突场景下不传 `--force` 时零文件被修改；
 - `/rewind` 报告包含 §8.6 的「不回滚项」清单；
 - `test_checkpoints.py`（23 例）与 `test_session_store.py`（7 例）全绿，且新事件类型不影响既有重放。

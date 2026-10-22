@@ -328,7 +328,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('checkpoints', '列出当前会话快照', aliases=('cps',)),
     CommandSpec('checkpoint-gc', '手动清理旧快照', '[--all] [--keep N]',
                 argument_completions=_checkpoint_gc_arguments),
-    CommandSpec('rewind', '回溯快照', '[ID|last|head] [--force] [--session] [--yes]'),
+    CommandSpec('rewind', '回溯快照', '[ID|turn|last|head] [--force] [--session] [--yes]'),
     CommandSpec('undo', '撤销最近一回合'),
     CommandSpec('fork', '从用户消息分叉', '[事件序号]'),
     CommandSpec('clone', '从当前叶复制会话（分叉）'),

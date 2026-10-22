@@ -57,7 +57,7 @@
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
   `textual-legacy`，`textual-next` 作为兼容别名。
 - P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
-  `ConfirmModal` 确认后才落盘；`/undo` = `last --yes`。
+  `ConfirmModal` 确认后才落盘；`/undo` = `turn --yes`（回退到用户回合开始）。
 - P6b：迁移剩余命令 `/archive` `/delete` `/find` `/workspaces` `/workspace`
   `/cd` `/watch` `/revoke` `/more`，并补 `/new --ws` 与参数补全。交互按 Pi
   `ctx.ui.select` 的思路抽成通用 modal：`ChoiceModal`（搜索+单选）、

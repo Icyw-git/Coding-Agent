@@ -437,7 +437,7 @@ HARNESS_PERF=1
 嵌套分段存在包含关系，不能直接相加。
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
-展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一次快照）、`/revoke`
+展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一个用户回合开始前）、`/revoke`
 （撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
 `/cache profile` 查看完整存储占用（源数据、派生缓存、未识别目录和可回收量）；
 `/cache gc` 默认只预览，按文件名匹配会话事件里的引用，宁可少删也不误删；
@@ -535,7 +535,7 @@ workspace-write 之间切换执行档位。
 `/checkpoint [标签]`、
 `/checkpoints`、`/rewind`、`/undo` 已接入新 TUI：`/rewind` 先显示文件/会话预览，
 确认弹窗按 `y`/Enter 才执行，`n`/Esc 不产生改动；`/undo` 等价于
-`/rewind last --yes`。`/checkpoint-gc` 默认只清理当前会话超过保留上限（20）的旧快照，
+`/rewind turn --yes`，回到最近一个用户回合开始前；`/rewind` 默认回到最近一个用户回合开始前，`/rewind last` 只撤销最近文件改动。`/checkpoint-gc` 默认只清理当前会话超过保留上限（20）的旧快照，
 其余会话的待清理数量会一并提示；`/checkpoint-gc --all` 先预览再确认清理所有会话，
 `--keep N` 覆盖本次命令每个会话的保留数量；清理始终手动触发，不会自动执行，
 `--keep` 也不改变默认保留策略。TUI 的

@@ -295,16 +295,37 @@ def test_last_skips_nodes_without_file_changes(ws):
     target.write_text('BROKEN', encoding='utf-8')
     mgr.seal()
 
-    answer = mgr.begin_turn(_msgs())           # 这一轮只输出最终回答
+    answer = mgr.begin_turn([
+        {'role': 'user', 'content': 'hello'},
+        {'role': 'assistant', 'content': 'done'},
+    ])                                         # 这一轮只输出最终回答
     mgr.seal()
 
     assert mgr.head() == answer
     assert mgr.resolve('head') == answer
     assert mgr.resolve('last') == changed
+    assert mgr.resolve('turn') == changed
     assert mgr.resolve('undo') == changed
 
     assert mgr.restore(mgr.resolve('last'))['ok'] is True
     assert target.read_text(encoding='utf-8') == 'v1'
+
+
+def test_turn_resolves_user_turn_start_even_without_files(ws):
+    mgr = _mgr(ws)
+    target = ws / 'a.txt'
+    target.write_text('v1', encoding='utf-8')
+    first = mgr.begin_turn(_msgs('first turn'))
+    mgr.capture_pre_image(target)
+    target.write_text('v2', encoding='utf-8')
+    mgr.seal()
+
+    second = mgr.begin_turn(_msgs('second turn'))  # 新用户回合，但没有文件改动
+    mgr.seal()
+
+    assert mgr.resolve('last') == first
+    assert mgr.resolve('turn') == second
+    assert mgr.resolve('undo') == second
 
 
 def test_last_falls_back_to_newest_when_nothing_changed(ws):

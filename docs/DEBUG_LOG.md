@@ -3533,3 +3533,27 @@ Pi 的 active-branch 投影一致：恢复源保留完整历史，但 UI 不应�
 `scripts/bench_stream.py` 输出不同文本长度下的固定/自适应间隔；新增间隔自适应测试。
 不改变 Markdown 最终排版或流式内容。验证：全量 **1277 passed / 1 skipped**，
 5 条 warning 均来自飞书 SDK；Ruff 与 diff 检查通过。
+
+## 快照语义对齐：turn 回退与 Pi/Codex 对照
+
+用户确认快照的核心预期是「回到一轮对话开始前」。原实现节点按 loop 迭代生成，
+`resolve('undo')` 实际是「最近一个有文件改动的节点」，因此可能落在回合中间；这
+解释了为什么文件回退了，但不一定是整轮开始前的状态。
+
+新增节点元数据 `turn_start`（仅 `trigger=turn` 且快照最后一条是 user 时置真），
+并增加 `resolve('turn')`：
+
+- `/rewind` 默认 `turn`：回到最近一个用户回合开始前的会话和文件；
+- `/undo` = `/rewind turn --yes`；
+- `/rewind last` 保留「只撤销最近文件改动」的旧语义；
+- `/rewind head` 仍是最新节点；
+- 老会话没有 `turn_start` 时，从 `messages.jsonl` 尾部读最后一条消息判断，兼容旧索引。
+
+此外调研了 Pi/Codex：Pi 是 `id`/`parentId` 会话树，`/tree`/`/fork`/`/clone` 做强分支，
+但没有等价的通用工作区文件快照；Codex 的 `ThreadRevertParams` 明确只替换会话历史、
+不恢复本地文件，archive/delete 和分页 history 更成熟。对齐结论：保留我们的文件
+pre-image 能力，不引入 Pi 的树模型；`turn` 默认化，`last` 保留为文件级撤销；bash、
+记忆、cron、任务和 worktree 仍明确列为不可回滚副作用。详细对照见
+`docs/CHECKPOINT_COMPARISON.md`。
+
+验证：全量 **1278 passed / 1 skipped**，5 条 warning 均来自飞书 SDK；Ruff 与 diff 检查通过。
