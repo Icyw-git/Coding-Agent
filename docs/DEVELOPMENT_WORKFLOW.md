@@ -27,7 +27,7 @@
 2. 从 main 创建 `fix/ui-*` 修复验收问题，并补必要回归；修改后重测受影响项。
 3. P7 已完成：旧实现、`textual-legacy` 入口和专属测试已删除；默认入口为 Textual，
    `HARNESS_UI=ansi` 保留为降级路径，`textual-next` 仅兼容别名。
-4. 上述验收完成后确认远端 main 仍包含修复，再删除 `feature/ui`。
+4. 验收已通过，`feature/ui` 已删除；后续 UI 改动从 main 拉 `fix/ui-*`。
 5. 默认入口已切换；ANSI 降级仍需在真实终端验证。
 
 当前流程已确定，人工验收尚无通过记录，不能仅凭自动测试宣称可合并。

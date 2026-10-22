@@ -703,7 +703,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 ## 分支说明
 
 - `main`：稳定集成分支，核心功能与 UI 最终都合入这里；从 main 创建短期功能或修复分支，验证后合回。
-- `feature/ui`：本次 Textual 重构的临时分支，已于 `bd99673` 合入 `main`；保留作真实终端验收回退，验收完成后再删除。后续验收修复从 `main` 拉短期分支。
+- `feature/ui`：本次 Textual 重构的临时分支，已于 `bd99673` 合入 `main`；验收通过后已删除，后续 UI 改动从 `main` 拉短期分支。
 - 独立核心功能（模型、MCP、工具、沙箱、API 等）从 main 拉短期分支；跨 UI 与核心的大重构尽量等本次 UI 合并后再做。
 - 紧急修复先合入 main；若 `feature/ui` 尚未删除，再同步该分支。
 
