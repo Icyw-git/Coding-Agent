@@ -188,3 +188,47 @@ def test_ui_mode_denies_when_modal_says_no(monkeypatch):
     allowed, message = gate.decide('bash', {'command': 'rm x'}, 'destructive')
 
     assert not allowed and message.startswith('denied')
+
+
+class _ScopedUIGate:
+    use_ui = True
+
+    def __init__(self, allowed=True, scope=None):
+        self.allowed = allowed
+        self.scope = scope
+        self.calls = []
+
+    def request_scoped(self, tool, args, title='', *, allow_session=True):
+        self.calls.append((tool, args, title, allow_session))
+        return self.allowed, self.scope
+
+
+def test_ui_mode_session_scope_reaches_the_session_allowlist(monkeypatch):
+    """Textual 的 a 必须与 CLI 的 a 等价：只放行同类，不扩大范围。"""
+    import harness
+
+    fake = _ScopedUIGate(scope='session')
+    monkeypatch.setattr(harness, 'permission_gate', fake)
+    gate = PermissionGate()
+
+    allowed, _ = gate.decide('bash', {'command': 'del x'}, 'destructive')
+
+    assert allowed
+    assert fake.calls == [('bash', {'command': 'del x'}, 'destructive', True)]
+    assert gate.session_allows('bash', {'command': 'del y'})
+    assert not gate.session_allows('bash', {'command': 'rm y'})
+
+
+def test_ui_mode_never_grants_scope_for_classless_commands(monkeypatch):
+    """解释器没有同类键；渲染层即使带回 scope，审批门也必须丢弃。"""
+    import harness
+
+    fake = _ScopedUIGate(scope='session')
+    monkeypatch.setattr(harness, 'permission_gate', fake)
+    gate = PermissionGate()
+
+    allowed, _ = gate.decide('bash', {'command': 'python -c "import os"'}, 'opaque')
+
+    assert allowed
+    assert fake.calls[0][-1] is False
+    assert not gate._session_allows

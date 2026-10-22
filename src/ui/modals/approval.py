@@ -1,4 +1,5 @@
-"""审批弹窗：y 允许 / n|Esc 拒绝，200ms 防误触。"""
+"""审批弹窗：y 允许 / a 本会话允许同类 / n|Esc 拒绝，200ms 防误触。"""
+
 from rich.markup import escape as markup_escape
 from rich.text import Text
 from textual.app import ComposeResult
@@ -11,24 +12,36 @@ from ui_events import bus
 class PermissionModal(ModalScreen):
     """权限确认覆盖层：y 允许 / n|Esc 拒绝。应答后 dismiss（gate 自动唤醒 agent 线程）。
 
-    200ms 防误触：弹窗后 0.2s 内按键无效（对应 CC 的 anti-misclick 设计）。"""
+    200ms 防误触：弹窗后 0.2s 内按键无效（对应 CC 的 anti-misclick 设计）。
+
+    a 只在 allow_session=True 时可见/生效：解释器、ssh/docker、Git 写操作没有
+    「同类」可记，按钮不该假装能买整会话免审。scope 由审批门按登记参数重算。"""
 
     BINDINGS = [
-        ("y", "approve", "Allow"),
-        ("n", "reject", "Deny"),
-        ("escape", "reject", "Deny"),
+        ('y', 'approve', 'Allow'),
+        ('a', 'approve_session', 'Allow for session'),
+        ('n', 'reject', 'Deny'),
+        ('escape', 'reject', 'Deny'),
     ]
 
     ARM_DELAY = 0.2
 
-    def __init__(self, req_id: str, tool: str, args: dict, title: str = 'Permission needed',
-                 risk: str = 'warning'):
+    def __init__(
+        self,
+        req_id: str,
+        tool: str,
+        args: dict,
+        title: str = 'Permission needed',
+        risk: str = 'warning',
+        allow_session: bool = True,
+    ):
         super().__init__()
         self.req_id = req_id
         self.tool = tool
         self.args = args
         self.title = title
         self.risk = risk if risk in ('warning', 'danger') else 'warning'
+        self.allow_session = bool(allow_session)
         self._armed = False
 
     def on_mount(self) -> None:
@@ -38,16 +51,19 @@ class PermissionModal(ModalScreen):
         self._armed = True
 
     def compose(self) -> ComposeResult:
-        with Static(id="perm-box", classes=f"risk-{self.risk}"):
+        with Static(id='perm-box', classes=f'risk-{self.risk}'):
             label = 'HIGH RISK' if self.risk == 'danger' else 'CONFIRM ACTION'
             title_color = 'red' if self.risk == 'danger' else 'yellow'
-            yield Static(f"[{title_color}][bold]{label}[/]  {markup_escape(self.title)}[/]",
-                         id="perm-title")
-            yield Static(Text("Tool: ", style="dim") + Text(self.tool))
+            yield Static(f'[{title_color}][bold]{label}[/]  {markup_escape(self.title)}[/]', id='perm-title')
+            yield Static(Text('Tool: ', style='dim') + Text(self.tool))
             yield Static(Text(self._detail_text()))
-            yield Static("")
-            yield Static("[yellow]y[/] = Allow    [yellow]n[/]/[yellow]Esc[/] = Deny    "
-                         f"([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])")
+            yield Static('')
+            session = '[yellow]a[/] = Allow same kind this session    ' if self.allow_session else ''
+            yield Static(
+                f'[yellow]y[/] = Allow    {session}'
+                '[yellow]n[/]/[yellow]Esc[/] = Deny    '
+                f'([dim]{int(self.ARM_DELAY * 1000)}ms 防误触[/])'
+            )
 
     def _detail_text(self) -> str:
         """审批前给出可判断的上下文：补丁/内容预览优先于原始参数。"""
@@ -80,6 +96,12 @@ class PermissionModal(ModalScreen):
         if not self._armed:
             return
         bus.emit('permission_resolve', req_id=self.req_id, approved=True)
+        self.dismiss()
+
+    def action_approve_session(self):
+        if not self._armed or not self.allow_session:
+            return
+        bus.emit('permission_resolve', req_id=self.req_id, approved=True, scope='session')
         self.dismiss()
 
     def action_reject(self):

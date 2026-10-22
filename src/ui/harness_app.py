@@ -699,12 +699,16 @@ class HarnessApp(App):
                                          'level': 'error'})
             self._mark_dirty()
         elif kind == 'permission_request':
-            self.push_screen(PermissionModal(
-                str(payload.get('req_id', '')),
-                str(payload.get('tool', '')),
-                payload.get('args') or {},
-                str(payload.get('title', 'Permission needed')),
-                str(payload.get('risk', 'warning'))))
+            self.push_screen(
+                PermissionModal(
+                    str(payload.get('req_id', '')),
+                    str(payload.get('tool', '')),
+                    payload.get('args') or {},
+                    str(payload.get('title', 'Permission needed')),
+                    str(payload.get('risk', 'warning')),
+                    allow_session=bool(payload.get('allow_session', True)),
+                )
+            )
         elif kind == 'round_end':
             prompt_tokens = int(payload.get('prompt_tokens') or 0)
             cached_tokens = int(payload.get('cached_tokens') or 0)

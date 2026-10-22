@@ -529,6 +529,26 @@ def test_permission_gate_cancel_pending():
     assert gate._pending == {}
 
 
+def test_permission_gate_scoped_resolution_and_classless_guard():
+    """scope 只能由登记方放行；allow_session=False 时事件里的 scope 被丢弃。"""
+    from ui_events import PermissionGate, UIEventBus
+
+    local_bus = UIEventBus()
+    gate = PermissionGate(local_bus, use_ui=True)
+    seen = []
+
+    def answer(event):
+        if event.type == 'permission_request':
+            seen.append(event)
+            local_bus.emit('permission_resolve', req_id=event.payload['req_id'], approved=True, scope='session')
+
+    local_bus.subscribe(answer)
+    assert gate.request_scoped('bash', {'command': 'del x'}, allow_session=True) == (True, 'session')
+    assert gate.request_scoped('bash', {'command': 'python -c "x"'}, allow_session=False) == (True, None)
+    assert seen[0].payload['allow_session'] is True
+    assert seen[1].payload['allow_session'] is False
+
+
 def test_textual_idle_does_not_hold_agent_lock():
     """Textual 等待输入时必须释放锁，供 cron 队列主动执行。"""
     import asyncio

@@ -3107,3 +3107,16 @@ footer ctx/cache 文案；总回归 1158 passed / 1 skipped，旧 UI 64 passed�
 
 **测试**：steer/follow-up 分队列、Alt+Up 全部取回、Esc 取消回填、agent_loop 注入；
 总回归 1170 passed / 1 skipped，旧 UI 64 passed。
+
+## 审批：TUI 卡片补上「本会话允许同类」
+
+- **现象**：同一类外部/MCP 工具调用在 CLI 里批一次后不再问，切到 Textual 后每次都弹；
+  用户直观感受是「审批变多了，是不是沙箱没了」。
+- **根因**：`PermissionModal` 只有 `y`/`n`，`ui_events.PermissionGate.request()` 只回
+  `bool`，`scope='session'` 从未到达 `hooks.GATE.resolve`。CLI 的 `a` 走的是另一条路径，
+  所以只有 TUI 丢失了预授权。
+- **修复**：`request_scoped()` 返回 `(allowed, scope)`，并按登记时的 `allow_session`
+  过滤伪造的 session scope；卡片新增 `a`，`hooks` 把它传给 `resolve`。没有同类键的命令
+  （解释器、外发请求等）不显示 `a`，服务端也会丢弃这类请求伪造的 scope。
+- **测试**：卡片 `y`/`n`/`a`、无同类键按 `a` 无效、`request_scoped` 的 scope 过滤；
+  全量回归 1175 passed / 1 skipped，旧 UI + 新 UI 定向 127 passed。

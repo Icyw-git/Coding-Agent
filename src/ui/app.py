@@ -1080,9 +1080,16 @@ class CCApp(App):
         elif e.type == 'permission_request':
             risk = self._permission_risk(e.payload.get('tool', ''), e.payload.get('args', {}),
                                          e.payload.get('title', ''))
-            self.push_screen(PermissionModal(
-                e.payload['req_id'], e.payload['tool'], e.payload['args'],
-                e.payload.get('title', 'Permission needed'), risk=risk))
+            self.push_screen(
+                PermissionModal(
+                    e.payload['req_id'],
+                    e.payload['tool'],
+                    e.payload['args'],
+                    e.payload.get('title', 'Permission needed'),
+                    risk=risk,
+                    allow_session=bool(e.payload.get('allow_session', True)),
+                )
+            )
         elif e.type == 'permission_resolve':
             self._input.focus()   # 弹窗应答后焦点回到输入框
         elif e.type == 'status':

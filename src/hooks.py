@@ -205,6 +205,20 @@ def _ui_mode() -> bool:
     return bool(getattr(_ui_gate(), 'use_ui', False))
 
 
+def _ask_ui(tool: str, args: dict, reason: str) -> tuple[bool, str | None]:
+    """UI 审批的 (allowed, scope)；旧适配器只有 bool 返回时退回单次允许。
+
+    allow_session 只在有「同类」键时打开：解释器、ssh/docker、Git 写操作
+    没有可记的类别，弹窗不该摆一个不起作用的 a。
+    """
+    gate = _ui_gate()
+    allow_session = bool(approval_class(tool, args))
+    scoped = getattr(gate, 'request_scoped', None)
+    if scoped is None:
+        return bool(gate.request(tool, args, title=reason)), None
+    return scoped(tool, args, title=reason, allow_session=allow_session)
+
+
 class PermissionGate:
     """登记请求并等待决议；双后端 + 超时熔断 + 审批历史（有界）。
 
@@ -387,9 +401,10 @@ class PermissionGate:
         req = self.request(tool, args, reason)
         if _ui_mode():
             # Textual 正占用终端：input() 读不到，打印会刷坏屏幕；
-            # 交给渲染层弹窗应答（弹窗自带超时与取消）。
-            allowed = _ui_gate().request(tool, args, title=reason)
-            self.resolve(req.req_id, allowed, by='ui-modal')
+            # 交给渲染层弹窗应答（弹窗自带超时与取消）。a 的同类范围在
+            # resolve 里按登记的参数重算，弹窗只能选择「要不要同类」。
+            allowed, scope = _ask_ui(tool, args, reason)
+            self.resolve(req.req_id, allowed, by='ui-modal', scope=scope)
             return self._conclude(req, quiet=True)
         if self.backend == 'remote':
             self._await_remote(req)
@@ -405,8 +420,8 @@ class PermissionGate:
         超时同样拒绝。阻塞的是这个工作线程，主循环不受影响。"""
         req = self.request(tool, args, reason)
         if _ui_mode():
-            allowed = _ui_gate().request(tool, args, title=reason)
-            self.resolve(req.req_id, allowed, by='ui-modal')
+            allowed, scope = _ask_ui(tool, args, reason)
+            self.resolve(req.req_id, allowed, by='ui-modal', scope=scope)
             return self._conclude(req, quiet=True)
         print(f'  \033[33m[permission] {approval_view.safe_text(tool)} 等待审批：'
               f'{approval_view.safe_text(reason)}'

@@ -304,9 +304,10 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
 `/status` 和 `--doctor` 始终显示实际生效的档位。
 
 审批有三条通道：CLI 主循环读 stdin（`y` 允许 / `n` 拒绝 / `a` 允许并把同类操作加入本会话白名单，
-与审批卡片的三个按钮一致）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
+与审批卡片的三个按钮一致，TUI 卡片同样是 `y`/`n`/`a`）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
 队列，由飞书卡片或 `/approvals` 决议；Teammate、后台 worker、任务 runner 这些不能抢控制台的线程
-只排队等远程决议。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝；值写成非数字或
+只排队等远程决议。没有同类键的命令（解释器、外发请求等）不显示 `a`，服务端也会丢弃这类请求伪造的
+`scope=session`。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝；值写成非数字或
 ≤0 不会挡住启动，也不会静默按你配的走：stderr 提示一次后按默认档。`GATE.timeout` 是普通属性，
 长驻服务改它即刻生效，不必重启。
 
@@ -509,7 +510,9 @@ python entrypoint.py
 git 分支，并显示模型、上下文占用、token 和缓存命中率；
 输入框支持多行：`Enter` 发送、`Ctrl-J` 换行（高度随内容增长，最多 8 行）。
 输入 `!命令`（如 `!pytest -q`）直接执行 shell 并展示输出，不进入模型上下文；
-审批、超时与沙箱规则仍由策略层决定。输入 `/` 或 `@` 时，输入框下方显示逐键
+审批、超时与沙箱规则仍由策略层决定。审批弹窗 `y` 允许、`n`/`Esc` 拒绝、
+`a` 允许并把同类加入本会话白名单；没有同类键的命令（解释器、外发等）不显示 `a`。
+输入 `/` 或 `@` 时，输入框下方显示逐键
 候选列表：`Tab` 采用、`Alt+↑` / `Alt+↓` 切换；`Ctrl+R` 在 read-only 与
 workspace-write 之间切换执行档位。
 回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。TUI 的 `/sessions` 与

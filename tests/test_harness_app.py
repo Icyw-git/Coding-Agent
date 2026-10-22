@@ -265,6 +265,79 @@ def test_permission_request_opens_modal_and_resolves():
         ui_events.bus.unsubscribe(record)
 
 
+def test_permission_request_can_allow_same_kind_for_session():
+    resolved = []
+
+    def record(event):
+        if event.type == 'permission_resolve':
+            resolved.append(event)
+
+    ui_events.bus.subscribe(record)
+    try:
+        async def scenario():
+            app = HarnessApp([])
+            async with app.run_test(size=(80, 24)) as pilot:
+                app._apply(
+                    UIEvent(
+                        'permission_request',
+                        {
+                            'req_id': 'perm-a',
+                            'tool': 'bash',
+                            'args': {'command': 'del x'},
+                            'title': 'destructive',
+                            'allow_session': True,
+                        },
+                    )
+                )
+                await pilot.pause()
+                assert type(app.screen).__name__ == 'PermissionModal'
+                await asyncio.sleep(0.25)
+                await pilot.press('a')
+                await pilot.pause()
+                assert resolved and resolved[-1].payload['approved'] is True
+                assert resolved[-1].payload['scope'] == 'session'
+
+        asyncio.run(scenario())
+    finally:
+        ui_events.bus.unsubscribe(record)
+
+
+def test_permission_request_ignores_session_key_when_classless():
+    resolved = []
+
+    def record(event):
+        if event.type == 'permission_resolve':
+            resolved.append(event)
+
+    ui_events.bus.subscribe(record)
+    try:
+        async def scenario():
+            app = HarnessApp([])
+            async with app.run_test(size=(80, 24)) as pilot:
+                app._apply(
+                    UIEvent(
+                        'permission_request',
+                        {
+                            'req_id': 'perm-b',
+                            'tool': 'bash',
+                            'args': {'command': 'python -c "import os"'},
+                            'title': 'opaque',
+                            'allow_session': False,
+                        },
+                    )
+                )
+                await pilot.pause()
+                await asyncio.sleep(0.25)
+                await pilot.press('a')
+                await pilot.pause()
+                assert resolved == []
+                await pilot.press('n')
+
+        asyncio.run(scenario())
+    finally:
+        ui_events.bus.unsubscribe(record)
+
+
 def test_bang_shell_runs_without_agent(monkeypatch):
     def fail_loop(messages, **kwargs):
         raise AssertionError('shell must not reach the model')
