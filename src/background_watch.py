@@ -116,9 +116,14 @@ def _parse(argument: str):
     return 'watch', timeout, bg_id, None
 
 
-def watch_command(argument: str, store=None) -> str:
-    """/watch 默认跟踪最新的后台任务，不需要记住编号。"""
+def watch_command(argument: str, store=None, emit=None) -> str:
+    """/watch 默认跟踪最新的后台任务，不需要记住编号。
+
+    emit 由调用方注入：REPL 传 print，TUI 传事件块更新回调，避免后台线程
+    直接写 stdout 覆盖界面。
+    """
     store = _store(store)
+    emit = emit or print
     action, timeout, bg_id, error = _parse(argument)
     if error:
         return error
@@ -132,7 +137,6 @@ def watch_command(argument: str, store=None) -> str:
         running = sum(1 for task in tasks
                       if task.get('status') in ('running', 'queued'))
         if running > 1:
-            emit_extra = (f'  另有 {running - 1} 个任务在运行；'
-                          '用 /watch --list 查看。')
-            print(emit_extra)
-    return watch(bg_id, store, timeout=timeout, emit=print)
+            emit(f'  另有 {running - 1} 个任务在运行；'
+                 '用 /watch --list 查看。')
+    return watch(bg_id, store, timeout=timeout, emit=emit)

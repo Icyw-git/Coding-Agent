@@ -304,9 +304,10 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
 `/status` 和 `--doctor` 始终显示实际生效的档位。
 
 审批有三条通道：CLI 主循环读 stdin（`y` 允许 / `n` 拒绝 / `a` 允许并把同类操作加入本会话白名单，
-与审批卡片的三个按钮一致）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
+与审批卡片的三个按钮一致，TUI 卡片同样是 `y`/`n`/`a`）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
 队列，由飞书卡片或 `/approvals` 决议；Teammate、后台 worker、任务 runner 这些不能抢控制台的线程
-只排队等远程决议。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝；值写成非数字或
+只排队等远程决议。没有同类键的命令（解释器、外发请求等）不显示 `a`，服务端也会丢弃这类请求伪造的
+`scope=session`。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝；值写成非数字或
 ≤0 不会挡住启动，也不会静默按你配的走：stderr 提示一次后按默认档。`GATE.timeout` 是普通属性，
 长驻服务改它即刻生效，不必重启。
 
@@ -384,7 +385,8 @@ LLM_MODEL_ID=your-model-id
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 
-# 可选：textual 或 ansi
+# 可选：ansi（默认）| textual（新全屏 TUI）| textual-legacy（旧 TUI 对照）
+# textual-next 是 textual 的兼容别名
 HARNESS_UI=ansi
 
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
@@ -392,6 +394,10 @@ HARNESS_MEMORY_RECALL=local
 
 # 可选：工作区 AGENTS.md / CLAUDE.md 注入（on 默认 / off 关闭）
 HARNESS_PROJECT_CONTEXT=on
+
+# 可选：覆盖模型价格表（每 1M tokens，JSON）
+# LLM_PRICING_JSON={"my-model":{"input":"2","output":"4",
+#                   "cached_input":"0.2","cache_write":"2.5","currency":"USD"}}
 
 # 可选：OS 沙箱 off（默认）/ auto / require；Windows Low IL，启用会标记工作区目录
 HARNESS_OS_SANDBOX=off
@@ -425,8 +431,11 @@ HARNESS_PERF=1
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
 展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一次快照）、`/revoke`
-（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。`/cache gc` 默认只预览，
-按文件名匹配会话事件里的引用，宁可少删也不误删；被清理的图片在恢复旧会话时降级为文本。
+（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
+`/cache profile` 查看完整存储占用（源数据、派生缓存、未识别目录和可回收量）；
+`/cache gc` 默认只预览，按文件名匹配会话事件里的引用，宁可少删也不误删；
+被清理的图片在恢复旧会话时降级为文本。存储策略与调研见
+[存储 profile](docs/STORAGE_PROFILE.md)。
 每个回合正常结束时，若本轮
 改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
 事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
@@ -493,7 +502,61 @@ python -m pip install -r requirements.txt
 python entrypoint.py
 ```
 
-首次启动时，程序会进入交互式 Agent 会话。使用 `HARNESS_UI=ansi` 可在不支持全屏终端的环境中运行。
+首次启动时，程序会进入交互式 Agent 会话。默认是 ANSI 行式界面；设置
+`HARNESS_UI=textual`（或 `--ui textual`）启用新的 Textual 全屏 TUI（需要
+`pip install textual`，依赖见 `pyproject.toml` 的 `ui` extra）。旧实现保留为
+`HARNESS_UI=textual-legacy`，仅用于对照；`textual-next` 是 `textual` 的兼容别名。
+TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接执行；Ctrl+P 打开命令面板。
+命令注册表的 40 条命令均已接入新 TUI，行式命令及别名由兼容测试核对；
+真实终端验收与旧实现清理尚未完成，`textual-legacy` 保留用于对照。TUI 与行式
+REPL 行为对齐：回合进行中按 Enter 把消息放进下回合队列（本回合结束后执行），
+Alt+Enter 则立即进入当前回合的 steering（Agent 下一次消费时注入）；空闲时两者
+都直接发送。状态行显示 `N queued`；`Alt+↑`/`Ctrl+G` 或 `/dequeue` 打开队列选择器：
+`↑↓` 选择、Enter 取回选中一条、`Ctrl+R` 取回全部、Delete/Ctrl+D 删除选中项（二次确认）、
+Esc 关闭；`Esc` 取消当前回合并把全部未消费消息取回输入框。
+`@` 列出并补全工作区文件（Tab）；`↑`/`↓` 翻输入历史；状态栏常驻当前目录与
+git 分支，并显示模型、上下文占用、token 和缓存命中率；
+输入框支持多行：`Enter` 发送、`Ctrl-J` 换行（高度随内容增长，最多 8 行）。
+输入 `!命令`（如 `!pytest -q`）直接执行 shell 并展示输出，不进入模型上下文；
+审批、超时与沙箱规则仍由策略层决定。审批弹窗 `y` 允许、`n`/`Esc` 拒绝、
+`a` 允许并把同类加入本会话白名单；没有同类键的命令（解释器、外发等）不显示 `a`。
+输入 `/` 或 `@` 时，输入框下方显示逐键
+候选列表：`Tab` 采用、`Alt+↑` / `Alt+↓` 切换；`Ctrl+R` 在 read-only 与
+workspace-write 之间切换执行档位。
+回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。任务运行时禁止切换
+会话或工作区；shell、压缩和会话清理期间输入的消息作为 follow-up 等待操作结束。
+`/checkpoint [标签]`、
+`/checkpoints`、`/rewind`、`/undo` 已接入新 TUI：`/rewind` 先显示文件/会话预览，
+确认弹窗按 `y`/Enter 才执行，`n`/Esc 不产生改动；`/undo` 等价于
+`/rewind last --yes`。`/checkpoint-gc` 默认只清理当前会话超过保留上限（20）的旧快照，
+其余会话的待清理数量会一并提示；`/checkpoint-gc --all` 先预览再确认清理所有会话，
+`--keep N` 覆盖本次命令每个会话的保留数量；清理始终手动触发，不会自动执行，
+`--keep` 也不改变默认保留策略。TUI 的
+`/sessions` 打开会话选择器（搜索标题/工作区/ID，`↑↓` 选择、`Enter` 恢复、
+`Esc` 取消），`/resume <序号|ID前缀|标题>` 直接恢复，两者都使用会话事件流
+（与行式 `/resume` 同一份数据）。`/find <关键词>` 在后台跨会话搜索，命中后弹出
+结果选择器，Enter 直接恢复；`/archive` `/delete` 打开多选清单（空格勾选、
+Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspace remove` 不带
+选择器时弹出登记项选择器。`/watch` 的进度与终态输出写进对话区状态块，
+不覆盖 TUI；`/cd`、`/new --ws`、`/archive`、`/watch` 均带参数补全。
+新 TUI 启动时载入全部历史，`/more` 只提示无需加载；旧 `textual-legacy`
+仍按 400 条分页。
+对话区支持拖选 Markdown 渲染后的文本（含中文、跨行与滚动后的内容），
+松开鼠标后自动复制选区，也可用 `Ctrl+Shift+C` 再次复制；
+`Ctrl+C` 有选区时复制、没有选区时退出，`Ctrl+Q` 始终退出。
+复制时去掉每行尾部的空格和 tab，保留行首缩进、正文内部空格与换行；提示显示
+非空白字符数，不计空格、tab、换行及其他 Unicode 空白，复制内容仍保留缩进与换行。
+单击或只选中行尾空白不覆盖剪贴板。
+复制的是显示文本，换宽重排后选区清除；`/copy` 复制最近一次完整工具输出。
+系统剪贴板由终端通过 OSC 52 接收，成功与否需粘贴到外部编辑器核对。
+输入框可使用终端粘贴快捷键（如 Windows Terminal 的 `Ctrl+Shift+V`）。
+交互模式启动时 MCP 在后台连接，界面先可用，首条消息前完成工具注册。
+状态栏按内置价格表估算成本（`~¥x.xxxx`），未知模型显示为不可用；
+可用 `LLM_PRICING_JSON` 覆盖价格（input/output/cached_input/cache_write，
+单位均为每 1M tokens；reasoning 视为 output 的子集，不会再重复计费）。
+新 TUI 的 footer 常驻 `目录 (分支)`，并显示 `ctx 25% 50k/200k`、
+`↑输入 ↓输出 R缓存读 W缓存写`、`cache 50%`（最近一次请求的缓存命中率）和成本；
+未知缓存字段不显示，避免把“未知”当成 0。
 
 启动前检查本地配置和目录：
 
@@ -609,14 +672,20 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_tasks.py` | 任务与 cron 工具：封装 task_system/cron_scheduler 并统一输出 |
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |
 | `src/tool_documents.py` | `view_image`/`read_document`/`render_document`：图片缓存与文档渲染引用 |
+| `src/documents.py` | 文档文本抽取入口：格式识别、PDF 解析与页选择 |
+| `src/document_formats.py` | DOCX/PPTX/XLSX 解析：OOXML zip/XML 工具与成员读取上限 |
 | `src/tool_search.py` | `glob`/`grep`/`ls`：只读边界、秘密文件过滤与 ripgrep 快路径 |
 | `src/tool_files.py` | `read`/`write`/`edit` 实现：边界门、编码保留与二进制保护（依赖注入） |
 | `src/tool_patch.py` | `apply_patch` 解析、规划与原子回滚；路径解析/审批/checkpoint 由 tools 注入 |
 | `src/tool_text.py` | 文件文本 BOM/编码探测、二进制拒绝与换行符保留 |
 | `src/tool_cache.py` | `/cache`：`.cache/tool_results` 统计与引用保护回收 |
-| `src/exec_policy.py` | 执行策略层：档位、黑名单与审批分级（纯判定，不做 OS 强制） |
+| `src/storage_profile.py` | `/cache profile`：源数据/派生缓存/未识别目录分类与可回收量 |
+| `src/exec_policy.py` | 执行策略层：档位、黑名单、路径分区与决策矩阵（纯判定，不做 OS 强制） |
+| `src/policy_bash.py` | bash 命令文本分析：包装器、只读判定、外发目标与「同类」授权键（启发式，不是安全边界） |
 | `src/sandbox.py` | Windows Low IL 进程沙箱：工作区标记、受限令牌、Job Object 与超时清理 |
-| `src/hooks.py` | PreToolUse 闸门与审批中心（控制台 / 远程 / 无头排队三种后端） |
+| `src/hooks.py` | PreToolUse 闸门、会话上下文与审批凭据；组装 `GATE` |
+| `src/approval.py` | 审批门：请求登记、控制台/远程/UI 决议、会话白名单与 fail-safe 超时 |
+| `src/approval_judge.py` | LLM 审查官：ASK 命令的单条与批量复核（fail-closed） |
 | `src/harness_sdk.py` | Python SDK facade，封装会话和消息操作 |
 | `src/harness_api.py` | FastAPI app factory 和 HTTP/SSE 适配层 |
 | `tests/` | 自动化测试与测试辅助程序 |
@@ -626,11 +695,14 @@ python -m pytest --basetemp /tmp/harness-pytest
 
 ## 分支说明
 
-- `main`：主开发分支，包含可合并和发布的基础功能。
-- `feature/ui`：终端 UI、会话指标和可视化相关功能。
-- `feature/cd-support`：持久化 `cd` 和当前工作目录支持。
+- `main`：稳定集成分支，核心功能与 UI 最终都合入这里；从 main 创建短期功能或修复分支，验证后合回。
+- `feature/ui`：本次 Textual 重构的临时收尾分支，只继续终端验收、缺陷修复、性能与运行时接线收尾；验收后合入 main，再删除分支。
+- 独立核心功能（模型、MCP、工具、沙箱、API 等）从 main 拉短期分支；跨 UI 与核心的大重构尽量等本次 UI 合并后再做。
+- 紧急修复先合入 main，再同步到 feature/ui，避免两边重复实现。
 
-建议从 `main` 创建功能分支，完成测试后通过 Pull Request 合并。
+具体分工、同步与合并条件见 [开发流程](docs/DEVELOPMENT_WORKFLOW.md)，
+本次人工验收见 [UI 终端验收记录](docs/UI_TERMINAL_ACCEPTANCE.md)。
+合入 main 与切换程序总体默认 UI 分开处理；目前总体默认仍为 `ansi`。
 
 ## 推送到 GitHub
 

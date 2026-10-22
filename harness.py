@@ -30,6 +30,7 @@ def enforce_trusted_policy_env() -> None:
 
 import concurrent.futures
 import contextvars
+import difflib
 import hashlib
 import json
 import re
@@ -48,6 +49,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
+import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
 import sandbox
@@ -113,7 +115,7 @@ from cron_scheduler import (
     scheduled_jobs,
     wait_for_cron_idle,
 )
-from exec_policy import is_readonly_command, load_policy, set_tier
+from exec_policy import is_readonly_command, is_secret_path, load_policy, set_tier
 from git_branch import current_branch
 from perf import record as perf_record
 from perf import reset as perf_reset
@@ -134,7 +136,7 @@ from session_title import generate_session_title as _generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
-from tools import TOOLS, ImageResult, restore_todos, run_bash, tool_registry
+from tools import TOOLS, ImageResult, patch_paths, restore_todos, run_bash, safe_path, tool_registry
 from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
@@ -214,6 +216,20 @@ class _LazyLLMClient:
 
 client = _LazyLLMClient()
 
+# UI 事件总线与权限门：Textual / ANSI 渲染层订阅 bus，并在弹窗里应答审批。
+# 非 UI 模式下 PermissionGate 仍走 stdin，行为与原 console 审批一致。
+from ui_events import PermissionGate, bus  # noqa: E402  UI 依赖放在配置区之后
+
+permission_gate = PermissionGate(bus)
+from ui_bridge import (  # noqa: E402
+    METRICS,
+    set_agent,
+    set_session,
+    status_payload,
+    streaming_enabled,
+)
+from ui_bridge import emit as ui_emit
+
 
 def __getattr__(name):
     """模块级懒加载（PEP 562）：mcp_bridge 的 import 约 1s，只延迟到真正
@@ -242,6 +258,7 @@ def list_session_paths(limit: int | None = 20) -> list[Path]:
 
 
 _session_summary_cache = {}
+_SESSION_SUMMARY_CACHE_MAX = 512
 
 
 def _session_catalog():
@@ -261,6 +278,8 @@ def _session_catalog():
             if cached is None or cached[0] != signature:
                 summary = SessionEventStore.open(path).session_summary()
                 _session_summary_cache[key] = (signature, summary)
+                while len(_session_summary_cache) > _SESSION_SUMMARY_CACHE_MAX:
+                    _session_summary_cache.pop(next(iter(_session_summary_cache)))
             rows.append(dict(_session_summary_cache[key][1]))
         except (OSError, SessionReplayError) as exc:
             _session_summary_cache.pop(key, None)
@@ -380,6 +399,28 @@ def _split_workspace_add(argument: str):
     return text, name
 
 
+def add_workspace_from_argument(argument: str) -> dict:
+    """`/workspace add` 的共享实现：解析路径与 `--name`，相对路径按当前工作区。"""
+    path, name = _split_workspace_add(argument)
+    if not path:
+        raise ValueError('用法：/workspace add <路径> [--name 名称]')
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = WORKDIR / candidate
+    return workspaces.add_workspace(candidate, name=name,
+                                    file=workspace_registry_path())
+
+
+def remove_workspace_selector(selector: str) -> dict:
+    """按序号/名称/id/路径移除登记项；只影响发现列表，不动任何文件。"""
+    selector = (selector or '').strip()
+    if not selector:
+        raise ValueError('用法：/workspace remove <序号|名称|路径>')
+    entry = find_workspace(registered_workspaces(), selector)
+    return workspaces.remove_workspace(entry['id'],
+                                       file=workspace_registry_path())
+
+
 def handle_workspace_command(command: str, argument: str) -> None:
     parts = argument.split(maxsplit=1)
     action = parts[0].lower() if parts else 'list'
@@ -387,30 +428,16 @@ def handle_workspace_command(command: str, argument: str) -> None:
         print(format_workspace_list())
         return
     if action == 'add':
-        path, name = _split_workspace_add(parts[1] if len(parts) > 1 else '')
-        if not path:
-            print('  用法：/workspace add <路径> [--name 名称]')
-            return
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = WORKDIR / candidate
         try:
-            entry = workspaces.add_workspace(candidate, name=name,
-                                             file=workspace_registry_path())
+            entry = add_workspace_from_argument(parts[1] if len(parts) > 1 else '')
         except (OSError, ValueError) as exc:
             print(f'  [workspace] {exc}')
             return
         print(f"  已登记工作区：{entry['name']}  {entry['path']}")
         return
     if action == 'remove':
-        selector = parts[1].strip() if len(parts) > 1 else ''
-        if not selector:
-            print('  用法：/workspace remove <序号|名称|路径>')
-            return
         try:
-            entry = find_workspace(registered_workspaces(), selector)
-            removed = workspaces.remove_workspace(entry['id'],
-                                                  file=workspace_registry_path())
+            removed = remove_workspace_selector(parts[1] if len(parts) > 1 else '')
         except (KeyError, OSError, ValueError) as exc:
             print(f'  [workspace] {exc}')
             return
@@ -437,6 +464,81 @@ def format_session_list(limit: int = 20) -> str:
     if not rows:
         return '  (no saved sessions)'
     return '\n\n'.join(session_label(row) for row in rows)
+
+
+def session_cleanup_plan(command: str, argument: str, current_id: str, *, emit=print):
+    """`/archive`、`/delete` 的候选集合：返回 (SessionArchive, rows)。
+
+    归档候选按天数/empty/all 过滤，删除与恢复只看已归档项；当前会话永远
+    排除。确认与执行由 UI 负责，这里只做只读扫描，便于 TUI 放到后台线程。
+    """
+    from session_cleanup import SessionArchive, cleanup_candidates
+
+    archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
+    deleting = command == 'delete'
+    restoring = argument == 'restore'
+    if restoring or deleting:
+        rows = archive.list(emit=emit)
+    else:
+        rows = cleanup_candidates(
+            session_rows(limit=None, include_empty=True), current_id,
+            days=int(argument) if argument.isdigit() else 30,
+            empty_only=argument == 'empty')
+        if argument == 'all':
+            rows = session_rows(limit=None, include_empty=True)
+    return archive, [row for row in rows if row['id'] != current_id]
+
+
+def apply_session_cleanup(archive, rows, action: str, current_id: str):
+    """执行已确认的归档/恢复/删除，返回 (completed, [(row, error), ...])。"""
+    completed = 0
+    failures = []
+    for row in rows:
+        try:
+            if action == 'delete':
+                archive.delete(row, current_id)
+            elif action == 'restore':
+                archive.restore(row['id'])
+            else:
+                archive.archive(row, current_id)
+            completed += 1
+        except (OSError, ValueError) as exc:
+            failures.append((row, str(exc)))
+    return completed, failures
+
+
+# ---------- 转录导出（Textual / 命令面板共用）----------
+
+def export_session(messages) -> Path:
+    """把当前会话写出一份 transcript，返回路径（复用 agent_core 的唯一写入实现）。"""
+    return write_transcript(messages)
+
+
+def list_transcripts() -> list[Path]:
+    """最近优先的 transcript 列表；目录不存在时返回空列表。"""
+    try:
+        return sorted(TRANSCRIPT_DIR.glob('transcript_*.jsonl'),
+                      key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def load_transcript(path) -> list[dict]:
+    """读回一份 transcript；坏行跳过，不因一行损坏丢掉整场会话。"""
+    records = []
+    try:
+        with open(path, encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return records
 
 
 # ---------- 执行档位（/sandbox）----------
@@ -551,6 +653,19 @@ def format_pending_approvals() -> str:
     return '\n'.join(lines)
 
 
+def storage_profile_data(*, deep: bool = True) -> dict:
+    """扫描工作区 .cache；TUI、行式 REPL 与 --doctor 共用同一份口径。"""
+    import storage_profile
+    return storage_profile.scan(
+        WORKDIR / '.cache', sessions_dir=SESSIONS_DIR,
+        checkpoint_keep=CHECKPOINT_MAX_NODES, deep=deep)
+
+
+def format_storage_profile(*, deep: bool = True) -> str:
+    import storage_profile
+    return storage_profile.format_profile(storage_profile_data(deep=deep))
+
+
 def run_doctor() -> int:
     """Report startup prerequisites without contacting the model provider."""
     checks = [
@@ -578,6 +693,11 @@ def run_doctor() -> int:
     cache = tool_cache.scan(TOOL_RESULTS_DIR)
     print(f"[cache] tool_results: {cache['files']} files, "
           f"{tool_cache.human_size(cache['bytes'])} (use /cache gc)")
+    try:
+        import storage_profile
+        print(storage_profile.format_summary(storage_profile_data(deep=False)))
+    except Exception as exc:
+        print(f'[storage] unavailable: {exc}')
     return 0 if all(passed for _, passed in checks) else 1
 
 
@@ -637,6 +757,27 @@ def _default_context_limit()->int:
     return max(4000,int((int(window)-OUTPUT_RESERVE)*CTX_SAFETY))
 
 CONTEXT_LIMIT=_default_context_limit()
+
+
+def _context_window(model: str) -> int:
+    """状态行显示用的真实窗口（不是压缩阈值 CONTEXT_LIMIT）。"""
+    window = os.getenv('LLM_CONTEXT_WINDOW') or MODEL_WINDOWS.get(model)
+    return int(window) if window else CONTEXT_LIMIT
+
+
+def update_panel_status(messages=None, *, model=None, ctx_tokens=None,
+                        ctx_source=None) -> None:
+    """把当前用量/上下文占用发给 UI 状态行；无订阅者时是空操作。"""
+    model = model or os.getenv('LLM_MODEL_ID', '')
+    if ctx_tokens is None:
+        ctx_tokens = estimate_size(messages) if messages else 0
+        ctx_source = ctx_source or 'estimated'
+    payload = status_payload(
+        model=model, workdir=get_workdir(), ctx_tokens=int(ctx_tokens),
+        ctx_source=ctx_source or 'confirmed', window=_context_window(model))
+    payload['branch'] = current_branch(get_workdir())
+    payload['sandbox'] = load_policy().sandbox_mode
+    ui_emit('status', **payload)
 KEEP_RECENT=6
 PERSIST_THERSHOLD=10000
 TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）
@@ -790,6 +931,61 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
     return messages, skip_micro_rounds
 
 
+_DIFF_TOOLS = frozenset({'write', 'edit', 'apply_patch'})
+_DIFF_MAX_FILE_BYTES = 1_000_000
+_DIFF_MAX_CHARS = 20_000
+
+
+def _diff_targets(name, args):
+    """要比较的文件（写入类工具）；路径解析失败/秘密文件直接跳过。"""
+    try:
+        if name in ('write', 'edit'):
+            raw = str(args.get('path') or '')
+            targets = [safe_path(raw, args.get('cwd'))] if raw else []
+        elif name == 'apply_patch' and args.get('patch'):
+            targets = [safe_path(path, args.get('cwd'))
+                       for path in patch_paths(str(args['patch']))]
+        else:
+            return []
+    except Exception:
+        return []
+    return [path for path in targets
+            if not is_secret_path(path, checkpoints.DEFAULT_SECRETS)]
+
+
+def _file_bytes(path):
+    try:
+        if path.is_file() and path.stat().st_size <= _DIFF_MAX_FILE_BYTES:
+            return path.read_bytes()
+    except OSError:
+        pass
+    return None
+
+
+def _capture_tool_files(name, args):
+    return {str(path): _file_bytes(path) for path in _diff_targets(name, args)}
+
+
+def _tool_diff(before):
+    chunks = []
+    for raw_path, old in before.items():
+        path = Path(raw_path)
+        new = _file_bytes(path)
+        if old == new:
+            continue
+        try:
+            old_text = (old or b'').decode('utf-8')
+            new_text = (new or b'').decode('utf-8')
+        except UnicodeDecodeError:
+            continue    # 二进制/编码不明：不做行 diff
+        diff = list(difflib.unified_diff(
+            old_text.splitlines(), new_text.splitlines(),
+            fromfile=raw_path, tofile=raw_path, lineterm=''))
+        if diff:
+            chunks.append(chr(10).join(diff))
+    return chr(10).join(chunks)[:_DIFF_MAX_CHARS]
+
+
 def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
                    on_event=None, on_activity=None):
     """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
@@ -828,7 +1024,10 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
         blocked = None
     images = []
     background_started = False
+    diff_before = (_capture_tool_files(name, args)
+                   if name in _DIFF_TOOLS else {})
     started = time.perf_counter()
+    ui_emit('tool_start', name=name, args=args, call_id=tool_call.id)
     if blocked:
         output = blocked
     elif name not in registry:
@@ -850,6 +1049,18 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
             # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
             output = f"Error: {e}"
     elapsed = time.perf_counter() - started
+    text_output = str(output)
+    failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
+    ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
+            output_preview=text_output[:2000], output_len=len(text_output),
+            diff=_tool_diff(diff_before) if diff_before else '',
+            ok=not (blocked or failed),
+            outcome=('denied' if blocked else
+                     'queued' if background_started else
+                     'failed' if failed else 'completed'),
+            background=background_started,
+            duration_ms=round(elapsed * 1000))
+    METRICS.record_tool()
     if on_activity is not None:
         from tool_activity import is_failure, result_hint
         on_activity(name, args, elapsed, is_failure(output),
@@ -915,6 +1126,9 @@ def _print_tool_activity(name, args, elapsed, failed, background=False,
     """交互终端的工具活动行；长输出折叠为头尾 + /expand 提示。"""
     if not sys.stdout.isatty():
         return
+    if getattr(permission_gate, 'use_ui', False):
+        # Textual 占用终端：工具块由事件流渲染，行式输出只会刷坏 TUI。
+        return
     from tool_activity import format_line, preview_lines
     line = format_line(name, args, elapsed, failed=failed,
                        background=background, hint=hint)
@@ -930,7 +1144,13 @@ def _print_tool_activity(name, args, elapsed, failed, background=False,
     if ACTIVE_TICKER is not None:
         ACTIVE_TICKER.emit_line(block)
         return
-    print(block, flush=True)
+    try:
+        print(block, flush=True)
+    except UnicodeEncodeError:
+        # 控制台编码（如 GBK）放不下 '•'/'→'：替换后重试，别让展示问题打断回合。
+        encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+        print(block.encode(encoding, 'replace').decode(encoding, 'replace'),
+              flush=True)
 
 
 def _batch_bash_commands(tool_calls):
@@ -1096,6 +1316,129 @@ def format_checkpoint_list(manager)->str:
     return '\n'.join(lines)
 
 
+def parse_checkpoint_gc(argument: str) -> tuple[bool, int]:
+    """解析 `/checkpoint-gc [--all] [--keep N]`，返回 (all, keep)。"""
+    all_sessions = False
+    keep = CHECKPOINT_MAX_NODES
+    tokens = (argument or '').split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--all':
+            all_sessions = True
+        elif token == '--keep':
+            index += 1
+            if index >= len(tokens):
+                raise ValueError('--keep 需要一个正整数')
+            token = tokens[index]
+            if not token.isdigit() or not 1 <= int(token) <= 10_000:
+                raise ValueError('--keep 需要 1～10000 之间的整数')
+            keep = int(token)
+        elif token.startswith('--keep='):
+            value = token.split('=', 1)[1]
+            if not value.isdigit() or not 1 <= int(value) <= 10_000:
+                raise ValueError('--keep 需要 1～10000 之间的整数')
+            keep = int(value)
+        else:
+            raise ValueError('用法：/checkpoint-gc [--all] [--keep N]')
+        index += 1
+    return all_sessions, keep
+
+
+def checkpoint_gc_preview(manager, argument: str) -> dict:
+    """只读预览；TUI 先弹确认，行式 REPL 打印后再执行。"""
+    all_sessions, keep = parse_checkpoint_gc(argument)
+    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
+    current_id = manager.session_id
+    current_nodes = counts.get(current_id, 0)
+    other_nodes = sum(count for session, count in counts.items()
+                      if session != current_id)
+    if all_sessions:
+        summary = checkpoints.gc_all_checkpoints(
+            CHECKPOINT_DIR, max_nodes=keep,
+            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=True)
+        summary.update({'mode': 'all', 'keep': keep,
+                        'current_nodes': current_nodes,
+                        'other_nodes': other_nodes,
+                        'sessions_total': len(counts)})
+        return summary
+
+    plan = manager.gc_plan(max_nodes=keep)
+    size = sum(item['bytes'] for item in plan)
+    return {
+        'mode': 'current', 'keep': keep, 'dry_run': True,
+        'removed': len(plan), 'bytes': size,
+        'details': [{'session_id': current_id, 'removed': len(plan),
+                     'bytes': size}] if plan else [],
+        'current_nodes': current_nodes, 'other_nodes': other_nodes,
+        'sessions_total': len(counts),
+    }
+
+
+def checkpoint_gc_execute(manager, argument: str) -> dict:
+    """执行已确认的回收；返回与预览同形的统计。调用方负责先预览。"""
+    all_sessions, keep = parse_checkpoint_gc(argument)
+    if all_sessions:
+        summary = checkpoints.gc_all_checkpoints(
+            CHECKPOINT_DIR, max_nodes=keep,
+            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=False)
+        summary.update({'mode': 'all', 'keep': keep,
+                        'sessions_total': summary.get('sessions', 0)})
+        return summary
+
+    current_id = manager.session_id
+    plan = manager.gc_plan(max_nodes=keep)
+    removed = manager.gc(max_nodes=keep)
+    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
+    other_nodes = sum(count for session, count in counts.items()
+                      if session != current_id)
+    size = sum(item['bytes'] for item in plan)
+    return {
+        'mode': 'current', 'keep': keep, 'dry_run': False,
+        'removed': len(removed), 'bytes': size,
+        'details': [{'session_id': current_id,
+                     'removed': len(removed), 'bytes': size}] if removed else [],
+        'current_nodes': counts.get(current_id, 0),
+        'other_nodes': other_nodes, 'sessions_total': len(counts),
+    }
+
+
+def format_checkpoint_gc(summary: dict, *, done: bool = False) -> str:
+    """把预览/执行结果格式化成 TUI 通知和行式 REPL 共用的一段文字。"""
+    keep = summary.get('keep', CHECKPOINT_MAX_NODES)
+    removed = summary.get('removed', 0)
+    size = tool_cache.human_size(summary.get('bytes', 0))
+    mode = summary.get('mode', 'current')
+    if mode == 'all':
+        sessions_total = summary.get('sessions_total', summary.get('sessions', 0))
+        scope = (f"所有 {sessions_total} 个会话" if sessions_total
+                 else '所有会话')
+    else:
+        scope = '当前会话'
+    if removed:
+        prefix = '已清理' if done else '可清理'
+        lines = [f'  {prefix} {removed} 个快照（约 {size}）。']
+        if mode == 'all':
+            sessions = summary.get('sessions', 0)
+            affected = len(summary.get('details', [])) or sessions
+            total = summary.get('sessions_total', sessions)
+            lines.append(f'  涉及 {affected}/{total} 个会话；'
+                         f'每个会话保留最新 {keep} 个、head 与带标签快照。')
+        else:
+            current_nodes = summary.get('current_nodes', 0)
+            lines.append(f'  当前会话共 {current_nodes} 个快照，保留上限 {keep}。')
+        if not done:
+            lines.append('  删除后旧快照不可恢复。')
+    else:
+        lines = [f'  {scope}无需清理：没有超过保留上限 {keep} 的可回收快照。']
+    if mode == 'current' and summary.get('other_nodes'):
+        other_nodes = summary['other_nodes']
+        lines.append(f'  其他会话还有 {other_nodes} 个快照；'
+                     '/checkpoint-gc --all 可统一清理。')
+    return '\n'.join(lines)
+
+
+
 def format_restore_report(plan:dict)->str:
     scope = '仅会话' if plan.get('scope') == 'session' else '会话与文件'
     lines = [f"  回溯预览：{plan.get('label') or plan['cp_id']} · {scope}"]
@@ -1189,8 +1532,11 @@ def handle_command(line:str,messages:list,session_store)->None:
         print(format_workspace_diff(color=sys.stdout.isatty()))
 
     elif command == '/cache':
-        print(tool_cache.handle_cache_command(
-            TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
+        if argument.strip().lower() == 'profile':
+            print(format_storage_profile())
+        else:
+            print(tool_cache.handle_cache_command(
+                TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
 
     elif command == '/review':
         from review import run_review
@@ -1264,24 +1610,17 @@ def handle_command(line:str,messages:list,session_store)->None:
 
     elif command in ('/archive', '/delete'):
         from cli_input import choose_cleanup_sessions
-        from session_cleanup import SessionArchive, cleanup_candidates
 
-        # Finish this process's background writes before moving a session log.
+        # 先等本进程的后台写入落盘，再移动会话日志。
         wait_for_housekeeping()
-        with _housekeeping_lock:
-            if any(thread.is_alive() for thread in _housekeeping_threads):
-                print('  会话后台整理尚未结束，请稍后再清理。')
-                return
-        archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
+        if housekeeping_busy():
+            print('  会话后台整理尚未结束，请稍后再清理。')
+            return
         deleting = command == '/delete'
         restoring = argument == 'restore'
-        rows = (archive.list() if restoring or deleting else cleanup_candidates(
-            session_rows(limit=None, include_empty=True), session_store.session_id,
-            days=int(argument) if argument.isdigit() else 30,
-            empty_only=argument == 'empty'))
-        if argument == 'all' and not deleting:
-            rows = session_rows(limit=None, include_empty=True)
-        rows = [row for row in rows if row['id'] != session_store.session_id]
+        action_key = 'delete' if deleting else 'restore' if restoring else 'archive'
+        archive, rows = session_cleanup_plan(command.lstrip('/'), argument,
+                                             session_store.session_id)
         selected = choose_cleanup_sessions(rows, restore=restoring, delete=deleting)
         selected_rows = [row for row in rows if row['id'] in selected]
         if not selected_rows:
@@ -1301,18 +1640,10 @@ def handle_command(line:str,messages:list,session_store)->None:
         if not confirmed:
             print('  已取消，未执行改动。')
             return
-        completed = 0
-        for row in selected_rows:
-            try:
-                if deleting:
-                    archive.delete(row, session_store.session_id)
-                elif restoring:
-                    archive.restore(row['id'])
-                else:
-                    archive.archive(row, session_store.session_id)
-                completed += 1
-            except (OSError, ValueError) as exc:
-                print(f"  未处理 {row['title']}：{exc}")
+        completed, failures = apply_session_cleanup(
+            archive, selected_rows, action_key, session_store.session_id)
+        for row, error in failures:
+            print(f"  未处理 {row['title']}：{error}")
         print(f'  已{action} {completed} 个会话。' + (
             '记录及关联快照不可恢复，项目文件未改动。' if deleting else
             '用 /archive restore 可恢复；项目文件未改动。' if not restoring else '可用 /resume 继续会话。'))
@@ -1374,8 +1705,19 @@ def handle_command(line:str,messages:list,session_store)->None:
                          force=force,scope=scope,report=False)
 
     elif command=='/checkpoint-gc':
-        removed=manager.gc()
-        print(f"  已清理 {len(removed)} 个旧快照。" if removed else '  无需清理快照。')
+        try:
+            preview = checkpoint_gc_preview(manager, argument)
+        except ValueError as exc:
+            print(f'  {exc}')
+            return
+        print(format_checkpoint_gc(preview))
+        if not preview['removed']:
+            return
+        if preview['mode'] == 'all' and not _confirm('确认清理这些旧快照？'):
+            print('  已取消，未删除任何快照。')
+            return
+        result = checkpoint_gc_execute(manager, argument)
+        print(format_checkpoint_gc(result, done=True))
 
     else:
         print(f"  unknown command: {command}")
@@ -1416,6 +1758,12 @@ def wait_for_housekeeping(timeout: float = 30.0) -> None:
         thread.join(timeout=max(0.0, deadline - time.time()))
 
 
+def housekeeping_busy() -> bool:
+    """后台整理是否仍在写会话日志；清理会话前必须为 False。"""
+    with _housekeeping_lock:
+        return any(thread.is_alive() for thread in _housekeeping_threads)
+
+
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f'{n / 1_000_000:.2f}M'
@@ -1440,8 +1788,19 @@ def _parse_usage(usage) -> dict | None:
     cached = getattr(details, 'cached_tokens', None) if details is not None else None
     if cached is None:
         cached = getattr(usage, 'prompt_cache_hit_tokens', None)
+    cache_write = getattr(usage, 'cache_creation_input_tokens', None)
+    if cache_write is None and details is not None:
+        cache_write = (getattr(details, 'cache_creation_tokens', None)
+                       or getattr(details, 'cache_write_tokens', None))
+    completion_details = getattr(usage, 'completion_tokens_details', None)
+    reasoning = (getattr(completion_details, 'reasoning_tokens', None)
+                 if completion_details is not None else None)
+    if reasoning is None:
+        reasoning = getattr(usage, 'reasoning_tokens', None)
     return {'prompt': prompt, 'completion': completion, 'total': total,
-            'cached': int(cached or 0), 'cached_seen': cached is not None}
+            'cached': int(cached or 0), 'cached_seen': cached is not None,
+            'cache_write': int(cache_write or 0),
+            'reasoning': int(reasoning or 0)}
 
 
 def _cache_hit_rate_line(bucket: dict) -> str:
@@ -1512,7 +1871,7 @@ def _stream_completion(create_kwargs, on_delta):
 
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None, *,
-               on_event=None, housekeeping=True):
+               on_event=None, housekeeping=True, steer_provider=None):
     """Run one OpenAI session, recording an append-only event stream for recovery.
 
     ``on_event`` mirrors tool execution for one-shot transports; ``housekeeping``
@@ -1526,6 +1885,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
     session_store.record_workspace(get_workdir())
+    wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
+    set_session(session_store.session_id)
+    set_agent('lead')   # 子代理会临时覆盖，退出后恢复
     context=update_context({},messages) #循环前更新上下文，包含所有对话记录
     recovery_state=recovery.RecoveryState()
     if messages:
@@ -1537,7 +1899,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
     turn_started=time.monotonic() #本回合起始（tokens 行显示总用时）
     turn_tokens=0 #本回合累计 tokens（含工具轮次）
-    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,'cached_seen':False} #本回合明细（回合末打印）
+    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,
+                'reasoning':0,'cached_seen':False} #本回合明细（回合末打印）
     ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
     snip_state={} #snip 触发迟滞：触发后基线+阈值/4 才允许再次触发（无迟滞则越线后每回合滑动断前缀）
     turn_no=0 #已完成回合数（每 8 回合异步重生成一次会话标题）
@@ -1555,7 +1918,29 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     baseline_taken = False
     turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
 
+    def _drain_steering() -> bool:
+        """把 TUI 运行中的 steer 消息注入当前上下文（下一轮请求前）。"""
+        if steer_provider is None:
+            return False
+        try:
+            texts = steer_provider() or []
+        except Exception:
+            return False
+        injected = False
+        for text in texts:
+            if not text:
+                continue
+            message = {'role': 'user', 'content': str(text)}
+            messages.append(message)
+            session_store.append_message(message)
+            ui_emit('user_message', text=str(text))
+            injected = True
+        return injected
+
     while True:
+        if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
+            raise KeyboardInterrupt
+        _drain_steering()
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
         _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
 
@@ -1603,6 +1988,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '',
             system=system)
 
+        request_started = time.monotonic()
+        stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
+        ui_emit('activity', state='thinking', detail='Requesting model response')
+
         def _create(): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
@@ -1614,12 +2003,19 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
-            if on_delta is None:
+            if on_delta is None and not streaming_enabled():
                 return client.chat.completions.create(**kwargs)
 
-            def _delta_hook(part):
+            def _delta_hook(part, probe=stream_probe, hook=on_delta):  # noqa: B023
+                if turn_control.cancel_requested():
+                    raise KeyboardInterrupt
+                if not probe['started']:
+                    probe['started'] = True
+                    ui_emit('assistant_start', mid=probe['mid'])
+                ui_emit('assistant_delta', mid=probe['mid'], delta=part)
                 streamed_parts.append(part)
-                on_delta(part)
+                if hook is not None:
+                    hook(part)
 
             streamed_parts.clear()   # 标记只反映最近一次调用
             return _stream_completion(kwargs, _delta_hook)
@@ -1637,13 +2033,28 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
                 detail['tools_fp'] = _tools_fingerprint()
                 turn_tokens += detail['total']
-                for _k in ('prompt','completion','cached','total'):
+                for _k in ('prompt','completion','cached','total','reasoning'):
                     turn_usage[_k] += detail[_k]
                 turn_usage['cached_seen'] = turn_usage['cached_seen'] or detail['cached_seen']
                 # 埋点：逐调用 usage 事件（供应商权威值；命中率可逐调用分析，
                 # 聚合口径由 usage_totals() 求和保持不变）
                 session_store.append('usage', **detail)
                 ctx_tokens = detail['prompt']   # 压缩判据锚点：本请求真实大小
+                METRICS.record_usage(detail)
+                ui_emit('round_end', round=turn_no,
+                        prompt_tokens=detail['prompt'],
+                        completion_tokens=detail['completion'],
+                        total_tokens=detail['total'],
+                        cached_tokens=detail['cached'],
+                        reasoning_tokens=detail.get('reasoning', 0),
+                        cost=str(METRICS.cost),
+                        cost_source=METRICS.cost_source,
+                        duration_ms=round(
+                            (time.monotonic() - request_started) * 1000),
+                        compressed=False)
+                update_panel_status(messages, model=detail['model'],
+                                    ctx_tokens=detail['prompt'],
+                                    ctx_source='confirmed')
         except Exception as e:
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
@@ -1677,6 +2088,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             }
         messages.append(assistant_message) #添加模型回复到上下文
         session_store.append_message(assistant_message)
+        if stream_probe['started']:
+            ui_emit('assistant_end', mid=stream_probe['mid'])
+        elif assistant_message.get('content'):
+            ui_emit('assistant_text', text=str(assistant_message['content']))
         if ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
             ctx_tokens += estimate_size([assistant_message])
 
@@ -1697,6 +2112,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
 
 
         if response.choices[0].finish_reason != "tool_calls":
+            # 若本轮已产生最终回答，但运行中又有 steer 消息，先继续同一 loop。
+            if _drain_steering():
+                continue
             force=trigger_hooks('Stop',messages)
             if force:
                 messages.append({'role':'user','content':force})
@@ -1711,9 +2129,16 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             if turn_tokens:
                 cum = session_store.usage_totals()   # 逐调用 usage 事件聚合
                 from turn_progress import format_duration
+                ctx_note = ''
+                if ctx_tokens is not None:
+                    window = _context_window(
+                        recovery_state.current_model
+                        or os.getenv('LLM_MODEL_ID') or '')
+                    ctx_note = f' · ctx {min(100, 100 * ctx_tokens // window)}%'
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
                       f'会话累计 {_fmt_tokens(cum["total"])}'
                       f' · 用时 {format_duration(time.monotonic() - turn_started)}'
+                      f'{ctx_note}'
                       f'{_cache_hit_rate_line(cum)}')
             write_transcript(messages)   # 正常结束也落盘，便于复盘
             _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
@@ -1753,6 +2178,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                                                 if th.is_alive()]
                     _housekeeping_threads.append(housekeeping_thread)
                 housekeeping_thread.start()
+            ui_emit('session_end', summary=METRICS.snapshot())
+            ui_emit('activity', state='complete', detail='Response complete')
             return message.content or "No output"
 
 
@@ -1778,6 +2205,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 hooks.preflight_judge(batch)  # noqa: B023
                 _run_tool_batch(batch, session_store, tool_messages,  # noqa: B023
                                 on_event=on_event)
+                ui_emit('activity', state='thinking',
+                        detail='Reviewing tool result')
+                if ctx_tokens is not None:   # noqa: B023  只复用已知用量
+                    update_panel_status(messages, ctx_tokens=ctx_tokens,  # noqa: B023
+                                        ctx_source='confirmed')
             batch.clear()  # noqa: B023
 
         for tool_call in message.tool_calls:
@@ -1862,13 +2294,18 @@ def resume_agent_loop(session_path: Path):
 
 _mcp_init_lock = threading.Lock()
 _mcp_initialized = False
+_mcp_ready = threading.Event()     # 连接/注册完成（成功或失败都置位：不让首条消息永久等待）
+_mcp_async_started = threading.Event()
 
 
 def initialize_mcp_tools() -> None:
     """Register configured MCP tools once for all adapters in this process."""
     global _mcp_initialized
     with _mcp_init_lock:
-        if not _mcp_initialized:
+        if _mcp_initialized:
+            _mcp_ready.set()
+            return
+        try:
             # 优先取模块命名空间里的 register_mcp_tools（测试可打补丁）；
             # 未注入时才懒加载 mcp_bridge（import 约 1s，见模块级 __getattr__）
             register = globals().get('register_mcp_tools')
@@ -1881,6 +2318,27 @@ def initialize_mcp_tools() -> None:
             hooks.register_external_tools(
                 schema['function']['name'] for schema in schemas)
             _mcp_initialized = True
+        finally:
+            # 失败也放行：首条消息最多等 wait_for_mcp_tools 的超时，不会卡死。
+            _mcp_ready.set()
+
+
+def start_mcp_initialization_async() -> None:
+    """交互模式下把 MCP 连接放到后台：先把界面交给用户，首条消息前再等它。"""
+    if _mcp_async_started.is_set():
+        return
+    _mcp_async_started.set()
+    threading.Thread(target=initialize_mcp_tools,
+                     name='mcp-init', daemon=True).start()
+
+
+def wait_for_mcp_tools(timeout: float = 10.0) -> bool:
+    """等待后台 MCP 初始化；仅当显式用异步启动过才可能阻塞。"""
+    if _mcp_initialized:
+        return True
+    if not _mcp_async_started.is_set():
+        return _mcp_initialized
+    return _mcp_ready.wait(timeout)
 
 
 def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
@@ -1932,12 +2390,30 @@ def prompt_text() -> str:
     return f'\n{label} [{mark}] > '
 
 
+_REPL_RENDERER_ATTACHED = False
+
+
+def _attach_repl_renderer() -> None:
+    """TTY 行式 REPL 订阅事件总线；非 TTY（测试/管道）保持纯文本。
+
+    只 attach 一次：同一进程多次 run_repl 时不重复订阅。
+    """
+    global _REPL_RENDERER_ATTACHED
+    if _REPL_RENDERER_ATTACHED or not sys.stdout.isatty():
+        return
+    from renderer import ReplRenderer
+    bus.subscribe(ReplRenderer().on_event)
+    _REPL_RENDERER_ATTACHED = True
+
+
 def run_repl(initial_messages:list, session_store=None):
     """最小交互循环：普通输入走 agent_loop，/ 开头的走 checkpoint 命令（见 handle_command）。
 
     agent_loop 每轮结束就返回，canonical history 由 session_store 维护，
     因此每轮结束后用 rebuild_openai_history() 刷新本地 messages —— 这样 /rewind 与多轮对话共用同一份历史。
     """
+    METRICS.reset()
+    ui_emit('session_start', prompt='')
     messages=[dict(m) for m in initial_messages]
     if session_store is None:
         session_store=SessionEventStore(SESSIONS_DIR)
@@ -1948,6 +2424,27 @@ def run_repl(initial_messages:list, session_store=None):
         workspace = session_store.session_summary()['workspace']
         if workspace:
             set_workspace(workspace)
+    ui_mode = os.getenv('HARNESS_UI', 'ansi')
+    if ui_mode in ('textual', 'textual-next', 'textual-legacy') and sys.stdin.isatty():
+        # textual 已是新实现；textual-next 保留为兼容别名，textual-legacy 仅用于对照。
+        module_name = ('ui_textual' if ui_mode == 'textual-legacy'
+                       else 'ui.harness_app')
+        try:
+            module = __import__(module_name, fromlist=['run'])
+        except Exception as exc:   # 缺 textual/渲染失败：回退行式 REPL
+            print(f'[ui] Textual 不可用，回退 ANSI：{exc}')
+        else:
+            try:
+                module.run(messages,
+                           session_id=session_store.session_id,
+                           title=session_store.session_summary()['title'],
+                           session_store=session_store)
+                return
+            except Exception as exc:   # 渲染驱动/终端不兼容：回退行式
+                print(f'[ui] Textual 运行失败，回退行式 REPL：'
+                      f'{type(exc).__name__}: {exc}')
+
+    _attach_repl_renderer()
     policy = load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "
           f"{session_store.session_summary()['title']}")
@@ -1990,6 +2487,14 @@ def run_repl(initial_messages:list, session_store=None):
                 print('\n  再按一次 Ctrl-C 退出（Ctrl-D 也可退出）。')
                 continue
             if not line:
+                continue
+            if line.startswith('!') and line[1:].strip():
+                # `!cmd`：直接执行 shell，输出只显示在终端，不进入模型上下文。
+                command = line[1:].strip()
+                try:
+                    print(run_bash(command))
+                except Exception as exc:
+                    print(f'Error: {exc}')
                 continue
             if line.startswith('/') or line == 'cd' or line.startswith('cd '):
                 if line == 'cd' or line.startswith('cd '):
@@ -2113,6 +2618,7 @@ def run_repl(initial_messages:list, session_store=None):
             messages[:] = session_store.rebuild_openai_history(recover_pending=True)
             messages.append({'role':'user','content':line})
             session_store.append_message(messages[-1])
+            ui_emit('user_message', text=line)
             global ACTIVE_TICKER
             turn_control.begin_turn()
             ticker = None
@@ -2139,7 +2645,11 @@ def run_repl(initial_messages:list, session_store=None):
                 # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
                 agent_loop(messages, session_store=session_store, on_delta=on_delta)
             except KeyboardInterrupt:
+                ui_emit('activity', state='cancelled', detail='Request cancelled')
                 print('\n[会话已中断]')
+            except Exception as exc:   # 让 UI 看到失败，同时保留终端可读性
+                ui_emit('error', msg=f'{type(exc).__name__}: {exc}')
+                print(f'\n[error] {type(exc).__name__}: {exc}')
             finally:
                 turn_control.end_turn()
                 if ticker is not None:
@@ -2149,8 +2659,7 @@ def run_repl(initial_messages:list, session_store=None):
 
 
 if __name__ == '__main__':
-    # Keep ``python harness.py`` working while the real process entrypoint lives
-    # in a module that can be tested and reused independently.
+    # 保留 python harness.py 入口；真正的进程入口放在可测试、可独立复用的模块里。
     from entrypoint import main
 
     main()

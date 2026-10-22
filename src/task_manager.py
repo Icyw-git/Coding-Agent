@@ -50,7 +50,7 @@ class TaskRecord:
     id: str
     command: str
     cwd: str
-    status: str                 # queued | running | succeeded | failed | cancelled | interrupted
+    status: str  # queued | running | succeeded | failed | cancelled | interrupted
     created_at: float
     started_at: float | None = None
     ended_at: float | None = None
@@ -129,10 +129,13 @@ class TaskManager:
         with self._lock:
             # created_at 在 Windows 上可能同刻（time.time 分辨率不足），
             # 用插入序号兜底，保证后创建的任务仍排在前面。
-            records = [record for _index, record in sorted(
-                enumerate(self._tasks.values()),
-                key=lambda item: (item[1].created_at, item[0]), reverse=True)]
-        return records[:max(1, limit)]
+            records = [
+                record
+                for _index, record in sorted(
+                    enumerate(self._tasks.values()), key=lambda item: (item[1].created_at, item[0]), reverse=True
+                )
+            ]
+        return records[: max(1, limit)]
 
     def stop(self, task_id: str) -> TaskRecord:
         """Cancel a queued task or terminate an owned running process tree."""
@@ -166,8 +169,11 @@ class TaskManager:
                     self.stop(task_id)
                 except RuntimeError as exc:
                     errors.append(str(exc))
-            threads = [thread for task_id, thread in self._threads.items()
-                       if self._tasks[task_id].status not in ACTIVE_STATUSES]
+            threads = [
+                thread
+                for task_id, thread in self._threads.items()
+                if self._tasks[task_id].status not in ACTIVE_STATUSES
+            ]
         for thread in threads:
             thread.join()
         if errors:
@@ -186,18 +192,12 @@ class TaskManager:
     # ---------- internals ----------
 
     def _validate_cwd(self, cwd: str | None) -> Path:
-        base = Path(cwd).resolve() if cwd else (
-            self.allowed_root or Path.cwd()
-        )
+        base = Path(cwd).resolve() if cwd else (self.allowed_root or Path.cwd())
         if not base.is_dir():
             raise ValueError(f'cwd does not exist: {base}')
-        if self.allowed_roots and not any(
-                base == root or root in base.parents for root in self.allowed_roots):
-            shown = (self.allowed_roots[0] if len(self.allowed_roots) == 1
-                     else self.allowed_roots)
-            raise ValueError(
-                f'cwd {base} is outside the allowed root {shown}'
-            )
+        if self.allowed_roots and not any(base == root or root in base.parents for root in self.allowed_roots):
+            shown = self.allowed_roots[0] if len(self.allowed_roots) == 1 else self.allowed_roots
+            raise ValueError(f'cwd {base} is outside the allowed root {shown}')
         return base
 
     def _run(self, record: TaskRecord) -> None:
@@ -209,7 +209,7 @@ class TaskManager:
             blocked = self._enforce(record.command) if self._enforce is not None else None
             if blocked is not None:
                 with self._lock:
-                    if record.status == 'queued':   # 等审批期间可能已被 stop
+                    if record.status == 'queued':  # 等审批期间可能已被 stop
                         record.status = 'cancelled'
                         record.ended_at = time.time()
                         record.duration_ms = _duration_ms(record)
@@ -230,11 +230,14 @@ class TaskManager:
                         # 嵌套根取最具体的一条：否则 [C:\, C:\proj] 会把沙箱
                         # 放宽到 C:\，多根反而比单根更松。
                         sandbox_root = max(
-                            (root for root in self.allowed_roots
-                             if cwd_path.is_relative_to(root)),
-                            key=lambda root: len(root.parts), default=cwd_path)
+                            (root for root in self.allowed_roots if cwd_path.is_relative_to(root)),
+                            key=lambda root: len(root.parts),
+                            default=cwd_path,
+                        )
                     proc = spawn_shell(
-                        record.command, cwd=record.cwd, stdout=handle,
+                        record.command,
+                        cwd=record.cwd,
+                        stdout=handle,
                         workspace=str(sandbox_root) if sandbox_root is not None else None,
                     )
                     record.pid = proc.pid
@@ -256,7 +259,7 @@ class TaskManager:
                 if record.status not in TERMINAL_STATUSES:
                     record.status = 'succeeded' if code == 0 else 'failed'
                 self._save(record)
-        except Exception as exc:   # spawn failures (bad cwd, OS errors)
+        except Exception as exc:  # spawn failures (bad cwd, OS errors)
             if proc is not None and proc.poll() is None:
                 self._kill_tree(proc)
             with self._lock:
@@ -300,7 +303,7 @@ class TaskManager:
                 data = json.loads(path.read_text(encoding='utf-8'))
                 record = TaskRecord(**{k: data[k] for k in names if k in data})
             except (OSError, json.JSONDecodeError, TypeError):
-                continue   # foreign/corrupt file: not one of ours, skip it
+                continue  # foreign/corrupt file: not one of ours, skip it
             if record.status in ACTIVE_STATUSES:
                 # An unclean exit loses ownership; a saved PID may already be reused.
                 # Do not claim the command exited or kill an unverified process.

@@ -158,7 +158,8 @@ def test_parse_usage_collects_cached_tokens():
                       prompt_tokens_details=NS(cached_tokens=80))
     detail = harness._parse_usage(openai_usage)
     assert detail == {'prompt': 100, 'completion': 20, 'total': 120,
-                      'cached': 80, 'cached_seen': True}
+                      'cached': 80, 'cached_seen': True,
+                      'cache_write': 0, 'reasoning': 0}
     # DeepSeek 扁平字段
     ds = harness._parse_usage(NS(prompt_tokens=100, completion_tokens=20, total_tokens=120,
                                  prompt_cache_hit_tokens=60))

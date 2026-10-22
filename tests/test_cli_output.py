@@ -149,9 +149,11 @@ def test_exec_tool_call_prints_activity_line_on_tty(monkeypatch):
     assert '• read' in output and 'a.py' in output and '✓' in output
 
 
-def test_exec_tool_call_is_silent_without_a_tty(capsys):
+def test_exec_tool_call_is_silent_without_a_tty(capsys, monkeypatch):
     import harness
 
+    # Check direct tool output independently of renderers imported by other UI tests.
+    monkeypatch.setattr(harness, 'ui_emit', lambda *args, **kwargs: None)
     tool_call = SimpleNamespace(
         id='call-1',
         function=SimpleNamespace(name='read', arguments='{"path":"a.py"}'))
@@ -245,3 +247,42 @@ def test_folded_tool_output_can_be_expanded(monkeypatch):
     assert '已折叠' in text and '/expand' in text
     number = text.rsplit('/expand ', 1)[1].splitlines()[0].strip()
     assert harness.format_tool_output(number) == output
+
+
+def test_bang_runs_shell_without_calling_the_agent(tmp_path, monkeypatch, capsys):
+    import cli_input
+    import harness
+
+    commands = iter(['!echo hi', '/quit'])
+    monkeypatch.setattr(cli_input, 'create_reader',
+                        lambda *args: lambda _: next(commands))
+    monkeypatch.setattr(harness, 'run_bash', lambda command: f'shell:{command}')
+    monkeypatch.setattr(harness, 'agent_loop',
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError('agent must not run for !cmd')))
+    store = harness.SessionEventStore(tmp_path, session_id='bang')
+
+    harness.run_repl([], store)
+
+    assert 'shell:echo hi' in capsys.readouterr().out
+
+
+def test_textual_flag_runs_new_app(tmp_path, monkeypatch):
+    import sys
+
+    import cli_input
+    import harness
+    import ui.harness_app
+
+    calls = []
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(ui.harness_app, 'run',
+                        lambda messages, **kwargs: calls.append((messages, kwargs)))
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
+    store = harness.SessionEventStore(tmp_path, session_id='next-ui')
+
+    harness.run_repl([{'role': 'user', 'content': 'hi'}], store)
+
+    assert calls and calls[0][1]['session_id'] == 'next-ui'
+    assert calls[0][0][0]['content'] == 'hi'

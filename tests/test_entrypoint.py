@@ -74,3 +74,93 @@ def test_doctor_reports_optional_document_extras(monkeypatch):
 
     monkeypatch.setattr('importlib.util.find_spec', lambda name: object())
     assert entrypoint.harness._document_extras_status() == 'installed'
+
+
+def test_interactive_lock_is_skipped_for_textual(monkeypatch):
+    import contextlib
+
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
+    monkeypatch.setenv('HARNESS_UI', 'textual-next')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
+    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
+    ctx = entrypoint._interactive_lock()
+    assert isinstance(ctx, contextlib.nullcontext)
+
+    monkeypatch.setenv('HARNESS_UI', 'ansi')
+    assert entrypoint._interactive_lock() is entrypoint.harness.agent_lock
+
+
+def test_ui_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv('HARNESS_UI', 'textual')
+    called = []
+    monkeypatch.setattr(entrypoint.harness, 'run_doctor',
+                        lambda: called.append(True) or 0)
+
+    assert entrypoint.main(['--ui', 'ansi', '--doctor']) == 0
+    assert entrypoint.os.environ['HARNESS_UI'] == 'ansi'
+    assert called
+
+
+def test_textual_failure_falls_back_to_line_repl(tmp_path, monkeypatch, capsys):
+    import sys
+
+    import cli_input
+    import harness
+    import ui_textual
+
+    monkeypatch.setenv('HARNESS_UI', 'textual-legacy')
+    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(ui_textual, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError('no driver')))
+    monkeypatch.setattr(cli_input, 'create_reader', lambda *args: lambda _: '/quit')
+    store = harness.SessionEventStore(tmp_path, session_id='ui-fallback')
+
+    harness.run_repl([], store)
+
+    output = capsys.readouterr().out
+    assert '回退行式 REPL' in output and 'no driver' in output
+
+
+def test_interactive_starts_before_mcp_finishes(monkeypatch):
+    import threading
+    import time
+
+    import harness
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_init():
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(harness, 'initialize_mcp_tools', slow_init)
+    monkeypatch.setattr(harness, '_mcp_async_started', threading.Event())
+    monkeypatch.setattr(harness, '_mcp_ready', threading.Event())
+    monkeypatch.setattr(harness, 'validate_runtime_config', lambda: None)
+    monkeypatch.setattr(harness, 'load_durable_jobs', lambda: None)
+    monkeypatch.setattr(harness, 'cron_scheduler_loop', lambda: None)
+    monkeypatch.setattr(harness, 'queue_processor_loop', lambda *a, **k: None)
+    monkeypatch.setattr(harness, 'wait_for_cron_idle', lambda: None)
+    monkeypatch.setattr(harness, 'wait_for_mcp_tools', lambda timeout=10: True)
+    monkeypatch.setattr(harness, 'shutdown_mcp', lambda: None)
+    monkeypatch.setattr(harness.client, 'warmup', lambda: None)
+
+    seen = []
+    start = time.monotonic()
+
+    def fake_repl(*args, **kwargs):
+        seen.append(time.monotonic() - start)
+
+    monkeypatch.setattr(harness, 'run_repl', fake_repl)
+
+    entrypoint.main([])
+
+    assert started.is_set()          # MCP 初始化已经开始
+    assert seen and seen[0] < 0.5    # 但 REPL 没有等它（后台线程）
+    release.set()

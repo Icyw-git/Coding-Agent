@@ -1,8 +1,7 @@
-"""Reusable session service around the existing agent turn executor.
+"""围绕既有回合执行器的可复用会话服务。
 
-The runtime deliberately owns session orchestration, while the caller supplies
-the actual turn executor. This keeps CLI, SDK, and HTTP adapters on one path
-without making the core loop depend on a particular transport.
+runtime 只负责会话编排，实际回合执行由调用方注入；CLI、SDK 与 HTTP 适配器
+因此共用一条路径，而核心循环不必依赖具体传输层。
 """
 
 from __future__ import annotations
@@ -21,14 +20,14 @@ from workspace_context import resolve_workspace, use_workspace
 
 @dataclass(frozen=True)
 class AgentResult:
-    """Result returned by one completed user turn."""
+    """一个已完成用户回合的结果。"""
 
     session_id: str
     content: str
 
 
 class SessionAlreadyExistsError(ValueError):
-    """Raised when a caller tries to create an existing session ID."""
+    """调用方试图创建已存在的会话 ID。"""
 
 
 # 会话摘要缓存 (path, size, mtime_ns) → summary：飞书 /sessions 每次列表都要
@@ -53,11 +52,11 @@ def _cached_summary(store) -> dict:
     if len(_summary_cache) > 512:
         _summary_cache.clear()
     _summary_cache[(str(store.path), stat.st_size, stat.st_mtime_ns)] = hit
-    return dict(hit)   # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
+    return dict(hit)  # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
 
 
 class AgentRuntime:
-    """Coordinate persisted sessions and invoke a supplied agent turn runner."""
+    """编排持久化会话，并调用注入的回合执行器。"""
 
     def __init__(
         self,
@@ -75,6 +74,7 @@ class AgentRuntime:
         self._sessions_dir = Path(sessions_dir)
         self._resolve_session_path = resolve_session_path
         from session_cleanup import SessionArchive
+
         self.archive = SessionArchive(self._sessions_dir, checkpoints_dir or self._sessions_dir.parent / 'checkpoints')
         self._before_session_change = before_session_change
         self._locks: dict[str, threading.RLock] = {}
@@ -100,7 +100,7 @@ class AgentRuntime:
         return self._workspace_file or workspaces.default_path(self._sessions_dir)
 
     def configure_workspace_roots(self, roots) -> None:
-        """Constrain remote workspaces to startup-authorized roots."""
+        """把远程可切换的工作区限制在启动时授权的根内。"""
         resolved = []
         for root in roots:
             path = resolve_workspace(root, base=Path.cwd())
@@ -112,32 +112,34 @@ class AgentRuntime:
         self._default_workspace = resolved[0]
 
     def configure_workspace_root(self, root: Path) -> None:
-        """Backward-compatible single-root setup."""
+        """兼容旧接口的单根配置。"""
         self.configure_workspace_roots([root])
 
     def create_session(self, session_id: str | None = None, *, workspace: str | None = None) -> str:
-        """Create an empty persisted session and return its identifier."""
+        """创建一个空的持久化会话并返回其标识。"""
         session_id = session_id or uuid.uuid4().hex
-        if not session_id.replace("-", "").replace("_", "").isalnum():
-            raise ValueError("Invalid session ID")
+        if not session_id.replace('-', '').replace('_', '').isalnum():
+            raise ValueError('Invalid session ID')
         with self._session_lock(session_id):
-            path = self._sessions_dir / f"session_{session_id}.jsonl"
+            path = self._sessions_dir / f'session_{session_id}.jsonl'
             if path.exists():
-                raise SessionAlreadyExistsError(f"Session {session_id} already exists")
-            directory = resolve_workspace(workspace if workspace is not None else self._default_workspace,
-                                          base=self._default_workspace,
-                                          allowed_roots=self._workspace_roots)
+                raise SessionAlreadyExistsError(f'Session {session_id} already exists')
+            directory = resolve_workspace(
+                workspace if workspace is not None else self._default_workspace,
+                base=self._default_workspace,
+                allowed_roots=self._workspace_roots,
+            )
             store = self._session_store_cls(self._sessions_dir, session_id=session_id)
-            store.append("session_created")
+            store.append('session_created')
             store.record_workspace(directory)
             workspaces.remember_workspace(directory, file=self.workspace_file)
             return store.session_id
 
     def _workspace_for(self, store) -> Path:
         saved = store.session_summary()['workspace']
-        return resolve_workspace(saved or self._default_workspace,
-                                 base=self._default_workspace,
-                                 allowed_roots=self._workspace_roots)
+        return resolve_workspace(
+            saved or self._default_workspace, base=self._default_workspace, allowed_roots=self._workspace_roots
+        )
 
     def get_workspace(self, session_id: str) -> str:
         return str(self._workspace_for(self._open_session(session_id)))
@@ -156,17 +158,15 @@ class AgentRuntime:
             lock.release()
 
     def list_workspaces(self, current: str | None = None) -> dict:
-        """Current + registered + recently used workspaces for pickers/API."""
-        current_path = (Path(current).expanduser() if current
-                        else self._default_workspace)
+        """为选择器/API 汇总当前、已登记与最近使用的工作区。"""
+        current_path = Path(current).expanduser() if current else self._default_workspace
         saved = workspaces.list_workspaces(file=self.workspace_file)
         # 选择器只展示最近几条；/workspaces 需要完整登记表，所以一次算全、
         # 再按选择器上限截取，避免两套排序规则漂移。
-        all_choices = workspace_choices(self.list_sessions(limit=1000), current_path,
-                                        saved=saved, allowed_roots=self._workspace_roots,
-                                        limit=None)
-        picker_limit = RECENT_LIMIT + (
-            1 if all_choices and all_choices[0]['current'] else 0)
+        all_choices = workspace_choices(
+            self.list_sessions(limit=1000), current_path, saved=saved, allowed_roots=self._workspace_roots, limit=None
+        )
+        picker_limit = RECENT_LIMIT + (1 if all_choices and all_choices[0]['current'] else 0)
         return {
             'current': str(current_path),
             'roots': [str(root) for root in self._workspace_roots or ()],
@@ -175,31 +175,36 @@ class AgentRuntime:
         }
 
     def add_workspace(self, path: str, name: str | None = None) -> dict:
-        directory = resolve_workspace(path, base=self._default_workspace,
-                                      allowed_roots=self._workspace_roots)
+        directory = resolve_workspace(path, base=self._default_workspace, allowed_roots=self._workspace_roots)
         return workspaces.add_workspace(directory, name=name, file=self.workspace_file)
 
     def remove_workspace(self, workspace_id: str) -> dict:
         return workspaces.remove_workspace(workspace_id, file=self.workspace_file)
 
-    def send(self, session_id: str, content: str, on_delta=None, *,
-             attachments: list[dict] | None = None, on_event=None,
-             housekeeping: bool = True) -> AgentResult:
-        """Append a user message, run one turn, and return the assistant content.
+    def send(
+        self,
+        session_id: str,
+        content: str,
+        on_delta=None,
+        *,
+        attachments: list[dict] | None = None,
+        on_event=None,
+        housekeeping: bool = True,
+    ) -> AgentResult:
+        """追加一条用户消息，执行一个回合，返回 assistant 内容。
 
-        ``attachments`` are ``harness_image`` references (already cached by the
-        caller); they travel as a separate user message right after the prompt,
-        matching how view_image results are replayed. ``on_event`` receives
-        ``(event_type, payload)`` for one-shot transports such as JSONL.
+        ``attachments`` 是 ``harness_image`` 引用（调用方已缓存），作为紧跟提示词
+        的独立用户消息存放，与 view_image 结果的回放方式一致。``on_event`` 接收
+        ``(event_type, payload)``，供 JSONL 等一次性传输使用。
         """
         if not isinstance(content, str) or not content.strip():
-            raise ValueError("message content must be a non-empty string")
+            raise ValueError('message content must be a non-empty string')
         with self._session_lock(session_id):
             store = self._open_session(session_id)
             workspace = self._workspace_for(store)
             store.record_workspace(workspace)
             messages = store.rebuild_openai_history(recover_pending=True)
-            message = {"role": "user", "content": content}
+            message = {'role': 'user', 'content': content}
             messages.append(message)
             store.append_message(message)
             if attachments:
@@ -208,25 +213,25 @@ class AgentRuntime:
                 store.append_message(attachment)
             turn_kwargs = {}
             if on_delta is not None:
-                turn_kwargs["on_delta"] = on_delta
+                turn_kwargs['on_delta'] = on_delta
             if on_event is not None:
-                turn_kwargs["on_event"] = on_event
+                turn_kwargs['on_event'] = on_event
             if not housekeeping:
-                turn_kwargs["housekeeping"] = False
+                turn_kwargs['housekeeping'] = False
             with use_workspace(workspace):
                 result = self._run_turn(messages, session_store=store, **turn_kwargs)
             return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:
-        """Return the replayable OpenAI history for a persisted session."""
+        """返回持久化会话可回放的 OpenAI 历史。"""
         return self._open_session(session_id).rebuild_openai_history(repair_gaps=True)
 
     def open_session(self, session_id: str):
-        """Open the persisted event store of an existing session (live tailing)."""
+        """打开既有会话的事件存储，用于实时 tail。"""
         return self._open_session(session_id)
 
     def list_sessions(self, limit: int = 20) -> list[dict]:
-        """Summarize sessions ordered by last user/assistant message time."""
+        """按最后一条用户/assistant 消息时间排序并概括会话。"""
         if not self._sessions_dir.is_dir():
             return []
         paths = self._sessions_dir.glob('session_*.jsonl')
@@ -235,15 +240,15 @@ class AgentRuntime:
             try:
                 hit = _summary_cached(path, path.stat())
             except OSError:
-                continue   # unreadable log: leave it out of the listing
+                continue  # 日志不可读：列表里直接跳过，不让一个坏文件拖垮整次列表
             if hit is not None:
-                rows.append(hit)   # 缓存命中：连 store 都不必构造
+                rows.append(hit)  # 缓存命中：连 store 都不必构造
                 continue
             try:
                 store = self._session_store_cls.open(path)
                 rows.append(_cached_summary(store))
             except (OSError, ValueError):
-                continue   # unreadable/corrupt log: leave it out of the listing
+                continue  # 日志不可读或损坏：同样跳过
         rows.sort(key=lambda row: (row['updated'], row['id']), reverse=True)
         return rows[:limit]
 
@@ -263,15 +268,18 @@ class AgentRuntime:
         if not title:
             raise ValueError('标题不能为空')
         store = self._open_session(session_id)
-        store.append_session_title(title[:80], source='user')   # 用户命名：异步重生成永不覆盖
+        store.append_session_title(title[:80], source='user')  # 用户命名：异步重生成永不覆盖
         return store.session_summary()['title']
 
     def manage_session(self, action: str, row: dict):
         if action not in ('archive', 'restore', 'delete'):
             raise ValueError('未知会话操作')
         session_id = row.get('id')
-        if (not isinstance(session_id, str) or not session_id
-                or not session_id.replace('-', '').replace('_', '').isalnum()):
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not session_id.replace('-', '').replace('_', '').isalnum()
+        ):
             raise ValueError('无效的会话标识')
         lock = self._session_lock(row['id'])
         if not lock.acquire(blocking=False):
@@ -294,9 +302,9 @@ class AgentRuntime:
         if self._resolve_session_path is not None:
             path = self._resolve_session_path(session_id)
         else:
-            path = self._sessions_dir / f"session_{session_id}.jsonl"
+            path = self._sessions_dir / f'session_{session_id}.jsonl'
             if not path.is_file():
-                raise FileNotFoundError(f"Session {session_id} not found")
+                raise FileNotFoundError(f'Session {session_id} not found')
         return self._session_store_cls.open(path)
 
     def _session_lock(self, session_id: str) -> threading.RLock:

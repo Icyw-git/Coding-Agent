@@ -387,7 +387,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
     session_id = hooks.current_session_id()
 
     def run_in_workspace():
+        from ui_bridge import set_agent, set_session
         with use_workspace(workspace), hooks.use_session(session_id):
+            # UI 事件归属：teammate 的工具/文本不混进主会话的聊天区
+            set_agent(f'teammate:{name}')
+            set_session(session_id)
             run()
 
     threading.Thread(target=run_in_workspace, daemon=True).start()

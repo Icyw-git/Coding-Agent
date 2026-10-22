@@ -33,8 +33,8 @@ COMMANDS = (
     Command('/watch', (), '[bg_id|--list] [--timeout 秒]',
             '跟踪最新的后台任务；--list 查看全部，无需记住编号', '常用'),
     Command('/diff', (), '', '查看当前工作区未提交改动的逐行 diff（只读）', '常用'),
-    Command('/cache', (), '[gc [天数] [--apply]]',
-            '查看工具缓存占用；gc 预览或清理过期且未被会话引用的文件', '常用'),
+    Command('/cache', (), '[profile|gc [天数] [--apply]]',
+            '查看存储 profile；gc 预览或清理过期且未被会话引用的工具缓存', '常用'),
     Command('/review', (), '', '用只读子代理审阅未提交改动并给出分级问题', '常用'),
     Command('/compact', (), '', '压缩当前会话上下文并保留完整记录', '常用'),
     Command('/undo', (), '', '撤销最近一次已完成回合的文件和会话改动', '常用'),
@@ -56,7 +56,8 @@ COMMANDS = (
     Command('/checkpoint', ('/cp',), '[标签]', '创建手动快照', '快照'),
     Command('/rewind', (), '[ID|last|head] [--force] [--session] [--yes]',
             '预览并确认回溯；--session 仅恢复会话，--force 允许覆盖冲突', '快照'),
-    Command('/checkpoint-gc', (), '', '清理旧快照', '快照'),
+    Command('/checkpoint-gc', (), '[--all] [--keep N]',
+            '手动清理当前会话旧快照；--all 清理所有会话，--keep 覆盖本次保留上限', '快照'),
     Command('/quit', ('/exit',), '', '退出；会话自动保存', '常用'),
 )
 
@@ -93,6 +94,25 @@ def command_error(name: str, argument: str) -> str | None:
                 and not (argument.isascii() and argument.isdigit()
                          and 1 <= int(argument) <= 36500)):
             return '用法：/archive [天数|all|empty|restore]，天数需为 1～36500。'
+    if name == '/checkpoint-gc' and argument:
+        tokens = argument.split()
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == '--all':
+                pass
+            elif token == '--keep':
+                index += 1
+                value = tokens[index] if index < len(tokens) else ''
+                if not value.isdigit() or not 1 <= int(value) <= 10_000:
+                    return f'参数无效。用法：{command.usage}'
+            elif token.startswith('--keep='):
+                value = token.split('=', 1)[1]
+                if not value.isdigit() or not 1 <= int(value) <= 10_000:
+                    return f'参数无效。用法：{command.usage}'
+            else:
+                return f'参数无效。用法：{command.usage}'
+            index += 1
     if name == '/approvals' and argument:
         tokens = argument.split()
         if (len(tokens) != 2 or not tokens[0].isdigit()

@@ -1,9 +1,7 @@
-"""Project instruction files (AGENTS.md / CLAUDE.md) from the active workspace.
+"""从当前工作区读取项目说明文件（AGENTS.md / CLAUDE.md）。
 
-Only the workspace root is considered: reading parent directories would reach
-outside the roots the process was authorized to use. Symlinks that escape the
-workspace are ignored, and oversized files are clipped so a repository cannot
-blow up the system prompt.
+只看工作区根目录：向上读父目录会越过进程被授权的根。解析后越出工作区的
+符号链接直接忽略，超大文件按上限截断，防止仓库把系统提示词撑爆。
 """
 
 import os
@@ -38,9 +36,8 @@ def _decode(data: bytes) -> str:
     return data.decode('utf-8', errors='replace')
 
 
-def load_project_instructions(workspace, *,
-                              max_bytes: int = MAX_PROJECT_CONTEXT_BYTES):
-    """Return the highest-precedence instruction file in ``workspace``, or None."""
+def load_project_instructions(workspace, *, max_bytes: int = MAX_PROJECT_CONTEXT_BYTES):
+    """返回 ``workspace`` 中优先级最高的说明文件，没有则返回 None。"""
     if not project_context_enabled():
         return None
     try:
@@ -78,15 +75,16 @@ def load_project_instructions(workspace, *,
         text = text.strip()
         if not text or '\x00' in text:
             return None
-        result = ProjectInstructions(source=path.name, text=text,
-                                     truncated=truncated, limit=max_bytes)
+        result = ProjectInstructions(source=path.name, text=text, truncated=truncated, limit=max_bytes)
         _cache[str(resolved)] = (signature, result)
+        while len(_cache) > 256:
+            _cache.pop(next(iter(_cache)))
         return result
     return None
 
 
 def format_project_instructions(instructions) -> str:
-    """Render instructions for the system prompt, or return an empty string."""
+    """把项目说明渲染成系统提示词片段；没有说明时返回空字符串。"""
     if instructions is None:
         return ''
     notice = ''

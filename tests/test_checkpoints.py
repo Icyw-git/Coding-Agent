@@ -634,3 +634,105 @@ def test_changed_files_since_sees_active_node_before_seal(ws):
     (ws / 'during.txt').write_text('x', encoding='utf-8')
 
     assert mgr.changed_files_since(start) == {'during.txt': 'A'}
+
+
+def test_gc_plan_is_read_only_and_global_gc_reports(ws):
+    from checkpoints import checkpoint_counts, gc_all_checkpoints
+
+    root = ws / '.cache' / 'checkpoints'
+    mgr = CheckpointManager(root, ws, 'sid', max_nodes=2)
+    nodes = [mgr.begin_turn(_msgs(f'm{i}')) for i in range(5)]
+    for _ in nodes:
+        mgr.seal()
+
+    plan = mgr.gc_plan()
+    assert len(plan) == 3
+    assert all((root / 'sid' / item['cp_id']).is_dir() for item in plan)
+    assert checkpoint_counts(root) == {'sid': 5}
+
+    preview = gc_all_checkpoints(root, max_nodes=2, dry_run=True)
+    assert preview['removed'] == 3
+    assert preview['bytes'] > 0
+    assert preview['details'][0]['session_id'] == 'sid'
+    assert len(mgr.list(limit=100)) == 5      # dry-run 不改盘
+
+    done = gc_all_checkpoints(root, max_nodes=2, dry_run=False)
+    assert done['removed'] == 3
+    assert len(mgr.list(limit=100)) == 2
+    assert checkpoint_counts(root) == {'sid': 2}
+
+
+def test_global_gc_visits_each_session_and_keeps_labels(ws):
+    from checkpoints import gc_all_checkpoints
+
+    root = ws / '.cache' / 'checkpoints'
+    first = CheckpointManager(root, ws, 'a', max_nodes=2)
+    second = CheckpointManager(root, ws, 'b', max_nodes=2)
+    kept = first.begin_turn(_msgs('keep'), label='keep')
+    for index in range(4):
+        first.begin_turn(_msgs(f'a{index}'))
+    for index in range(3):
+        second.begin_turn(_msgs(f'b{index}'))
+    first.seal()
+    second.seal()
+
+    summary = gc_all_checkpoints(root, max_nodes=2, dry_run=False)
+    assert summary['sessions'] == 2
+    assert summary['removed'] == 4          # a 删 3、b 删 1
+    assert (root / 'a' / kept).is_dir()     # 带 label 的节点保留
+    assert len(second.list(limit=100)) == 2
+
+
+def test_parse_and_format_checkpoint_gc():
+    import harness
+
+    assert harness.parse_checkpoint_gc('') == (False, harness.CHECKPOINT_MAX_NODES)
+    assert harness.parse_checkpoint_gc('--all --keep 5') == (True, 5)
+    assert harness.parse_checkpoint_gc('--keep=7') == (False, 7)
+    for bad in ('--all --keep', '--keep 0', '--keep x', '--nope'):
+        with pytest.raises(ValueError):
+            harness.parse_checkpoint_gc(bad)
+
+    text = harness.format_checkpoint_gc({
+        'mode': 'current', 'keep': 20, 'removed': 0,
+        'current_nodes': 3, 'other_nodes': 12, 'bytes': 0,
+    })
+    assert '无需清理' in text and '其他会话还有 12 个' in text
+
+
+def test_format_checkpoint_gc_all_reports_affected_sessions():
+    import harness
+
+    text = harness.format_checkpoint_gc({
+        'mode': 'all', 'keep': 2, 'removed': 3, 'bytes': 10,
+        'sessions': 5, 'sessions_total': 5,
+        'details': [{'session_id': 'a'}, {'session_id': 'b'}],
+    })
+    assert '可清理 3 个快照' in text
+    assert '涉及 2/5 个会话' in text
+
+
+def test_repl_checkpoint_gc_all_requires_confirmation(tmp_path, ws, monkeypatch, capsys):
+    import harness
+    from checkpoints import CheckpointManager
+    from session_store import SessionEventStore
+
+    root = tmp_path / 'checkpoints'
+    store = SessionEventStore(tmp_path / 'sessions', session_id='sid')
+    mgr = CheckpointManager(root, ws, 'sid', max_nodes=2)
+    for index in range(4):
+        mgr.begin_turn(_msgs(f'm{index}'))
+    mgr.seal()
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', root)
+    monkeypatch.setattr(harness, 'CHECKPOINT_MAX_NODES', 2)
+    monkeypatch.setattr(harness, 'get_workdir', lambda: ws)
+    monkeypatch.setattr(harness, '_confirm', lambda prompt: False)
+
+    harness.handle_command('/checkpoint-gc --all', [], store)
+    assert len(mgr.list(limit=100)) == 4
+    assert '已取消' in capsys.readouterr().out
+
+    monkeypatch.setattr(harness, '_confirm', lambda prompt: True)
+    harness.handle_command('/checkpoint-gc --all', [], store)
+    assert len(mgr.list(limit=100)) == 2
+    assert '已清理 2 个快照' in capsys.readouterr().out

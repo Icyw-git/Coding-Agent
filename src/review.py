@@ -52,26 +52,27 @@ _SYSTEM_PROMPT = (
     '测试建议：<missing tests, or 无>\n'
 )
 
-_BUDGET_NOTE = ('The review context budget is exhausted. Do not call more tools. '
-                'Give your final review now from what you have already inspected.')
-_ROUNDS_NOTE = ('The tool-call budget is exhausted. Give your final review now '
-                'from what you have already inspected.')
+_BUDGET_NOTE = (
+    'The review context budget is exhausted. Do not call more tools. '
+    'Give your final review now from what you have already inspected.'
+)
+_ROUNDS_NOTE = 'The tool-call budget is exhausted. Give your final review now from what you have already inspected.'
 
 
 def _h():
     import harness
+
     return harness
 
 
 def _guard(name: str, handler, workspace: Path):
-    """Deny paths outside the workspace before policy/gate code can prompt."""
+    """在策略层/审批门之前拒掉工作区外的路径，避免弹出注定被拒的审批。"""
 
     def guarded(**args):
         path = args.get('path')
         if path is None or path == '':
             path = '.'
-        zone = classify_path(str(path), cwd=args.get('cwd'),
-                             workspace=workspace, secrets=DEFAULT_SECRETS)
+        zone = classify_path(str(path), cwd=args.get('cwd'), workspace=workspace, secrets=DEFAULT_SECRETS)
         if zone != PATH_WORKSPACE:
             return f'Error: /review only reads inside the workspace (blocked: {zone})'
         if name == 'glob':
@@ -130,8 +131,7 @@ def _answer(message) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        return '\n'.join(str(part.get('text') or '') for part in content
-                         if isinstance(part, dict)).strip()
+        return '\n'.join(str(part.get('text') or '') for part in content if isinstance(part, dict)).strip()
     return ''
 
 
@@ -154,9 +154,9 @@ def _result(answer: str, files: int, skipped: int) -> str:
     return header + '\n\n' + (answer or '审阅模型没有返回内容。')
 
 
-def _review_loop(h, api, messages: list[dict], schemas: list[dict],
-                 handlers: dict, files: int, skipped: int,
-                 max_rounds: int) -> str:
+def _review_loop(
+    h, api, messages: list[dict], schemas: list[dict], handlers: dict, files: int, skipped: int, max_rounds: int
+) -> str:
     tools = schemas
     for _ in range(max(1, max_rounds)):
         if _history_chars(messages) > MAX_REVIEW_CONTEXT_CHARS:
@@ -169,8 +169,7 @@ def _review_loop(h, api, messages: list[dict], schemas: list[dict],
         if not tool_calls or tools is None:
             return _result(_answer(message), files, skipped)
         for tool_call in tool_calls:
-            _, _, tool_message, _images = h.exec_tool_call(
-                tool_call, registry=handlers, hooks=False, background=False)
+            _, _, tool_message, _images = h.exec_tool_call(tool_call, registry=handlers, hooks=False, background=False)
             messages.append(tool_message)
 
     messages.append({'role': 'user', 'content': _ROUNDS_NOTE})
@@ -178,9 +177,14 @@ def _review_loop(h, api, messages: list[dict], schemas: list[dict],
     return _result(_answer(response.choices[0].message), files, skipped)
 
 
-def run_review(workspace=None, *, client=None, progress=None,
-               max_rounds: int = MAX_REVIEW_ROUNDS,
-               max_diff_chars: int = MAX_REVIEW_DIFF_CHARS) -> str:
+def run_review(
+    workspace=None,
+    *,
+    client=None,
+    progress=None,
+    max_rounds: int = MAX_REVIEW_ROUNDS,
+    max_diff_chars: int = MAX_REVIEW_DIFF_CHARS,
+) -> str:
     """审阅工作区未提交改动，返回可直接打印的分级报告。"""
     h = _h()
     workspace = Path(workspace or h.get_workdir()).expanduser().resolve()
@@ -193,15 +197,13 @@ def run_review(workspace=None, *, client=None, progress=None,
     entries, skipped = _safe_entries(entries)
     if not entries:
         return '  未提交改动只涉及敏感文件，/review 不会把内容发送给模型。'
-    diff = workspace_diff.format_entries(
-        workspace, entries, max_chars=max_diff_chars)
+    diff = workspace_diff.format_entries(workspace, entries, max_chars=max_diff_chars)
 
     system = _SYSTEM_PROMPT.format(workspace=workspace)
     project = h.project_prompt_section(workspace)
     if project:
         system += '\n\n' + project
-    prompt = (f'请审阅当前工作区 {workspace} 的未提交改动，共 {len(entries)} 个文件。'
-              '文件状态和 diff 如下：\n\n' + diff)
+    prompt = f'请审阅当前工作区 {workspace} 的未提交改动，共 {len(entries)} 个文件。文件状态和 diff 如下：\n\n' + diff
     if skipped:
         prompt += f'\n\n（另有 {skipped} 个敏感文件未包含在 diff 中。）'
     messages = [
@@ -215,5 +217,4 @@ def run_review(workspace=None, *, client=None, progress=None,
         progress(f'  [review] 正在审阅 {len(entries)} 个未提交文件（只读）…')
 
     with use_workspace(workspace):
-        return _review_loop(h, api, messages, schemas, handlers,
-                            len(entries), skipped, max_rounds)
+        return _review_loop(h, api, messages, schemas, handlers, len(entries), skipped, max_rounds)

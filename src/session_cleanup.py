@@ -52,7 +52,7 @@ class SessionArchive:
                 target.rmdir()
                 raise
 
-    def list(self):
+    def list(self, *, emit=print):
         if not self.root.exists():
             return []
         rows = []
@@ -60,7 +60,7 @@ class SessionArchive:
             try:
                 rows.append(SessionEventStore.open(path).session_summary())
             except (OSError, ValueError) as exc:
-                print(f'  无法读取归档 {path.parent.name}，已跳过：{exc}')
+                emit(f'  无法读取归档 {path.parent.name}，已跳过：{exc}')
         return sorted(rows, key=lambda row: row['updated'], reverse=True)
 
     def restore(self, session_id):

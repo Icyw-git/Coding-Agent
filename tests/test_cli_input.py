@@ -91,11 +91,11 @@ def test_select_all_with_no_visible_rows_is_a_noop():
     assert selected == {'a'} and not added
 
 
-def test_cleanup_hint_advertises_both_select_all_keys():
+def test_cleanup_hint_advertises_select_all_key():
     from cli_input import CLEANUP_HINT
 
-    # F2 是不依赖输入框焦点的备用键，和 Ctrl+A 一起写进提示
-    assert 'Ctrl+A' in CLEANUP_HINT and 'F2' in CLEANUP_HINT
+    # F2 常被终端/系统占用，只保留 Ctrl+A。
+    assert 'Ctrl+A' in CLEANUP_HINT and 'F2' not in CLEANUP_HINT
 
 
 def test_cleanup_picker_ctrl_a_selects_all_even_with_search_focused():
