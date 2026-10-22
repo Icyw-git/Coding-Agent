@@ -1677,3 +1677,61 @@ def test_textual_run_swaps_ansi_renderer_and_restores_it(monkeypatch):
 
     assert seen == [False]
     assert default_renderer.on_event in bus._subs
+
+
+def test_history_starts_with_recent_window_and_loads_older_page():
+    messages = []
+    for index in range(1000):
+        role = 'user' if index % 2 == 0 else 'assistant'
+        messages.append({'role': role, 'content': f'history-{index}'})
+
+    async def scenario():
+        app = HarnessApp(messages)
+        async with app.run_test(size=(80, 20)) as pilot:
+            await pilot.pause()
+            assert len(app._messages) == 1000
+            assert len(app.model) == 400
+            assert app.model.snapshot()[0].payload['text'] == 'history-600'
+            assert app._history_start == 600
+
+            before = app.view.content_line_count
+            assert app.load_older_history() == 200
+            await pilot.pause()
+            assert app._history_start == 400
+            assert len(app.model) == 600
+            assert app.model.snapshot()[0].payload['text'] == 'history-400'
+            assert app.view.content_line_count > before
+            assert app.load_older_history() == 200
+            await pilot.pause()
+            assert app._history_start == 200
+            assert app.model.snapshot()[0].payload['text'] == 'history-200'
+
+    asyncio.run(scenario())
+
+
+def test_scrolling_to_top_loads_older_history():
+    messages = [
+        {'role': 'user' if index % 2 == 0 else 'assistant',
+         'content': f'history-{index}'}
+        for index in range(1000)
+    ]
+
+    async def scenario():
+        app = HarnessApp(messages)
+        async with app.run_test(size=(80, 20)) as pilot:
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if app._history_auto_armed and app._history_last_offset > 0:
+                    break
+            assert app._history_start == 600
+            app.view.scroll_home(animate=False)
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if app._history_start < 600:
+                    break
+            assert app._history_start == 400
+            assert len(app.model) == 600
+
+    asyncio.run(scenario())

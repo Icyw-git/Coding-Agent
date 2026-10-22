@@ -3480,3 +3480,21 @@ HEAD `00e2683`）；当前 `.cache` 约 31 MB。验证：全量 **1271 passed / 
 新增缓存淘汰/高度保持测试、流式尾部更新 starts 回归；验证：全量
 **1273 passed / 1 skipped**，5 条 warning 均来自飞书 SDK，Ruff 与 diff 检查通过。若后续继续压低峰值，需要把块高度也改为
 惰性估算，或参考 Codex 的分页 history / Pi 的 active-branch projection 做真正的窗口化。
+
+## UI 历史分页实验
+
+全量 10,000 条消息的启动基线：UI 块/布局行 10000，`run_test` 就绪约 10.9 s，
+当前内存约 18.1 MB、峰值约 27.8 MB。这与 Codex 的 paginated thread history、
+Pi 的 active-branch 投影一致：恢复源保留完整历史，但 UI 不应一次渲染全部。
+
+实现：`HISTORY_INITIAL_MESSAGES=400`、`HISTORY_PAGE_MESSAGES=200`。
+`_load_history()` 只把最近 400 条消息转成块，完整 `_messages` 仍给 Agent；
+滚动到顶部（经过一次从非顶部到顶部的偏移变化）或 `/more` 调
+`load_older_history()`，按页 prepend 并补偿滚动位置。`ConversationModel.prepend()`
+支持前插；`/clear` 重置分页状态。
+
+对比：10,000 条消息初始只加载 400 条后，就绪约 **0.57 s**、当前约 **2.3 MB**、
+峰值约 **6.2 MB**；加载更早的 200 条后块数为 600。分页减少的是 UI/布局首屏成本，
+不改 `_messages` 的 Agent 上下文，也不删除源历史。新增测试覆盖初始窗口、手动
+前插两页和滚到顶部自动加载。验证：全量 **1275 passed / 1 skipped**，5 条 warning
+均来自飞书 SDK，Ruff 与 diff 检查通过。

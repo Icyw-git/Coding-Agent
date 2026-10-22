@@ -63,6 +63,11 @@ def _short_count(value) -> str:
 
 FOLLOW_END = True
 SUGGESTION_LIMIT = 6
+# 首次只把最近一段历史转成 UI 块；完整消息仍保留在 _messages 供 Agent 使用。
+# 滚动到顶部或 /more 时按页向前补，和 Codex 的分页 history、Pi 的 active
+# branch 投影一样，避免启动时把整份长历史渲染进内存。
+HISTORY_INITIAL_MESSAGES = 400
+HISTORY_PAGE_MESSAGES = 200
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
 # TUI 的 Rich Markdown 主题：避免默认的 “cyan on black” 代码块在深色终端上
@@ -358,6 +363,11 @@ class HarnessApp(App):
         super().__init__()
         self._source_messages = list(messages or [])
         self._messages = list(messages or [])
+        self._history_messages: list[dict] = []
+        self._history_start = 0
+        self._history_loading = False
+        self._history_auto_armed = False
+        self._history_last_offset = 0
         self._session_id = session_id or ''
         self._title = title
         self._store = session_store
@@ -463,6 +473,12 @@ class HarnessApp(App):
         self._last_stream_render = time.monotonic()
         self._dirty = False
         self.view.refresh_layout()
+        # 首次贴底布局完成后才允许自动上翻，避免启动瞬间 offset 仍为 0
+        # 时把历史页连续加载进来。
+        if (not self._history_auto_armed
+                and self.view.content_line_count > self.view.size.height):
+            self._history_auto_armed = True
+            self._history_last_offset = int(self.view.scroll_offset.y)
 
     def _refresh_footer(self) -> None:
         if self._footer is None:
@@ -736,6 +752,12 @@ class HarnessApp(App):
     def _tick_border_status(self) -> None:
         if self._composer is None:
             return
+        offset = int(self.view.scroll_offset.y) if self.view.is_attached else 0
+        if (not self._busy and self._history_auto_armed
+                and self._history_start > 0 and offset <= 1
+                and self._history_last_offset > 1):
+            self.load_older_history()
+        self._history_last_offset = offset
         if not self._busy:
             if self._composer.border_title:
                 self._composer.border_title = ''
@@ -880,19 +902,57 @@ class HarnessApp(App):
             self._status['phase'] = payload.get('state')
             self._refresh_footer()
 
+    def _append_history_message(self, message: dict, *, prepend: bool = False) -> None:
+        role = message.get('role')
+        content = message.get('content')
+        if role == 'user':
+            kind, payload = 'user', {'text': str(content or '')}
+        elif role == 'assistant':
+            kind, payload = 'assistant', {'text': str(content or '')}
+        elif role == 'tool':
+            kind, payload = 'tool', {
+                'name': 'tool', 'args': {}, 'state': 'complete',
+                'output': str(content or ''), 'expanded': False}
+        else:
+            return
+        if prepend:
+            self.model.prepend(kind, payload)
+        else:
+            self.model.append(kind, payload)
+
     def _load_history(self, messages: list) -> None:
-        for message in messages:
-            role = message.get('role')
-            content = message.get('content')
-            if role == 'user':
-                self.model.append('user', {'text': str(content or '')})
-            elif role == 'assistant':
-                self.model.append('assistant', {'text': str(content or '')})
-            elif role == 'tool':
-                self.model.append('tool', {
-                    'name': 'tool', 'args': {}, 'state': 'complete',
-                    'output': str(content or ''), 'expanded': False})
+        self._history_messages = list(messages)
+        self._history_start = max(0, len(messages) - HISTORY_INITIAL_MESSAGES)
+        self._history_loading = False
+        self._history_auto_armed = False
+        self._history_last_offset = 0
+        self.model.clear()
+        for message in messages[self._history_start:]:
+            self._append_history_message(message)
         self._mark_dirty()
+
+    def load_older_history(self) -> int:
+        """向模型前补一页历史，返回新增的消息数；0 表示已到顶部/无历史。"""
+        if self._history_loading or self._history_start <= 0:
+            return 0
+        self._history_loading = True
+        try:
+            start = max(0, self._history_start - HISTORY_PAGE_MESSAGES)
+            older = self._history_messages[start:self._history_start]
+            before = self.view.content_line_count
+            offset = int(self.view.scroll_offset.y)
+            for message in reversed(older):
+                self._append_history_message(message, prepend=True)
+            self._history_start = start
+            self._mark_dirty()
+            self._flush_layout(force=True)
+            added = max(0, self.view.content_line_count - before)
+            if added:
+                self.view.scroll_to(y=offset + added, animate=False)
+            self.view.refresh()
+            return len(older)
+        finally:
+            self._history_loading = False
 
     def _mark_dirty(self) -> None:
         self._dirty = True
@@ -1028,9 +1088,14 @@ class HarnessApp(App):
             self._notice(commands.hotkeys_text())
         elif verb == 'clear':
             self.model.clear()
+            self._history_messages = []
+            self._history_start = 0
+            self._history_auto_armed = False
+            self._history_last_offset = 0
             self._mark_dirty()
         elif verb == 'more':
-            self._notice('新 TUI 启动时已加载全部历史，无需 /more。')
+            if not self.load_older_history():
+                self._notice('没有更早的历史了。')
         elif verb in ('status', 'pwd'):
             state = self._display_status()
             lines = [f"model: {harness.os.getenv('LLM_MODEL_ID', '') or 'unset'}",

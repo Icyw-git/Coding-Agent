@@ -102,6 +102,7 @@ python scripts/profile_storage.py --session largest
 python scripts/profile_storage.py --json
 python scripts/profile_storage.py --shallow
 python scripts/bench_layout.py 10000 100
+python scripts/bench_history.py 10000
 ```
 
 `--session` 用 `tracemalloc` 统计读取事件、重建 OpenAI 历史和峰值；它只测量存储/历史层，不包含 Textual 界面渲染。
@@ -142,6 +143,19 @@ TUI 布局同样不再长期保留所有块的行文本：`TranscriptLayout` 默
 布局约多 15–20 ms。流式更新只从变更块重算起始行，不再每次扫全部 10k 块：
 尾部流式段落旧方式约 1.2 ms/次，现在约 0.05 ms/次。后续若要继续降低峰值，
 需要让块高度也可惰性计算。
+
+### 历史分页实验
+
+完整历史仍保留给 Agent，但 TUI 初始只把最近 400 条消息变成块；滚动到顶部或
+`/more` 时每次向前补 200 条。10,000 条消息的启动对比：
+
+| 模式 | UI 块数 | 就绪时间 | 当前内存 | 峰值 | 历史起点 |
+|---|---:|---:|---:|---:|---:|
+| 全量 | 10000 | 约 10.9 s | 18.1 MB | 27.8 MB | 0 |
+| 初始 400 + 分页 | 400 | **约 0.57 s** | **2.3 MB** | **6.2 MB** | 9600 |
+
+分页显著减少首次布局和 UI 内存，但不会减少 `_messages` 中供模型使用的完整历史；
+它解决的是长会话进入界面时的首屏成本。
 
 ## 6. 暂不采用
 

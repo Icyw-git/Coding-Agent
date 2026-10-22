@@ -47,6 +47,17 @@ class ConversationModel:
             self.revision += 1
             return block
 
+    def prepend(self, kind: str, payload: dict | None = None, *,
+                block_id: str | None = None) -> Block:
+        """把历史页插到当前模型前面；用于滚动到顶部时加载更早消息。"""
+        with self._lock:
+            block = Block(block_id or self._new_id(), kind, dict(payload or {}))
+            self._blocks.insert(0, block)
+            self._by_id[block.id] = block
+            self._dirty.add(block.id)
+            self.revision += 1
+            return block
+
     def update(self, block_id: str, **payload) -> Block | None:
         with self._lock:
             block = self._by_id.get(block_id)
