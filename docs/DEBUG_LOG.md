@@ -3441,3 +3441,26 @@ P7 执行内容：
 （skip 为主机不支持 symlink；5 条 warning 均来自飞书 SDK 的 pkg_resources），
 Ruff 与 diff 检查通过。ANSI 回退、Textual 默认入口、RLock 重入、renderer 切换和
 旧测试删除后的顺序依赖均已覆盖。
+
+## 长会话内存优化：事件缓存边界与流式重建
+
+profile 显示最大会话（约 5 MB JSONL）完整读取事件峰值约 23 MB，同时 `messages`
+还保存了一份重建历史。参考 Codex 的分页/按需历史读取和 Pi 只投影 active branch
+的思路，不删除 append-only 源数据，改为收紧内存中的派生副本：
+
+- `SessionEventStore.read_events()` 只缓存不超过 `HARNESS_EVENT_CACHE_MAX_BYTES`
+  （默认 2 MiB）的文件；超限时返回结果但不保留完整事件表。
+- `rebuild_openai_history()` 对超限会话走两遍流式扫描：第一遍收集
+  `tool_compacted` 占位，第二遍构建 messages，避免先构造完整事件列表。
+- `session_summary()` 单独按 `(size, mtime)` 缓存摘要；`append()` 使摘要缓存失效，
+  长会话列表/标题查询不再为摘要保留整份事件。
+- 新增 `iter_events()`，复用 JSONL 序号/尾部半行校验；小会话仍走原缓存路径。
+
+实测最大会话：显式 `read_events()` 峰值约 22.9 MB；流式 rebuild 峰值约 **1.8 MB**、
+当前约 0.5 MB，重建约 0.4 s。重建变慢约 0.2 s/次，是有意的内存换 CPU 折中；
+小会话不受影响。新增测试覆盖超限不缓存、流式 compaction/placeholder、摘要缓存失效。
+
+同时清理了误放在 `.cache` 的 `xmanrui/dsh-im` 公共 clone（42 MB，无本地改动，
+HEAD `00e2683`）；当前 `.cache` 约 31 MB。验证：全量 **1271 passed / 1 skipped**
+（skip 为主机不支持 symlink；5 条 warning 均来自飞书 SDK 的 pkg_resources），
+新增流式重建/缓存边界测试通过，Ruff 与 diff 检查通过。

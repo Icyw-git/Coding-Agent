@@ -41,9 +41,13 @@
 
 以当前工作区为例（数字随使用变化）：
 
-- `.cache` 总计约 75 MB；其中可识别的 Agent 数据约 29 MB，未识别目录约 42 MB（`dsh-im-reference`，不自动处理）。
+- `.cache` 初始约 75 MB，其中 42 MB 是误放在缓存里的 `xmanrui/dsh-im` 公共仓库 clone；
+  已确认无本地改动（HEAD `00e2683`）并清理，可按需重新 clone。当前剩余约 31 MB，
+  可识别 Agent 数据约 29 MB，未识别文件仅 `probe_pt.py`（654 B，保留排查用）。
 - `sessions` 约 9 MB / 46 个文件；`checkpoints` 约 17 MB / 177 个节点；`transcripts` 约 1.8 MB；`tool_results` 约 58 KB。
-- 最大单个 session 约 5 MB：完整读取事件约 12 MB 当前内存、23 MB 峰值，读取约 100 ms、重建历史约 200 ms。
+- 最大单个 session 约 5 MB：显式 `read_events()` 峰值约 23 MB；改为流式 rebuild 后
+  重建峰值约 1.8 MB、当前约 0.5 MB。流式重建比缓存路径多花约 200 ms/次，是
+  “长会话内存换 CPU”的有意折中。
 - 之前对快照执行 `--keep 10` 后，21 个会话各保留 10 个节点；默认策略仍是 20，因此当前 `/cache profile` 显示快照可回收 0。
 
 ## 3. 分类与清理矩阵
@@ -80,7 +84,7 @@
 `/cache profile` 输出示例（会随实际数据变化）：
 
 ```text
-存储 profile：已知 29.0 MB，可回收约 0 B；未识别 42.4 MB（不处理）。
+存储 profile：已知 29.1 MB，可回收约 0 B；未识别 654 B（不处理）。
 源数据（不自动删除）
   会话事件流: 9.0 MB · 46 个文件 · 最早 5 天前 → 保留；用 /archive 或 /delete 管理
   ...
@@ -88,7 +92,7 @@
   工具大输出/图片: 58.4 KB · 2 个文件 → /cache gc [天数] [--apply]
   回溯快照: 17.2 MB · 398 个文件 · 177 个节点 → /checkpoint-gc [--all] [--keep N]
 未识别目录（只报告，不自动清理）
-  dsh-im-reference: 42.4 MB · 859 个文件 · 请确认用途后手动处理
+  probe_pt.py: 654 B · 1 个文件 · 排查脚本，保留
 ```
 
 独立 profile（含最大会话加载内存）：
@@ -115,7 +119,14 @@ python scripts/profile_storage.py --shallow
 | `TranscriptLayout` | 按块版本/宽度缓存，宽度变化重建 |
 | 审批历史/审查官缓存 | 固定上限，撤销时连带清空 |
 
-活跃会话的 `SessionEventStore._events_cache` 仍保存完整解析事件；`messages` 还保存重放后的历史。这是当前“恢复速度 vs 内存”的折中。若单个会话继续增长，下一步应参考 Codex 的分页 history / Pi 的 active-branch projection，而不是简单把历史删掉。
+`SessionEventStore` 默认只缓存不超过 **2 MiB** 的事件文件；超过后 `read_events()`
+不保留完整事件表，`rebuild_openai_history()` 走两遍流式扫描（第一遍取
+`tool_compacted` 占位，第二遍构建 messages）。`session_summary()` 另按
+`(size, mtime)` 缓存摘要，不缓存完整事件。环境变量
+`HARNESS_EVENT_CACHE_MAX_BYTES` 可调整阈值（默认 2097152，0 表示关闭事件缓存）。
+这借鉴 Codex 的“历史分页/按需读取”和 Pi 的“只投影当前 active branch”思路：
+保留 append-only 源数据，不把完整事件列表长期复制到内存。若 session 继续增长，
+下一步再考虑分页/压缩存储，而不是删除历史。
 
 ## 6. 暂不采用
 

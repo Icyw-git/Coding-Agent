@@ -29,21 +29,28 @@ def _session_memory(path: Path) -> dict:
         store = SessionEventStore.open(path)
         events = store.read_events()
         read_ms = (time.perf_counter() - started) * 1000
+        read_current, read_peak = tracemalloc.get_traced_memory()
+        event_count = len(events)
+        del events
+        tracemalloc.reset_peak()
         started = time.perf_counter()
         messages = store.rebuild_openai_history()
         rebuild_ms = (time.perf_counter() - started) * 1000
-        current, peak = tracemalloc.get_traced_memory()
+        current, rebuild_peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
     return {
         'path': str(path),
         'disk_bytes': path.stat().st_size,
-        'events': len(events),
+        'events': event_count,
         'messages': len(messages),
         'read_ms': round(read_ms, 1),
         'rebuild_ms': round(rebuild_ms, 1),
+        'read_current_bytes': read_current,
+        'read_peak_bytes': read_peak,
         'current_bytes': current,
-        'peak_bytes': peak,
+        'rebuild_peak_bytes': rebuild_peak,
+        'peak_bytes': max(read_peak, rebuild_peak),
     }
 
 
@@ -105,9 +112,10 @@ def main(argv=None) -> int:
         print('  会话加载内存 profile')
         print(f"  {Path(memory['path']).name}: 磁盘 {storage_profile._size(memory['disk_bytes'])} · "
               f"{memory['events']} 事件 / {memory['messages']} 消息")
-        print(f"  读取 {memory['read_ms']} ms · 重建历史 {memory['rebuild_ms']} ms · "
-              f"当前 {storage_profile._size(memory['current_bytes'])} · "
-              f"峰值 {storage_profile._size(memory['peak_bytes'])}")
+        print(f"  读取 {memory['read_ms']} ms（峰值 {storage_profile._size(memory['read_peak_bytes'])}）· "
+              f"重建历史 {memory['rebuild_ms']} ms"
+              f"（峰值 {storage_profile._size(memory['rebuild_peak_bytes'])}）· "
+              f"当前 {storage_profile._size(memory['current_bytes'])}")
     return 0
 
 

@@ -389,6 +389,9 @@ MCP_SERVERS_FILE=.cache/mcp_servers.json
 # textual-next 是 textual 的兼容别名
 HARNESS_UI=textual
 
+# 可选：长会话事件缓存上限（默认 2 MiB；0 表示不缓存，改为按需重读）
+HARNESS_EVENT_CACHE_MAX_BYTES=2097152
+
 # 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
 HARNESS_MEMORY_RECALL=local
 

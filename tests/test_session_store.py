@@ -182,3 +182,51 @@ def test_path_lock_shared_across_instances(tmp_path):
         t.join()
     seqs = [e["seq"] for e in s1.read_events()]
     assert len(seqs) == len(set(seqs)) == 40
+
+
+def test_large_session_disables_event_cache_and_streams_rebuild(tmp_path, monkeypatch):
+    store = SessionEventStore(tmp_path, session_id='large')
+    monkeypatch.setenv('HARNESS_EVENT_CACHE_MAX_BYTES', '512')
+    for index in range(20):
+        store.append_message({'role': 'user', 'content': f'message-{index}-' + 'x' * 100})
+
+    events = store.read_events()
+    assert len(events) == 20
+    assert store._events_cache is None       # 超限不保留完整事件表
+    assert [event['seq'] for event in store.iter_events()] == list(range(1, 21))
+    assert [m['content'] for m in store.rebuild_openai_history()] == [
+        f'message-{index}-' + 'x' * 100 for index in range(20)]
+
+    summary = store.session_summary()
+    assert summary['events'] == 20 and store._summary_cache is not None
+    store.append_message({'role': 'assistant', 'content': 'done'})
+    assert store._summary_cache is None
+    assert store.session_summary()['events'] == 21
+
+
+def test_streaming_rebuild_applies_compaction_and_placeholders(tmp_path, monkeypatch):
+    monkeypatch.setenv('HARNESS_EVENT_CACHE_MAX_BYTES', '1')
+    store = SessionEventStore(tmp_path, session_id='streaming')
+    store.append_message({'role': 'user', 'content': 'start'})
+    store.append_message({'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call-1', 'type': 'function',
+         'function': {'name': 'read', 'arguments': '{}'}},
+    ]})
+    store.append_message({'role': 'tool', 'tool_call_id': 'call-1',
+                          'content': 'raw output'})
+    store.append_tool_compacted('call-1', '<omitted tool output>')
+    store.append_compaction('compressed', 'auto', tail=[
+        {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'call-1', 'type': 'function',
+             'function': {'name': 'read', 'arguments': '{}'}},
+        ]},
+        {'role': 'tool', 'tool_call_id': 'call-1', 'content': 'raw output'},
+        {'role': 'user', 'content': 'continue'},
+    ])
+
+    history = store.rebuild_openai_history()
+    assert history[0] == {'role': 'user', 'content': '[Compacted]' + chr(10) * 2 + 'compressed'}
+    assert history[1]['role'] == 'assistant'
+    assert history[2] == {'role': 'tool', 'tool_call_id': 'call-1',
+                          'content': '<omitted tool output>'}
+    assert history[3] == {'role': 'user', 'content': 'continue'}

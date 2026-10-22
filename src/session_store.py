@@ -16,6 +16,20 @@ class SessionReplayError(ValueError):
 _GENERIC_ACKS = {'go', 'ok', 'okay', 'yes', 'y', '嗯', '行', '好的',
                  '继续', 'continue', 'do it', 'start'}
 
+# 长会话不在进程里保留完整事件列表：活跃历史本身已经是 messages 的一份
+# 副本，再缓存所有事件会让 5MB JSONL 膨胀到十几 MB。超过上限时按需重读，
+# rebuild 走流式扫描；小会话仍保留缓存，维持列表/恢复的响应速度。
+DEFAULT_EVENT_CACHE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _event_cache_limit() -> int:
+    raw = os.getenv('HARNESS_EVENT_CACHE_MAX_BYTES', '')
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_EVENT_CACHE_MAX_BYTES
+    return max(0, value)
+
 # agent_loop 以 user 角色注入的系统消息前缀： todo 提醒 / 后台任务通知 / cron /
 # compact 工具备注 / 续写提示 / 落盘引用 / 恢复注入 —— 它们不是用户的「最近动态」，
 # 混进 last_user/preview/标题取材会把会话列表变成垃圾场（实测 preview 全是
@@ -59,6 +73,7 @@ class SessionEventStore:
         # 首步卡顿的来源。命中时浅拷贝列表返回（事件 dict 只读共享）。
         # 必须在 _read_last_seq() 之前就位——它会触发第一次 read_events。
         self._events_cache = None
+        self._summary_cache = None
         self._next_seq = self._read_last_seq() + 1
         # 锁在初始化时解析一次（每次 append 都 resolve 约 10ms 开销）；
         # 同路径的多实例仍从类级 _locks 取到同一把锁
@@ -141,6 +156,10 @@ class SessionEventStore:
                                       cache[2] + [copy.deepcopy(event)])
             else:
                 self._events_cache = None
+            if (self._events_cache is not None
+                    and self._known_size > _event_cache_limit()):
+                self._events_cache = None
+            self._summary_cache = None
         return event
 
     def append_message(self, message: dict) -> dict:
@@ -160,15 +179,28 @@ class SessionEventStore:
 
     def session_summary(self) -> dict:
         """Local listing metadata; never calls a model or replays checkpoints."""
-        events = self.read_events()
+        try:
+            stat = self.path.stat()
+        except OSError:
+            stat = None
+        signature = (stat.st_size, stat.st_mtime_ns) if stat else None
+        cached = self._summary_cache
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+        large = stat is not None and stat.st_size > _event_cache_limit()
+        events = self.iter_events() if large else self.read_events()
         workspace = None
         title = None
         prompts = []
-        created = events[0]['ts'] if events else 0
+        created = 0
+        event_count = 0
         last_message = None
         last_user = last_assistant = ''
         last_useful_user = ''
         for event in events:
+            if event_count == 0:
+                created = event.get('ts', 0)
+            event_count += 1
             if event.get('workspace'):
                 workspace = str(event['workspace'])
             if event.get('type') == 'session_title' and event.get('title'):
@@ -211,7 +243,7 @@ class SessionEventStore:
         # preview 兜底：最后一段没有有效用户输入（整段都是工具活动）时，展示
         # 最后一条 assistant 文本——比 reminder/通知垃圾或空白都有信息量
         preview_src = last_useful_user or last_user or last_assistant
-        return {
+        summary = {
             'id': self.session_id,
             'title': chosen,
             'workspace': workspace,
@@ -219,12 +251,20 @@ class SessionEventStore:
                         if preview_src else '尚无任务'),
             'last_user': last_useful_user or last_user,
             'last_assistant': last_assistant,
-            'events': len(events),
+            'events': event_count,
             'created': created,
             # Empty sessions use creation time; metadata and tool events never
             # advance the last conversational activity timestamp.
             'updated': last_message if last_message is not None else created,
         }
+        # 大文件不缓存事件列表，但摘要很小，按 (size, mtime) 复用；append 会清空。
+        try:
+            after = self.path.stat()
+        except OSError:
+            after = None
+        if after is not None and signature == (after.st_size, after.st_mtime_ns):
+            self._summary_cache = (signature, summary)
+        return dict(summary)
 
     def session_title(self) -> str:
         """Return the saved topic, or derive one from the first user message for older logs."""
@@ -356,6 +396,36 @@ class SessionEventStore:
             restored_files=list(restored_files or []),
         )
 
+    def iter_events(self, *, allow_partial_tail: bool = True):
+        """流式读取完整事件；用于长会话 rebuild，避免先构造完整事件列表。"""
+        if not self.path.exists():
+            return
+        size = self.path.stat().st_size
+        expected_seq = 1
+        with self.path.open('rb') as handle:
+            line_no = 0
+            for raw in handle:
+                line_no += 1
+                if not raw.strip():
+                    continue
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    if allow_partial_tail and handle.tell() >= size:
+                        return
+                    raise SessionReplayError(
+                        f"invalid JSONL event at line {line_no}") from exc
+                if not isinstance(event, dict):
+                    raise SessionReplayError(
+                        f"event at line {line_no} is not an object")
+                seq = event.get('seq')
+                if seq != expected_seq:
+                    raise SessionReplayError(
+                        f"event sequence mismatch at line {line_no}: "
+                        f"expected {expected_seq}, got {seq}")
+                expected_seq += 1
+                yield event
+
     def read_events(self, *, allow_partial_tail: bool = True) -> list[dict]:
         if not self.path.exists():
             return []
@@ -386,8 +456,12 @@ class SessionEventStore:
                 )
             expected_seq += 1
             events.append(event)
-        if not partial_tail:
+        if not partial_tail and stat.st_size <= _event_cache_limit():
             self._events_cache = (stat.st_size, stat.st_mtime_ns, events)
+        elif partial_tail:
+            self._events_cache = None
+        else:
+            self._events_cache = None
         return events
 
     def tail_events(self, offset: int = 0, *, strict: bool = False) -> tuple[list[dict], int]:
@@ -431,14 +505,29 @@ class SessionEventStore:
 
     def rebuild_openai_history(self, *, recover_pending: bool = False,
                                repair_gaps: bool = False) -> list[dict]:
-        """Rebuild the current compacted OpenAI history from the append-only event stream."""
-        events = self.read_events()
-        # tool_compacted 占位（micro_compact 的持久化决策）：两遍扫描 ——
-        # 先收集 tool_call_id → 占位文本，再在构建时替换对应 tool 消息
-        placeholders = {e['tool_call_id']: e['placeholder']
-                        for e in events
-                        if e.get('type') == 'tool_compacted'
-                        and e.get('tool_call_id') and e.get('placeholder')}
+        """Rebuild the current compacted OpenAI history from the append-only event stream.
+
+        大文件走流式扫描（两遍：先取占位表，再构建），不把完整事件列表长期
+        留在内存；小文件仍使用 read_events 缓存，保持原有性能。
+        """
+        size = self.path.stat().st_size if self.path.exists() else 0
+        if size > _event_cache_limit():
+            # 第一遍只收集 tool_compacted 占位，第二遍才构造 messages。
+            placeholders = {
+                e['tool_call_id']: e['placeholder']
+                for e in self.iter_events()
+                if e.get('type') == 'tool_compacted'
+                and e.get('tool_call_id') and e.get('placeholder')
+            }
+            events = self.iter_events()
+        else:
+            events = self.read_events()
+            # tool_compacted 占位（micro_compact 的持久化决策）：两遍扫描 ——
+            # 先收集 tool_call_id → 占位文本，再在构建时替换对应 tool 消息
+            placeholders = {e['tool_call_id']: e['placeholder']
+                            for e in events
+                            if e.get('type') == 'tool_compacted'
+                            and e.get('tool_call_id') and e.get('placeholder')}
         messages = []
         for event in events:
             event_type = event.get("type")
