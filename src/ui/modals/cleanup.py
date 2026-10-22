@@ -35,7 +35,7 @@ class CleanupSearchInput(Input):
 
 
 class CleanupPickerModal(ModalScreen):
-    """空格勾选、Ctrl+A/F2 全选可见、Enter 确认、Esc 取消。
+    """空格勾选、Ctrl+A 全选可见、Enter 确认、Esc 取消。
 
     Enter 只做确认，不复用 SelectionList 的「切换勾选」——否则按回车会
     以为确认了、实际又勾了一条（旧 CleanupPicker 注释里踩过的坑）。
@@ -44,7 +44,6 @@ class CleanupPickerModal(ModalScreen):
     BINDINGS = [
         Binding('enter', 'confirm', 'Confirm', show=False, priority=True),
         Binding('ctrl+a', 'select_all', 'Select all', show=False, priority=True),
-        Binding('f2', 'select_all', 'Select all', show=False),
         Binding('escape', 'cancel', 'Cancel'),
     ]
 
@@ -71,7 +70,7 @@ class CleanupPickerModal(ModalScreen):
     def _count_text(self, message: str = '') -> str:
         marked = sum(row['id'] in self.selected for row in self.rows)
         text = (
-            f'已选 {marked}/{len(self.rows)} · 输入筛选 / ↓ 进列表 · 空格勾选 · Ctrl+A/F2 全选 · Enter 确认 · Esc 取消'
+            f'已选 {marked}/{len(self.rows)} · 输入筛选 / ↓ 进列表 · 空格勾选 · Ctrl+A 全选 · Enter 确认 · Esc 取消'
         )
         return f'{message} · {text}' if message else text
 

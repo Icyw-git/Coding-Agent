@@ -179,7 +179,7 @@ class PendingQueue:
 
 
 class Composer(TextArea):
-    """多行输入：Enter 排队/发送、Ctrl-J 换行、Alt+Enter 立即插队、F2 管理队列。"""
+    """多行输入：Enter 排队/发送、Ctrl-J 换行、Alt+Enter 立即插队、Ctrl+G 管理队列。"""
 
     BINDINGS = [
         Binding('enter', 'submit', 'Send', show=False, priority=True),
@@ -189,7 +189,7 @@ class Composer(TextArea):
         Binding('alt+down', 'queued_next', 'Next', show=False),
         Binding('alt+enter', 'submit_now', 'Send now', show=False,
                 priority=True),
-        Binding('f2', 'dequeue', 'Dequeue', show=False, priority=True),
+        Binding('ctrl+g', 'dequeue', 'Manage queue', show=False, priority=True),
         Binding('up', 'suggest_prev', 'Prev', show=False),
         Binding('down', 'suggest_next', 'Next', show=False),
         Binding('ctrl+o', 'expand_tool', 'Expand tool', show=False,
@@ -613,7 +613,7 @@ class HarnessApp(App):
         self._refresh_queue()
 
     def dequeue_all(self) -> None:
-        """Esc / 选择器 F2：把 steering 和 follow-up 全部取回输入框。"""
+        """Esc / 选择器 Ctrl+R：把 steering 和 follow-up 全部取回输入框。"""
         if self._composer is None:
             return
         items = self._steering.drain() + self._pending.drain()
@@ -655,7 +655,7 @@ class HarnessApp(App):
         return rows
 
     def open_queue_picker(self) -> None:
-        """F2 / Alt+↑ / `/dequeue`：单条直接取回，多条用选择器管理。"""
+        """Ctrl+G / Alt+↑ / `/dequeue`：单条直接取回，多条用选择器管理。"""
         rows = self._queued_rows()
         if not rows:
             self._notice('No queued messages to restore.')
@@ -725,7 +725,7 @@ class HarnessApp(App):
             for index, item in enumerate(items[:3]))
         more = f' … +{len(items) - 3}' if len(items) > 3 else ''
         self._queue_widget.update(f'⏳ {len(items)} queued: {preview}{more} '
-                                  '· F2 管理')
+                                  '· Ctrl+G 管理')
         self._queue_widget.display = True
 
     # ---------- 状态 ----------

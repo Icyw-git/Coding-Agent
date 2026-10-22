@@ -1119,11 +1119,11 @@ def test_steering_queue_and_dequeue_all(monkeypatch):
             await pilot.pause()
             assert app._steering.snapshot() == ['steer me']
             assert app._pending.snapshot() == ['follow up']
-            # 多条时 Alt+Up 打开选择器，F2 取回全部
+            # 多条时 Alt+Up 打开选择器，Ctrl+R 取回全部
             await pilot.press('alt+up')
             await pilot.pause()
             assert type(app.screen).__name__ == 'QueueModal'
-            await pilot.press('f2')
+            await pilot.press('ctrl+r')
             await pilot.pause()
             assert not app._steering.snapshot()
             assert not app._pending.snapshot()

@@ -39,7 +39,7 @@ def test_single_queued_message_restores_directly():
         app = HarnessApp([])
         async with app.run_test(size=(80, 20)) as pilot:
             _busy(app, [('only one', 'followup')])
-            await pilot.press('f2')
+            await pilot.press('ctrl+g')
             await pilot.pause()
             assert type(app.screen).__name__ != 'QueueModal'
             assert app._pending.snapshot() == []
@@ -60,7 +60,7 @@ def test_queue_picker_restores_selected_message_only():
             _busy(app, [('steer one', 'steer'),
                         ('next one', 'followup'),
                         ('next two', 'followup')])
-            await pilot.press('f2')
+            await pilot.press('ctrl+g')
             await pilot.pause()
             assert isinstance(app.screen, QueueModal)
             app.screen.query_one('#queue-list', OptionList).focus()
@@ -88,7 +88,7 @@ def test_queue_picker_deletes_selected_after_confirmation():
         async with app.run_test(size=(80, 20)) as pilot:
             _busy(app, [('keep steer', 'steer'),
                         ('drop next', 'followup')])
-            await pilot.press('f2')
+            await pilot.press('ctrl+g')
             await pilot.pause()
             assert isinstance(app.screen, QueueModal)
             await pilot.press('down')              # 进列表
@@ -112,7 +112,7 @@ def test_cancelled_delete_keeps_message():
         async with app.run_test(size=(80, 20)) as pilot:
             _busy(app, [('keep me', 'followup'),
                         ('also keep', 'followup')])
-            await pilot.press('f2')
+            await pilot.press('ctrl+g')
             await pilot.pause()
             await pilot.press('delete')
             await pilot.pause()
@@ -142,7 +142,7 @@ def test_stale_picker_row_does_not_restore_another_message():
         async with app.run_test(size=(80, 20)) as pilot:
             _busy(app, [('steer gone', 'steer'),
                         ('next stays', 'followup')])
-            await pilot.press('f2')
+            await pilot.press('ctrl+g')
             await pilot.pause()
             assert isinstance(app.screen, QueueModal)
             app._steering.drain()          # 模拟 Agent 在弹窗打开期间消费了消息

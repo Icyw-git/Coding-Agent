@@ -508,8 +508,8 @@ TUI 输入 `/` 会在输入框下方列出可用的命令提示，Enter 直接�
 真实终端验收与旧实现清理尚未完成，`textual-legacy` 保留用于对照。TUI 与行式
 REPL 行为对齐：回合进行中按 Enter 把消息放进下回合队列（本回合结束后执行），
 Alt+Enter 则立即进入当前回合的 steering（Agent 下一次消费时注入）；空闲时两者
-都直接发送。状态行显示 `N queued`；`Alt+↑`/F2 或 `/dequeue` 打开队列选择器：
-`↑↓` 选择、Enter 取回选中一条、F2 取回全部、Delete/Ctrl+D 删除选中项（二次确认）、
+都直接发送。状态行显示 `N queued`；`Alt+↑`/`Ctrl+G` 或 `/dequeue` 打开队列选择器：
+`↑↓` 选择、Enter 取回选中一条、`Ctrl+R` 取回全部、Delete/Ctrl+D 删除选中项（二次确认）、
 Esc 关闭；`Esc` 取消当前回合并把全部未消费消息取回输入框。
 `@` 列出并补全工作区文件（Tab）；`↑`/`↓` 翻输入历史；状态栏常驻当前目录与
 git 分支，并显示模型、上下文占用、token 和缓存命中率；
@@ -530,7 +530,7 @@ workspace-write 之间切换执行档位。
 `Esc` 取消），`/resume <序号|ID前缀|标题>` 直接恢复，两者都使用会话事件流
 （与行式 `/resume` 同一份数据）。`/find <关键词>` 在后台跨会话搜索，命中后弹出
 结果选择器，Enter 直接恢复；`/archive` `/delete` 打开多选清单（空格勾选、
-F2/Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspace remove` 不带
+Ctrl+A 全选、Enter 确认），删除还需输入“删除”；`/workspace remove` 不带
 选择器时弹出登记项选择器。`/watch` 的进度与终态输出写进对话区状态块，
 不覆盖 TUI；`/cd`、`/new --ws`、`/archive`、`/watch` 均带参数补全。
 新 TUI 启动时载入全部历史，`/more` 只提示无需加载；旧 `textual-legacy`

@@ -49,7 +49,7 @@ class QueueModal(ModalScreen):
 
     BINDINGS = [
         Binding('escape', 'cancel', 'Close'),
-        Binding('f2', 'restore_all', 'Restore all', show=False, priority=True),
+        Binding('ctrl+r', 'restore_all', 'Restore all', show=False, priority=True),
         # 不用裸字母：搜索框里还要能输入 d。列表获得焦点后按键会冒泡到这里。
         Binding('delete', 'delete', 'Delete', show=False),
         Binding('ctrl+d', 'delete', 'Delete', show=False),
@@ -59,7 +59,7 @@ class QueueModal(ModalScreen):
         super().__init__()
         self.rows = list(rows)
         self.hint = hint or (
-            '↑↓ 选择 · Enter 取回 · Delete/Ctrl+D 删除 · F2 取回全部 · Esc 关闭')
+            '↑↓ 选择 · Enter 取回 · Delete/Ctrl+D 删除 · Ctrl+R 取回全部 · Esc 关闭')
         self._visible: list[dict] = []
 
     def compose(self) -> ComposeResult:

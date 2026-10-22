@@ -374,7 +374,7 @@ HOTKEYS = (
     ('Esc', '关闭补全候选；回合中取消并取回全部排队消息'),
     ('Ctrl+C', '/quit', '有选中文本时复制，否则退出'),
     ('Ctrl+Shift+C', '/copy', '复制选中文本（/copy 复制最近工具输出）'),
-    ('Alt+↑ / F2', '/dequeue', '打开队列选择器：↑↓ 选择、Enter 取回、Delete 删除、F2 取回全部'),
+    ('Alt+↑ / Ctrl+G', '/dequeue', '打开队列选择器：↑↓ 选择、Enter 取回、Delete 删除、Ctrl+R 取回全部'),
     ('Ctrl+O', '展开最近工具块'),
     ('Ctrl+Q', '/quit', '退出'),
 )

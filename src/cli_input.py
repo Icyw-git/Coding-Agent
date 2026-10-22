@@ -661,7 +661,7 @@ def toggle_cleanup_selection(rows, selected):
     return selected | set(ids), True
 
 
-CLEANUP_HINT = ('↑↓ 移动 · 空格 勾选 · Ctrl+A / F2 全选/全不选 · '
+CLEANUP_HINT = ('↑↓ 移动 · 空格 勾选 · Ctrl+A 全选/全不选 · '
                 'Enter 确认 · 输入关键词筛选 · Esc 返回')
 
 
@@ -671,7 +671,7 @@ class CleanupPicker:
     不用 prompt_toolkit 的 checkboxlist_dialog：那里 Enter 和空格是同一个
     「切换勾选」动作，回车不会确认，按完以为是确认、实际只是又勾了一条；
     也没有全选，几十个会话只能一条条按空格。这里让回车只做确认，勾选交给
-    空格，并给 Ctrl+A / F2 全选/全不选（作用于当前筛选结果）。
+    空格，并给 Ctrl+A 全选/全不选（作用于当前筛选结果）。
 
     注意 Ctrl+A 必须 eager：筛选框本身绑定了行首移动，不抢先处理就永远
     轮不到应用层的全选。
@@ -725,7 +725,6 @@ class CleanupPicker:
         # eager：筛选框聚焦时，TextArea 自己绑定了 c-a（行首），不加 eager
         # 这个键会被它吃掉——全选看起来就是“没反应”。
         @bindings.add('c-a', eager=True)
-        @bindings.add('f2', eager=True)
         def toggle_all(event):
             rows = self.visible()
             self.selected, selected_all = toggle_cleanup_selection(rows, self.selected)
