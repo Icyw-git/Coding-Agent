@@ -53,8 +53,10 @@
 - P5n：队列语义对齐 Pi：Enter 运行中=steer，Alt+Enter=follow-up；Alt+↑/F2 或
   `/dequeue` 取回全部；Esc 取消时把队列内容退回编辑器。
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
-  `textual-legacy`，`textual-next` 作为兼容别名。下一步是真实终端 checklist 与
-  `/rewind`、`/undo` 等剩余命令。
+  `textual-legacy`，`textual-next` 作为兼容别名。
+- P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
+  `ConfirmModal` 确认后才落盘；`/undo` = `last --yes`。下一步是真实终端
+  checklist 与 `/archive` `/delete`、`/tree` 评估。
 目标分支：`feature/ui`
 调研日期：2026-10-21
 

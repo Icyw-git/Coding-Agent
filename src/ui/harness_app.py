@@ -9,8 +9,10 @@ import asyncio
 import contextlib
 import io
 import queue
+import re
 import threading
 import time
+from functools import partial
 
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
@@ -26,12 +28,20 @@ from file_mentions import workspace_files
 from ui import commands
 from ui.composer.completions import apply_suggestion, suggestions
 from ui.modals.approval import PermissionModal
+from ui.modals.confirm import ConfirmModal
 from ui.modals.forks import ForkPickerModal
 from ui.modals.models import ModelPickerModal
 from ui.modals.sessions import SessionPickerModal
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
 from ui_events import UIEvent, bus
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def _strip_ansi(text: str) -> str:
+    """harness 的 format_* 报告带 ANSI 色码；Textual 里统一剥掉。"""
+    return _ANSI_RE.sub('', str(text))
 
 
 def _short_count(value) -> str:
@@ -295,6 +305,8 @@ class HarnessApp(App):
     #model-box { width: 60; max-height: 20; padding: 1 2;
                  border: round $accent; background: $boost; }
     #model-list { height: auto; max-height: 14; }
+    #confirm-box { width: 78; max-height: 28; padding: 1 2;
+                   border: round $warning; background: $boost; }
     """
 
     def __init__(self, messages: list | None = None,
@@ -950,8 +962,17 @@ class HarnessApp(App):
                 self.open_fork_picker()
         elif verb == 'clone':
             self.fork_session('')
+        elif verb == 'checkpoint':
+            self.create_checkpoint(argument)
         elif verb == 'checkpoints':
             self.show_checkpoints()
+        elif verb == 'rewind':
+            self.start_rewind(argument)
+        elif verb == 'undo':
+            if argument:
+                self._notice('用法：/undo（不带参数）', level='error')
+            else:
+                self.start_rewind('last --yes')
         elif verb == 'compact':
             self.start_compact(argument)
         elif verb == 'sessions':
@@ -1158,6 +1179,102 @@ class HarnessApp(App):
             self._notice(harness.format_checkpoint_list(manager))
         except Exception as exc:
             self._notice(f'Checkpoints failed: {exc}', level='error')
+
+    def create_checkpoint(self, label: str = '') -> None:
+        """`/checkpoint [label]`：手动快照当前会话（文件前像 + 历史）。"""
+        import harness
+        if self._busy:
+            self._notice('Cannot create a checkpoint while a request is running.')
+            return
+        if not self._store:
+            self._notice('No session context.', level='error')
+            return
+        try:
+            manager = harness.get_checkpoint_manager(self._store)
+            cp_id = manager.begin_turn(self._messages, self._store,
+                                       label=label.strip(), trigger='manual')
+            manager.seal()
+            self._notice(f'Created checkpoint {cp_id}. Use /rewind head to restore.')
+        except Exception as exc:
+            self._notice(f'Checkpoint failed: {exc}', level='error')
+
+    def start_rewind(self, argument: str) -> None:
+        """`/rewind`：先预览，再确认；`--yes` 跳过确认，`/undo` 即 last --yes。"""
+        import harness
+        if self._busy:
+            self._notice('Cannot rewind while a request is running.')
+            return
+        if not self._store:
+            self._notice('No session context.', level='error')
+            return
+        argument = (argument or '').strip()
+        error = harness.command_error('/rewind', argument)
+        if error:
+            self._notice(error, level='error')
+            return
+        parts = argument.split()
+        ref = next((part for part in parts if not part.startswith('--')), 'last')
+        force = '--force' in parts
+        scope = 'session' if '--session' in parts else 'all'
+        try:
+            manager = harness.get_checkpoint_manager(self._store)
+            cp_id = manager.resolve(ref)
+            if not manager.snapshot_path(cp_id).exists():
+                self._notice(f'[rewind] snapshot missing for {cp_id}', level='error')
+                return
+            preview = manager.plan_restore(cp_id, scope=scope)
+            preview['scope'] = scope
+        except Exception as exc:
+            self._notice(f'[rewind] {exc}', level='error')
+            return
+        report = _strip_ansi(harness.format_restore_report(preview))
+        if preview['conflicts'] and not force:
+            self._notice(report + chr(10) + '未执行任何改动；确认可覆盖后重试 '
+                         f'/rewind {cp_id} --force')
+            return
+        if not preview.get('ok'):
+            self._notice(report)
+            return
+        if '--yes' in parts:
+            self._execute_rewind(True, cp_id, force, scope)
+            return
+        self.push_screen(
+            ConfirmModal('Rewind checkpoint?', report, 'Rewind'),
+            # callback 先收到 True/False，再带上用于执行的参数
+            partial(self._execute_rewind, cp_id=cp_id,
+                    force=force, scope=scope),
+        )
+
+    def _execute_rewind(self, confirmed: bool, cp_id: str,
+                        force: bool, scope: str) -> None:
+        if not confirmed or self._busy or not self._store:
+            return
+        import harness
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                ok = harness.rewind_to(
+                    self._messages, self._store,
+                    harness.get_checkpoint_manager(self._store),
+                    cp_id, force=force, scope=scope, report=False)
+        except Exception as exc:
+            self._notice(f'[rewind] {exc}', level='error')
+            return
+        detail = _strip_ansi(output.getvalue()).strip()
+        if not ok:
+            self._notice(detail or f'[rewind] could not restore {cp_id}',
+                         level='error')
+            return
+        self._reload_transcript()
+        self._notice(f'Rewound to {cp_id}.' + (chr(10) + detail if detail else ''))
+
+    def _reload_transcript(self) -> None:
+        """回溯会替换 canonical history，按它重建块模型。"""
+        self.model.clear()
+        self._load_history(self._messages)
+        self._mark_dirty()
+        self._flush_layout(force=True)
+        self._refresh_footer()
 
     def start_compact(self, instructions: str = '') -> None:
         """`/compact`：后台压缩当前上下文（Pi `/compact [instructions]`）。"""

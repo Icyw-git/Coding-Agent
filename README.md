@@ -517,7 +517,10 @@ git 分支，并显示模型、上下文占用、token 和缓存命中率；
 输入 `/` 或 `@` 时，输入框下方显示逐键
 候选列表：`Tab` 采用、`Alt+↑` / `Alt+↓` 切换；`Ctrl+R` 在 read-only 与
 workspace-write 之间切换执行档位。
-回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。TUI 的 `/sessions` 与
+回合中按 `Esc` 取消当前请求（空闲时 `Esc` 回到最新消息）。`/checkpoint [标签]`、
+`/checkpoints`、`/rewind`、`/undo` 已接入新 TUI：`/rewind` 先显示文件/会话预览，
+确认弹窗按 `y`/Enter 才执行，`n`/Esc 不产生改动；`/undo` 等价于
+`/rewind last --yes`。TUI 的 `/sessions` 与
 `/sessions` 打开会话选择器（搜索标题/工作区/ID，`↑↓` 选择、`Enter` 恢复、
 `Esc` 取消），`/resume <序号|ID前缀|标题>` 直接恢复，两者都使用会话事件流
 （与行式 `/resume` 同一份数据）。恢复大历史时只渲染最近 400 条并批量挂载，更早的消息

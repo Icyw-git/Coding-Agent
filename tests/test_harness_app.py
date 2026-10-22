@@ -474,7 +474,7 @@ def test_help_with_argument_shows_command_details(monkeypatch):
             text = app.model.snapshot()[-1].payload['text']
             assert '/resume' in text and '恢复会话' in text
 
-            app.submit_text('/help rewind')
+            app.submit_text('/help archive')
             await pilot.pause()
             text = app.model.snapshot()[-1].payload['text']
             assert '仅行式 REPL' in text
@@ -1180,4 +1180,119 @@ def test_steering_does_not_render_until_agent_consumes_it():
             await pilot.pause()
             assert any(block.kind == 'user' for block in app.model.snapshot())
             app._busy = False
+    asyncio.run(scenario())
+
+
+def test_checkpoint_rewind_and_undo_commands(tmp_path, monkeypatch):
+    import harness
+    snapshot = tmp_path / 'cp_messages.jsonl'
+    snapshot.write_text(
+        '{"role": "user", "content": "first"}\n'
+        '{"role": "assistant", "content": "old answer"}\n',
+        encoding='utf-8')
+
+    class FakeManager:
+        head = 'cp_test'
+
+        def __init__(self):
+            self.begun = None
+            self.sealed = False
+
+        def begin_turn(self, messages, store, label='', trigger='turn'):
+            self.begun = (list(messages), label, trigger)
+            return 'cp_test'
+
+        def seal(self):
+            self.sealed = True
+
+        def resolve(self, ref):
+            return 'cp_test'
+
+        def snapshot_path(self, cp_id):
+            return snapshot
+
+        def plan_restore(self, cp_id, scope='all'):
+            return {
+                'cp_id': cp_id, 'label': 'manual', 'scope': scope,
+                'actions': [], 'conflicts': [], 'unverified': [],
+                'drift': [], 'applied': [], 'ok': True, 'reason': '',
+            }
+
+        def restore(self, cp_id, force=False, scope='all'):
+            return self.plan_restore(cp_id, scope=scope)
+
+    manager = FakeManager()
+    monkeypatch.setattr(harness, 'get_checkpoint_manager', lambda store: manager)
+    store = _temp_store(tmp_path, (
+        {'role': 'user', 'content': 'first'},
+        {'role': 'assistant', 'content': 'old answer'},
+        {'role': 'user', 'content': 'second'},
+    ))
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.submit_text('/checkpoint before refactor')
+            await pilot.pause()
+            assert manager.begun[1] == 'before refactor'
+            assert manager.begun[2] == 'manual'
+            assert manager.sealed
+            assert 'Created checkpoint' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text('/rewind head')
+            await pilot.pause()
+            assert app.screen.query_one('#confirm-box') is not None
+            await pilot.press('y')
+            await pilot.pause()
+            assert all('second' not in str(m.get('content'))
+                       for m in app._messages)
+            assert any('Rewound to cp_test' in str(m.get('content'))
+                       for m in app._messages)
+
+            app.submit_text('/undo extra')
+            await pilot.pause()
+            assert '用法：/undo' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+
+
+def test_rewind_cancel_keeps_history(tmp_path, monkeypatch):
+    import harness
+    snapshot = tmp_path / 'cp_messages.jsonl'
+    snapshot.write_text('{"role": "user", "content": "kept"}\n',
+                        encoding='utf-8')
+
+    class FakeManager:
+        def resolve(self, ref):
+            return 'cp_test'
+
+        def snapshot_path(self, cp_id):
+            return snapshot
+
+        def plan_restore(self, cp_id, scope='all'):
+            return {
+                'cp_id': cp_id, 'label': 'manual', 'scope': scope,
+                'actions': [], 'conflicts': [], 'unverified': [],
+                'drift': [], 'applied': [], 'ok': True, 'reason': '',
+            }
+
+    monkeypatch.setattr(harness, 'get_checkpoint_manager',
+                        lambda store: FakeManager())
+    store = _temp_store(tmp_path, (
+        {'role': 'user', 'content': 'kept'},
+        {'role': 'user', 'content': 'later'},
+    ))
+
+    async def scenario():
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
+        async with app.run_test(size=(80, 24)) as pilot:
+            before = [dict(m) for m in app._messages]
+            app.submit_text('/rewind last')
+            await pilot.pause()
+            await pilot.press('n')
+            await pilot.pause()
+            assert app._messages == before
+
     asyncio.run(scenario())

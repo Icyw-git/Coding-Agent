@@ -42,3 +42,11 @@ def test_skill_commands_are_registered_dynamically():
     assert spec.ported
     assert commands.find(spec.name) is not None
     assert any(item.name == spec.name for item in commands.matches('skill:'))
+
+
+def test_snapshot_commands_are_ported_to_tui():
+    for name in ('checkpoint', 'checkpoints', 'rewind', 'undo'):
+        spec = commands.find(name)
+        assert spec is not None and spec.ported
+    text = commands.help_text()
+    assert '/rewind' in text and '/undo' in text

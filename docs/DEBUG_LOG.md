@@ -3164,3 +3164,22 @@ cron 争锁；`--ui` 的 choices 同步增加 `textual-legacy`。新 app 启动/
 **验证**：`tests/test_entrypoint.py` 覆盖三种模式的锁、`tests/test_cli_output.py`
 确认 `textual` 进入新 app；定向 76 passed。真实终端 checklist（Windows Terminal /
 PowerShell / VS Code 终端）仍待人工验收。
+## TUI 迁移：/checkpoint /rewind /undo
+
+新 TUI 之前只迁了 `/checkpoints`（只读列表），快照写操作和回滚仍要切 ANSI。现在补齐：
+
+- `/checkpoint [label]`：调用 `CheckpointManager.begin_turn(..., trigger='manual')`
+  后立即 `seal()`；忙碌时拒绝，避免在工具调用中间拍快照；
+- `/rewind [ID|last|head] [--force] [--session] [--yes]`：
+  1. `command_error` 先校验参数；
+  2. `resolve` + `snapshot_path` 检查快照存在；
+  3. `plan_restore` 只预览，不落盘；有冲突且无 `--force` 时直接拒绝；
+  4. 默认弹 `ConfirmModal`（`y`/Enter 确认，`n`/Esc 取消），`--yes` 才跳过；
+  5. 执行走既有 `harness.rewind_to`，保留 append-only rewind 事件、文件恢复和
+     `messages[:]` 替换；随后 `_reload_transcript()` 清空块模型并按新历史重建；
+- `/undo` = `/rewind last --yes`，与 ANSI 行为一致；
+- `ConfirmModal` 是独立 modal，不依赖审批门；报告里的 ANSI 色码统一剥离；
+- 忙碌中拒绝回滚；回滚失败（快照缺失/`ok=False`/异常）只显示通知，不改内存历史。
+
+**测试**：`/checkpoint` 参数与 seal、`/rewind` 预览 + y 确认、n 取消保持历史、
+`/undo` 参数校验；命令注册表确认四条命令 `ported=True`。定向 56 passed。
