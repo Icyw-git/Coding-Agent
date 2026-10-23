@@ -20,13 +20,15 @@ def percentile(values: list[float], fraction: float) -> float | None:
 
 
 def summarize(paths: list[Path]) -> dict:
-    usage_rows, tool_rows = [], []
+    usage_rows, tool_rows, failure_rows = [], [], []
     for path in paths:
         for event in SessionEventStore.open(path).iter_events():
             if event.get('type') == 'usage':
                 usage_rows.append(event)
             elif event.get('type') == 'tool_profile':
                 tool_rows.append(event)
+            elif event.get('type') == 'model_request_failed':
+                failure_rows.append(event)
     prompt = sum(int(row.get('prompt', 0) or 0) for row in usage_rows)
     cached = sum(int(row.get('cached', 0) or 0) for row in usage_rows)
     timings = {}
@@ -42,6 +44,10 @@ def summarize(paths: list[Path]) -> dict:
         row.get('cache_prefix_status') for row in usage_rows
         if row.get('cache_prefix_status') and int(row.get('prompt', 0) or 0) > 0
         and int(row.get('cached', 0) or 0) / int(row['prompt']) < .5)
+    failures_by_status = collections.Counter(
+        str(row.get('provider_status') or 'unknown') for row in failure_rows)
+    failed_request_times = [float(row['request_ms']) for row in failure_rows
+                            if row.get('request_ms') is not None]
     return {
         'sessions': len(paths), 'model_calls': len(usage_rows),
         'profiled_calls': sum('request_ms' in row for row in usage_rows),
@@ -54,6 +60,13 @@ def summarize(paths: list[Path]) -> dict:
         'cache_prefix_status': dict(prefix_status),
         'low_hit_by_prefix_status': dict(low_hit_by_prefix),
         'cache_prefix_diagnostic_calls': sum(prefix_status.values()),
+        'failed_model_requests': len(failure_rows),
+        'failures_by_provider_status': dict(failures_by_status),
+        'failed_request_ms': {
+            'count': len(failed_request_times),
+            'p50': statistics.median(failed_request_times) if failed_request_times else None,
+            'p95': percentile(failed_request_times, .95),
+        },
         'tool_batches': len(tool_rows),
         'tool_batch_ms': {
             'p50': statistics.median([float(row['duration_ms']) for row in tool_rows]) if tool_rows else None,

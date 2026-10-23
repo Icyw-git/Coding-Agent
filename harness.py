@@ -2107,6 +2107,22 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                                     ctx_tokens=detail['prompt'],
                                     ctx_source='confirmed')
         except Exception as e:
+            request_ms = round((time.monotonic() - request_started) * 1000, 3)
+            response = getattr(e, 'response', None)
+            status_code = (getattr(e, 'status_code', None)
+                           or getattr(response, 'status_code', None))
+            failure_profile = {
+                **profile_timing,
+                'request_ms': request_ms,
+                'error_type': type(e).__name__,
+                'provider_status': status_code,
+                'prompt_too_long': recovery.is_prompt_too_long_error(e),
+                'prompt_message_count': prompt_message_count,
+            }
+            if memory_profile_pending:
+                failure_profile['memory_load_ms'] = memory_load_ms
+                memory_profile_pending = False
+            session_store.append('model_request_failed', **failure_profile)
             if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
                 # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
                 attempts=((6,None),(3,12_000),(1,4_000))
