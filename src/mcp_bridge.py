@@ -15,6 +15,8 @@ import atexit
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
 from typing import List
 
 from MCPclient import MCPclient
@@ -26,6 +28,46 @@ _loop_thread.start()
 _clients: list[MCPclient] = []
 _clients_lock = threading.Lock()
 _shutdown = False
+
+# Per-thread telemetry sink. The main agent opens it around tool execution so
+# MCP calls can land in the active session event stream; teammates/subagents
+# simply run without a sink. Thread-local (not ContextVar) because tool batches
+# execute in ThreadPoolExecutor workers. A sink failure never changes a result.
+_TELEMETRY = threading.local()
+
+
+@contextmanager
+def telemetry_sink(sink):
+    previous = getattr(_TELEMETRY, 'sink', None)
+    _TELEMETRY.sink = sink
+    try:
+        yield
+    finally:
+        _TELEMETRY.sink = previous
+
+
+def _error_type(message: str) -> str:
+    normalized = message.casefold()
+    if 'not connected' in normalized:
+        return 'not_connected'
+    if 'timeout' in normalized or 'timed out' in normalized:
+        return 'timeout'
+    return 'server_error'
+
+
+def _exception_type(exc: Exception) -> str:
+    name = type(exc).__name__
+    return 'timeout' if 'timeout' in name.casefold() else name
+
+
+def _emit_telemetry(event: dict) -> None:
+    sink = getattr(_TELEMETRY, 'sink', None)
+    if sink is None:
+        return
+    try:
+        sink(event)
+    except Exception:
+        pass
 
 
 def _load_server_configs() -> List[dict]: # 加载 MCP server 配置
@@ -95,12 +137,30 @@ def _run_async(coro, timeout: float = 120):
 def _make_sync_wrapper(client: MCPclient, tool_name: str):
     """为单个 MCP 工具生成同步 handler，与 tool_registry 的 (**args) 签名一致。"""
     def run(**kwargs):
-        fut = asyncio.run_coroutine_threadsafe(
-            client.call_tool(tool_name, kwargs), _loop)
+        started = time.perf_counter()
+        status, error_type = 'ok', ''
         try:
-            return fut.result(timeout=client._timeout)
-        except Exception as e:
-            return f'MCP error: {e}'
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    client.call_tool(tool_name, kwargs), _loop)
+                result = fut.result(timeout=getattr(client, '_timeout', 120))
+            except Exception as exc:
+                status = 'error'
+                error_type = _exception_type(exc)
+                result = f'MCP error: {exc}'
+            else:
+                if isinstance(result, str) and result.startswith('MCP error:'):
+                    status = 'error'
+                    error_type = _error_type(result)
+            return result
+        finally:
+            _emit_telemetry({
+                'server': getattr(client, 'name', 'unknown'),
+                'tool': tool_name,
+                'duration_ms': round((time.perf_counter() - started) * 1000, 3),
+                'status': status,
+                'error_type': error_type,
+            })
     run.__name__ = tool_name
     return run
 

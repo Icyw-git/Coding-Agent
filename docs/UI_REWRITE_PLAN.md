@@ -1,6 +1,6 @@
 # TUI 重构计划（对标 Pi / Codex）
 
-状态：已合并到 main（bd99673）；P7 legacy 清理和默认 Textual 入口已完成；真实终端验收仍待执行
+状态：已合并到 main（bd99673）；P7 legacy 清理和默认 Textual 入口已完成；用户已确认真实终端验收通过，环境/版本与逐项结果记录仍待补齐（见 UI_TERMINAL_ACCEPTANCE.md）
 进展：
 - P1 拆包：TUI 实现迁到 `src/ui/app.py`，根 `ui_textual.py` 变兼容壳，UI 测试 75 条全绿。
 - P0 虚拟化：`src/ui/transcript/{model,layout}.py` + 基准脚本；10k blocks 布局 27ms、

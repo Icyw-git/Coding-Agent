@@ -38,7 +38,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +49,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
+import checkpoint_commands
 import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import recovery
@@ -101,6 +102,7 @@ from background_task import (
     start_background_task,
 )
 from background_watch import watch_command
+from checkpoint_commands import format_checkpoint_list, format_restore_report, rewind_to
 from checkpoints import CheckpointError, CheckpointManager
 from cli_commands import command_error, format_command_help, parse_command
 from cron_scheduler import (
@@ -1185,6 +1187,15 @@ def _batch_bash_commands(tool_calls):
     return commands
 
 
+def _mcp_telemetry_scope(session_store):
+    """MCP 调用遥测只在桥已加载时开启，避免为未使用 MCP 的进程导入 SDK。"""
+    bridge = sys.modules.get('mcp_bridge')
+    if bridge is None:
+        return nullcontext()
+    return bridge.telemetry_sink(
+        lambda event: session_store.append('mcp_call', **event))
+
+
 def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
     """执行工具批次，并记录不含工具内容的批次与单工具耗时。"""
     profile_started = time.perf_counter()
@@ -1202,9 +1213,10 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
 
         def run_parallel(tc):
             started = time.perf_counter()
-            result = contextvars.copy_context().run(
-                exec_tool_call, tc, on_event=on_event,
-                on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
+            with _mcp_telemetry_scope(session_store):
+                result = contextvars.copy_context().run(
+                    exec_tool_call, tc, on_event=on_event,
+                    on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
             tool_timings[tc.id] = round((time.perf_counter() - started) * 1000, 3)
             return result
 
@@ -1220,9 +1232,10 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)
             started = time.perf_counter()
-            executed.append(exec_tool_call(
-                tool_call, on_event=on_event,
-                on_activity=_print_tool_activity))
+            with _mcp_telemetry_scope(session_store):
+                executed.append(exec_tool_call(
+                    tool_call, on_event=on_event,
+                    on_activity=_print_tool_activity))
             tool_timings[tool_call.id] = round(
                 (time.perf_counter() - started) * 1000, 3)
     for _, _, tool_message, _images in executed:   # 原序写回结果
@@ -1314,204 +1327,32 @@ def _safe_checkpoint(action,*args,**kwargs):
         return None
 
 
-def _snapshot_path(manager, cp_id:str)->Path:
-    return manager.snapshot_path(cp_id)
-
-
-def format_checkpoint_list(manager)->str:
-    rows=manager.list()
-    if not rows:
-        return '  暂无快照。用 /checkpoint 创建，或在执行任务时自动生成。'
-    head=manager.head()
-    from turn_progress import relative_time
-    lines=[]
-    for row in rows:
-        mark='*' if row['cp_id']==head else ' '
-        label = row.get('label') or ('手动快照' if row['trigger'] == 'manual' else '任务快照')
-        status = ' · 尚未完成' if row['status'] == 'open' else ''
-        current = ' · 当前' if mark == '*' else ''
-        turn = ' · 回合起点' if row.get('turn_start') else ''
-        # 时间锚点：没有它无法分辨快照是「刚才」还是「两小时前」的
-        when = f" · {relative_time(row.get('created_at'))}" if row.get('created_at') else ''
-        lines.append(f"  {label}{current}{turn}{status} · {len(row['files'])} 个文件{when}\n"
-                     f"    /rewind {row['cp_id']}")
-    return '\n'.join(lines)
-
-
 def parse_checkpoint_gc(argument: str) -> tuple[bool, int]:
-    """解析 `/checkpoint-gc [--all] [--keep N]`，返回 (all, keep)。"""
-    all_sessions = False
-    keep = CHECKPOINT_MAX_NODES
-    tokens = (argument or '').split()
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == '--all':
-            all_sessions = True
-        elif token == '--keep':
-            index += 1
-            if index >= len(tokens):
-                raise ValueError('--keep 需要一个正整数')
-            token = tokens[index]
-            if not token.isdigit() or not 1 <= int(token) <= 10_000:
-                raise ValueError('--keep 需要 1～10000 之间的整数')
-            keep = int(token)
-        elif token.startswith('--keep='):
-            value = token.split('=', 1)[1]
-            if not value.isdigit() or not 1 <= int(value) <= 10_000:
-                raise ValueError('--keep 需要 1～10000 之间的整数')
-            keep = int(value)
-        else:
-            raise ValueError('用法：/checkpoint-gc [--all] [--keep N]')
-        index += 1
-    return all_sessions, keep
+    """解析 `/checkpoint-gc [--all] [--keep N]`，使用当前保留配置。"""
+    return checkpoint_commands.parse_checkpoint_gc(
+        argument, default_keep=CHECKPOINT_MAX_NODES)
 
 
 def checkpoint_gc_preview(manager, argument: str) -> dict:
     """只读预览；TUI 先弹确认，行式 REPL 打印后再执行。"""
-    all_sessions, keep = parse_checkpoint_gc(argument)
-    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
-    current_id = manager.session_id
-    current_nodes = counts.get(current_id, 0)
-    other_nodes = sum(count for session, count in counts.items()
-                      if session != current_id)
-    if all_sessions:
-        summary = checkpoints.gc_all_checkpoints(
-            CHECKPOINT_DIR, max_nodes=keep,
-            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=True)
-        summary.update({'mode': 'all', 'keep': keep,
-                        'current_nodes': current_nodes,
-                        'other_nodes': other_nodes,
-                        'sessions_total': len(counts)})
-        return summary
-
-    plan = manager.gc_plan(max_nodes=keep)
-    size = sum(item['bytes'] for item in plan)
-    return {
-        'mode': 'current', 'keep': keep, 'dry_run': True,
-        'removed': len(plan), 'bytes': size,
-        'details': [{'session_id': current_id, 'removed': len(plan),
-                     'bytes': size}] if plan else [],
-        'current_nodes': current_nodes, 'other_nodes': other_nodes,
-        'sessions_total': len(counts),
-    }
+    return checkpoint_commands.checkpoint_gc_preview(
+        manager, argument, base_dir=CHECKPOINT_DIR,
+        default_keep=CHECKPOINT_MAX_NODES,
+        keep_labeled=CHECKPOINT_KEEP_LABELED)
 
 
 def checkpoint_gc_execute(manager, argument: str) -> dict:
     """执行已确认的回收；返回与预览同形的统计。调用方负责先预览。"""
-    all_sessions, keep = parse_checkpoint_gc(argument)
-    if all_sessions:
-        summary = checkpoints.gc_all_checkpoints(
-            CHECKPOINT_DIR, max_nodes=keep,
-            keep_labeled=CHECKPOINT_KEEP_LABELED, dry_run=False)
-        summary.update({'mode': 'all', 'keep': keep,
-                        'sessions_total': summary.get('sessions', 0)})
-        return summary
-
-    current_id = manager.session_id
-    plan = manager.gc_plan(max_nodes=keep)
-    removed = manager.gc(max_nodes=keep)
-    counts = checkpoints.checkpoint_counts(CHECKPOINT_DIR)
-    other_nodes = sum(count for session, count in counts.items()
-                      if session != current_id)
-    size = sum(item['bytes'] for item in plan)
-    return {
-        'mode': 'current', 'keep': keep, 'dry_run': False,
-        'removed': len(removed), 'bytes': size,
-        'details': [{'session_id': current_id,
-                     'removed': len(removed), 'bytes': size}] if removed else [],
-        'current_nodes': counts.get(current_id, 0),
-        'other_nodes': other_nodes, 'sessions_total': len(counts),
-    }
+    return checkpoint_commands.checkpoint_gc_execute(
+        manager, argument, base_dir=CHECKPOINT_DIR,
+        default_keep=CHECKPOINT_MAX_NODES,
+        keep_labeled=CHECKPOINT_KEEP_LABELED)
 
 
 def format_checkpoint_gc(summary: dict, *, done: bool = False) -> str:
     """把预览/执行结果格式化成 TUI 通知和行式 REPL 共用的一段文字。"""
-    keep = summary.get('keep', CHECKPOINT_MAX_NODES)
-    removed = summary.get('removed', 0)
-    size = tool_cache.human_size(summary.get('bytes', 0))
-    mode = summary.get('mode', 'current')
-    if mode == 'all':
-        sessions_total = summary.get('sessions_total', summary.get('sessions', 0))
-        scope = (f"所有 {sessions_total} 个会话" if sessions_total
-                 else '所有会话')
-    else:
-        scope = '当前会话'
-    if removed:
-        prefix = '已清理' if done else '可清理'
-        lines = [f'  {prefix} {removed} 个快照（约 {size}）。']
-        if mode == 'all':
-            sessions = summary.get('sessions', 0)
-            affected = len(summary.get('details', [])) or sessions
-            total = summary.get('sessions_total', sessions)
-            lines.append(f'  涉及 {affected}/{total} 个会话；'
-                         f'每个会话保留最新 {keep} 个、head 与带标签快照。')
-        else:
-            current_nodes = summary.get('current_nodes', 0)
-            lines.append(f'  当前会话共 {current_nodes} 个快照，保留上限 {keep}。')
-        if not done:
-            lines.append('  删除后旧快照不可恢复。')
-    else:
-        lines = [f'  {scope}无需清理：没有超过保留上限 {keep} 的可回收快照。']
-    if mode == 'current' and summary.get('other_nodes'):
-        other_nodes = summary['other_nodes']
-        lines.append(f'  其他会话还有 {other_nodes} 个快照；'
-                     '/checkpoint-gc --all 可统一清理。')
-    return '\n'.join(lines)
-
-
-
-def format_restore_report(plan:dict)->str:
-    scope = '仅会话' if plan.get('scope') == 'session' else '会话与文件'
-    lines = [f"  回溯预览：{plan.get('label') or plan['cp_id']} · {scope}"]
-    for entry in plan['actions']:
-        lines.append(f"    {entry['action']:<9} {entry['path']}  ({entry['reason']})")
-    for title,items in (('存在冲突',plan['conflicts']),
-                        ('快照尚未完成，无法校验',plan['unverified']),
-                        ('命令或外部改动，无法自动恢复',plan['drift'])):
-        if items:
-            remaining = f'（另有 {len(items) - 10} 项）' if len(items) > 10 else ''
-            lines.append(f"    \033[33m{title}: {', '.join(items[:10])}{remaining}\033[0m")
-    lines.append('    注意：记忆、定时任务、任务进程和 worktree 不随回溯撤销。')
-    if not plan['ok']:
-        lines.append(f"    \033[31m{plan['reason']}\033[0m")
-    return '\n'.join(lines)
-
-
-def rewind_to(messages:list,session_store,manager,ref:str,*,force=False,scope='all',report=True)->bool:
-    """把 messages 就地替换成回溯后的历史，并把 rewind 事件写进 session。
-
-    report=True 时打印完整计划+结果（直接调用时用）；命令层已经打印过计划，传 report=False，
-    这里只输出「实际做了什么」，避免同一份报告刷两遍。
-    """
-    try:
-        cp_id=manager.resolve(ref)
-    except CheckpointError as e:
-        print(f"  \033[31m[rewind] {e}\033[0m")
-        return False
-    if not _snapshot_path(manager, cp_id).exists():
-        print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
-        return False
-
-    try:
-        plan=manager.restore(cp_id,force=force,scope=scope)
-    except CheckpointError as exc:
-        print(f'  [rewind] {exc}')
-        return False
-    if report:
-        print(format_restore_report(plan))
-    if not plan['ok']:
-        print(f"  \033[33m[rewind] 未执行任何改动；确认可覆盖后重试 "
-              f"/rewind {cp_id} --force\033[0m")
-        return False
-
-    session_store.append_rewind(cp_id,scope=scope,
-                                 snapshot_path=str(_snapshot_path(manager, cp_id)),
-                                restored_files=plan['applied'])
-    messages[:]=session_store.rebuild_openai_history()
-    applied = ', '.join(plan['applied']) if plan['applied'] else '无文件改动'
-    print(f"  已恢复会话 · {applied}")
-    return True
+    return checkpoint_commands.format_checkpoint_gc(
+        summary, default_keep=CHECKPOINT_MAX_NODES, done=done)
 
 
 def _confirm(prompt:str)->bool:
@@ -1706,7 +1547,7 @@ def handle_command(line:str,messages:list,session_store)->None:
         except CheckpointError as e:
             print(f"  \033[31m[rewind] {e}\033[0m")
             return
-        if not _snapshot_path(manager, cp_id).exists():
+        if not manager.snapshot_path(cp_id).exists():
             print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
             return
 
@@ -2351,8 +2192,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
 def resume_agent_loop(session_path: Path):
     """Resume a persisted OpenAI session without automatically repeating pending tools."""
     session_store = SessionEventStore.open(session_path)
-    messages = session_store.rebuild_openai_history(recover_pending=True)
+    # 先取未闭合的调用再 recover：recover_pending 会写入 tool_recovery 事件，
+    # 之后 pending_tool_calls() 看到的就是已闭合的空集合。
     recovery_message = session_store.recovery_message()
+    messages = session_store.rebuild_openai_history(recover_pending=True)
     if recovery_message:
         messages.append(recovery_message)
         session_store.append_message(recovery_message)

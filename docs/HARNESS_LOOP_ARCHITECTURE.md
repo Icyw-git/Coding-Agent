@@ -15,14 +15,17 @@
 | `tools.py`            | 工具接线、路径边界与 `tool_registry`                                                             |
 | `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
+| `tool_recovery.py`    | 中断工具调用的恢复分级（read-only / idempotent / destructive）与恢复提示文本                     |
 | `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收（见 `CHECKPOINT_DESIGN.md`） |
 | `recovery.py`         | 429/overload 重试、备用模型、输出截断和上下文超限判断                                            |
 | `background_task.py`  | 慢工具后台执行和完成通知收集                                                                     |
 | `cron_scheduler.py`   | cron 时间匹配、持久化、队列生产和队列处理线程                                                    |
 | `mcp_bridge.py`       | MCP server 连接、异步事件循环、动态工具注册                                                      |
 | `subagent.py`         | `task` 工具启动的短生命周期子代理循环                                                            |
+| `subagent_events.py`  | 子代理独立事件日志与父会话引用事件（best-effort，不改变子代理结果）                              |
 | `agent_teams.py`      | 常驻 teammate 线程、邮箱通信、计划审批、任务工具和 worktree 上下文                               |
-| `task_system.py`      | 持久化任务板、依赖、认领、完成和解锁                                                             |
+| `task_system.py`      | 持久化任务板、依赖、认领、完成和解锁（跨进程文件锁）                                             |
+| `file_lock.py`        | Windows/POSIX 通用独占文件锁，供任务板等小型读改写存储使用                                        |
 | `autonomous_agent.py` | teammate 空闲轮询、收消息、自动认领任务                                                          |
 | `team_protocols.py`   | shutdown/plan approval 协议状态机                                                                |
 | `skill_system.py`     | skill 扫描、目录展示和按需加载                                                                   |
@@ -268,6 +271,9 @@ compact 后面尚未执行的工具不会由旧响应强行执行，而是等待
 
 - `message`：OpenAI 原生消息；
 - `tool_started`：工具意图已经发出；
+- `mcp_call`：一次 MCP 调用的 server、工具、耗时、状态与错误类型（不含参数）；
+- `subagent_started` / `subagent_finished`：子代理运行的轻量引用（id、描述、状态、轮数、
+  耗时、子日志相对路径），不进入历史重放；
 - `compaction`：历史已被摘要替换；
 - `checkpoint`：一个可回溯节点已创建（只记录引用，快照在 `.cache/checkpoints/<session_id>/`）；
 - `rewind`：用户回溯到某节点，重放时用该节点快照替换此前历史；
@@ -284,12 +290,22 @@ compact 后面尚未执行的工具不会由旧响应强行执行，而是等待
 [`harness.py:498`](harness.py:498) 的 `resume_agent_loop(session_path)`：
 
 1. 打开 session JSONL。
-2. 重建 OpenAI 消息。
-3. 检查 pending tool calls。
-4. 添加 recovery 提示。
+2. 在闭合 pending calls 之前收集 recovery 提示（`tool_recovery` 事件一旦写入，
+   `pending_tool_calls()` 看到的就是已闭合历史）。
+3. 重建 OpenAI 消息并写入 synthetic tool results。
+4. 追加 recovery 提示。
 5. 继续进入 `agent_loop()`。
 
-现阶段恢复会识别 pending tool，但不会无条件自动重跑副作用工具；恢复提示要求先检查当前状态。
+恢复不会自动重跑任何工具，只按三类给出下一条行动建议：
+
+- `read-only`：读文件/检索/只读 bash 等，没有持久副作用，可按需重复；
+- `idempotent`：整文件 `write`、`todo_write`、带状态保护的 claim/complete 等，
+  先核对状态，再决定是否重试；
+- `destructive`：`edit`/`apply_patch`、发消息、创建任务、消费 inbox 及未知/MCP
+  工具，可能已部分生效或重复副作用，必须先检查当前状态，禁止盲重试。
+
+分类实现集中在 [`tool_recovery.py`](tool_recovery.py)，只读取工具名与参数，不执行工具。
+synthetic tool result 仍保留 “outcome is unknown”，并附带对应类别建议。
 
 ### 11.4 快照导出
 
@@ -337,6 +353,23 @@ LLM tool_call
 
 MCP 失败会被 wrapper 转成 `MCP error: ...` 字符串，再由主循环作为 tool result 交给模型。
 
+### 12.3 调用遥测
+
+每个 MCP sync wrapper 在返回前记录一条 telemetry，字段为：
+
+```text
+server        MCP server 名称
+tool          MCP 工具名
+duration_ms   从投递到拿到结果的墙钟耗时
+status        ok | error
+error_type    timeout | not_connected | server_error | 异常类名
+```
+
+主 agent 在 `_run_tool_batch()` 里通过 `_mcp_telemetry_scope()` 打开 thread-local
+sink，把事件追加为 session JSONL 的 `mcp_call`；并行批次在每个 worker 线程内各自
+打开 sink，避免跨线程丢失。teammate/subagent 或未加载 MCP bridge 的进程没有 sink，
+调用照常执行、只是不写事件。事件不记录参数，sink 抛错也不会改变工具结果。
+
 ## 13. 短生命周期 subagent
 
 `task` 工具由 [`subagent.py:19`](subagent.py:19) 的 `spawn_subagent()` 实现。
@@ -359,7 +392,23 @@ subagent 返回最终文本
 主 agent 收到 task 的 role=tool 结果
 ```
 
-subagent 使用 `SUB_TOOLS` 和 `SUB_HANDLERS` 快照，当前实现没有复用主循环的完整 session event 记录、recovery retry 和记忆提取。
+subagent 的工具面由 `_subagent_surface()` 按当前实时注册表构造（含后注册的 MCP 工具），
+没有复用主循环的 recovery retry 和记忆提取。
+
+每次运行由 [`subagent_events.py`](subagent_events.py) 的 `SubagentRecorder` 写一份独立
+事件日志：
+
+```text
+.cache/sessions/subagents/session_subagent_<id>.jsonl
+  message             system / user / assistant / tool 消息，可 rebuild
+  subagent_started    描述
+  subagent_finished   status / turns / duration_ms / error_type
+```
+
+父会话只追加 `subagent_started` / `subagent_finished` 两个小事件并带子日志相对路径；
+`/sessions` 只扫顶层 `session_*.jsonl`，内部运行不会出现在列表里。写入失败（目录不可写、
+磁盘满）会被吞掉，子代理继续执行；状态取值 `completed` / `limit` / `error` / `cancelled`。
+子日志不是主 agent 的 canonical history，也不会被 checkpoint/rewind 记录。
 
 ## 14. 常驻 teammate loop
 
@@ -377,11 +426,11 @@ teammate 由 [`agent_teams.py:215`](agent_teams.py:215) 的 `spawn_teammate_thre
 ### 14.2 每轮 teammate 循环
 
 ```text
-读取自己的 mailbox
+claim 自己的 mailbox（不删除）
   ↓
 处理 shutdown / plan approval 协议
   ↓
-普通消息包装成 <inbox>
+普通消息包装成 <inbox>，然后 ack
   ↓
 执行和主循环相同的预压缩
   ↓
@@ -390,7 +439,7 @@ teammate 由 [`agent_teams.py:215`](agent_teams.py:215) 的 `spawn_teammate_thre
   └─ tool_calls：执行工具，继续下一轮
 ```
 
-代码位置：[`agent_teams.py:237-297`](agent_teams.py:237)。
+代码位置：[`agent_teams.py:386`](agent_teams.py:386)。
 
 teammate 工具执行时：
 
@@ -409,7 +458,19 @@ teammate 工具执行时：
 .mailbox/<agent>.jsonl
 ```
 
-`send()` 追加 JSONL；`read_inbox()` 读取后删除文件，实现简单的消费队列。
+`send()` 追加 JSONL，并为每条消息分配 `msg_<uuid>`；无 id 的旧消息在读取时按原始行内容
+生成稳定的 `legacy-<hash>` id。
+
+消费分两步，提供 at-least-once 语义：
+
+- `claim_inbox(agent)`：返回未确认消息，不修改邮箱；重复调用会重放同一批消息；
+- `ack(agent, ids)`：按 id 删除消息；重写邮箱时先写临时文件再原子替换，并用跨进程
+  `exclusive_file_lock`（`<agent>.lock`）包住 send/claim/ack，避免并行会话丢消息。
+
+`replay_unacked()` 是 `claim_inbox()` 的显式别名；`read_inbox()` 保留旧的「读取后立即
+确认」语义，供不关心重放的调用方使用。teammate、idle_poll 和 Lead 的 `check_inbox`
+都改为 claim 后 ack：进程在「消息已注入对话、尚未 ack」之间退出时，重启后会再次收到。
+重复投递是设计代价，协议处理（shutdown/plan response）本身幂等。
 
 ### 15.2 Lead -> teammate
 
@@ -460,13 +521,13 @@ worktree
 
 ### 16.2 创建
 
-`create_task()` 生成唯一 id，状态设为 `pending`，写入任务文件。
+`create_task()` 在 `task_transaction()` 内生成唯一 id，状态设为 `pending`，写入任务文件。
 
 任务可指定 `blockedBy`，表示必须等待前置任务完成。
 
 ### 16.3 认领
 
-`claim_task(task_id, owner)` 的流程：
+`claim_task(task_id, owner)` 在 `task_transaction()` 内执行：
 
 1. 加载任务。
 2. 检查状态必须是 `pending`。
@@ -475,19 +536,19 @@ worktree
 5. 状态改为 `in_progress`。
 6. 立即持久化。
 
-代码位置：[`task_system.py:54-64`](task_system.py:54)。
+`task_transaction()` 同时持有进程内 `RLock` 和 `.cache/tasks/.tasks.lock` 上的
+跨进程独占锁；`save_task()` 复用外层事务，不会重复加锁。这样两个进程不会同时读到
+`pending` 后各自写回。锁是 advisory 的，进程退出时由 OS 释放。
 
 ### 16.4 完成
 
-`complete_task()`：
+`complete_task()` 同样在 `task_transaction()` 内：
 
 1. 将状态设为 `completed`。
 2. 持久化任务。
 3. 扫描所有 pending 任务。
 4. 找出依赖已满足的任务。
 5. 在返回信息中报告被解锁任务。
-
-代码位置：[`task_system.py:67-76`](task_system.py:67)。
 
 ### 16.5 teammate 自动认领
 
@@ -719,16 +780,22 @@ seal()                                  # 记录每个文件写入后的 hash，
 2. 记忆、cron、任务板、worktree、后台任务等副作用不回滚（报告里显式列出）。
 3. `.worktrees/`、`.cache/`、`.git/` 及敏感文件不抓 pre-image。
 4. 恢复默认要求目标文件与节点 seal 时的 hash 一致，否则整体中止（`--force` 才覆盖）。
-5. teammate / subagent 的写入会挂到主会话当前节点，但它们没有自己的节点，也不产生会话事件。
+5. teammate / subagent 的写入会挂到主会话当前节点，但它们没有自己的 checkpoint 节点；
+   subagent 另有一份独立运行日志，teammate 目前没有。
 
 ## 23. 重要实现边界
 
-1. 主 agent 有 session event 记录；subagent 和 teammate 目前没有完全接入同一套 session event store。
-2. `resume_agent_loop()` 能识别 pending tool，但副作用工具的自动恢复策略仍应按工具类型细分。
-3. mailbox 的 `read_inbox()` 是读完即删，适合简单协作，不是可靠事件日志。
-4. 任务认领没有跨进程锁，多个进程同时认领同一 pending task 可能发生竞态。
+1. 主 agent 有 canonical session event；subagent 写独立运行日志并在父会话留引用事件，
+   但子日志不参与主会话恢复；teammate 仍然没有独立事件日志。
+2. `resume_agent_loop()` 会按三类标注 pending tool，但仍不自动重放任何工具；即使是
+   `read-only` 也只给建议，由模型决定是否再次调用。
+3. mailbox 已具备消息 id、claim/ack 与未确认重放；语义是 at-least-once，崩溃窗口内可能
+   重复投递，不保证 exactly-once。
+4. 任务认领已使用 advisory 跨进程文件锁；只保护遵守 `task_transaction()` 的写入方，
+   外部进程直接改 `task_*.json` 仍可绕过。
 5. teammate 自动认领采用第一个可用任务，没有公平分配策略。
-6. MCP 工具调用是同步等待异步桥结果，超时会转成普通工具错误。
+6. MCP 工具调用是同步等待异步桥结果，超时会转成普通工具错误；`mcp_call` 只记录
+   server/工具/耗时/错误类型，不记录参数或返回内容。
 7. daemon 线程在进程退出时会被直接终止；cron 通过 `wait_for_cron_idle()` 延长主进程生命周期。
 8. 后台任务完成不会主动打断当前 LLM 调用，只能在后续工具轮被收集。
 9. `write_transcript()` 是快照，不应作为 session crash recovery 的唯一来源。
@@ -737,10 +804,6 @@ seal()                                  # 记录每个文件写入后的 hash，
 
 后续如果继续增强，优先级建议为：
 
-1. 为 pending tool 增加 `read-only / idempotent / destructive` 恢复策略。
-2. 为任务 claim 增加文件锁或原子状态更新。
-3. 将 teammate 和 subagent 的关键事件也接入独立 session store。
-4. 为 mailbox 增加消息 id、ack 和未确认重放能力。
-5. 给 MCP wrapper 增加工具调用耗时、server 名称和错误类型事件。
-6. 为自动认领加入 owner lease、超时回收和公平调度。
-7. 让 checkpoint 覆盖 `bash` 侧的文件改动（git 基线 → 可选精确回滚）。
+1. 将 teammate 的关键事件也接入独立运行日志（subagent 已完成）。
+2. 为自动认领加入 owner lease、超时回收和公平调度。
+3. 让 checkpoint 覆盖 `bash` 侧的文件改动（git 基线 → 可选精确回滚）。

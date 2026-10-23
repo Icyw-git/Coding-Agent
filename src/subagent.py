@@ -4,6 +4,7 @@ import copy
 import os
 
 from agent_core import _extract_text, expand_image_parts, image_attachment_message, trigger_hooks
+from subagent_events import SubagentRecorder
 from tools import TOOLS
 from ui_bridge import agent_context
 
@@ -52,55 +53,74 @@ def spawn_subagent(description:str)->str:
     print('\n\033[35m[Subagent spawned]\033[0m')
     messages=[{'role':'system','content':_h().build_sub_system()},{'role':'user','content':description}]
     sub_tools, sub_handlers = _subagent_surface()
+    recorder = SubagentRecorder(description)
+    recorder.log_messages(messages)
+    status = 'limit'
+    result = ''
 
+    try:
+        for _ in range(30):
+            recorder.turns += 1
+            response=_h().client.chat.completions.create(
+                model=os.getenv("LLM_MODEL_ID"),
+                # 图片附件在副本里展开，messages 本身只保留 harness_image 引用
+                messages=expand_image_parts(messages),
+                tools=sub_tools,
+                temperature=0.7,
+                max_tokens=8000,
+            )
+            message=response.choices[0].message
+            dumped=message.model_dump()
+            messages.append(dumped)
+            recorder.log_message(dumped)
 
-    for _ in range(30):
+            if response.choices[0].finish_reason != "tool_calls":
+                force=trigger_hooks('Stop',messages)
+                if force:
+                    injected={'role':'user','content':force}
+                    messages.append(injected)
+                    recorder.log_message(injected)
+                    continue
+                if message.content:
+                    print(message.content)
+                result=message.content or "No output"
+                status='completed'
+                return result
 
-        response=_h().client.chat.completions.create(
-            model=os.getenv("LLM_MODEL_ID"),
-            # 图片附件在副本里展开，messages 本身只保留 harness_image 引用
-            messages=expand_image_parts(messages),
-            tools=sub_tools,
-            temperature=0.7,
-            max_tokens=8000,
-        )
-        message=response.choices[0].message
-        messages.append(message.model_dump())
+            tool_messages = []
+            attachments = []
+            for tool_call in message.tool_calls:
+                # 与主循环共用同一条执行路径：审批、入口截断、checkpoint、UI 事件
+                # 与后台判定都只在这里维护一份。子代理不再嵌套后台任务。
+                with agent_context('subagent'):
+                    _, _, tool_message, images = _h().exec_tool_call(
+                        tool_call, registry=sub_handlers,
+                        hooks=True, background=False)
+                tool_messages.append(tool_message)
+                recorder.log_message(tool_message)
+                if images:
+                    attachments.append(image_attachment_message(images))
 
-        if response.choices[0].finish_reason != "tool_calls":
-            force=trigger_hooks('Stop',messages)
-            if force:
-                messages.append({'role':'user','content':force})
-                continue
-            if message.content:
-                print(message.content)
-            return message.content or "No output"
+            # 工具结果连续，图片附件排在整批之后（role=tool 里放图各家支持不一）
+            messages.extend(tool_messages)
+            messages.extend(attachments)
+            recorder.log_messages(attachments)
 
-        tool_messages = []
-        attachments = []
-        for tool_call in message.tool_calls:
-            # 与主循环共用同一条执行路径：审批、入口截断、checkpoint、UI 事件
-            # 与后台判定都只在这里维护一份。子代理不再嵌套后台任务。
-            with agent_context('subagent'):
-                _, _, tool_message, images = _h().exec_tool_call(
-                    tool_call, registry=sub_handlers,
-                    hooks=True, background=False)
-            tool_messages.append(tool_message)
-            if images:
-                attachments.append(image_attachment_message(images))
-
-        # 工具结果连续，图片附件排在整批之后（role=tool 里放图各家支持不一）
-        messages.extend(tool_messages)
-        messages.extend(attachments)
-
-    result=_extract_text(messages[-1]['content']) if isinstance(messages[-1].get('content'), str) else ""
-    if not result:
-        for m in reversed(messages):
-            if m['role']=='assistant' and isinstance(m.get('content'), str):
-                result=_extract_text(m['content'])
-                if result:
-                    break
+        result=_extract_text(messages[-1]['content']) if isinstance(messages[-1].get('content'), str) else ""
         if not result:
-            result="Subagent stopped after 30 turns without final answer."
-    print("\033[35m[Subagent done]\033[0m")
-    return result
+            for m in reversed(messages):
+                if m['role']=='assistant' and isinstance(m.get('content'), str):
+                    result=_extract_text(m['content'])
+                    if result:
+                        break
+            if not result:
+                result="Subagent stopped after 30 turns without final answer."
+        print("\033[35m[Subagent done]\033[0m")
+        return result
+    except BaseException as exc:
+        status = 'cancelled' if isinstance(exc, KeyboardInterrupt) else 'error'
+        error_type = 'cancelled' if status == 'cancelled' else type(exc).__name__
+        recorder.finish(status, error_type=error_type, error=str(exc))
+        raise
+    finally:
+        recorder.finish(status, result=result)

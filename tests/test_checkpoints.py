@@ -1,3 +1,4 @@
+import gzip
 import json
 import subprocess
 
@@ -32,12 +33,46 @@ def test_turn_node_writes_messages_and_index(tmp_path, ws):
     node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
 
     assert mgr.messages_snapshot(cp_id) == _msgs()
+    assert (node / 'messages.jsonl.gz').is_file()
+    assert not (node / 'messages.jsonl').exists()
     assert json.loads((node / 'meta.json').read_text(encoding='utf-8'))['status'] == 'open'
     assert mgr.list()[0]['status'] == 'open'
     # 事件流里记录了节点引用，但不含快照本体
     event = store.read_events()[-1]
     assert event['type'] == 'checkpoint' and event['checkpoint_id'] == cp_id
     assert 'message' not in event
+
+
+def test_legacy_plain_snapshot_is_still_readable(ws):
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('legacy'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    compressed = node / 'messages.jsonl.gz'
+    with gzip.open(compressed, 'rt', encoding='utf-8') as handle:
+        body = handle.read()
+    (node / 'messages.jsonl').write_text(body, encoding='utf-8')
+    compressed.unlink()
+
+    assert mgr.snapshot_path(cp_id).name == 'messages.jsonl'
+    assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
+
+
+def test_rewind_replays_compressed_snapshot(ws):
+    store = SessionEventStore(ws / '.cache' / 'sessions', session_id='sid')
+    store.append_message({'role': 'user', 'content': 'hello'})
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('hello'), store)
+    mgr.seal()
+    snapshot = mgr.snapshot_path(cp_id)
+    assert snapshot.suffix == '.gz'
+
+    store.append_message({'role': 'assistant', 'content': 'later'})
+    store.append_rewind(cp_id, snapshot_path=str(snapshot))
+    history = store.rebuild_openai_history()
+
+    assert history[0] == {'role': 'user', 'content': 'hello'}
+    assert history[-1]['role'] == 'user'
+    assert f'Rewound to {cp_id}' in history[-1]['content']
 
 
 def test_capture_pre_image_is_idempotent_per_node(ws):

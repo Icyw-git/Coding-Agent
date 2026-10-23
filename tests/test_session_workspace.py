@@ -163,7 +163,7 @@ def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path,
 
     harness, root = _loop_env(tmp_path, monkeypatch)
     release = threading.Event()
-    seen, threads = [], []
+    seen, acked, threads = [], [], []
     original_thread = threading.Thread
 
     def thread_factory(*args, **kwargs):
@@ -183,7 +183,8 @@ def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path,
     monkeypatch.setattr(agent_teams, '_build_team_tools', build_tools)
     monkeypatch.setattr(agent_teams, 'active_teammates', {})
     monkeypatch.setattr(agent_teams, 'BUS', SimpleNamespace(
-        read_inbox=lambda name: [{}], send=lambda *args: None))
+        claim_inbox=lambda name: [{'id': 'm1'}], send=lambda *args: None,
+        ack=lambda agent, ids: acked.append((agent, list(ids)))))
     monkeypatch.setattr(agent_teams, 'handle_inbox_message', lambda *args: 'shutdown')
     token = harness._checkpoint_manager.set(SimpleNamespace(session_id='parent'))
     try:
@@ -193,6 +194,8 @@ def test_teammate_keeps_workspace_without_inheriting_parent_checkpoint(tmp_path,
         threads[0].join(3)
         assert not threads[0].is_alive()
         assert seen == [(root, None, 'parent')]
+        # shutdown 消息注入后立刻确认；没有 ack 的消息下次会重放
+        assert acked == [('test-worker', ['m1'])]
         assert not agent_teams.active_teammates
     finally:
         release.set()

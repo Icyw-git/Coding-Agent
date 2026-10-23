@@ -59,7 +59,7 @@
 | 任务状态 `tasks/`、`os_tasks/` | 可恢复任务状态，不自动删 | `/watch`、任务系统 |
 | 导出 `transcripts/` | 用户产物，不自动删 | 手动处理 |
 | 工具大输出/图片 `tool_results/` | 超期且未被会话引用才删 | `/cache gc [天数] [--apply]` |
-| checkpoint `checkpoints/` | 每会话保留最新 N 个；head/label 永不删 | `/checkpoint-gc`、`/checkpoint-gc --all` |
+| checkpoint `checkpoints/` | 每会话保留最新 N 个；head/label 永不删；新节点快照 gzip | `/checkpoint-gc`、`/checkpoint-gc --all` |
 | `tmp/`、`sandbox-tmp/` | 只报告，过期项可手动处理 | 预览后手动 |
 | API 访问日志、`cache_debug.jsonl` | 审计/诊断，默认保留 | 按需轮转 |
 | 未识别目录/文件 | 只报告，不猜 | 手动确认 |
@@ -188,6 +188,8 @@ Textual 调度影响有抖动，因此不把单次数字当硬性 SLA。初载�
 - 不在启动时做全量 GC；`/cache profile` 只读，清理必须显式。
 - 不按“文件夹年龄”删除未知数据；没有引用关系证据就不动。
 - 暂不引入 rollout zstd 压缩或分页存储；先把 profile 和可证明的回收规则稳定下来，再按真实增长数据决定。
+- checkpoint 的 messages 快照已改为 gzip（新节点 `messages.jsonl.gz`，旧明文继续可读）；抽样压缩比约 0.28。
+  活动会话 JSONL 仍保持明文追加，因为重放和尾部读取依赖字节偏移；归档区压缩留作独立改动。
 
 ## 7. 验证
 

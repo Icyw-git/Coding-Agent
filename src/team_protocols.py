@@ -75,8 +75,14 @@ def match_response(response_type, request_id, approve): # 匹配响应函数
 
 
 def consume_lead_inbox(route_protocol=True) -> list:
-    """Lead 收件箱：路由协议响应（更新 pending_requests 状态），返回全部消息供注入对话。"""
-    msgs = _bus().read_inbox('lead')
+    """Lead 收件箱：路由协议响应（更新 pending_requests 状态），返回全部消息供注入对话。
+
+    先 claim 再路由，最后 ack：路由过程中崩溃或 ack 失败时，消息仍在邮箱里，
+    下次会重放。重复投递是 at-least-once 的预期代价，协议状态更新本身是幂等的
+    （已决议的请求不会再次变更）。
+    """
+    bus = _bus()
+    msgs = bus.claim_inbox('lead')
     if route_protocol:
         for msg in msgs:
             meta = msg.get('metadata', {})
@@ -84,4 +90,11 @@ def consume_lead_inbox(route_protocol=True) -> list:
             msg_type = msg.get('type', '')
             if req_id and msg_type.endswith('_response'):
                 match_response(msg_type, req_id, meta.get('approve', False)) # 匹配响应，更新协议状态
+    ids = [msg.get('id') for msg in msgs
+           if isinstance(msg, dict) and msg.get('id')]
+    if ids:
+        try:
+            bus.ack('lead', ids)
+        except Exception as exc:
+            print(f"  \033[33m[bus] ack failed for lead: {exc}\033[0m")
     return msgs

@@ -1,11 +1,14 @@
 """Append-only OpenAI session events and crash-safe replay helpers."""
 import copy
+import gzip
 import json
 import os
 import threading
 import time
 import uuid
 from pathlib import Path
+
+import tool_recovery
 
 
 class SessionReplayError(ValueError):
@@ -711,12 +714,11 @@ class SessionEventStore:
         pending = {}
 
         def close_pending():
-            for call_id in pending:
+            for call_id, call in pending.items():
                 result.append({
                     'role': 'tool', 'tool_call_id': call_id,
-                    'content': ('Error: Tool execution was interrupted; no result was recorded. '
-                                'The outcome is unknown. Verify current state before retrying '
-                                'any operation with side effects.'),
+                    'content': tool_recovery.close_message(
+                        tool_recovery.classify_tool_call(call)),
                 })
             pending.clear()
 
@@ -726,7 +728,9 @@ class SessionEventStore:
             result.append(message)
             if message.get('role') == 'assistant':
                 for call in message.get('tool_calls') or []:
-                    pending[call['id']] = call
+                    call_id = call.get('id') if isinstance(call, dict) else None
+                    if call_id:
+                        pending[call_id] = call
             elif message.get('role') == 'tool':
                 pending.pop(message.get('tool_call_id'), None)
         if close_tail:
@@ -743,8 +747,13 @@ class SessionEventStore:
         if not snapshot_path.exists():
             raise SessionReplayError(
                 f"rewind at seq {event.get('seq')}: snapshot missing for {checkpoint_id}")
+        if snapshot_path.suffix == ".gz":
+            with gzip.open(snapshot_path, "rt", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        else:
+            lines = snapshot_path.read_text(encoding="utf-8").splitlines()
         messages = []
-        for line in snapshot_path.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             if not line.strip():
                 continue
             message = json.loads(line)
@@ -809,17 +818,10 @@ class SessionEventStore:
         pending = self.pending_tool_calls()
         if not pending:
             return None
-        names = []
-        for call in pending:
-            function = call.get("function") or {}
-            names.append(f"{function.get('name', 'unknown')} ({call.get('id')})")
+        classified = [tool_recovery.classify_tool_call(call) for call in pending]
         return {
             "role": "user",
-            "content": (
-                "<recovery>Session resumed after interruption. Pending tool calls: "
-                + ", ".join(names)
-                + ". Verify current state before repeating any operation with side effects.</recovery>"
-            ),
+            "content": tool_recovery.resume_message(classified),
         }
 
     # ---------- 分叉与跨会话搜索 ----------

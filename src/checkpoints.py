@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -24,6 +26,8 @@ DEFAULT_IGNORE = ('.cache', '.git', '.worktrees', '.mailbox', '__pycache__', '.p
 DEFAULT_SECRETS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx',
                    '*_rsa', 'id_ecdsa', 'id_ed25519', 'id_dsa')
 MAX_FILE_BYTES = 5 * 1024 * 1024
+MESSAGES_FILE = 'messages.jsonl'
+MESSAGES_GZIP_FILE = 'messages.jsonl.gz'
 
 
 class CheckpointError(RuntimeError):
@@ -152,10 +156,21 @@ class CheckpointManager:
     def _node_dir(self, cp_id: str) -> Path:
         return self.base_dir / cp_id
 
+    def _messages_path(self, cp_id: str) -> Path:
+        """新节点用 gzip；旧节点没有 .gz 时继续读明文 JSONL。"""
+        node_dir = self._node_dir(cp_id)
+        compressed = node_dir / MESSAGES_GZIP_FILE
+        if compressed.is_file():
+            return compressed
+        plain = node_dir / MESSAGES_FILE
+        if plain.is_file():
+            return plain
+        return compressed
+
     def snapshot_path(self, cp_id: str) -> Path:
         """返回指定节点的会话快照路径，并校验它属于当前 session。"""
         self.get(cp_id)
-        return self._node_dir(cp_id) / 'messages.jsonl'
+        return self._messages_path(cp_id)
 
     def _abs_of(self, key: str) -> Path:
         return self.workspace / key
@@ -249,20 +264,10 @@ class CheckpointManager:
         if 'turn_start' in row:
             return bool(row.get('turn_start'))
         try:
-            path = self._node_dir(row['cp_id']) / 'messages.jsonl'
-            if not path.is_file():
-                return False
-            with path.open('rb') as handle:
-                handle.seek(max(0, path.stat().st_size - 65536))
-                lines = handle.read().splitlines()
-            for raw in reversed(lines):
-                if not raw.strip():
-                    continue
-                message = json.loads(raw)
-                return message.get('role') == 'user'
-        except (OSError, ValueError, TypeError):
+            messages = self.messages_snapshot(row['cp_id'])
+        except (OSError, ValueError, TypeError, CheckpointError):
             return False
-        return False
+        return bool(messages) and messages[-1].get('role') == 'user'
 
     # ---------- 节点生命周期 ----------
 
@@ -293,7 +298,7 @@ class CheckpointManager:
             'files': {},
             'git': self._git_baseline(),
         }
-        _atomic_write(node_dir / 'messages.jsonl', self._encode_messages(messages))
+        _atomic_write(node_dir / MESSAGES_GZIP_FILE, self._encode_messages(messages))
         self._write_meta(node_dir, meta)
         self._append_index(self._summary(meta))
         self._save_head(cp_id)
@@ -433,14 +438,23 @@ class CheckpointManager:
     @staticmethod
     def _encode_messages(messages: list) -> bytes:
         body = ''.join(json.dumps(m, ensure_ascii=False, default=str) + '\n' for m in messages)
-        return body.encode('utf-8')
+        buffer = io.BytesIO()
+        # mtime=0 让相同快照得到相同字节，便于测试和跨机器比较。
+        with gzip.GzipFile(fileobj=buffer, mode='wb', compresslevel=6, mtime=0) as handle:
+            handle.write(body.encode('utf-8'))
+        return buffer.getvalue()
 
     def messages_snapshot(self, cp_id: str) -> list[dict]:
-        path = self._node_dir(cp_id) / 'messages.jsonl'
-        if not path.exists():
+        path = self._messages_path(cp_id)
+        if not path.is_file():
             raise CheckpointError(f'checkpoint {cp_id} has no messages snapshot')
+        if path.suffix == '.gz':
+            with gzip.open(path, 'rt', encoding='utf-8') as handle:
+                lines = handle.read().splitlines()
+        else:
+            lines = path.read_text(encoding='utf-8').splitlines()
         messages = []
-        for line in path.read_text(encoding='utf-8').splitlines():
+        for line in lines:
             if line.strip():
                 messages.append(json.loads(line))
         return messages

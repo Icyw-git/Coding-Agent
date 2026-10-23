@@ -3,14 +3,42 @@ import random
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
+
+from file_lock import exclusive_file_lock
 
 # 任务持久化目录：与仓库 .cache 约定一致，保存时按需自动创建
 TASK_DIR = Path(__file__).resolve().parents[1] / '.cache' / 'tasks'
 TASKS_DIR = TASK_DIR
 task_lock = threading.RLock()
+_transaction_state = threading.local()
+
+
+@contextmanager
+def task_transaction():
+    """Serialize task read-modify-write across threads and processes.
+
+    Nested calls reuse the lock held by the outer transaction; ``save_task``
+    is called from create/claim/complete and must not try to re-lock.
+    """
+    with task_lock:
+        depth = getattr(_transaction_state, 'depth', 0)
+        if depth:
+            _transaction_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                _transaction_state.depth = depth
+            return
+        with exclusive_file_lock(TASK_DIR / '.tasks.lock'):
+            _transaction_state.depth = 1
+            try:
+                yield
+            finally:
+                _transaction_state.depth = 0
 
 
 
@@ -29,7 +57,7 @@ def random_hex(n:int):
     return ''.join(random.choices('0123456789abcdef',k=n))
 
 def create_task(subject:str,description:str='',blockedBy:Optional[List[str]] = None): #创建任务
-    with task_lock:
+    with task_transaction():
         task=Task(
             id=f'task_{int(time.time())}_{uuid.uuid4().hex[:8]}',
             subject=subject,
@@ -54,7 +82,7 @@ def can_start(task_id:str): #判断任务是否可以开始
 
 
 def claim_task(task_id:str,owner:str='agent')->str: #认领任务，返回认领结果
-    with task_lock:
+    with task_transaction():
         task=load_task(task_id)
         if task.status !='pending':
             return f'Task {task_id} is {task.status},cannot claim '
@@ -73,7 +101,7 @@ def claim_task(task_id:str,owner:str='agent')->str: #认领任务，返回认领
 
 
 def complete_task(task_id:str)->str: #完成任务，返回完成结果
-    with task_lock:
+    with task_transaction():
         task=load_task(task_id)
         if task.status == 'completed':
             return f'Task {task_id} is already completed'
@@ -95,7 +123,7 @@ def _task_path(task_id:str)->Path: #获取任务文件路径
     return TASK_DIR/f'{task_id}.json'
 
 def save_task(task:Task): #保存任务到文件
-    with task_lock:
+    with task_transaction():
         TASK_DIR.mkdir(parents=True, exist_ok=True)
         path = _task_path(task.id)
         tmp = path.with_suffix('.tmp')

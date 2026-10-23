@@ -56,7 +56,7 @@
   index.jsonl                 # append-only 索引，每行一个节点
   state.json                  # {current_head: cp_xxx} 当前分支头
   <cp_id>/
-    messages.jsonl            # canonical messages 快照（含完整 tool_calls 配对）
+    messages.jsonl.gz         # canonical messages 快照（gzip；旧节点仍可是 messages.jsonl）
     meta.json                 # 节点元数据 + 每个文件的 exists / sha256 / 是否敏感
     files/
       <relpath>               # pre-image（原文件内容）；快照时不存在则只在 meta 里记 exists=false
@@ -80,6 +80,12 @@
 
 `meta.json` 额外记录每个文件的 `sha256`（快照时）与 `restored_at`，用于冲突检测与审计。
 
+新节点把 messages 写为 `messages.jsonl.gz`（gzip level 6，`mtime=0` 保证同内容同字节）。
+读取时优先找 `.gz`，找不到再回退旧版明文 `messages.jsonl`；因此升级前创建的节点和
+升级后新写的节点可以混用，不需要一次性迁移。以本机 20 个最大快照抽样，压缩后约为
+原始 JSONL 的 28%（约节省 72%）。旧明文快照不会在读取时被隐式改写，仍由
+`/checkpoint-gc` 按节点整体回收。
+
 放在 `.cache/` 下与现有 `sessions/`、`transcripts/`、`tool_results/` 一致，且 `.cache/` 已在
 [`.gitignore`](.gitignore) 中忽略，不会污染工作区。
 
@@ -95,7 +101,7 @@
 
 ```json
 {"type":"checkpoint","seq":43,"checkpoint_id":"cp_xxx","through_seq":42,"label":"","trigger":"turn"}
-{"type":"rewind","seq":88,"checkpoint_id":"cp_xxx","snapshot_path":".cache/checkpoints/<session_id>/cp_xxx/messages.jsonl",
+{"type":"rewind","seq":88,"checkpoint_id":"cp_xxx","snapshot_path":".cache/checkpoints/<session_id>/cp_xxx/messages.jsonl.gz",
  "scope":"session+files","restored_files":["t.py"]}
 ```
 
@@ -107,7 +113,7 @@
    以及 `append_checkpoint(...)` / `append_rewind(...)` 两个封装方法，风格与
    [`append_message`](session_store.py#L66-L75)、[`append_compaction`](session_store.py#L77-L83) 一致。
 2. [`rebuild_openai_history()`](session_store.py#L111-L127) 新增 `rewind` 分支：
-   - 读取该 `checkpoint_id` 的 `messages.jsonl`；
+   - 读取该 `checkpoint_id` 的快照；`.gz` 用 gzip 解压，旧明文直接读取；
    - 用它替换当前累积的 `messages`；
    - 追加一条 user 消息 `[Rewound to <cp_id>] Conversation history restored to this checkpoint.`，
      让模型知道中间发生过回滚；
@@ -418,7 +424,7 @@ CHECKPOINT_MANAGER = None          # 活跃 manager；tools 的 write/edit 通�
 
 | 用例                 | 断言                                                                                                 |
 | -------------------- | ---------------------------------------------------------------------------------------------------- |
-| turn 节点落盘        | `messages.jsonl` 内容与传入 messages 深相等；index 行 `status=open`                                  |
+| turn 节点落盘        | `messages.jsonl.gz` 解压后与传入 messages 深相等；index 行 `status=open`                             |
 | pre-image 幂等       | 同一节点内对同一路径调用两次，`files/` 下只有一个副本                                                |
 | 懒建节点             | 一轮内改两个文件，两个 pre-image 落在同一个 `cp_id`                                                  |
 | 新建文件回滚         | tombstone 记录的文件在 restore 后被删除                                                              |

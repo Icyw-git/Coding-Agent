@@ -3631,3 +3631,119 @@ Rich Markdown 解析 54ms，自适应节流 108ms；10k 行布局有界缓存常
 加强 `test_global_gc_visits_each_session_and_keeps_labels`：先断言多会话 dry-run 不改节点数/head，
 再执行临时目录中的 GC，断言各会话 head 与带标签节点目录均保留、回收后节点数符合 keep。
 `tests/test_checkpoints.py` 46 passed，增量 Ruff 通过。
+
+## Checkpoint 快照压缩与命令层拆分
+
+P1 存储：新 checkpoint 把 canonical messages 写为 `messages.jsonl.gz`（gzip level 6，
+`mtime=0`），读取时优先 `.gz`、回退旧版明文 `messages.jsonl`；`snapshot_path()` 返回实际存在的
+文件，rewind 事件记录实际路径，`SessionEventStore` 在重放时按后缀解压。旧明文节点不在读取时
+被隐式改写，仍由 `/checkpoint-gc` 整体回收。
+
+本机对 20 个最大快照做只读抽样：原始 5.14 MiB，gzip 后 1.43 MiB，比例 0.278（约省 72%）。
+新增用例覆盖新节点写 `.gz`、旧明文仍可读、gzip 快照 replay。
+
+P2 拆分：checkpoint 列表/GC 预览与执行/rewind 报告和重放从 `harness.py` 移到
+`src/checkpoint_commands.py`；`harness.py` 保留读取 `CHECKPOINT_DIR`、
+`CHECKPOINT_MAX_NODES`、`CHECKPOINT_KEEP_LABELED` 的薄包装，因此现有命令入口和测试导入路径
+不变。`harness.py` 从 2735 行降到 2565 行，新模块 211 行。
+
+P2b：把 `HarnessApp` 的 24 个会话生命周期方法（`/new` `/rename` `/fork` `/sessions`
+`/compact` 以及 checkpoint/rewind/GC）原样移到 `src/ui/session_actions.py` 的
+`SessionActionsMixin`；`harness_app.py` 从 2327 行降到 1903 行，新模块 444 行。App 的
+继承顺序改为 `SessionActionsMixin, App`，方法仍通过 `self` 使用原有状态；同时把只服务于
+这些命令的 `_strip_ansi` 和 modal 导入移入新模块，避免两套名字。AST 核对 mixin 恰含
+预期的 24 个方法、App 无重复方法。
+
+验证：全量 **1261 passed / 1 skipped**（P2b 定向 142 passed），5 条 warning 仍来自飞书 SDK
+的 pkg_resources 弃用；`ruff check .` 与 `git diff --check` 通过。真实终端验收记录仍未补齐，
+等待用户提供终端/版本信息。
+
+## Pending 工具恢复分级
+
+新增 `src/tool_recovery.py`，把「assistant 已发出 tool_call、结果未落盘」的 pending
+调用按风险分为三类，只生成恢复建议，不执行任何工具：
+
+- `read-only`：读文件、检索、读文档、`web_fetch`、只读查询以及 `is_readonly_command`
+  判定为只读的 bash；可安全重复，仍由模型决定是否调用。
+- `idempotent`：整文件 `write`、`todo_write`、带状态保护的 claim/complete、
+  `cancel_cron`、`kill_background` 等；重复会收敛或被拒绝，仍要求先核对状态。
+- `destructive`：`edit`/`apply_patch`、创建任务/cron/teammate、发送消息、消费 inbox、
+  worktree 删除及所有未知/MCP 工具；可能已部分生效或重复副作用，禁止盲重试。
+
+`SessionEventStore.close_interrupted_tools()` 的 synthetic tool result 保留
+“outcome is unknown”，并附带对应类别的行动建议；`recovery_message()` 按
+read-only → idempotent → destructive 分组列出名称与 call id。修正了
+`resume_agent_loop()` 的旧顺序问题：原先先 `recover_pending=True` 写入
+`tool_recovery` 事件，随后再取 pending 时集合已为空，恢复提示实际不会注入；现在
+先收集提示再闭合调用。
+
+验证：`tests/test_tool_recovery.py` 覆盖三类工具、malformed 参数/调用、
+`close_message`/`resume_message`、rebuild 分类结果与 resume 注入顺序；
+定向 80 passed（含 session/tool interruption/history projection），Ruff 通过。
+
+## 任务认领跨进程锁
+
+新增 `src/file_lock.py`：POSIX 用 `fcntl.flock`、Windows 用 `msvcrt.locking` 的
+非阻塞轮询封装，超时抛 `FileLockTimeout`，进程退出时由 OS 释放。`task_system`
+新增 `task_transaction()`：外层同时持有进程内 `RLock` 与 `.cache/tasks/.tasks.lock`，
+嵌套调用复用深度计数；`create_task`/`claim_task`/`complete_task`/`save_task` 统一走
+该事务，`save_task` 不再单独抢锁。
+
+新增 `tests/test_task_locking.py`：两个 spawn 进程在拉长读改写窗口后同时 claim，
+断言恰好一个成功；原有线程并发用例继续通过。定向 43 passed，Ruff 通过。
+
+## MCP 调用遥测
+
+MCP sync wrapper 现在记录 server、工具名、墙钟耗时、`status` 和 `error_type`：
+`timeout` / `not_connected` / `server_error`，以及 bridge 异常的真实类名。事件不含
+参数与返回内容；sink 抛错被吞掉，不改变工具结果。
+
+主 agent 在 `_run_tool_batch()` 的每次工具执行外打开 `mcp_bridge.telemetry_sink()`，
+把事件追加为 session JSONL 的 `mcp_call`。sink 用 thread-local 而非 ContextVar：
+并行批次在 ThreadPoolExecutor worker 内执行，ContextVar 不会从提交线程自动继承。
+每个 worker 自己打开/关闭 sink，主线程串行路径同样处理；未配置 MCP 时
+`sys.modules` 查不到 bridge，直接 `nullcontext()`，不额外导入 SDK。
+
+新增 `tests/test_mcp_telemetry.py` 覆盖成功、四类错误、sink 失败隔离、串行批次事件、
+并行 worker 事件；MCP 相关 22 passed，Ruff 通过。
+
+## 子代理独立运行日志
+
+`task` 子代理原先只有一段返回文本，中途的 LLM 消息、工具调用和失败位置都不落盘。
+新增 `src/subagent_events.py` 的 `SubagentRecorder`：
+
+- 每次运行写 `.cache/sessions/subagents/session_subagent_<id>.jsonl`，记录
+  system/user/assistant/tool 消息以及 `subagent_started` / `subagent_finished`；
+  该事件流可被 `SessionEventStore.rebuild_openai_history()` 还原，工具中途退出时
+  留下的 pending 调用也能按现有规则检查；
+- 父会话只追加两个轻量引用事件（id、描述、状态、轮数、耗时、子日志相对路径），
+  `/sessions` 仍只扫顶层 `session_*.jsonl`，内部运行不会出现在会话列表；
+- 状态为 `completed` / `limit` / `error` / `cancelled`，结束事件由 `finally` 保证
+  恰好一次；错误只记录类型和截断后的信息；
+- 所有写入 best-effort：目录不可写、磁盘满或父会话引用失败都不改变子代理结果。
+
+新增 `tests/test_subagent_events.py`：成功路径校验子会话角色序列、父引用和跨实例
+seq 追加，失败路径校验错误记录后原样重抛，另覆盖记录器构造失败隔离和无会话上下文。
+子代理相关定向 9 passed，Ruff 通过。
+
+## Mailbox 消息 id 与未确认重放
+
+`MessageBus` 从「读完即删文件」改为两步消费：
+
+- `send()` 为每条消息分配 `msg_<uuid>`；旧消息没有 id 时，读取阶段按原始行内容生成
+  稳定的 `legacy-<hash>`，因此升级前留在邮箱里的消息也能正常 ack；
+- `claim_inbox()` 只返回未确认消息、不修改邮箱，重复调用即重放；`ack()` 按 id 删除，
+  重写时先写临时文件再 `Path.replace`，并用跨进程 `exclusive_file_lock` 包住
+  send/claim/ack，避免并行会话的 append 被 ack 重写吞掉；
+- `read_inbox()` 保留旧的「读取后立即确认」语义；损坏/半行消息跳过，并在下一次
+  ack 重写时清理；
+- teammate 循环、`idle_poll()` 和 Lead 的 `consume_lead_inbox()` 统一改为
+  claim → 注入对话 → ack。进程在注入后、ack 前退出时消息仍在邮箱，重启后重放；
+  这是 at-least-once，shutdown/plan response 的处理本身幂等。ack 失败只告警，
+  下一轮重放而不是丢消息。
+
+`tests/test_runtime_reliability.py` 新增消息 id/claim/ack/replay、claim 后新到消息
+不被误删、legacy id 稳定、损坏行清理、Lead 路由后 ack、idle_poll 注入/shutdown
+先 ack；`tests/test_session_workspace.py` 校验 teammate 处理 shutdown 后确认。
+mailbox/teammate 相关定向 55 passed，Ruff 通过。全量回归 **1331 passed / 1 skipped**
+（symlink 在本机不可用），5 条 warning 仍来自飞书 SDK。

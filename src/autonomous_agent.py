@@ -10,12 +10,6 @@ IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 
-def _bus():
-    """延迟取 agent_teams.BUS：避免模块级循环导入（agent_teams 会 import 本模块）。"""
-    from agent_teams import BUS
-    return BUS
-
-
 def scan_unclaimed_tasks() -> list:
     unclaimed = []
     for f in sorted(TASKS_DIR.glob('task_*.json')):
@@ -31,16 +25,20 @@ def idle_poll(name: str, messages: list, role: str, wt_ctx: dict = None) -> str:
     - 收 inbox：shutdown→'shutdown'；plan 决定/Lead 消息→'work'；
     - 自动认领待办任务，成功→'work'（任务绑定了 worktree 则切换 wt_ctx）；
     - IDLE_TIMEOUT 内无任何事→'timeout'。"""
+    # 延迟导入避免 agent_teams ↔ autonomous_agent 的模块级循环。
+    from agent_teams import ack_inbox, claim_inbox
+
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
-        # 收 inbox：协议消息走 handle_inbox_message，其余注入 <inbox>
-        inbox = _bus().read_inbox(name)
+        # 收 inbox：先 claim，注入对话后再 ack；未确认消息在下一轮/重启后重放。
+        inbox = claim_inbox(name)
         new_content = False
         non_protocol = []
         for msg in inbox:
             result = handle_inbox_message(name, msg, messages)
             if result == 'shutdown':
+                ack_inbox(name, inbox)
                 return 'shutdown'
             elif result == 'awake':
                 new_content = True
@@ -53,6 +51,7 @@ def idle_poll(name: str, messages: list, role: str, wt_ctx: dict = None) -> str:
             })
             new_content = True
         if new_content:
+            ack_inbox(name, inbox)
             return 'work'
 
         # 自动认领任务系统里的待办任务

@@ -10,12 +10,14 @@ from types import SimpleNamespace
 import pytest
 
 import agent_teams
+import autonomous_agent
 import background_task
 import cron_scheduler
 import harness
 import hooks
 import recovery
 import task_system
+import team_protocols
 
 
 def test_task_claim_is_atomic(tmp_path, monkeypatch):
@@ -48,6 +50,133 @@ def test_message_bus_reads_all_sent_messages(tmp_path, monkeypatch):
 
     assert [message['content'] for message in bus.read_inbox('lead')] == ['first', 'second']
     assert bus.read_inbox('lead') == []
+
+
+def test_message_bus_claim_ack_and_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+
+    first = bus.send('alice', 'lead', 'first')
+    second = bus.send('bob', 'lead', 'second')
+    assert first['id'] and first['id'] != second['id']
+
+    claimed = bus.claim_inbox('lead')
+    assert [message['content'] for message in claimed] == ['first', 'second']
+    # 未 ack 前重复读取会原样重放，而不是把消息丢掉
+    assert bus.claim_inbox('lead') == claimed
+
+    assert bus.ack('lead', [first['id']]) == 1
+    assert [message['content'] for message in bus.replay_unacked('lead')] == ['second']
+    assert bus.ack('lead', ['missing-id']) == 0
+    assert bus.ack('lead', [second['id']]) == 1
+    assert bus.peek('lead') is False
+
+
+def test_ack_keeps_messages_that_arrived_after_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+
+    first = bus.send('alice', 'lead', 'first')
+    bus.claim_inbox('lead')
+    second = bus.send('bob', 'lead', 'second')
+
+    bus.ack('lead', [first['id']])
+
+    remaining = bus.claim_inbox('lead')
+    assert [message['content'] for message in remaining] == ['second']
+    assert remaining[0]['id'] == second['id']
+    bus.ack('lead', [second['id']])
+
+
+def test_legacy_mailbox_messages_get_stable_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+    inbox = tmp_path / 'lead.jsonl'
+    inbox.write_text(json.dumps({
+        'from': 'worker', 'to': 'lead', 'content': 'old',
+        'type': 'message', 'ts': 1,
+    }) + '\n', encoding='utf-8')
+
+    first = bus.claim_inbox('lead')
+    second = bus.claim_inbox('lead')
+    assert first[0]['id'].startswith('legacy-')
+    assert first[0]['id'] == second[0]['id']
+
+    assert bus.ack('lead', [first[0]['id']]) == 1
+    assert not inbox.exists()
+
+
+def test_malformed_mailbox_lines_are_skipped_and_pruned(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+    inbox = tmp_path / 'lead.jsonl'
+    one = json.dumps({'from': 'a', 'to': 'lead', 'content': 'one'})
+    two = json.dumps({'from': 'b', 'to': 'lead', 'content': 'two'})
+    inbox.write_text(f'{one}\n{{broken\n{two}\n', encoding='utf-8')
+
+    claimed = bus.claim_inbox('lead')
+    assert [message['content'] for message in claimed] == ['one', 'two']
+
+    bus.ack('lead', [claimed[0]['id']])
+    assert [message['content'] for message in bus.claim_inbox('lead')] == ['two']
+    assert '{broken' not in inbox.read_text(encoding='utf-8')
+    bus.ack('lead', [claimed[1]['id']])
+
+
+def test_consume_lead_inbox_routes_then_acks(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.BUS
+    request_id = 'req-mailbox-ack'
+    team_protocols.pending_requests[request_id] = team_protocols.ProtocolState(
+        request_id=request_id, type='shutdown', sender='w1', target='lead',
+        status='pending', payload='')
+    try:
+        bus.send('w1', 'lead', 'Done.', 'shutdown_response',
+                 {'request_id': request_id, 'approve': True})
+        bus.send('w1', 'lead', 'Note.', 'message')
+
+        messages = team_protocols.consume_lead_inbox()
+
+        assert [message['content'] for message in messages] == ['Done.', 'Note.']
+        assert team_protocols.pending_requests[request_id].status == 'approved'
+        assert bus.replay_unacked('lead') == []
+    finally:
+        team_protocols.pending_requests.pop(request_id, None)
+
+
+def test_idle_poll_claims_and_acks_mailbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    monkeypatch.setattr(autonomous_agent, 'IDLE_POLL_INTERVAL', 1)
+    monkeypatch.setattr(autonomous_agent, 'IDLE_TIMEOUT', 1)
+    monkeypatch.setattr(autonomous_agent.time, 'sleep', lambda seconds: None)
+    bus = agent_teams.BUS
+    bus.send('lead', 'worker', 'hello')
+
+    messages = []
+    try:
+        assert autonomous_agent.idle_poll('worker', messages, 'tester') == 'work'
+        assert 'hello' in messages[-1]['content']
+        assert bus.replay_unacked('worker') == []
+    finally:
+        bus.ack('worker', [message.get('id')
+                           for message in bus.claim_inbox('worker')])
+
+
+def test_idle_poll_acks_shutdown_before_returning(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    monkeypatch.setattr(autonomous_agent, 'IDLE_POLL_INTERVAL', 1)
+    monkeypatch.setattr(autonomous_agent, 'IDLE_TIMEOUT', 1)
+    monkeypatch.setattr(autonomous_agent.time, 'sleep', lambda seconds: None)
+    bus = agent_teams.BUS
+    bus.send('lead', 'worker', 'stop', 'shutdown_request',
+             {'request_id': 'req-idle-shutdown'})
+
+    assert autonomous_agent.idle_poll('worker', [], 'tester') == 'shutdown'
+    assert bus.replay_unacked('worker') == []
+    # shutdown 回执进入 lead 收件箱，等 lead 下次 check_inbox 时消费
+    replies = bus.replay_unacked('lead')
+    assert [message['type'] for message in replies] == ['shutdown_response']
+    bus.ack('lead', [message['id'] for message in replies])
 
 
 def test_message_bus_rejects_path_traversal_agent_names(tmp_path, monkeypatch):

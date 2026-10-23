@@ -1,13 +1,16 @@
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from autonomous_agent import idle_poll
+from file_lock import exclusive_file_lock
 from task_system import load_task
 from team_protocols import ProtocolState, handle_inbox_message, new_request_id, pending_requests
 from worktree import WORKTREES_DIR
@@ -45,7 +48,13 @@ AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 
 class MessageBus:
-    """消息总线，用于团队成员之间的通信。"""
+    """消息总线，用于团队成员之间的通信。
+
+    邮箱是 append-only JSONL，消费分两步：``claim_inbox`` 只读取未确认消息，
+    ``ack`` 才按消息 id 删除。接收方在把消息注入对话后确认；进程在两步之间
+    退出时，消息仍在邮箱里，下次启动会重放（at-least-once）。``read_inbox``
+    保留旧的「读完即清空」语义，供不关心重放的调用方使用。
+    """
     def __init__(self):
         self._locks: dict[Path, threading.Lock] = {}
         self._locks_guard = threading.Lock()
@@ -63,10 +72,42 @@ class MessageBus:
     def _inbox_path(self, agent: str) -> Path:
         return MAILBOX_DIR / f'{self._validate_agent_name(agent)}.jsonl'
 
+    @staticmethod
+    def _lock_path(inbox: Path) -> Path:
+        return inbox.with_suffix('.lock')
+
+    @staticmethod
+    def _legacy_id(line: str) -> str:
+        """旧消息没有 id：按原始行内容生成稳定 id，ack 时仍能精确删除。"""
+        return 'legacy-' + hashlib.sha1(line.encode('utf-8')).hexdigest()[:16]
+
+    def _read_records(self, inbox: Path) -> list[tuple[str, dict]]:
+        """解析有效消息；损坏/半行跳过（ack 重写时一并清理）。"""
+        if not inbox.exists():
+            return []
+        records = []
+        for line in inbox.read_text(encoding='utf-8', errors='replace').splitlines():
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            message_id = msg.get('id')
+            if not isinstance(message_id, str) or not message_id:
+                message_id = self._legacy_id(line)
+                msg['id'] = message_id
+            records.append((message_id, msg))
+        return records
+
     # 邮箱用 UTF-8 显式读写：GBK 默认码页是 Windows 隐形杀手（见 DEBUG_LOG 第 10 部分）
     def send(self, from_agent: str, to_agent: str, content: str,
-             msg_type: str = 'message', metadata: dict = None): #发送消息至指定_agent的邮箱
+             msg_type: str = 'message', metadata: dict = None) -> dict:
+        """发送消息至指定 agent 的邮箱；返回带 id 的消息。"""
         msg = {
+            'id': f'msg_{uuid.uuid4().hex}',
             'from': from_agent,
             'to': to_agent,
             'content': content,
@@ -77,30 +118,86 @@ class MessageBus:
             msg['metadata'] = metadata
         inbox = self._inbox_path(to_agent)
         with self._inbox_lock(inbox):
-            with open(inbox, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+            # 跨进程锁：并行会话可能共享同一个 .mailbox，ack 重写不能吞掉
+            # 另一个进程刚 append 的消息。
+            with exclusive_file_lock(self._lock_path(inbox)):
+                with open(inbox, 'a', encoding='utf-8', newline='\n') as f:
+                    f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+                    f.flush()
+                    os.fsync(f.fileno())
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
+        return msg
 
-    def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
-        """读取指定_agent的邮箱消息，清空邮箱。返回消息列表。"""
+    def claim_inbox(self, agent: str) -> list:
+        """读取指定 agent 的未确认消息，但不删除；可安全地重复读取/重放。"""
         inbox = self._inbox_path(agent)
         with self._inbox_lock(inbox):
-            if not inbox.exists():
-                return []
-            msgs = [json.loads(line) for line in
-                    inbox.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip()]
-            inbox.unlink() # 清空邮箱
-            return msgs
+            with exclusive_file_lock(self._lock_path(inbox)):
+                return [msg for _, msg in self._read_records(inbox)]
+
+    def ack(self, agent: str, message_ids) -> int:
+        """确认消息：按 id 从邮箱中删除，返回删除条数。重复确认无副作用。"""
+        ids = {str(message_id) for message_id in message_ids or () if message_id}
+        if not ids:
+            return 0
+        inbox = self._inbox_path(agent)
+        with self._inbox_lock(inbox):
+            with exclusive_file_lock(self._lock_path(inbox)):
+                records = self._read_records(inbox)
+                keep = [json.dumps(msg, ensure_ascii=False)
+                        for message_id, msg in records if message_id not in ids]
+                removed = len(records) - len(keep)
+                if not removed:
+                    return 0
+                if keep:
+                    temporary = inbox.with_name(inbox.name + '.tmp')
+                    with open(temporary, 'w', encoding='utf-8', newline='\n') as f:
+                        f.write('\n'.join(keep) + '\n')
+                        f.flush()
+                        os.fsync(f.fileno())
+                    temporary.replace(inbox)
+                else:
+                    inbox.unlink()
+                return removed
+
+    def read_inbox(self, agent: str) -> list: #读取指定_agent的邮箱消息
+        """读取并确认全部未读消息（旧的消费语义）；崩溃安全请用 claim+ack。"""
+        messages = self.claim_inbox(agent)
+        self.ack(agent, [message.get('id') for message in messages])
+        return messages
+
+    def replay_unacked(self, agent: str) -> list:
+        """显式重放入口：返回未确认消息且不改变邮箱，供重启后的接收方重试。"""
+        return self.claim_inbox(agent)
 
     def peek(self, agent: str) -> bool: #检查指定_agent的邮箱是否有消息
         """检查指定_agent的邮箱是否有消息。返回是否有消息。"""
         inbox = self._inbox_path(agent)
         with self._inbox_lock(inbox):
-            return inbox.exists() and inbox.stat().st_size > 0
+            with exclusive_file_lock(self._lock_path(inbox)):
+                return bool(self._read_records(inbox))
 
 
 BUS = MessageBus()
+
+
+def claim_inbox(agent: str) -> list:
+    """读取未确认消息；兼容只有 read_inbox 的旧总线替身。"""
+    claim = getattr(BUS, 'claim_inbox', None)
+    return claim(agent) if claim is not None else BUS.read_inbox(agent)
+
+
+def ack_inbox(agent: str, messages) -> None:
+    """确认已注入对话的消息；确认失败只告警，下一轮会重放而不是丢消息。"""
+    ids = [message.get('id') for message in messages or ()
+           if isinstance(message, dict) and message.get('id')]
+    if not ids:
+        return
+    try:
+        BUS.ack(agent, ids)
+    except Exception as exc:
+        print(f"  \033[33m[bus] ack failed for {agent}: {exc}\033[0m")
 
 
 def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员工具集
@@ -287,8 +384,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
         should_stop=False # 是否停止线程
 
         while not should_stop:
-            # 收 inbox：协议消息（shutdown/plan_approval）走 handle_inbox_message，其余注入 <inbox>
-            inbox = BUS.read_inbox(name)
+            # 收 inbox：先 claim，注入对话后再 ack。进程在两步之间退出时，
+            # 未确认消息留在邮箱里，重启后重放。
+            inbox = claim_inbox(name)
 
             non_protocol = []
             for msg in inbox:
@@ -302,12 +400,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
                 else:
                     non_protocol.append(msg)
             if should_stop: #跳出循环
+                ack_inbox(name, inbox)
                 break
             if non_protocol:
                 messages.append({
                     'role': 'user',
                     'content': f"<inbox>{json.dumps(non_protocol, ensure_ascii=False)}</inbox>",
                 })
+            ack_inbox(name, inbox)
 
             # 与主循环同一套压缩预处理（budget → snip → micro → 超限 LLM 摘要）
             messages, skip_micro_rounds = harness.pre_compact_messages(messages, skip_micro_rounds)
