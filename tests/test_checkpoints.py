@@ -697,10 +697,24 @@ def test_global_gc_visits_each_session_and_keeps_labels(ws):
     first.seal()
     second.seal()
 
+    first_head = first.head()
+    second_head = second.head()
+    preview = gc_all_checkpoints(root, max_nodes=2, dry_run=True)
+    assert preview['removed'] == 4
+    assert len(first.list(limit=100)) == 5
+    assert len(second.list(limit=100)) == 3
+    assert first.head() == first_head
+    assert second.head() == second_head
+
     summary = gc_all_checkpoints(root, max_nodes=2, dry_run=False)
     assert summary['sessions'] == 2
     assert summary['removed'] == 4          # a 删 3、b 删 1
     assert (root / 'a' / kept).is_dir()     # 带 label 的节点保留
+    assert (root / 'a' / first_head).is_dir()
+    assert (root / 'b' / second_head).is_dir()
+    assert first.head() == first_head
+    assert second.head() == second_head
+    assert len(first.list(limit=100)) == 2
     assert len(second.list(limit=100)) == 2
 
 

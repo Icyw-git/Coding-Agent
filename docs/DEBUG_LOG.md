@@ -3620,6 +3620,14 @@ Rich spans 必须完全相等，应用路径只做一次全量解析；不同形
 191 个节点，`keep=5` 预计回收 92 个节点、8,625,056 字节。没有执行删除，等待用户明确确认。
 全量性能回归基线：10k 块布局 36.5ms、滚动帧 1.61ms、流式尾部更新 0.85ms；100k 字符
 Rich Markdown 解析 54ms，自适应节流 108ms；10k 行布局有界缓存常驻 7.5 MiB/峰值 8.2 MiB，
-完整缓存为 9.6/10.2 MiB。
-历史初载默认改为 200 后，定向历史用例 3 passed；全量回归仍为 **1298 passed / 1 skipped**、5 条
-飞书 SDK warning。增量 Ruff 与 `git diff --check` 通过。
+- 长会话首载窗口调整后全量回归 1298 passed / 1 skipped；Ruff、diff check 通过。
+
+## 全局 checkpoint GC 保护复核
+
+对本地 `.cache/checkpoints` 仅执行 `gc_all_checkpoints(max_nodes=5, dry_run=True)`：22 个会话、
+191 个节点，计划回收 92 个、8,625,056 字节；逐会话核验候选集均保留当前 head 与全部带标签节点，
+没有会话超出 keep=5。未执行删除。
+
+加强 `test_global_gc_visits_each_session_and_keeps_labels`：先断言多会话 dry-run 不改节点数/head，
+再执行临时目录中的 GC，断言各会话 head 与带标签节点目录均保留、回收后节点数符合 keep。
+`tests/test_checkpoints.py` 46 passed，增量 Ruff 通过。
