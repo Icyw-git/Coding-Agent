@@ -162,6 +162,40 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     assert '缓存命中 96%' in harness.format_status(reopened)
 
 
+def test_agent_loop_persists_failed_model_request_profile(tmp_path, monkeypatch):
+    from session_store import SessionEventStore
+
+    store = SessionEventStore(tmp_path / 'sessions', session_id='failed-profile')
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', tmp_path / 'checkpoints')
+    monkeypatch.setattr(harness, 'wait_for_mcp_tools', lambda: None)
+    monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
+    monkeypatch.setattr(harness, 'streaming_enabled', lambda: False)
+
+    class ProviderError(Exception):
+        status_code = 402
+
+    def fail_request(**kwargs):
+        raise ProviderError('private provider response body')
+
+    monkeypatch.setattr(harness.client.chat.completions, 'create', fail_request)
+
+    with pytest.raises(ProviderError, match='private provider response body'):
+        harness.agent_loop([{'role': 'user', 'content': 'profile failure'}],
+                           session_store=store, housekeeping=False)
+
+    failure = next(event for event in store.read_events()
+                   if event.get('type') == 'model_request_failed')
+    assert failure['provider_status'] == 402
+    assert failure['error_type'] == 'ProviderError'
+    assert failure['prompt_message_count'] > 0
+    assert failure['request_ms'] >= 0
+    assert failure['compact_ms'] >= 0
+    assert failure['prompt_assembly_ms'] >= 0
+    assert 'private provider response body' not in json.dumps(failure)
+
+
 def test_parse_usage_collects_cached_tokens():
     from types import SimpleNamespace as NS
 
