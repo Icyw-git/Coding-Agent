@@ -10,6 +10,7 @@ import contextlib
 import io
 import os
 import queue
+import re
 import threading
 import time
 from functools import partial
@@ -96,6 +97,42 @@ MARKDOWN_THEME = Theme({
     'markdown.hr': '#5f8787',
 })
 
+
+
+_FENCE_OPEN = re.compile(r'^( {0,3})(`{3,}|~{3,})([^\r\n]*)(\r?\n)?$')
+_FENCE_CLOSE = re.compile(r'^ {0,3}(`{3,}|~{3,})[ \t]*(\r?\n)?$')
+
+
+def _streaming_markdown_source(source: str) -> tuple[str, bool]:
+    """Avoid expensive syntax lexing for labeled fenced code during streaming."""
+    if '```' not in source and '~~~' not in source:
+        return source, False
+    output = []
+    fence_char = None
+    fence_size = 0
+    changed = False
+    for line in source.splitlines(keepends=True):
+        if fence_char is None:
+            match = _FENCE_OPEN.match(line)
+            if match:
+                fence = match.group(2)
+                info = match.group(3)
+                if fence[0] == '`' and '`' in info:
+                    output.append(line)  # CommonMark: backticks invalidate this fence.
+                    continue
+                fence_char, fence_size = fence[0], len(fence)
+                if info.strip() and info.split()[0] != 'text':
+                    output.append(f'{match.group(1)}{fence}text{match.group(4) or ""}')
+                    changed = True
+                    continue
+        else:
+            close = _FENCE_CLOSE.match(line)
+            if close:
+                fence = close.group(1)
+                if fence[0] == fence_char and len(fence) >= fence_size:
+                    fence_char, fence_size = None, 0
+        output.append(line)
+    return (''.join(output), changed) if changed else (source, False)
 
 
 def _render_markdown(text: str, width: int) -> list[Text]:
@@ -982,18 +1019,21 @@ class HarnessApp(SessionActionsMixin, App):
             text = str(payload.get('text', ''))
             if not text:
                 return []
-            if not payload.get('streaming'):
+            streaming = bool(payload.get('streaming'))
+            render_text, provisional_styles = (
+                _streaming_markdown_source(text) if streaming else (text, False))
+            if not streaming and not provisional_styles:
                 cached = self._stream_render_cache
                 if cached is not None:
                     block_id, cached_width, source, lines = cached
                     if block_id == block.id and cached_width == width and source == text:
                         self._stream_render_cache = None
                         return lines
-            # 流式中间帧不做缓存查找；只保存最近一帧供 assistant_end 复用。
-            # 不拼接 Markdown 段落，内容/宽度变化照常完整渲染。
+            # Provisional code styles must never leak into the finalized frame.
             self._stream_render_cache = None
-            lines = _render_markdown(text, width)
-            if payload.get('streaming') and len(text) <= 100_000 and len(lines) <= 10_000:
+            lines = _render_markdown(render_text, width)
+            if (streaming and not provisional_styles
+                    and len(text) <= 100_000 and len(lines) <= 10_000):
                 self._stream_render_cache = (block.id, width, text, lines)
             return lines
         if kind == 'tool':

@@ -83,8 +83,9 @@
 新节点把 messages 写为 `messages.jsonl.gz`（gzip level 6，`mtime=0` 保证同内容同字节）。
 读取时优先找 `.gz`，找不到再回退旧版明文 `messages.jsonl`；因此升级前创建的节点和
 升级后新写的节点可以混用，不需要一次性迁移。以本机 20 个最大快照抽样，压缩后约为
-原始 JSONL 的 28%（约节省 72%）。旧明文快照不会在读取时被隐式改写，仍由
-`/checkpoint-gc` 按节点整体回收。
+原始 JSONL 的 28%（约节省 72%）。交互启动时后台迁移为旧明文节点补齐校验后的
+`.gz`，默认不删原明文；仅显式 `remove_plain=True` 才删除明文。
+`/checkpoint-gc` 仍须按节点预览并取得授权后才执行整体回收。
 
 放在 `.cache/` 下与现有 `sessions/`、`transcripts/`、`tool_results/` 一致，且 `.cache/` 已在
 [`.gitignore`](.gitignore) 中忽略，不会污染工作区。

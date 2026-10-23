@@ -162,6 +162,34 @@ def test_agent_loop_reports_tokens(tmp_path, monkeypatch, capsys):
     assert '缓存命中 96%' in harness.format_status(reopened)
 
 
+def test_agent_loop_persists_successful_request_without_usage(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    store = SessionEventStore(tmp_path / 'sessions', session_id='no-usage')
+    monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
+    monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', tmp_path / 'checkpoints')
+    monkeypatch.setattr(harness, 'wait_for_mcp_tools', lambda: None)
+    monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
+    monkeypatch.setattr(harness, 'streaming_enabled', lambda: False)
+    monkeypatch.setattr(harness.client.chat.completions, 'create', lambda **kwargs: NS(
+        choices=[NS(message=NS(role='assistant', content='done', tool_calls=None),
+                     finish_reason='stop')],
+        usage=None,
+    ))
+
+    assert harness.agent_loop([{'role': 'user', 'content': 'no usage'}],
+                              session_store=store, housekeeping=False) == 'done'
+
+    completed = next(event for event in store.read_events()
+                     if event.get('type') == 'model_request_completed')
+    assert completed['usage_available'] is False
+    assert completed['request_ms'] >= 0
+    assert completed['prompt_message_count'] > 0
+    assert completed['finish_reason'] == 'stop'
+    assert 'done' not in json.dumps(completed)
+
+
 def test_agent_loop_persists_failed_model_request_profile(tmp_path, monkeypatch):
     from session_store import SessionEventStore
 

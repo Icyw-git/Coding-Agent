@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -21,6 +22,32 @@ import task_system
 import team_protocols
 
 
+def _claim_task_process(task_dir, task_id, owner, start, results):
+    task_system.TASK_DIR = Path(task_dir)
+    task_system.TASKS_DIR = Path(task_dir)
+    start.wait(15)
+    results.put(task_system.claim_task(task_id, owner))
+
+
+def _claim_task_then_exit(task_dir, task_id):
+    task_system.TASK_DIR = Path(task_dir)
+    task_system.TASKS_DIR = Path(task_dir)
+    task_system.claim_task(task_id, 'crashed-owner', lease_seconds=0)
+    os._exit(17)
+
+
+def _mailbox_claim_then_exit(mailbox_dir, agent):
+    agent_teams.MAILBOX_DIR = Path(mailbox_dir)
+    agent_teams.MessageBus().claim_inbox(agent)
+    os._exit(17)
+
+
+def _mailbox_send_process(mailbox_dir, start):
+    agent_teams.MAILBOX_DIR = Path(mailbox_dir)
+    start.wait(15)
+    agent_teams.MessageBus().send('worker', 'lead', 'arrived during ack')
+
+
 def test_task_claim_is_atomic(tmp_path, monkeypatch):
     monkeypatch.setattr(task_system, 'TASK_DIR', tmp_path)
     monkeypatch.setattr(task_system, 'TASKS_DIR', tmp_path)
@@ -40,6 +67,96 @@ def test_task_claim_is_atomic(tmp_path, monkeypatch):
 
     assert sum('Claimed' in result for result in results) == 1
     assert task_system.load_task(task.id).owner in {'alice', 'bob'}
+
+
+def test_task_claim_is_atomic_across_processes(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_system, 'TASK_DIR', tmp_path)
+    monkeypatch.setattr(task_system, 'TASKS_DIR', tmp_path)
+    task = task_system.create_task('One process owner')
+    context = multiprocessing.get_context('spawn')
+    start = context.Event()
+    results = context.Queue()
+    processes = [context.Process(
+        target=_claim_task_process,
+        args=(str(tmp_path), task.id, owner, start, results))
+        for owner in ('alice', 'bob')]
+    try:
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(20)
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0]
+        outcomes = [results.get(timeout=3) for _ in processes]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        results.close()
+
+    assert sum('Claimed' in result for result in outcomes) == 1
+    assert task_system.load_task(task.id).owner in {'alice', 'bob'}
+
+
+def test_task_lease_recovers_after_claiming_process_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_system, 'TASK_DIR', tmp_path)
+    monkeypatch.setattr(task_system, 'TASKS_DIR', tmp_path)
+    task = task_system.create_task('Recover process crash')
+    process = multiprocessing.get_context('spawn').Process(
+        target=_claim_task_then_exit, args=(str(tmp_path), task.id))
+    process.start()
+    process.join(20)
+
+    assert not process.is_alive()
+    assert process.exitcode == 17
+    crashed = task_system.load_task(task.id)
+    assert crashed.owner == 'crashed-owner'
+    assert crashed.lease_expires <= time.time()
+    assert 'recovered' in task_system.claim_task(task.id, 'replacement')
+    assert task_system.load_task(task.id).owner == 'replacement'
+
+
+def test_message_bus_claim_replays_after_consumer_process_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+    original = bus.send('sender', 'lead', 'survive consumer crash')
+    process = multiprocessing.get_context('spawn').Process(
+        target=_mailbox_claim_then_exit, args=(str(tmp_path), 'lead'))
+    process.start()
+    process.join(20)
+
+    assert not process.is_alive()
+    assert process.exitcode == 17
+    replayed = bus.replay_unacked('lead')
+    assert [message['id'] for message in replayed] == [original['id']]
+    assert bus.ack('lead', [original['id']]) == 1
+    assert bus.replay_unacked('lead') == []
+
+
+def test_message_bus_ack_does_not_lose_concurrent_process_send(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
+    bus = agent_teams.MessageBus()
+    first = bus.send('sender', 'lead', 'remove only this message')
+    context = multiprocessing.get_context('spawn')
+    start = context.Event()
+    process = context.Process(
+        target=_mailbox_send_process, args=(str(tmp_path), start))
+    process.start()
+    start.set()
+    try:
+        assert bus.ack('lead', [first['id']]) == 1
+        process.join(20)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    remaining = bus.replay_unacked('lead')
+    assert [message['content'] for message in remaining] == ['arrived during ack']
 
 
 def test_message_bus_reads_all_sent_messages(tmp_path, monkeypatch):
@@ -201,8 +318,8 @@ def test_idle_poll_acks_shutdown_before_returning(tmp_path, monkeypatch):
     bus.ack('lead', [message['id'] for message in replies])
 
 
-def test_storage_maintenance_migrates_and_reclaims(tmp_path, monkeypatch):
-    """启动维护：旧快照压缩迁移 + 孤儿子日志回收，在后台线程各跑一次。"""
+def test_storage_maintenance_migrates_and_previews_orphans(tmp_path, monkeypatch):
+    """启动维护迁移旧快照，但仅预览孤儿子日志。"""
     checkpoint_dir = tmp_path / 'checkpoints'
     sessions_dir = tmp_path / 'sessions'
     node = checkpoint_dir / 'sid' / 'cp1'
@@ -227,10 +344,30 @@ def test_storage_maintenance_migrates_and_reclaims(tmp_path, monkeypatch):
             assert not thread.is_alive()
 
     assert (node / 'messages.jsonl.gz').is_file()
-    assert not plain.exists()
-    assert not orphan.exists()
+    assert plain.exists()
+    assert orphan.exists()
     assert any('旧快照迁移完成' in line for line in lines)
-    assert any('孤儿子日志' in line for line in lines)
+    assert any('仅预览，未删除' in line for line in lines)
+
+
+def test_storage_maintenance_requires_explicit_orphan_purge(tmp_path, monkeypatch):
+    sessions_dir = tmp_path / 'sessions'
+    orphan_dir = sessions_dir / 'teammates'
+    orphan_dir.mkdir(parents=True)
+    orphan = orphan_dir / 'session_teammate_lost.jsonl'
+    orphan.write_text('{"type": "teammate_started"}\n', encoding='utf-8')
+    old = time.time() - 40 * 86400
+    os.utime(orphan, (old, old))
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', tmp_path / 'checkpoints')
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions_dir)
+
+    harness.start_storage_maintenance(emit=lambda _line: None, purge_orphans=True)
+    for thread in threading.enumerate():
+        if thread.name == 'storage-maintenance':
+            thread.join(5)
+            assert not thread.is_alive()
+
+    assert not orphan.exists()
 
 
 def test_message_bus_rejects_path_traversal_agent_names(tmp_path, monkeypatch):

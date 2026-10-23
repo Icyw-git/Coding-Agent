@@ -20,21 +20,24 @@ def percentile(values: list[float], fraction: float) -> float | None:
 
 
 def summarize(paths: list[Path]) -> dict:
-    usage_rows, tool_rows, failure_rows = [], [], []
+    usage_rows, completion_rows, tool_rows, failure_rows = [], [], [], []
     for path in paths:
         for event in SessionEventStore.open(path).iter_events():
             if event.get('type') == 'usage':
                 usage_rows.append(event)
+            elif event.get('type') == 'model_request_completed':
+                completion_rows.append(event)
             elif event.get('type') == 'tool_profile':
                 tool_rows.append(event)
             elif event.get('type') == 'model_request_failed':
                 failure_rows.append(event)
     prompt = sum(int(row.get('prompt', 0) or 0) for row in usage_rows)
     cached = sum(int(row.get('cached', 0) or 0) for row in usage_rows)
+    request_rows = [*usage_rows, *completion_rows]
     timings = {}
     for field in ('memory_load_ms', 'compact_ms', 'prompt_assembly_ms',
                   'prepare_ms', 'request_ms', 'ttfb_ms', 'stream_ms'):
-        values = [float(row[field]) for row in usage_rows if row.get(field) is not None]
+        values = [float(row[field]) for row in request_rows if row.get(field) is not None]
         timings[field] = {'count': len(values), 'p50': statistics.median(values) if values else None,
                           'p95': percentile(values, .95)}
     prefix_status = collections.Counter(
@@ -50,7 +53,9 @@ def summarize(paths: list[Path]) -> dict:
                             if row.get('request_ms') is not None]
     return {
         'sessions': len(paths), 'model_calls': len(usage_rows),
-        'profiled_calls': sum('request_ms' in row for row in usage_rows),
+        'successful_model_requests': len(request_rows),
+        'successful_requests_without_usage': len(completion_rows),
+        'profiled_calls': sum('request_ms' in row for row in request_rows),
         'prompt_tokens': prompt, 'cached_tokens': cached,
         'weighted_cache_hit_rate': cached / prompt if prompt else None,
         'low_hit_calls': sum(
@@ -72,6 +77,7 @@ def summarize(paths: list[Path]) -> dict:
             'p50': statistics.median([float(row['duration_ms']) for row in tool_rows]) if tool_rows else None,
             'p95': percentile([float(row['duration_ms']) for row in tool_rows], .95),
         },
+        'tool_batches_with_errors': sum(row.get('status') == 'error' for row in tool_rows),
         'tool_calls': sum(int(row.get('tool_count', 0)) for row in tool_rows),
     }
 

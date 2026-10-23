@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+import checkpoints
 from checkpoints import CheckpointError, CheckpointManager, migrate_legacy_checkpoints
 from session_store import SessionEventStore
 
@@ -71,15 +72,65 @@ def test_migrate_legacy_checkpoints_compresses_plain_nodes(ws):
 
     assert stats == {'migrated': 1, 'skipped': 0, 'failed': 0}
     assert (node / 'messages.jsonl.gz').is_file()
-    assert not (node / 'messages.jsonl').exists()
+    assert (node / 'messages.jsonl').is_file()
     assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
-    # 幂等：明文删净后重跑无事可做
+    # 已有明文始终保留；重复运行只报告已有压缩副本。
     assert migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints') == {
+        'migrated': 0, 'skipped': 1, 'failed': 0}
+
+
+def test_migrate_removes_plain_only_with_explicit_authorization(ws):
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('authorized'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    plain = node / 'messages.jsonl'
+    plain.write_text(json.dumps(_msgs('authorized')[0]) + '\n', encoding='utf-8')
+    (node / 'messages.jsonl.gz').unlink()
+
+    stats = migrate_legacy_checkpoints(
+        ws / '.cache' / 'checkpoints', remove_plain=True)
+
+    assert stats == {'migrated': 1, 'skipped': 0, 'failed': 0}
+    assert not plain.exists()
+    assert mgr.messages_snapshot(cp_id) == _msgs('authorized')
+
+
+def test_migrate_skips_linked_storage_root(ws, monkeypatch):
+    base = ws / '.cache' / 'checkpoints'
+    node = base / 'sid' / 'cp1'
+    node.mkdir(parents=True)
+    plain = node / 'messages.jsonl'
+    plain.write_text(json.dumps(_msgs('keep')[0]) + '\n', encoding='utf-8')
+    original = checkpoints._is_reparse_point
+    monkeypatch.setattr(checkpoints, '_is_reparse_point',
+                        lambda path: path == base or original(path))
+
+    assert migrate_legacy_checkpoints(base) == {
         'migrated': 0, 'skipped': 0, 'failed': 0}
+    assert plain.exists()
+    assert not (node / 'messages.jsonl.gz').exists()
+
+
+def test_migrate_skips_reparse_point_paths(ws, monkeypatch):
+    base = ws / '.cache' / 'checkpoints'
+    node = base / 'sid' / 'cp-link'
+    node.mkdir(parents=True)
+    plain = node / 'messages.jsonl'
+    plain.write_text(json.dumps({'role': 'user', 'content': 'keep'}) + '\n',
+                     encoding='utf-8')
+    original = checkpoints._is_reparse_point
+    monkeypatch.setattr(checkpoints, '_is_reparse_point',
+                        lambda path: path == node or original(path))
+
+    stats = migrate_legacy_checkpoints(base)
+
+    assert stats == {'migrated': 0, 'skipped': 1, 'failed': 0}
+    assert plain.exists()
+    assert not (node / 'messages.jsonl.gz').exists()
 
 
 def test_migrate_completes_interrupted_migration(ws):
-    """上次迁移写到一半（.gz 已写、明文未删）：内容一致就补删明文。"""
+    """已有匹配的 gzip 是成功迁移；默认保留明文副本。"""
     mgr = _mgr(ws)
     cp_id = mgr.begin_turn(_msgs('legacy'))
     node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
@@ -88,8 +139,8 @@ def test_migrate_completes_interrupted_migration(ws):
 
     stats = migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints')
 
-    assert stats == {'migrated': 1, 'skipped': 0, 'failed': 0}
-    assert not (node / 'messages.jsonl').exists()
+    assert stats == {'migrated': 0, 'skipped': 1, 'failed': 0}
+    assert (node / 'messages.jsonl').exists()
     assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
 
 

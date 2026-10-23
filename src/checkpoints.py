@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -106,23 +107,58 @@ def _read_gzip_snapshot(path: Path) -> list:
                 in handle.read().splitlines() if line.strip()]
 
 
-def migrate_legacy_checkpoints(base_dir, *, emit=print) -> dict:
-    """把升级前的明文 messages.jsonl 快照压缩成 .gz（一次性、幂等）。
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return path.is_symlink() or bool(
+        getattr(info, 'st_file_attributes', 0)
+        & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
 
-    每个节点先写 .gz，再解压回读与明文逐条比对，一致才删除明文；任何一步
-    失败都保留明文原样。新节点本就直接写 .gz，重跑只会得到 skipped。
+
+def _migration_path_is_safe(base: Path, path: Path) -> bool:
+    try:
+        parts = path.relative_to(base).parts
+    except ValueError:
+        return False
+    current = base
+    for part in parts:
+        current = current / part
+        if _is_reparse_point(current):
+            return False
+    return True
+
+
+def migrate_legacy_checkpoints(base_dir, *, emit=print,
+                               remove_plain: bool = False) -> dict:
+    """把升级前的明文快照复制压缩为 .gz（幂等，默认保留源文件）。
+
+    每个节点先写 .gz，再解压回读与明文逐条比对；只有显式指定
+    ``remove_plain=True`` 才会删除已验证的明文副本。任何一步失败都保留明文。
     """
     stats = {'migrated': 0, 'skipped': 0, 'failed': 0}
-    base = Path(base_dir)
+    configured_base = Path(base_dir).absolute()
+    if _is_reparse_point(configured_base) or _is_reparse_point(configured_base.parent):
+        emit(f'  [checkpoint] 跳过链接存储根目录 {configured_base}')
+        return stats
+    base = configured_base.resolve()
     if not base.is_dir():
         return stats
     for plain in sorted(base.glob('*/*/messages.jsonl')):
         compressed = plain.parent / MESSAGES_GZIP_FILE
+        if (not _migration_path_is_safe(base, plain)
+                or not _migration_path_is_safe(base, compressed)):
+            stats['skipped'] += 1
+            emit(f'  [checkpoint] 跳过链接路径 {plain.parent.name}')
+            continue
         if compressed.is_file():
-            # .gz 已存在：多半是上次迁移写到一半。内容一致就补删明文，
-            # 不一致（或明文损坏）则不动，读路径本就优先用 .gz。
             try:
-                if _read_plain_snapshot(plain) == _read_gzip_snapshot(compressed):
+                matches = (_read_plain_snapshot(plain)
+                           == _read_gzip_snapshot(compressed))
+                if matches and remove_plain:
                     plain.unlink()
                     stats['migrated'] += 1
                 else:
@@ -145,12 +181,13 @@ def migrate_legacy_checkpoints(base_dir, *, emit=print) -> dict:
             stats['failed'] += 1
             emit(f'  [checkpoint] 迁移失败，明文保留 {plain.parent.name}: {exc}')
             continue
-        try:
-            plain.unlink()
-        except OSError as exc:
-            stats['failed'] += 1
-            emit(f'  [checkpoint] 明文删除失败 {plain.parent.name}: {exc}')
-            continue
+        if remove_plain:
+            try:
+                plain.unlink()
+            except OSError as exc:
+                stats['failed'] += 1
+                emit(f'  [checkpoint] 明文删除失败 {plain.parent.name}: {exc}')
+                continue
         stats['migrated'] += 1
     return stats
 

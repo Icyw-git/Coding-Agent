@@ -82,6 +82,26 @@ def _tool_call(call_id, name='mcp_search'):
     )
 
 
+def test_tool_batch_profiles_exceptions_without_arguments(tmp_path, monkeypatch):
+    def fail(_tool_call, **_kwargs):
+        raise RuntimeError('private command and arguments')
+
+    monkeypatch.setattr(harness, 'exec_tool_call', fail)
+    store = SessionEventStore(tmp_path, session_id='tool-failure-profile')
+
+    with pytest.raises(RuntimeError, match='private command and arguments'):
+        harness._run_tool_batch([_tool_call('failed-call', name='bash')], store, [])
+
+    profile = next(event for event in store.read_events()
+                   if event.get('type') == 'tool_profile')
+    assert profile['status'] == 'error'
+    assert profile['error_type'] == 'RuntimeError'
+    assert profile['tool_count'] == 1
+    assert profile['tools'][0]['name'] == 'bash'
+    assert profile['tools'][0]['duration_ms'] >= 0
+    assert 'private command and arguments' not in str(profile)
+
+
 def test_tool_batch_records_mcp_call_without_arguments(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'exec_tool_call', _fake_exec(wrapper()))
     store = SessionEventStore(tmp_path, session_id='mcp')

@@ -801,11 +801,11 @@ _checkpoint_manager = ContextVar('checkpoint_manager', default=None)
 
 # ---------- 存储维护（启动后台执行一次，全部幂等）----------
 
-def start_storage_maintenance(emit=print) -> None:
-    """后台跑一轮存储维护：旧 checkpoint 快照压缩迁移 + 孤儿子日志回收。
+def start_storage_maintenance(emit=print, *, purge_orphans=False) -> None:
+    """后台跑一轮存储维护：迁移快照格式并预览孤儿子日志。
 
-    迁移只碰升级前的明文 messages.jsonl（校验一致才删明文）；回收只删
-    无任何父会话引用且超过保留期的子日志。失败只打印，绝不影响会话。
+    旧快照在内容逐条校验后迁移到 gzip。孤儿日志默认只列出候选；传入
+    ``purge_orphans=True`` 才会删除超过保留期且未被父会话引用的日志。
     """
     def _run():
         try:
@@ -817,13 +817,19 @@ def start_storage_maintenance(emit=print) -> None:
         except Exception as exc:
             emit(f'  [checkpoint] 旧快照迁移异常：{exc}')
         try:
-            from session_cleanup import purge_orphan_child_logs
-            deleted, failures = purge_orphan_child_logs(SESSIONS_DIR, emit=emit)
-            if deleted or failures:
-                extra = f'（{failures} 个删除失败）' if failures else ''
-                emit(f'  [cleanup] 已回收 {len(deleted)} 个孤儿子日志{extra}')
+            from session_cleanup import orphan_child_logs, purge_orphan_child_logs
+            if purge_orphans:
+                deleted, failures = purge_orphan_child_logs(SESSIONS_DIR, emit=emit)
+                if deleted or failures:
+                    extra = f'（{failures} 个删除失败）' if failures else ''
+                    emit(f'  [cleanup] 已回收 {len(deleted)} 个孤儿子日志{extra}')
+            else:
+                candidates = orphan_child_logs(SESSIONS_DIR, emit=emit)
+                if candidates:
+                    emit(f'  [cleanup] 发现 {len(candidates)} 个过期孤儿子日志；'
+                         '本次仅预览，未删除')
         except Exception as exc:
-            emit(f'  [cleanup] 孤儿子日志回收异常：{exc}')
+            emit(f'  [cleanup] 孤儿子日志维护异常：{exc}')
 
     threading.Thread(target=_run, name='storage-maintenance', daemon=True).start()
 
@@ -1235,38 +1241,54 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
         commands = _batch_bash_commands(tool_calls)
         parallel = (commands is not None
                     and all(is_readonly_command(command) for command in commands))
-    if parallel:
-        activities = {}
-        for tool_call in tool_calls:
-            session_store.append_tool_started(tool_call)   # 原序登记全部 started
+    def record_profile(status, error_type=''):
+        session_store.append('tool_profile', duration_ms=round(
+            (time.perf_counter() - profile_started) * 1000, 3),
+            parallel=parallel, status=status, error_type=error_type,
+            tool_count=len(tool_calls),
+            tools=[{'name': tc.function.name,
+                    'duration_ms': tool_timings.get(tc.id)} for tc in tool_calls])
 
-        def run_parallel(tc):
-            started = time.perf_counter()
-            with _mcp_telemetry_scope(session_store):
-                result = contextvars.copy_context().run(
-                    exec_tool_call, tc, on_event=on_event,
-                    on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
-            tool_timings[tc.id] = round((time.perf_counter() - started) * 1000, 3)
-            return result
+    try:
+        if parallel:
+            activities = {}
+            for tool_call in tool_calls:
+                session_store.append_tool_started(tool_call)   # 原序登记全部 started
 
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
-            executed = list(pool.map(run_parallel, tool_calls))
-        for tool_call in tool_calls:   # 并行完成顺序不定，按原序补打活动行
-            activity = activities.get(tool_call.id)
-            if activity is not None:
-                _print_tool_activity(*activity)
-    else:
-        executed = []
-        for tool_call in tool_calls:
-            session_store.append_tool_started(tool_call)
-            started = time.perf_counter()
-            with _mcp_telemetry_scope(session_store):
-                executed.append(exec_tool_call(
-                    tool_call, on_event=on_event,
-                    on_activity=_print_tool_activity))
-            tool_timings[tool_call.id] = round(
-                (time.perf_counter() - started) * 1000, 3)
+            def run_parallel(tc):
+                started = time.perf_counter()
+                try:
+                    with _mcp_telemetry_scope(session_store):
+                        return contextvars.copy_context().run(
+                            exec_tool_call, tc, on_event=on_event,
+                            on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
+                finally:
+                    tool_timings[tc.id] = round(
+                        (time.perf_counter() - started) * 1000, 3)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
+                executed = list(pool.map(run_parallel, tool_calls))
+            for tool_call in tool_calls:   # 并行完成顺序不定，按原序补打活动行
+                activity = activities.get(tool_call.id)
+                if activity is not None:
+                    _print_tool_activity(*activity)
+        else:
+            executed = []
+            for tool_call in tool_calls:
+                session_store.append_tool_started(tool_call)
+                started = time.perf_counter()
+                try:
+                    with _mcp_telemetry_scope(session_store):
+                        executed.append(exec_tool_call(
+                            tool_call, on_event=on_event,
+                            on_activity=_print_tool_activity))
+                finally:
+                    tool_timings[tool_call.id] = round(
+                        (time.perf_counter() - started) * 1000, 3)
+    except BaseException as exc:
+        record_profile('error', type(exc).__name__)
+        raise
     for _, _, tool_message, _images in executed:   # 原序写回结果
         tool_messages.append(tool_message)
         session_store.append_message(tool_message)
@@ -1277,11 +1299,7 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
             attachment = image_attachment_message(images)
             tool_messages.append(attachment)
             session_store.append_message(attachment)
-    session_store.append('tool_profile', duration_ms=round(
-        (time.perf_counter() - profile_started) * 1000, 3),
-        parallel=parallel, tool_count=len(tool_calls),
-        tools=[{'name': tc.function.name,
-                'duration_ms': tool_timings.get(tc.id)} for tc in tool_calls])
+    record_profile('ok')
 
 def _record_compaction(session_store, compacted_messages, strategy):
     summary = next(
@@ -1939,6 +1957,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 response=recovery.with_retry(_create,recovery_state)
             reactive_retries=0
             detail=_parse_usage(getattr(response, 'usage', None))
+            request_ms = round((time.monotonic() - request_started) * 1000, 3)
             if detail:
                 # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
                 detail['model'] = (recovery_state.current_model
@@ -1950,7 +1969,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 if memory_profile_pending:
                     detail['memory_load_ms'] = memory_load_ms
                     memory_profile_pending = False
-                detail['request_ms'] = round((time.monotonic() - request_started) * 1000, 3)
+                detail['request_ms'] = request_ms
                 detail.setdefault('ttfb_ms', None)
                 detail['prompt_message_count'] = prompt_message_count
                 turn_tokens += detail['total']
@@ -1976,6 +1995,24 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 update_panel_status(messages, model=detail['model'],
                                     ctx_tokens=detail['prompt'],
                                     ctx_source='confirmed')
+            else:
+                completed_profile = {
+                    **profile_timing,
+                    'request_ms': request_ms,
+                    'ttfb_ms': profile_timing.get('ttfb_ms'),
+                    'prompt_message_count': prompt_message_count,
+                    'usage_available': False,
+                    'model': (recovery_state.current_model
+                              or os.getenv('LLM_MODEL_ID') or ''),
+                    'system_fp': hashlib.sha1(
+                        (system or '').encode('utf-8', 'replace')).hexdigest()[:12],
+                    'tools_fp': _tools_fingerprint(),
+                    'finish_reason': getattr(response.choices[0], 'finish_reason', None),
+                }
+                if memory_profile_pending:
+                    completed_profile['memory_load_ms'] = memory_load_ms
+                    memory_profile_pending = False
+                session_store.append('model_request_completed', **completed_profile)
         except Exception as e:
             request_ms = round((time.monotonic() - request_started) * 1000, 3)
             response = getattr(e, 'response', None)

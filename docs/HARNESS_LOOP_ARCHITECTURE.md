@@ -837,8 +837,8 @@ seal()                                  # 记录每个文件写入后的 hash，
 6. 自动认领是 FIFO + 过期租约重试，没有按 owner 负载或任务优先级加权；claim 事务是
    跨进程的，但仍是 pull 模型。
 7. 归档只管理父会话引用到的子日志；父引用事件写失败或手工删除父日志后留下的孤儿
-   `subagents/`、`teammates/` 文件由启动维护回收（无引用且超过 30 天才删，父日志
-   读不出来时本轮整体放弃）。
+   `subagents/`、`teammates/` 文件由启动维护预览（无引用且超过 30 天才列为候选，
+   默认不删；父日志读不出来时本轮整体放弃）。
 8. MCP 工具调用是同步等待异步桥结果，超时会转成普通工具错误；`mcp_call` 只记录
    server/工具/耗时/错误类型，不记录参数或返回内容。
 9. daemon 线程在进程退出时会被直接终止；cron 通过 `wait_for_cron_idle()` 延长主进程生命周期。
@@ -853,8 +853,9 @@ seal()                                  # 记录每个文件写入后的 hash，
 2. begin_turn 的基线捕获与 `_git_status` 各起一个 git 进程，可合并成一次调用省一半开销。
 
 启动维护（`harness.start_storage_maintenance()`，交互入口后台线程执行一次）已覆盖：
-升级前的明文 checkpoint 快照压缩迁移（校验一致才删明文，幂等）与孤儿子日志回收
-（`session_cleanup.purge_orphan_child_logs`，默认保留 30 天）。
+升级前的明文 checkpoint 快照压缩迁移（校验一致、默认保留明文，幂等），以及
+孤儿子日志预览（默认不删，仅列出 30 天以上候选）。删除明文须显式
+`remove_plain=True`；删除孤儿日志须显式 `purge_orphans=True`。
 
 checkpoint 对 bash 改动的覆盖（§22.4）已完成：基线脏文件在 begin_turn 预存 pre-image，
 seal 时按 git 基线补记外部新建/修改/删除（HEAD blob 取基线内容），回滚、冲突检测与

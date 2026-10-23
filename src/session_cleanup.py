@@ -38,6 +38,9 @@ def orphan_child_logs(sessions_dir, days=30, now=None, *, emit=print):
     （归档/删除已把它们和父会话一起搬走）。
     """
     sessions = Path(sessions_dir)
+    if _is_link(sessions) or _is_link(sessions.parent):
+        emit(f'  跳过链接会话存储根目录 {sessions}，本轮不执行回收')
+        return []
     cutoff = (time.time() if now is None else now) - days * 86400
     referenced = set()
     for log in sorted(sessions.glob('session_*.jsonl')):
@@ -79,7 +82,7 @@ def purge_orphan_child_logs(sessions_dir, days=30, now=None, *, emit=print):
     """删除孤儿子日志，返回 (已删除路径, 失败数)；单个删除失败不影响其余。"""
     deleted, failures = [], 0
     for path in orphan_child_logs(sessions_dir, days, now, emit=emit):
-        if _is_link(path):
+        if _is_link(path.parent) or _is_link(path):
             failures += 1
             emit(f'  拒绝删除链接孤儿日志 {path.name}')
             continue

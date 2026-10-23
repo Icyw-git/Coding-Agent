@@ -128,6 +128,23 @@ def test_orphan_child_logs_reclaims_only_stale_unreferenced(tmp_path):
     assert child.path.exists() and mate.path.exists() and fresh.path.exists()
 
 
+def test_orphan_scan_skips_linked_storage_root(tmp_path, monkeypatch):
+    sessions = tmp_path / 'sessions'
+    directory = sessions / 'teammates'
+    directory.mkdir(parents=True)
+    child = SessionEventStore(directory, session_id='teammate_old')
+    child.append('teammate_started', name='old')
+    old = time.time() - 40 * 86400
+    os.utime(child.path, (old, old))
+    original = session_cleanup._is_link
+    monkeypatch.setattr(session_cleanup, '_is_link',
+                        lambda path: Path(path) == sessions or original(path))
+
+    assert orphan_child_logs(sessions) == []
+    assert purge_orphan_child_logs(sessions) == ([], 0)
+    assert child.path.exists()
+
+
 def test_orphan_scan_skips_linked_child_directory(tmp_path, monkeypatch):
     sessions = tmp_path / 'sessions'
     target = tmp_path / 'outside'

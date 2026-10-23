@@ -3607,6 +3607,14 @@ Rich spans 必须完全相等，应用路径只做一次全量解析；不同形
 变化失效、超限不缓存、重载释放。稳定前缀拼接仅留实验脚本，不进入产品。
 验证：全量 **1298 passed / 1 skipped**，5 条 warning 均来自飞书 SDK；Ruff 与 diff 检查通过。
 
+本轮新增受控代码围栏候选（`scripts/bench_stream_codeblocks.py`）：仅流式中间帧、且围栏有
+语言标记时把 lexer 临时改为 `text`；无围栏/无语言标记保持 Rich 原路径，终帧
+强制重渲染并恢复语法高亮。实际 `_render_block` 对照（600 行代码，5 次中位数）：
+60/100 列分别由 **504/463ms 降至 110/108ms**；含未闭合围栏由 **485/468ms**
+降至 **122/128ms**；无语言标记约 **103/104ms → 102/100ms**。逐行文本与换行相同，
+终帧 Rich spans 完全相同；普通文本/列表/表格的无围栏检测不足 0.02ms。
+真实终端复测尚未执行，不能将这些渲染基准当作终端交互验收。
+
 ## 长会话初载窗口调整
 
 最新 10k 消息历史窗口基准在 Windows/Textual run_test 下有调度抖动。复测 400 条初载
@@ -3825,9 +3833,9 @@ Ruff 通过。
 - `orphan_child_logs()` 读全部顶层父日志收集 `log` 引用；无引用且 mtime 超过保留期
   （默认 30 天）才算孤儿——正在写入的运行日志 mtime 新，天然豁免；
 - 任何父日志读不出来（OSError）整轮放弃，宁可不删也不误删；归档目录不参与扫描；
-- `purge_orphan_child_logs()` 逐个删除，单个失败计数并继续；
-- `harness.start_storage_maintenance()` 在交互入口（entrypoint）起后台 daemon 线程
-  执行一次，有回收/迁移才打印一行。
+- `purge_orphan_child_logs()` 是显式删除入口，单个失败计数并继续；遇到链接存储根目录、子目录或文件跳过；
+- `harness.start_storage_maintenance()` 在交互入口起后台 daemon 线程；默认只预览孤儿
+  日志、不删除。仅显式传入 `purge_orphans=True` 时清理（只在测试临时目录验证）。
 
 `tests/test_session_child_logs.py` 覆盖「只回收过期且无引用」「被引用的旧日志保留」
 「父日志不可读整体放弃」。
@@ -3837,14 +3845,13 @@ Ruff 通过。
 升级前的节点还是明文 `messages.jsonl`，新节点直接写 `.gz`。`checkpoints.py` 新增
 `migrate_legacy_checkpoints(base_dir)` 一次性补齐存量：
 
-- 先写 `.gz`，再解压回读与明文逐条比对，一致才删明文；任何失败保留明文并计 `failed`；
-- 崩溃中间态（`.gz` 已写、明文未删）视为中断的迁移：内容一致就补删明文（`migrated`），
-  不一致则不动（读路径本就优先 `.gz`）；
-- 明文删净后重跑零操作，天然幂等；损坏明文不会删除。
+- 先写 `.gz`，再解压回读与明文逐条比对；默认保留明文副本，任何失败也保留明文；
+- `.gz` 已存在且内容一致时默认记为 `skipped`，不一致则不动（读路径优先 `.gz`）；
+- 只有显式传入 `remove_plain=True` 才删除经校验的明文；遇到链接/junction 存储根目录、节点或文件路径跳过。
 
-迁移与孤儿回收共用 `start_storage_maintenance()`：交互启动后台线程各跑一次，
-不阻塞会话。`tests/test_checkpoints.py` 覆盖迁移、幂等、中断补完、冲突对保留与损坏
-保留；`tests/test_runtime_reliability.py` 端到端验证维护线程。
+迁移与孤儿**预览**共用 `start_storage_maintenance()`：交互启动后台线程各跑一次，
+不阻塞会话。`tests/test_checkpoints.py` 覆盖迁移、幂等、链接路径、冲突对保留与损坏
+保留；`tests/test_runtime_reliability.py` 验证默认不删除及显式授权删除（均为临时文件）。
 
 ## checkpoint 覆盖 bash 文件改动
 
