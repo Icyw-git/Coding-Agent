@@ -39,6 +39,17 @@ def test_unborn_head_is_empty(monkeypatch):
     assert mgr._git_baseline() == {'head': '', 'status': []}
 
 
+def test_baseline_keys_split_quoted_rename_paths_only():
+    quoted = CheckpointManager._status_keys([
+        'R  "old name.txt" -> "new name.txt"',
+    ])
+    arrow_in_name = CheckpointManager._status_keys([
+        'R  "old -> name.txt" -> "new -> name.txt"',
+    ])
+    assert quoted == {'old name.txt', 'new name.txt'}
+    assert arrow_in_name == {'old -> name.txt', 'new -> name.txt'}
+
+
 def test_git_preserves_leading_status_space(monkeypatch):
     from types import SimpleNamespace
 

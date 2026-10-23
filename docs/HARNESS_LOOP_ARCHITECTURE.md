@@ -16,13 +16,14 @@
 | `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
 | `tool_recovery.py`    | 中断工具调用的恢复分级（read-only / idempotent / destructive）与恢复提示文本                     |
-| `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收（见 `CHECKPOINT_DESIGN.md`） |
+| `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收、旧明文快照迁移（见 `CHECKPOINT_DESIGN.md`） |
+| `session_cleanup.py`  | 会话归档/恢复/永久删除，连同任务引用的子代理与 teammate 日志一起移动；孤儿子日志回收           |
 | `recovery.py`         | 429/overload 重试、备用模型、输出截断和上下文超限判断                                            |
 | `background_task.py`  | 慢工具后台执行和完成通知收集                                                                     |
 | `cron_scheduler.py`   | cron 时间匹配、持久化、队列生产和队列处理线程                                                    |
 | `mcp_bridge.py`       | MCP server 连接、异步事件循环、动态工具注册                                                      |
 | `subagent.py`         | `task` 工具启动的短生命周期子代理循环                                                            |
-| `subagent_events.py`  | 子代理独立事件日志与父会话引用事件（best-effort，不改变子代理结果）                              |
+| `subagent_events.py`  | 子代理/teammate 独立事件日志与父会话引用事件（best-effort，不改变运行结果）                      |
 | `agent_teams.py`      | 常驻 teammate 线程、邮箱通信、计划审批、任务工具和 worktree 上下文                               |
 | `task_system.py`      | 持久化任务板、依赖、认领、完成和解锁（跨进程文件锁）                                             |
 | `file_lock.py`        | Windows/POSIX 通用独占文件锁，供任务板等小型读改写存储使用                                        |
@@ -410,6 +411,10 @@ subagent 的工具面由 `_subagent_surface()` 按当前实时注册表构造（
 磁盘满）会被吞掉，子代理继续执行；状态取值 `completed` / `limit` / `error` / `cancelled`。
 子日志不是主 agent 的 canonical history，也不会被 checkpoint/rewind 记录。
 
+父会话归档时，`SessionArchive` 读取这些引用事件，把 `subagents/`、`teammates/` 下的日志
+一并移入归档目录；恢复时移回原位，永久删除时随归档一起清理。路径必须位于会话存储
+目录内，链接/重解析点和未知文件会被拒绝。
+
 ## 14. 常驻 teammate loop
 
 teammate 由 [`agent_teams.py:215`](agent_teams.py:215) 的 `spawn_teammate_thread()` 创建 daemon 线程。
@@ -417,11 +422,13 @@ teammate 由 [`agent_teams.py:215`](agent_teams.py:215) 的 `spawn_teammate_thre
 ### 14.1 启动
 
 1. 检查同名 teammate 是否已存在。
-2. 创建线程和 teammate system prompt。
-3. 构建 teammate 专用工具集。
-4. 初始化 worktree 上下文 `wt_ctx`。
-5. 召回记忆，但不提炼全局记忆。
-6. 进入常驻循环。
+2. 在 Lead 线程创建 `TeammateRecorder`（父会话 store 显式传入，因为 ContextVar 不跨线程），
+   写 `teammates/session_teammate_<name>_<id>.jsonl` 和父会话引用事件。
+3. 创建线程和 teammate system prompt。
+4. 构建 teammate 专用工具集。
+5. 初始化 worktree 上下文 `wt_ctx`。
+6. 召回记忆，但不提炼全局记忆。
+7. 进入常驻循环。
 
 ### 14.2 每轮 teammate 循环
 
@@ -440,6 +447,10 @@ claim 自己的 mailbox（不删除）
 ```
 
 代码位置：[`agent_teams.py:386`](agent_teams.py:386)。
+
+每轮新增的 inbox 注入、assistant 消息、tool 结果和图片附件都写入独立日志；结束事件由
+`finally` 保证恰好一次，状态为 `completed` / `error` / `cancelled`，并带轮数、耗时和
+错误类型。记录失败只丢日志，不改变 teammate 的汇报与线程清理。
 
 teammate 工具执行时：
 
@@ -515,6 +526,9 @@ status: pending | in_progress | completed
 owner
 blockedBy
 worktree
+claimed_at
+lease_expires
+attempts
 ```
 
 每个任务保存为 `.cache/tasks/task_<id>.json`。
@@ -527,14 +541,20 @@ worktree
 
 ### 16.3 认领
 
-`claim_task(task_id, owner)` 在 `task_transaction()` 内执行：
+`claim_task(task_id, owner, lease_seconds=3600)` 在 `task_transaction()` 内执行：
 
 1. 加载任务。
-2. 检查状态必须是 `pending`。
+2. 状态为 `pending`，或 `in_progress` 且租约已过期（可回收）；其他状态拒绝。
 3. 检查所有 `blockedBy` 任务存在且为 `completed`。
-4. 写入 owner。
+4. 写入 owner、`claimed_at`、`lease_expires`，`attempts += 1`。
 5. 状态改为 `in_progress`。
 6. 立即持久化。
+
+没有 `lease_expires` 的旧 in_progress 任务视为失效（升级重启后原 owner 已不在），
+可被重新认领，返回信息会标注 `recovered expired lease`。租约是固定的 1 小时，不做
+自动续期由持有者负责：teammate 循环每轮开始调用 `renew_lease(task_id, owner=name)`
+刷新 `lease_expires`（不改动 `claimed_at`/`attempts`，过期排序仍按首次认领时间）。
+不续租的持有者——线程崩溃或超过 1 小时没有任何 LLM 轮——任务照常过期可回收。
 
 `task_transaction()` 同时持有进程内 `RLock` 和 `.cache/tasks/.tasks.lock` 上的
 跨进程独占锁；`save_task()` 复用外层事务，不会重复加锁。这样两个进程不会同时读到
@@ -542,13 +562,17 @@ worktree
 
 ### 16.4 完成
 
-`complete_task()` 同样在 `task_transaction()` 内：
+`complete_task(task_id, owner=None)` 同样在 `task_transaction()` 内：
 
-1. 将状态设为 `completed`。
-2. 持久化任务。
-3. 扫描所有 pending 任务。
-4. 找出依赖已满足的任务。
-5. 在返回信息中报告被解锁任务。
+1. 校验任务处于 `in_progress`；传入 owner 时必须与当前 owner 一致。
+2. 将状态设为 `completed`，清空租约。
+3. 持久化任务。
+4. 扫描所有 pending 任务。
+5. 找出依赖已满足的任务。
+6. 在返回信息中报告被解锁任务。
+
+teammate 的 claim/complete handler 传入自己的名字，避免租约被回收后旧 owner 误完成
+新 owner 的任务；主 agent 的工具不传 owner，保持原有行为。
 
 ### 16.5 teammate 自动认领
 
@@ -557,15 +581,26 @@ teammate 在普通回答后进入 `idle_poll()`，默认每 5 秒检查一次，
 1. 读取 mailbox。
 2. 处理 shutdown/plan 协议。
 3. 普通消息唤醒工作。
-4. 扫描未认领且依赖满足的任务。
-5. 选择第一个可认领任务。
-6. 调用 `claim_task(task_id, name)`。
-7. 如果任务绑定 worktree，更新 `wt_ctx['path']`。
-8. 注入 `<auto-claimed>...</auto-claimed>`，回到 LLM 工作轮。
+4. `claim_next_task(name)` 在事务内重新扫描候选：
+   - pending 任务按创建顺序优先；
+   - 其次是与 owner 无关的过期租约任务，按 attempts、claimed_at、id 排序；
+   - 逐个调用 `claim_task()`，直到某一候选认领成功。
+5. 如果任务绑定 worktree，更新 `wt_ctx['path']`，并记下 `wt_ctx['task_id']`。
+6. 注入 `<auto-claimed>...</auto-claimed>`，回到 LLM 工作轮。
 
 代码位置：[`autonomous_agent.py:29-78`](autonomous_agent.py:29)。
 
-当前自动分配策略是“扫描排序后的第一个可用任务”，没有公平调度、租约、抢占或失联超时回收。
+这一步没有中央调度器：teammate 仍是 pull 模型，但候选顺序固定（FIFO + 过期任务重试），
+认领在跨进程事务内完成；并发 teammate 不会同时拿到同一任务，也不会因一次竞争失败
+白等一个轮询周期。当前没有按 owner 负载或任务优先级加权。
+
+### 16.6 租约续期
+
+teammate 循环每一轮开始（含工具轮与空闲轮）调用 `_renew_task_lease()`：`wt_ctx`
+里记着当前持有任务的 id（claim 工具与 idle 自动认领都会写入，complete 清空），
+非空就调 `task_system.renew_lease(task_id, owner=name)` 把租约刷满 1 小时。
+续租被拒（任务被回收/已完成）或抛异常只打印告警，不打断工作；真正的保护在
+`complete_task` 的 owner 校验——被抢走的任务无法被旧持有者标记完成。
 
 ## 17. Worktree 隔离循环
 
@@ -776,34 +811,51 @@ seal()                                  # 记录每个文件写入后的 hash，
 
 ### 22.4 边界
 
-1. 只回滚 canonical messages 与被 `write`/`edit` 改过的文件；`bash`、MCP、外部进程的改动只提示不恢复。
+1. 回滚范围是 canonical messages + `write`/`edit` 的文件 + **bash/外部进程的文件改动**：
+   begin_turn 预存当时已脏文件的 pre-image（source='baseline'），seal 时从 git 基线补记
+   回合内的新建/修改/删除（source='git'，干净跟踪文件取 HEAD blob 作 pre-image）；
+   git 索引/暂存状态不回滚，敏感文件与超大文件仍只提示不覆盖。
 2. 记忆、cron、任务板、worktree、后台任务等副作用不回滚（报告里显式列出）。
 3. `.worktrees/`、`.cache/`、`.git/` 及敏感文件不抓 pre-image。
 4. 恢复默认要求目标文件与节点 seal 时的 hash 一致，否则整体中止（`--force` 才覆盖）。
 5. teammate / subagent 的写入会挂到主会话当前节点，但它们没有自己的 checkpoint 节点；
-   subagent 另有一份独立运行日志，teammate 目前没有。
+   两者各有一份独立运行日志，父会话归档/恢复/删除时随之移动或清理。
 
 ## 23. 重要实现边界
 
-1. 主 agent 有 canonical session event；subagent 写独立运行日志并在父会话留引用事件，
-   但子日志不参与主会话恢复；teammate 仍然没有独立事件日志。
+1. 主 agent 有 canonical session event；subagent/teammate 写独立运行日志并在父会话留
+   引用事件，子日志不参与主会话恢复，但会随父会话归档、恢复和删除。
 2. `resume_agent_loop()` 会按三类标注 pending tool，但仍不自动重放任何工具；即使是
    `read-only` 也只给建议，由模型决定是否再次调用。
 3. mailbox 已具备消息 id、claim/ack 与未确认重放；语义是 at-least-once，崩溃窗口内可能
    重复投递，不保证 exactly-once。
 4. 任务认领已使用 advisory 跨进程文件锁；只保护遵守 `task_transaction()` 的写入方，
    外部进程直接改 `task_*.json` 仍可绕过。
-5. teammate 自动认领采用第一个可用任务，没有公平分配策略。
-6. MCP 工具调用是同步等待异步桥结果，超时会转成普通工具错误；`mcp_call` 只记录
+5. 任务租约基于墙钟，默认 1 小时；teammate 每轮自动续租，但进程挂起或系统休眠期间
+   无法续租，超时后仍会被回收。回收后旧 owner 的 complete 会因 owner 不匹配被拒绝，
+   但它已经产生的文件改动不会被回滚。
+6. 自动认领是 FIFO + 过期租约重试，没有按 owner 负载或任务优先级加权；claim 事务是
+   跨进程的，但仍是 pull 模型。
+7. 归档只管理父会话引用到的子日志；父引用事件写失败或手工删除父日志后留下的孤儿
+   `subagents/`、`teammates/` 文件由启动维护回收（无引用且超过 30 天才删，父日志
+   读不出来时本轮整体放弃）。
+8. MCP 工具调用是同步等待异步桥结果，超时会转成普通工具错误；`mcp_call` 只记录
    server/工具/耗时/错误类型，不记录参数或返回内容。
-7. daemon 线程在进程退出时会被直接终止；cron 通过 `wait_for_cron_idle()` 延长主进程生命周期。
-8. 后台任务完成不会主动打断当前 LLM 调用，只能在后续工具轮被收集。
-9. `write_transcript()` 是快照，不应作为 session crash recovery 的唯一来源。
+9. daemon 线程在进程退出时会被直接终止；cron 通过 `wait_for_cron_idle()` 延长主进程生命周期。
+10. 后台任务完成不会主动打断当前 LLM 调用，只能在后续工具轮被收集。
+11. `write_transcript()` 是快照，不应作为 session crash recovery 的唯一来源。
 
 ## 24. 推荐的维护方向
 
 后续如果继续增强，优先级建议为：
 
-1. 将 teammate 的关键事件也接入独立运行日志（subagent 已完成）。
-2. 为自动认领加入 owner lease、超时回收和公平调度。
-3. 让 checkpoint 覆盖 `bash` 侧的文件改动（git 基线 → 可选精确回滚）。
+1. 按 teammate 负载/任务优先级调整自动认领顺序（续期已完成）。
+2. begin_turn 的基线捕获与 `_git_status` 各起一个 git 进程，可合并成一次调用省一半开销。
+
+启动维护（`harness.start_storage_maintenance()`，交互入口后台线程执行一次）已覆盖：
+升级前的明文 checkpoint 快照压缩迁移（校验一致才删明文，幂等）与孤儿子日志回收
+（`session_cleanup.purge_orphan_child_logs`，默认保留 30 天）。
+
+checkpoint 对 bash 改动的覆盖（§22.4）已完成：基线脏文件在 begin_turn 预存 pre-image，
+seal 时按 git 基线补记外部新建/修改/删除（HEAD blob 取基线内容），回滚、冲突检测与
+回合清单（非 Git 时的 fallback）免费获得同一份覆盖。

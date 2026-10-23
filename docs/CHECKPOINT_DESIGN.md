@@ -57,7 +57,7 @@
   state.json                  # {current_head: cp_xxx} 当前分支头
   <cp_id>/
     messages.jsonl.gz         # canonical messages 快照（gzip；旧节点仍可是 messages.jsonl）
-    meta.json                 # 节点元数据 + 每个文件的 exists / sha256 / 是否敏感
+    meta.json                 # 节点元数据 + 每个文件的 exists / sha256 / 是否敏感 / 来源（tool|baseline|git）
     files/
       <relpath>               # pre-image（原文件内容）；快照时不存在则只在 meta 里记 exists=false
 ```
@@ -304,15 +304,20 @@ class CheckpointManager:
 CLI 默认先输出计划（将覆盖 / 将删除 / 冲突 / 跳过），用户确认后才落盘。
 `restore(dry_run=...)` 与 `plan_restore()` 共用同一套计算逻辑，避免「预览和实际不一致」。
 
-### 8.5 bash 漂移提示（不做精确回滚）
+### 8.5 bash 改动的覆盖与剩余漂移
 
-turn 节点记录一次 `git status --porcelain` 与 `git rev-parse HEAD` 作为基线。回溯时：
+turn 节点在 begin_turn 时记录一次 git 基线（HEAD + `status --porcelain=v2 -z --untracked-files=all` 转成 v1 行）。bash / 外部进程的文件改动通过两条通道进入恢复范围：
 
-- 对比基线与当前 `git status`，列出**不在 checkpoint 文件清单里**但发生了变化的文件；
-- 这些文件标记为 `unrestorable`，在报告里显著提示「由 bash 或外部改动产生，未自动恢复」；
-- 不自动执行 `git checkout`（避免动用户的 working tree 与未跟踪文件）。
+- **基线脏文件（source='baseline'）**：begin_turn 时已经脏/未跟踪的文件，当场预存 pre-image。回合内 bash 继续改它们时，工具捕获覆盖不到，这条保证「回到节点开始时」能还原。
+- **基线外变化（source='git'）**：seal 时把当前状态与基线对比，工具没碰过的新增/修改/删除补一条 files 记录——干净跟踪文件从 HEAD blob 取 pre-image（= 节点开始内容），回合内新建的文件记 `exists=False`（回溯=删除），bash 删掉的跟踪文件记 post=''（回溯=重建）。
 
-这保证了能力的诚实边界：能恢复的说能恢复，不能恢复的明确列出来。
+恢复后剩余的漂移只剩不可自动处理的情形：
+
+- 敏感文件（只留元数据，恢复时跳过）与超大文件（unstorable）；
+- 读不到 HEAD blob 的极端情况（只标记，不做无依据恢复）；
+- git 索引 / 暂存区状态不恢复（`git mv` 的 staged 状态会残留，工作区文件内容正确）。
+
+`_drift_files` 仍会对比基线与当前状态，列出**不在 checkpoint 文件清单里**的变化作为提示；不自动执行 `git checkout`（避免动用户的 working tree 与未跟踪文件）。两侧状态同用 `_git_status`（-z + -uall）生成，保证行格式逐字可比，非ASCII 路径不会因转义差异产生假漂移。
 
 ### 8.6 不受回滚影响的副作用（必须显式告知用户）
 
@@ -326,7 +331,7 @@ turn 节点记录一次 `git status --porcelain` 与 `git rev-parse HEAD` 作为
 | 任务板          | `.cache/tasks/task_*.json`     | `create_task`/`claim_task`/`complete_task` 的结果不回滚 |
 | worktree        | `.worktrees/`、git 分支        | 已创建的 worktree/分支不回滚                            |
 | 后台任务        | 进程内 `background_results`    | 已启动的后台命令无法取消                                |
-| bash 的文件改动 | 工作区                         | 只提示，不恢复（§8.5）                                  |
+| bash 的文件改动 | 工作区                         | 已进入恢复范围（§8.5）；git 索引/暂存状态不回滚        |
 
 `/rewind` 的输出报告必须列出这些「不回滚项」的当前状态，避免用户误以为回到了完全干净的过去。
 这一条是二期实现的硬性验收点。
@@ -452,14 +457,15 @@ CHECKPOINT_MANAGER = None          # 活跃 manager；tools 的 write/edit 通�
 
 ## 12. 边界与已知限制
 
-1. `bash`、MCP 工具、外部进程产生的文件改动无法精确回滚，只做漂移提示（§8.5）。
+1. bash / 外部进程的文件改动已进入恢复范围（§8.5），但 git 索引/暂存区不回滚：`git mv` 等操作回滚后工作区文件内容正确，staged 状态会残留。
 2. 二进制文件按字节保存 pre-image，超大文件（默认 > 5 MB）只记录 hash 与路径，标记为不可恢复。
 3. 同一 `session_id` 的多进程并发写入未加跨进程锁；回溯依赖 `agent_lock` 在进程内串行化。
 4. subagent / teammate 的文件改动会被 pre-image 覆盖（同进程共享 manager），但它们不产生会话节点。
-5. 回滚是「恢复内容」，不恢复文件 mtime/权限位。
+5. 回滚是「恢复内容」，不恢复文件 mtime/权限位；CRLF 文件从 blob 恢复后行尾归一为 LF（git status 仍视为干净）。
 6. `index.jsonl` 与 `session_*.jsonl` 需成对保留；单独删除 `session_*.jsonl` 会使 rewind 事件失去引用。
 7. 记忆、cron、任务板、worktree、后台任务等副作用不回滚（§8.6），回滚后工作区并非「完全干净的过去」。
 8. 「前滚」依赖目标节点未被 GC；被回收的节点只能重新开始，不能跳回。
+9. blob 恢复依赖 HEAD 未变：节点存的是基线 HEAD 引用，基线提交被 rebase/清掉后外部改动记录退化为 unstorable。
 
 ## 13. 实施步骤与验收
 

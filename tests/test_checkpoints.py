@@ -1,10 +1,11 @@
 import gzip
+import hashlib
 import json
 import subprocess
 
 import pytest
 
-from checkpoints import CheckpointError, CheckpointManager
+from checkpoints import CheckpointError, CheckpointManager, migrate_legacy_checkpoints
 from session_store import SessionEventStore
 
 
@@ -55,6 +56,70 @@ def test_legacy_plain_snapshot_is_still_readable(ws):
 
     assert mgr.snapshot_path(cp_id).name == 'messages.jsonl'
     assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
+
+
+def test_migrate_legacy_checkpoints_compresses_plain_nodes(ws):
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('legacy'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    compressed = node / 'messages.jsonl.gz'
+    with gzip.open(compressed, 'rt', encoding='utf-8') as handle:
+        (node / 'messages.jsonl').write_text(handle.read(), encoding='utf-8')
+    compressed.unlink()
+
+    stats = migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints')
+
+    assert stats == {'migrated': 1, 'skipped': 0, 'failed': 0}
+    assert (node / 'messages.jsonl.gz').is_file()
+    assert not (node / 'messages.jsonl').exists()
+    assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
+    # 幂等：明文删净后重跑无事可做
+    assert migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints') == {
+        'migrated': 0, 'skipped': 0, 'failed': 0}
+
+
+def test_migrate_completes_interrupted_migration(ws):
+    """上次迁移写到一半（.gz 已写、明文未删）：内容一致就补删明文。"""
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('legacy'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    with gzip.open(node / 'messages.jsonl.gz', 'rt', encoding='utf-8') as handle:
+        (node / 'messages.jsonl').write_text(handle.read(), encoding='utf-8')
+
+    stats = migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints')
+
+    assert stats == {'migrated': 1, 'skipped': 0, 'failed': 0}
+    assert not (node / 'messages.jsonl').exists()
+    assert mgr.messages_snapshot(cp_id) == _msgs('legacy')
+
+
+def test_migrate_leaves_conflicting_pair_alone(ws):
+    """明文与 .gz 内容不一致：不删明文也不删 .gz，读路径优先用 .gz。"""
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('fine'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    (node / 'messages.jsonl').write_text(
+        json.dumps({'role': 'user', 'content': 'different'}) + '\n', encoding='utf-8')
+
+    stats = migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints')
+
+    assert stats == {'migrated': 0, 'skipped': 1, 'failed': 0}
+    assert (node / 'messages.jsonl').exists()
+    assert (node / 'messages.jsonl.gz').is_file()
+
+
+def test_migrate_keeps_corrupt_plain_snapshot_untouched(ws):
+    mgr = _mgr(ws)
+    cp_id = mgr.begin_turn(_msgs('fine'))
+    node = ws / '.cache' / 'checkpoints' / 'sid' / cp_id
+    (node / 'messages.jsonl').write_text('{broken', encoding='utf-8')
+    (node / 'messages.jsonl.gz').unlink()
+
+    stats = migrate_legacy_checkpoints(ws / '.cache' / 'checkpoints')
+
+    assert stats == {'migrated': 0, 'skipped': 0, 'failed': 1}
+    assert (node / 'messages.jsonl').read_text(encoding='utf-8') == '{broken'
+    assert not (node / 'messages.jsonl.gz').exists()
 
 
 def test_rewind_replays_compressed_snapshot(ws):
@@ -645,6 +710,295 @@ def test_clean_baseline_detects_new_external_change(ws):
 def test_unborn_repository_has_no_head(ws):
     _git_init(ws)
     assert _mgr(ws)._git_baseline()['head'] == ''
+
+
+def test_baseline_status_enumerates_untracked_files_individually(ws):
+    """-uall：未跟踪目录逐文件列出——折叠成 dir/ 会让基线键漏掉目录内文件。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    (ws / 'newdir').mkdir()
+    (ws / 'newdir' / 'one.txt').write_text('1', encoding='utf-8')
+
+    baseline = _mgr(ws)._git_baseline()
+    assert '?? newdir/one.txt' in baseline['status']
+    assert not any(line.endswith('newdir/') for line in baseline['status'])
+
+
+def test_baseline_keys_parse_rename_both_sides_and_quotes():
+    keys = CheckpointManager._status_keys([
+        '?? added.txt',
+        ' D old.txt',
+        'R  tracked.txt -> renamed.txt',
+        'M  "file name.txt"',
+        'C  src.txt -> copied.txt',
+    ])
+    assert keys == {'added.txt', 'old.txt', 'tracked.txt', 'renamed.txt',
+                    'file name.txt', 'src.txt', 'copied.txt'}
+
+
+# ---------- bash / 外部改动的快照覆盖（source='baseline' / 'git'） ----------
+
+
+def test_seal_captures_bash_created_file_for_delete(ws):
+    """回合内新建（bash）的文件：seal 补记录，回溯=删除。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'bash_new.txt').write_text('made by bash', encoding='utf-8')
+    meta = mgr.seal()
+
+    record = meta['files']['bash_new.txt']
+    assert record['exists'] is False
+    assert record['source'] == 'git'
+    assert record['post_sha256']
+
+    cp_id = mgr.head()
+    plan = mgr.plan_restore(cp_id)
+    action = next(e for e in plan['actions'] if e['path'] == 'bash_new.txt')
+    assert action['action'] == 'delete'
+    mgr.restore(cp_id)
+    assert not (ws / 'bash_new.txt').exists()
+
+
+def test_seal_captures_bash_modified_clean_tracked(ws):
+    """bash 改掉干净跟踪文件：pre-image 取 HEAD blob，回溯还原节点开始内容。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'a.txt').write_text('bash edit', encoding='utf-8')
+    mgr.seal()
+
+    cp_id = mgr.head()
+    record = mgr.get(cp_id)['files']['a.txt']
+    assert record['exists'] is True
+    assert record['source'] == 'git'
+    assert record['pre_sha256'] == hashlib.sha256(b'v1').hexdigest()
+
+    mgr.restore(cp_id)
+    assert (ws / 'a.txt').read_text(encoding='utf-8') == 'v1'
+
+
+def test_seal_recreates_bash_deleted_tracked_file(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'a.txt').unlink()
+    mgr.seal()
+
+    cp_id = mgr.head()
+    record = mgr.get(cp_id)['files']['a.txt']
+    assert record['exists'] is True
+    assert record['post_sha256'] == ''
+    assert record['source'] == 'git'
+
+    mgr.restore(cp_id)
+    assert (ws / 'a.txt').read_text(encoding='utf-8') == 'v1'
+
+
+def test_seal_covers_bash_rename_of_clean_tracked(ws):
+    """回合内 git mv：回溯后旧名按 HEAD 内容恢复、新名删除。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    _git_run(ws, 'mv', 'a.txt', 'b.txt')
+    mgr.seal()
+
+    mgr.restore(mgr.head())
+    assert (ws / 'a.txt').read_text(encoding='utf-8') == 'v1'
+    assert not (ws / 'b.txt').exists()
+
+
+def test_baseline_capture_restores_dirty_file_to_node_start(ws):
+    """begin 时已脏的文件：回合内又被 bash 改 → 回溯到节点开始时的脏内容。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    (ws / 'a.txt').write_text('dirty at begin', encoding='utf-8')   # 节点开始前已脏
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'a.txt').write_text('bash edit during turn', encoding='utf-8')
+    mgr.seal()
+
+    cp_id = mgr.head()
+    record = mgr.get(cp_id)['files']['a.txt']
+    assert record['source'] == 'baseline'
+    assert record['pre_sha256'] == hashlib.sha256(b'dirty at begin').hexdigest()
+
+    mgr.restore(cp_id)
+    assert (ws / 'a.txt').read_text(encoding='utf-8') == 'dirty at begin'
+
+
+def test_baseline_captures_untracked_file_content(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    (ws / 'scratch.txt').write_text('untracked v1', encoding='utf-8')   # 未跟踪
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'scratch.txt').write_text('untracked v2', encoding='utf-8')
+    mgr.seal()
+
+    mgr.restore(mgr.head())
+    assert (ws / 'scratch.txt').read_text(encoding='utf-8') == 'untracked v1'
+
+
+def test_sensitive_bash_created_file_keeps_metadata_only(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / '.env').write_text('SECRET=1', encoding='utf-8')
+    meta = mgr.seal()
+
+    record = meta['files']['.env']
+    assert record['sensitive'] is True
+    assert record['exists'] is False
+    assert not (mgr._node_dir(meta['cp_id']) / 'files' / '.env').exists()
+
+    plan = mgr.plan_restore(meta['cp_id'])
+    action = next(e for e in plan['actions'] if e['path'] == '.env')
+    assert action['action'] == 'skip'
+    mgr.restore(meta['cp_id'])
+    assert (ws / '.env').read_text(encoding='utf-8') == 'SECRET=1'   # 不动敏感文件
+
+
+def test_created_then_deleted_file_is_not_recorded(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'temp.txt').write_text('x', encoding='utf-8')
+    (ws / 'temp.txt').unlink()
+    meta = mgr.seal()
+
+    assert 'temp.txt' not in meta['files']
+
+
+def test_ignored_directory_changes_are_not_captured(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    cache = ws / '.cache' / 'scratch'
+    cache.mkdir(parents=True)
+    (cache / 'x.txt').write_text('x', encoding='utf-8')
+    meta = mgr.seal()
+
+    assert not any(key.startswith('.cache') for key in meta['files'])
+
+
+def test_unicode_path_is_captured_without_escaping(ws):
+    """-z 让中文文件名原样进基线键（v1 的 \\346 转义会生成坏键）。"""
+    _git_init(ws)
+    (ws / '文档.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / '文档.txt').write_text('bash edit', encoding='utf-8')
+    mgr.seal()
+
+    cp_id = mgr.head()
+    assert '文档.txt' in mgr.get(cp_id)['files']
+    mgr.restore(cp_id)
+    assert (ws / '文档.txt').read_text(encoding='utf-8') == 'v1'
+
+
+def test_plan_restore_reports_missing_pre_image(ws):
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    mgr.begin_turn(_msgs())
+    (ws / 'a.txt').write_text('bash edit', encoding='utf-8')
+    mgr.seal()
+    cp_id = mgr.head()
+    (mgr._node_dir(cp_id) / 'files' / 'a.txt').unlink()   # 模拟 pre-image 丢失
+
+    plan = mgr.plan_restore(cp_id)
+    action = next(e for e in plan['actions'] if e['path'] == 'a.txt')
+    assert action['action'] == 'skip'
+    assert action['reason'] == 'pre-image content missing'
+
+
+def test_baseline_records_do_not_pollute_last_undo(ws):
+    """基线脏文件本轮没动：索引 files 里不出现，last 仍指向真正改文件的节点。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+    (ws / 'a.txt').write_text('dirty', encoding='utf-8')   # 已脏但本节点不动它
+
+    mgr = _mgr(ws)
+    idle = mgr.begin_turn(_msgs('idle'))
+    mgr.seal()
+    assert mgr.get(idle)['files']['a.txt']['source'] == 'baseline'
+
+    mgr.begin_turn(_msgs('work'))
+    mgr.capture_pre_image(ws / 'a.txt')
+    (ws / 'a.txt').write_text('tool edit', encoding='utf-8')
+    mgr.seal()
+
+    rows = [row for row in mgr.list(limit=10)]
+    assert rows[0]['files'] == ['a.txt']   # 只有动过文件的节点带 files
+    assert rows[1]['files'] == []
+    assert mgr.resolve('last') == rows[0]['cp_id']
+
+
+def test_changed_files_since_covers_bash_changes(ws):
+    """Git 工作区：bash 的新建/修改/删除也进入回合改动清单。"""
+    _git_init(ws)
+    (ws / 'a.txt').write_text('v1', encoding='utf-8')
+    (ws / 'gone.txt').write_text('bye', encoding='utf-8')
+    _git_run(ws, 'add', '.')
+    _git_run(ws, 'commit', '-qm', 'init')
+
+    mgr = _mgr(ws)
+    start = mgr.begin_turn(_msgs())
+    mgr.seal()
+
+    mgr.begin_turn(_msgs())
+    (ws / 'a.txt').write_text('bash edit', encoding='utf-8')   # 改
+    (ws / 'new.txt').write_text('x', encoding='utf-8')         # 建
+    (ws / 'gone.txt').unlink()                                 # 删
+    mgr.seal()
+
+    assert mgr.changed_files_since(start) == {
+        'a.txt': 'M', 'new.txt': 'A', 'gone.txt': 'D'}
 
 
 def test_changed_files_since_reports_net_edits(ws):

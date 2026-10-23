@@ -1,8 +1,9 @@
 """自主 teammate 空闲行为：轮询收件箱（协议 + 普通消息）+ 自动认领任务系统的待办任务。"""
 import json
 import time
+from dataclasses import asdict
 
-from task_system import TASKS_DIR, can_start, claim_task, load_task
+from task_system import claim_next_task, claimable_tasks, load_task
 from team_protocols import handle_inbox_message
 from worktree import WORKTREES_DIR
 
@@ -11,13 +12,8 @@ IDLE_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob('task_*.json')):
-        task = json.loads(f.read_text()) # 读取任务 JSON 内容
-        if (task.get('status') == 'pending' and not task.get('owner')
-                and can_start(task['id'])): # 如果任务是待办状态且未被认领且可以开始
-            unclaimed.append(task)
-    return unclaimed
+    """兼容旧调用：可认领任务（pending 优先，含租约过期的 in_progress）。"""
+    return [asdict(task) for task in claimable_tasks()]
 
 
 def idle_poll(name: str, messages: list, role: str, wt_ctx: dict = None) -> str:
@@ -54,24 +50,21 @@ def idle_poll(name: str, messages: list, role: str, wt_ctx: dict = None) -> str:
             ack_inbox(name, inbox)
             return 'work'
 
-        # 自动认领任务系统里的待办任务
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task['id'], name)
-            if 'Claimed' in result:
-                if wt_ctx is not None:
-                    try:
-                        claimed = load_task(task['id'])
-                        wt_ctx['path'] = str(WORKTREES_DIR / claimed.worktree) if claimed.worktree else None
-                    except Exception:
-                        wt_ctx['path'] = None
-                messages.append({
-                    'role': 'user',
-                    'content': f"<auto-claimed>Task {task['id']}: {task['subject']}</auto-claimed>",
-                })
-                print(f"  \033[32m[idle] {name} auto-claimed: {task['subject']}\033[0m")
-                return 'work'
-            print(f"  \033[33m[idle] {name} claim failed: {result}\033[0m")
+        # 自动认领任务系统里的待办任务：pending 优先，回收过期租约
+        task = claim_next_task(name)
+        if task is not None:
+            if wt_ctx is not None:
+                try:
+                    claimed = load_task(task.id)
+                    wt_ctx['path'] = str(WORKTREES_DIR / claimed.worktree) if claimed.worktree else None
+                except Exception:
+                    wt_ctx['path'] = None
+                wt_ctx['task_id'] = task.id   # 记下持有任务，teammate 循环按轮续租
+            messages.append({
+                'role': 'user',
+                'content': f"<auto-claimed>Task {task.id}: {task.subject}</auto-claimed>",
+            })
+            print(f"  \033[32m[idle] {name} auto-claimed: {task.subject}\033[0m")
+            return 'work'
     print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
     return 'timeout'

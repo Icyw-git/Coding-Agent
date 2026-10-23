@@ -798,6 +798,35 @@ CHECKPOINT_IGNORE=['.cache','.git','.worktrees','.mailbox','__pycache__','.pytes
 CHECKPOINT_SECRETS=['.env','*.pem','*_rsa']
 _checkpoint_manager = ContextVar('checkpoint_manager', default=None)
 
+
+# ---------- 存储维护（启动后台执行一次，全部幂等）----------
+
+def start_storage_maintenance(emit=print) -> None:
+    """后台跑一轮存储维护：旧 checkpoint 快照压缩迁移 + 孤儿子日志回收。
+
+    迁移只碰升级前的明文 messages.jsonl（校验一致才删明文）；回收只删
+    无任何父会话引用且超过保留期的子日志。失败只打印，绝不影响会话。
+    """
+    def _run():
+        try:
+            from checkpoints import migrate_legacy_checkpoints
+            stats = migrate_legacy_checkpoints(CHECKPOINT_DIR, emit=emit)
+            if stats['migrated'] or stats['failed']:
+                emit(f"  [checkpoint] 旧快照迁移完成：压缩 {stats['migrated']}，"
+                     f"跳过 {stats['skipped']}，失败 {stats['failed']}")
+        except Exception as exc:
+            emit(f'  [checkpoint] 旧快照迁移异常：{exc}')
+        try:
+            from session_cleanup import purge_orphan_child_logs
+            deleted, failures = purge_orphan_child_logs(SESSIONS_DIR, emit=emit)
+            if deleted or failures:
+                extra = f'（{failures} 个删除失败）' if failures else ''
+                emit(f'  [cleanup] 已回收 {len(deleted)} 个孤儿子日志{extra}')
+        except Exception as exc:
+            emit(f'  [cleanup] 孤儿子日志回收异常：{exc}')
+
+    threading.Thread(target=_run, name='storage-maintenance', daemon=True).start()
+
 # ---------- 重试配置 ----------
 MAX_REACTIVE_RETRIES=3   # 逐次缩尾重试（keep/budget 见 agent_loop 的 attempts），仍超限才 raise
 

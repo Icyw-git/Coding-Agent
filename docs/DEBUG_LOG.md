@@ -3747,3 +3747,125 @@ seq 追加，失败路径校验错误记录后原样重抛，另覆盖记录器�
 先 ack；`tests/test_session_workspace.py` 校验 teammate 处理 shutdown 后确认。
 mailbox/teammate 相关定向 55 passed，Ruff 通过。全量回归 **1331 passed / 1 skipped**
 （symlink 在本机不可用），5 条 warning 仍来自飞书 SDK。
+
+## teammate 独立运行日志
+
+teammate 线程原先同样只把最终一句汇报送回 Lead，中间的工具调用和失败位置不落盘。
+`subagent_events.py` 抽出 `AgentRunRecorder`，新增 `TeammateRecorder`：
+
+- 每次 teammate 启动写 `.cache/sessions/teammates/session_teammate_<name>_<id>.jsonl`，
+  记录 system/user、inbox 注入、assistant 消息、tool 结果和图片附件；
+- 父会话只追加 `teammate_started` / `teammate_finished`，带 teammate 名、run id、role
+  和子日志相对路径；`/sessions` 仍看不到内部运行；
+- 父 store 在 Lead 线程显式传给 recorder，因为 teammate 线程不继承 checkpoint manager
+  的 ContextVar；父会话与子线程写同一 store 时依赖 `SessionEventStore` 的路径级锁；
+- 空闲期 `idle_poll()` 注入的 inbox/自动认领消息也一并写入子日志，回放时不会出现
+  “助手在回应一条日志里不存在的任务”；
+- 结束事件由 `finally` 保证恰好一次，状态 `completed` / `error` / `cancelled`，并统一
+  清理 `active_teammates`、投递最终汇报；记录失败只丢日志，不改变执行。
+
+新增 `tests/test_teammate_events.py`：成功路径校验父子日志、角色序列和任务内汇报；
+空闲期注入消息落盘；LLM 异常校验 error 字段后线程正常收尾；另覆盖无父会话与记录器构造失败。
+
+## 子代理/teammate 日志随父会话归档
+
+`SessionArchive` 现在按父会话的 `subagent_started` / `teammate_started` 事件收集 `log`
+引用：
+
+- 归档时依次移动 checkpoints、子日志、父日志；任一步失败按反序回滚，空目录一并清理；
+  被手工删掉的子日志直接跳过，不阻塞归档；
+- 恢复时校验归档目录、子目录和文件均非链接/重解析点，目标已存在则整体拒绝，绝不覆盖；
+- 永久删除把 `subagents/`、`teammates/` 加入允许集合，并拒绝其中的未知文件。
+
+子日志路径必须恰为 `subagents|teammates/session_*.jsonl`，解析后仍位于会话存储目录；
+引用越界直接拒绝归档。父日志中的相对路径在归档后仍然有效。
+
+新增 `tests/test_session_child_logs.py`：归档/恢复/删除、目标冲突、越界引用、子目录未知
+文件、手工删除的子日志和父日志移动失败后的回滚；原有 cleanup/delete/review 用例保持通过。
+
+## 任务租约与自动认领
+
+任务新增 `claimed_at`、`lease_expires`、`attempts`，默认租约 1 小时：
+
+- `claim_task()` 允许回收租约过期的 in_progress 任务，返回 `recovered expired lease`；
+  没有租约字段的旧任务视为失效，避免升级后任务永久卡住；
+- `complete_task(owner=...)` 在 owner 不匹配时拒绝，防止租约被回收后旧 teammate 误完成；
+- `claim_next_task()` 在事务内重扫候选：pending 按创建顺序优先，其次是过期任务
+  （按 attempts、claimed_at、id）；认领失败会继续尝试后续候选；
+- teammate 的 claim/complete handler 改为传自己的名字，不再全部记成 `agent`；
+  `idle_poll()` 使用 `claim_next_task()`，7 秒轮询内不再固定抢第一个任务。
+
+新增 `tests/test_task_system.py` 的租约回收、活跃租约保护、owner 校验和候选顺序用例，
+`tests/test_runtime_reliability.py` 覆盖 idle 自动认领写租约。claim_task 描述变化同步更新了
+`tests/test_tool_schemas.py` 的 schema 指纹。本轮三项（teammate 日志、子日志归档、任务租约）
+全量回归 **1348 passed / 1 skipped**（symlink 在本机不可用），5 条 warning 仍来自飞书 SDK，
+Ruff 通过。
+
+## 长任务租约续期
+
+固定 1 小时的租约对长任务不友好：teammate 正在干活，租约到期就被别人回收。
+新增 `task_system.renew_lease(task_id, owner, lease_seconds)`，teammate 循环每轮
+开始自动续租：
+
+- 续租在 `task_transaction()` 内校验状态与 owner，只刷新 `lease_expires`；
+  `claimed_at`/`attempts` 不动，过期任务的公平排序仍按首次认领时间；
+- `wt_ctx['task_id']` 由 claim 工具与 idle 自动认领写入、complete 清空；
+  `_renew_task_lease()` 每轮据此续租，失败或被拒（任务被抢走/已完成）只打印告警；
+- 真正的保护仍是 `complete_task` 的 owner 校验：被回收的任务无法被旧持有者标记完成。
+
+`tests/test_task_system.py` 覆盖续期扩展、历史字段不变、owner 拒绝与非进行中拒绝；
+`tests/test_teammate_events.py` 验证每轮循环续租一次；`tests/test_runtime_reliability.py`
+的 idle 认领用例补验 `wt_ctx['task_id']`。
+
+## 孤儿子日志回收
+
+`subagents/`、`teammates/` 里没被任何父会话引用的日志（父引用写失败、手工删父日志）
+会永久堆积。`session_cleanup` 新增扫描与清理：
+
+- `orphan_child_logs()` 读全部顶层父日志收集 `log` 引用；无引用且 mtime 超过保留期
+  （默认 30 天）才算孤儿——正在写入的运行日志 mtime 新，天然豁免；
+- 任何父日志读不出来（OSError）整轮放弃，宁可不删也不误删；归档目录不参与扫描；
+- `purge_orphan_child_logs()` 逐个删除，单个失败计数并继续；
+- `harness.start_storage_maintenance()` 在交互入口（entrypoint）起后台 daemon 线程
+  执行一次，有回收/迁移才打印一行。
+
+`tests/test_session_child_logs.py` 覆盖「只回收过期且无引用」「被引用的旧日志保留」
+「父日志不可读整体放弃」。
+
+## 旧 checkpoint 快照压缩迁移
+
+升级前的节点还是明文 `messages.jsonl`，新节点直接写 `.gz`。`checkpoints.py` 新增
+`migrate_legacy_checkpoints(base_dir)` 一次性补齐存量：
+
+- 先写 `.gz`，再解压回读与明文逐条比对，一致才删明文；任何失败保留明文并计 `failed`；
+- 崩溃中间态（`.gz` 已写、明文未删）视为中断的迁移：内容一致就补删明文（`migrated`），
+  不一致则不动（读路径本就优先 `.gz`）；
+- 明文删净后重跑零操作，天然幂等；损坏明文不会删除。
+
+迁移与孤儿回收共用 `start_storage_maintenance()`：交互启动后台线程各跑一次，
+不阻塞会话。`tests/test_checkpoints.py` 覆盖迁移、幂等、中断补完、冲突对保留与损坏
+保留；`tests/test_runtime_reliability.py` 端到端验证维护线程。
+
+## checkpoint 覆盖 bash 文件改动
+
+此前回滚只覆盖 `write`/`edit` 触过的文件，bash 造成的改动只有漂移提示。现在两条
+通道把 bash 改动纳入同一套 files 记录，恢复/冲突检测/回合清单免费获得覆盖：
+
+- **基线脏文件（source='baseline'）**：`_begin_turn` 解析已存的 git 基线状态行，
+  对当时已脏/未跟踪的文件预存 pre-image。同一节点内同一路径只记一次的规则
+  让工具捕获自然跳过这些键，pre-image 因此是「节点开始时」的状态。
+- **基线外变化（source='git'）**：`_seal` 把当前状态与基线对比，工具没碰过的
+  新建/修改/删除补记录——干净跟踪文件的 pre-image 从 HEAD blob 取（节点开始
+  内容），回合内新建记 `exists=False`（回溯=删除），bash 删掉的跟踪文件记
+  post=''（回溯=重建），建了又删净变化为零不记录，敏感文件照旧只留元数据。
+
+配套调整：`_git_status` 改用 `porcelain=v2 -z --untracked-files=all`（-z 关掉
+quotePath 转义，中文路径不再变成 `\346...` 坏键；-uall 让未跟踪目录逐文件进
+基线），`_git` 加 `--no-optional-locks` 与 UTF-8 解码；`_drift_files` 与基线同用
+一份转换，行格式逐字可比；`plan_restore` 新增「pre-image 内容丢失」诚实跳过；
+索引摘要里未变动的基线记录被过滤，`last`/`undo` 的「最近改文件节点」语义不受
+影响。
+
+`tests/test_checkpoints.py` 新增 14 例：bash 新建/修改/删除/重命名的回滚、基线
+脏文件还原到节点开始、未跟踪文件内容还原、敏感文件不动、`_status_keys` 解析、
+-uall 枚举、中文路径、pre-image 丢失报告与 last/undo 不被污染。

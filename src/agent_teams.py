@@ -11,7 +11,10 @@ from dotenv import load_dotenv
 
 from autonomous_agent import idle_poll
 from file_lock import exclusive_file_lock
-from task_system import load_task
+from subagent_events import TeammateRecorder
+from task_system import claim_task as claim_task_record
+from task_system import complete_task as complete_task_record
+from task_system import load_task, renew_lease
 from team_protocols import ProtocolState, handle_inbox_message, new_request_id, pending_requests
 from worktree import WORKTREES_DIR
 
@@ -266,7 +269,8 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
         'type': 'function',
         'function': {
             'name': 'claim_task',
-            'description': "Claim a pending task (switches cwd into its worktree if bound).",
+            'description': "Claim a pending or expired task "
+                           "(switches cwd into its worktree if bound).",
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -338,8 +342,9 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
     handlers['submit_plan'] = lambda plan: _teammate_submit_plan(agent_name, plan)
 
     def run_claim_task_t(task_id: str) -> str:
-        result = harness.tool_registry['claim_task'](task_id=task_id)
+        result = claim_task_record(task_id, owner=agent_name)
         if 'Claimed' in result:
+            wt_ctx['task_id'] = task_id   # 记下持有任务，循环里按轮续租
             try:
                 task = load_task(task_id)
                 wt_ctx['path'] = str(WORKTREES_DIR / task.worktree) if task.worktree else None
@@ -349,14 +354,32 @@ def _build_team_tools(agent_name: str, wt_ctx: dict = None): #构建团队成员
 
     def run_complete_task_t(task_id: str) -> str:
         """完成指定任务，清空当前 worktree 目录。返回完成结果。"""
-        result = harness.tool_registry['complete_task'](task_id=task_id)
+        result = complete_task_record(task_id, owner=agent_name)
         wt_ctx['path'] = None   # 完成任务 → 离开 worktree
+        wt_ctx['task_id'] = None
         return result
 
     handlers['list_tasks'] = harness.tool_registry['list_tasks']
     handlers['claim_task'] = run_claim_task_t
     handlers['complete_task'] = run_complete_task_t
     return tools, handlers
+
+
+def _renew_task_lease(name: str, wt_ctx: dict) -> None:
+    """持有任务期间每轮续租；失败只告警，不打断 teammate 工作。
+
+    租约固定 1 小时，长任务不续租会被其他 teammate 当过期回收；
+    任务被抢走后 renew 会报 owned by，下次 complete 也会被 owner 校验拦住。
+    """
+    task_id = wt_ctx.get('task_id') if wt_ctx else None
+    if not task_id:
+        return
+    try:
+        result = renew_lease(task_id, owner=name)
+        if 'Renewed' not in result:
+            print(f"  \033[33m[teammate] {name} lease: {result}\033[0m")
+    except Exception as exc:
+        print(f"  \033[33m[teammate] {name} lease renewal failed: {exc}\033[0m")
 
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团队成员线程，用于执行任务
@@ -371,111 +394,144 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
               f"Use tools to complete tasks. "
               f"Send results via send_message to 'lead'.")
 
+    recorder = TeammateRecorder(name, role, prompt)
+
     def run(): # 团队成员线程运行函数
         """团队成员线程运行函数，用于执行任务。"""
         messages = [
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': prompt},
         ]
-        wt_ctx = {'path': None}   # 当前任务 worktree 目录（认领任务后切换，完成任务清空）
-        sub_tools, sub_handlers = _build_team_tools(name, wt_ctx) # 构建团队成员工具集
-        skip_micro_rounds = 0
-        memories_content = harness.load_memories(messages)   # 记忆召回（只读，不提炼，避免污染全局记忆）
+        recorder.log_messages(messages)
         should_stop=False # 是否停止线程
-
-        while not should_stop:
-            # 收 inbox：先 claim，注入对话后再 ack。进程在两步之间退出时，
-            # 未确认消息留在邮箱里，重启后重放。
-            inbox = claim_inbox(name)
-
-            non_protocol = []
-            for msg in inbox:
-                result=handle_inbox_message(name, msg, messages)
-                if result=='shutdown': #收到主线程的shutdown指令，停止线程
-                    should_stop=True
-                    break
-                elif result=='awake':
-                    pass
-
-                else:
-                    non_protocol.append(msg)
-            if should_stop: #跳出循环
-                ack_inbox(name, inbox)
-                break
-            if non_protocol:
-                messages.append({
-                    'role': 'user',
-                    'content': f"<inbox>{json.dumps(non_protocol, ensure_ascii=False)}</inbox>",
-                })
-            ack_inbox(name, inbox)
-
-            # 与主循环同一套压缩预处理（budget → snip → micro → 超限 LLM 摘要）
-            messages, skip_micro_rounds = harness.pre_compact_messages(messages, skip_micro_rounds)
-            # 记忆注入：只往第一条 user 消息追加，副本不污染 messages；
-            # 图片引用在这里展开成 data URI（历史里始终是轻量引用）。
-            request_messages = harness.expand_image_parts(
-                harness.inject_memories(messages, memories_content))
-            try:
-                response = client.chat.completions.create(
-                    model=os.getenv('LLM_MODEL_ID'),
-                    messages=request_messages,
-                    temperature=0.7,
-                    tools=sub_tools,
-                    max_tokens=8000,
-                )
-            except Exception:
-                break
-            message = response.choices[0].message
-            # 保留 tool_calls：只存 content 会丢 tool_calls → 孤儿 tool 消息 → API 400
-            messages.append(message.model_dump())
-
-            if response.choices[0].finish_reason != "tool_calls":
-                # 空闲：自动认领任务 + 收 inbox；shutdown→退出；work→回 LLM turn
-                while not should_stop:
-                    status = idle_poll(name, messages, role, wt_ctx)
-                    if status == 'shutdown':
-                        should_stop = True
-                        break
-                    if status == 'work':
-                        break
-                    # 'timeout' → 保持存活，继续下一轮空闲轮询
-                continue   # 关键：跳过工具执行段（本轮的 response 没有 tool_calls）
-
-            results = []
-            attachments = []
-            for tool_call in message.tool_calls:
-                # 复用主循环执行路径：hooks=False（teammate 无人交互，判定下移到工具
-                # 边界，run_bash / run_write 会按无头路径审批）；
-                # background=False（teammate 本身已是后台线程，不再嵌套后台任务）
-                _, _, tm, images = harness.exec_tool_call(
-                    tool_call, registry=sub_handlers,
-                    hooks=False, background=False)
-                results.append(tm)
-                if images:
-                    attachments.append(harness.image_attachment_message(images))
-            # tool 结果必须连续，图片附件统一排在整批之后
-            messages.extend(results)   # extend：摊平成多条 tool 消息；append 会嵌套成一条
-            messages.extend(attachments)
-
-        # 取最近一条非空 assistant 文本作为最终汇报（content 可能是 str 或 content blocks）
+        status = 'completed'
+        error_type = ''
+        error = ''
         summary = "Done."
-        for msg in reversed(messages):
-            if msg.get('role') != 'assistant':
-                continue
-            content = msg.get('content')
-            if isinstance(content, list):
-                text = "".join(b.get('text', '') for b in content
-                               if isinstance(b, dict) and b.get('type') == 'text')
-            elif isinstance(content, str):
-                text = content
-            else:
-                continue
-            if text.strip():
-                summary = text
-                break
-        BUS.send(name, 'lead', summary, 'result')
-        active_teammates.pop(name, None)
-        print(f"  \033[32m[teammate] {name} finished\033[0m")
+
+        try:
+            wt_ctx = {'path': None}   # 当前任务 worktree 目录（认领任务后切换，完成任务清空）
+            sub_tools, sub_handlers = _build_team_tools(name, wt_ctx) # 构建团队成员工具集
+            skip_micro_rounds = 0
+            memories_content = harness.load_memories(messages)   # 记忆召回（只读，不提炼，避免污染全局记忆）
+
+            while not should_stop:
+                _renew_task_lease(name, wt_ctx)   # 长任务防过期回收
+                # 收 inbox：先 claim，注入对话后再 ack。进程在两步之间退出时，
+                # 未确认消息留在邮箱里，重启后重放。
+                inbox = claim_inbox(name)
+
+                before = len(messages)
+                non_protocol = []
+                for msg in inbox:
+                    result=handle_inbox_message(name, msg, messages)
+                    if result=='shutdown': #收到主线程的shutdown指令，停止线程
+                        should_stop=True
+                        break
+                    elif result=='awake':
+                        pass
+
+                    else:
+                        non_protocol.append(msg)
+                if should_stop: #跳出循环
+                    recorder.log_messages(messages[before:])
+                    ack_inbox(name, inbox)
+                    break
+                if non_protocol:
+                    messages.append({
+                        'role': 'user',
+                        'content': f"<inbox>{json.dumps(non_protocol, ensure_ascii=False)}</inbox>",
+                    })
+                ack_inbox(name, inbox)
+                recorder.log_messages(messages[before:])
+
+                # 与主循环同一套压缩预处理（budget → snip → micro → 超限 LLM 摘要）
+                messages, skip_micro_rounds = harness.pre_compact_messages(messages, skip_micro_rounds)
+                # 记忆注入：只往第一条 user 消息追加，副本不污染 messages；
+                # 图片引用在这里展开成 data URI（历史里始终是轻量引用）。
+                request_messages = harness.expand_image_parts(
+                    harness.inject_memories(messages, memories_content))
+                recorder.turns += 1
+                try:
+                    response = client.chat.completions.create(
+                        model=os.getenv('LLM_MODEL_ID'),
+                        messages=request_messages,
+                        temperature=0.7,
+                        tools=sub_tools,
+                        max_tokens=8000,
+                    )
+                except Exception as exc:
+                    status = 'error'
+                    error_type = type(exc).__name__
+                    error = str(exc)
+                    break
+                message = response.choices[0].message
+                # 保留 tool_calls：只存 content 会丢 tool_calls → 孤儿 tool 消息 → API 400
+                dumped = message.model_dump()
+                messages.append(dumped)
+                recorder.log_message(dumped)
+
+                if response.choices[0].finish_reason != "tool_calls":
+                    # 空闲：自动认领任务 + 收 inbox；shutdown→退出；work→回 LLM turn
+                    while not should_stop:
+                        before_idle = len(messages)
+                        idle_status = idle_poll(name, messages, role, wt_ctx)
+                        # 空闲期注入的 inbox/自动认领消息也要进子会话日志
+                        recorder.log_messages(messages[before_idle:])
+                        if idle_status == 'shutdown':
+                            should_stop = True
+                            break
+                        if idle_status == 'work':
+                            break
+                        # 'timeout' → 保持存活，继续下一轮空闲轮询
+                    continue   # 关键：跳过工具执行段（本轮的 response 没有 tool_calls）
+
+                results = []
+                attachments = []
+                for tool_call in message.tool_calls:
+                    # 复用主循环执行路径：hooks=False（teammate 无人交互，判定下移到工具
+                    # 边界，run_bash / run_write 会按无头路径审批）；
+                    # background=False（teammate 本身已是后台线程，不再嵌套后台任务）
+                    _, _, tm, images = harness.exec_tool_call(
+                        tool_call, registry=sub_handlers,
+                        hooks=False, background=False)
+                    results.append(tm)
+                    recorder.log_message(tm)
+                    if images:
+                        attachments.append(harness.image_attachment_message(images))
+                # tool 结果必须连续，图片附件统一排在整批之后
+                messages.extend(results)   # extend：摊平成多条 tool 消息；append 会嵌套成一条
+                messages.extend(attachments)
+                recorder.log_messages(attachments)
+
+            # 取最近一条非空 assistant 文本作为最终汇报（content 可能是 str 或 content blocks）
+            for msg in reversed(messages):
+                if msg.get('role') != 'assistant':
+                    continue
+                content = msg.get('content')
+                if isinstance(content, list):
+                    text = "".join(b.get('text', '') for b in content
+                                   if isinstance(b, dict) and b.get('type') == 'text')
+                elif isinstance(content, str):
+                    text = content
+                else:
+                    continue
+                if text.strip():
+                    summary = text
+                    break
+        except BaseException as exc:
+            status = 'cancelled' if isinstance(exc, KeyboardInterrupt) else 'error'
+            error_type = 'cancelled' if status == 'cancelled' else type(exc).__name__
+            error = str(exc)
+            raise
+        finally:
+            recorder.finish(status, result=summary, error_type=error_type, error=error)
+            try:
+                BUS.send(name, 'lead', summary, 'result')
+            except Exception as exc:
+                print(f"  \033[33m[teammate] {name} result delivery failed: {exc}\033[0m")
+            active_teammates.pop(name, None)
+            print(f"  \033[32m[teammate] {name} finished\033[0m")
 
     active_teammates[name] = True # 标记为活跃，等待主线程唤醒
     import hooks

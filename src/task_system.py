@@ -13,6 +13,7 @@ from file_lock import exclusive_file_lock
 # 任务持久化目录：与仓库 .cache 约定一致，保存时按需自动创建
 TASK_DIR = Path(__file__).resolve().parents[1] / '.cache' / 'tasks'
 TASKS_DIR = TASK_DIR
+DEFAULT_LEASE_SECONDS = 3600
 task_lock = threading.RLock()
 _transaction_state = threading.local()
 
@@ -51,6 +52,9 @@ class Task:
     owner:Optional[str] = None
     blockedBy:List[str] = field(default_factory=list)
     worktree:str = ''   # 关联的 git worktree 名（空 = 无隔离目录）
+    claimed_at:Optional[float] = None
+    lease_expires:Optional[float] = None
+    attempts:int = 0
 
 
 def random_hex(n:int):
@@ -81,10 +85,35 @@ def can_start(task_id:str): #判断任务是否可以开始
         return True
 
 
-def claim_task(task_id:str,owner:str='agent')->str: #认领任务，返回认领结果
+def lease_expired(task:Task, now:Optional[float]=None)->bool:
+    """in_progress 任务是否已超过租约；升级前没有租约的旧任务视为失效。"""
+    if task.status != 'in_progress':
+        return False
+    if task.lease_expires is None:
+        return True
+    return task.lease_expires <= (time.time() if now is None else now)
+
+
+def claimable_tasks(now:Optional[float]=None)->List[Task]:
+    """可认领任务：pending 按创建顺序在前，过期租约按认领时间排在后面。"""
+    current = time.time() if now is None else now
+    pending, expired = [], []
+    for task in list_tasks():
+        if task.status == 'pending':
+            if can_start(task.id):
+                pending.append(task)
+        elif task.status == 'in_progress' and lease_expired(task, current):
+            expired.append(task)
+    expired.sort(key=lambda task: (task.attempts or 0, task.claimed_at or 0, task.id))
+    return pending + expired
+
+
+def claim_task(task_id:str,owner:str='agent',
+               lease_seconds:float=DEFAULT_LEASE_SECONDS)->str: #认领任务，返回认领结果
     with task_transaction():
         task=load_task(task_id)
-        if task.status !='pending':
+        recovered = task.status == 'in_progress' and lease_expired(task)
+        if not recovered and task.status != 'pending':
             return f'Task {task_id} is {task.status},cannot claim '
         if not can_start(task_id):
             deps=[]
@@ -94,20 +123,53 @@ def claim_task(task_id:str,owner:str='agent')->str: #认领任务，返回认领
                 elif load_task(dep_id).status != 'completed':
                     deps.append(dep_id)
             return f'Blocked by:{deps}'
+        now = time.time()
         task.owner=owner
         task.status='in_progress'
+        task.claimed_at=now
+        task.lease_expires=now + max(0.0, float(lease_seconds))
+        task.attempts=(task.attempts or 0) + 1
         save_task(task)
-        return f'Claimed {task_id} ({task.subject})'
+        suffix = ' (recovered expired lease)' if recovered else ''
+        return f'Claimed {task_id} ({task.subject}){suffix}'
 
 
-def complete_task(task_id:str)->str: #完成任务，返回完成结果
+def claim_next_task(owner:str='agent',
+                    lease_seconds:float=DEFAULT_LEASE_SECONDS)->Optional[Task]:
+    """认领队列中的下一个任务；候选在事务内重读，抢不到时继续尝试后续。"""
+    with task_transaction():
+        for task in claimable_tasks():
+            result = claim_task(task.id, owner, lease_seconds)
+            if 'Claimed' in result:
+                return load_task(task.id)
+        return None
+
+
+def renew_lease(task_id:str,owner:str='agent',
+                lease_seconds:float=DEFAULT_LEASE_SECONDS)->str: #续期任务租约
+    """持有者每轮刷新租约，避免长任务超过 1 小时被其他 teammate 回收。"""
+    with task_transaction():
+        task=load_task(task_id)
+        if task.status != 'in_progress':
+            return f'Task {task_id} is {task.status}, nothing to renew'
+        if owner and task.owner and owner != task.owner:
+            return f'Task {task_id} is owned by {task.owner}, cannot renew'
+        task.lease_expires = time.time() + max(0.0, float(lease_seconds))
+        save_task(task)
+        return f'Renewed lease for {task_id} ({task.subject})'
+
+
+def complete_task(task_id:str, owner:Optional[str]=None)->str: #完成任务，返回完成结果
     with task_transaction():
         task=load_task(task_id)
         if task.status == 'completed':
             return f'Task {task_id} is already completed'
         if task.status != 'in_progress':
             return f'Task {task_id} is {task.status}, claim it before completing'
+        if owner and task.owner and owner != task.owner:
+            return f'Task {task_id} is owned by {task.owner}, cannot complete'
         task.status='completed'
+        task.lease_expires=None
         save_task(task)
         unblocked=[t.subject for t in list_tasks() if t.status=='pending' and t.blockedBy and can_start(t.id)]
         msg=f'Completed {task_id} ({task.subject})'

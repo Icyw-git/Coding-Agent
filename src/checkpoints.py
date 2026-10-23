@@ -4,6 +4,8 @@
 - 本模块只做文件逻辑，不 import harness（避免循环依赖）；可变配置（目录/忽略名单）由调用方传入。
 - 快照失败不得影响 write/edit 的正常落盘：capture_pre_image 内部吞掉异常并打印告警。
 - 恢复语义是「回到该节点开始时的状态」：文件侧按节点链逆序合成 pre-image（见 plan_restore）。
+- bash / 外部进程的文件改动也有覆盖：begin_turn 预存当时已脏文件的 pre-image
+  （source='baseline'），seal 时从 git 基线补记回合内的新建/修改/删除（source='git'）。
 """
 from __future__ import annotations
 
@@ -28,6 +30,25 @@ DEFAULT_SECRETS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx',
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MESSAGES_FILE = 'messages.jsonl'
 MESSAGES_GZIP_FILE = 'messages.jsonl.gz'
+
+
+def _split_rename_paths(value: str) -> tuple[str, str] | None:
+    """Split Git's ``old -> new`` display form outside quoted path names."""
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\' and quoted:
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        if not quoted and value.startswith(' -> ', index):
+            return value[:index].strip().strip('"'), value[index + 4:].strip().strip('"')
+    return None
 
 
 class CheckpointError(RuntimeError):
@@ -68,6 +89,70 @@ def checkpoint_counts(base_dir) -> dict[str, int]:
         manager = CheckpointManager(base_dir, entry, entry.name)
         counts[entry.name] = len(manager.list(limit=10_000))
     return counts
+
+
+def _read_plain_snapshot(path: Path) -> list:
+    """明文 JSONL 快照 → 消息列表；空行跳过，坏行抛 JSONDecodeError。"""
+    messages = []
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if line.strip():
+            messages.append(json.loads(line))
+    return messages
+
+
+def _read_gzip_snapshot(path: Path) -> list:
+    with gzip.open(path, 'rt', encoding='utf-8') as handle:
+        return [json.loads(line) for line
+                in handle.read().splitlines() if line.strip()]
+
+
+def migrate_legacy_checkpoints(base_dir, *, emit=print) -> dict:
+    """把升级前的明文 messages.jsonl 快照压缩成 .gz（一次性、幂等）。
+
+    每个节点先写 .gz，再解压回读与明文逐条比对，一致才删除明文；任何一步
+    失败都保留明文原样。新节点本就直接写 .gz，重跑只会得到 skipped。
+    """
+    stats = {'migrated': 0, 'skipped': 0, 'failed': 0}
+    base = Path(base_dir)
+    if not base.is_dir():
+        return stats
+    for plain in sorted(base.glob('*/*/messages.jsonl')):
+        compressed = plain.parent / MESSAGES_GZIP_FILE
+        if compressed.is_file():
+            # .gz 已存在：多半是上次迁移写到一半。内容一致就补删明文，
+            # 不一致（或明文损坏）则不动，读路径本就优先用 .gz。
+            try:
+                if _read_plain_snapshot(plain) == _read_gzip_snapshot(compressed):
+                    plain.unlink()
+                    stats['migrated'] += 1
+                else:
+                    stats['skipped'] += 1
+            except (OSError, json.JSONDecodeError, ValueError):
+                stats['skipped'] += 1
+            continue
+        try:
+            messages = _read_plain_snapshot(plain)
+        except (OSError, json.JSONDecodeError) as exc:
+            stats['failed'] += 1
+            emit(f'  [checkpoint] 损坏快照保持原样 {plain.parent.name}: {exc}')
+            continue
+        try:
+            _atomic_write(compressed, CheckpointManager._encode_messages(messages))
+            if _read_gzip_snapshot(compressed) != messages:
+                raise ValueError('压缩回读与明文不一致')
+        except Exception as exc:
+            compressed.unlink(missing_ok=True)
+            stats['failed'] += 1
+            emit(f'  [checkpoint] 迁移失败，明文保留 {plain.parent.name}: {exc}')
+            continue
+        try:
+            plain.unlink()
+        except OSError as exc:
+            stats['failed'] += 1
+            emit(f'  [checkpoint] 明文删除失败 {plain.parent.name}: {exc}')
+            continue
+        stats['migrated'] += 1
+    return stats
 
 
 def gc_all_checkpoints(base_dir, *, max_nodes: int = 20,
@@ -299,6 +384,7 @@ class CheckpointManager:
             'git': self._git_baseline(),
         }
         _atomic_write(node_dir / MESSAGES_GZIP_FILE, self._encode_messages(messages))
+        self._capture_baseline(node_dir, meta)
         self._write_meta(node_dir, meta)
         self._append_index(self._summary(meta))
         self._save_head(cp_id)
@@ -338,26 +424,177 @@ class CheckpointManager:
         node_dir = self._node_dir(self._active)
         meta = self.get(self._active)
         key = self._rel_key(path)
-        if key is None or key in meta['files'] or self._is_ignored(key):
+        if key is None:
             return
+        if self._capture_key(node_dir, meta, key):
+            self._write_meta(node_dir, meta)
+
+    def _capture_key(self, node_dir: Path, meta: dict, key: str,
+                     source: str = 'tool') -> bool:
+        """记录一个 workspace 相对键；返回是否写入记录。
+
+        pre-image 只在文件存在且非敏感/未超限时落盘。工具路径沿用「同一节点
+        同一路径只记一次」：节点开始时基线已抓过的文件，工具捕获自然跳过，
+        pre-image 因此是节点开始时的状态——对「回到该节点开始时」更准确。
+        """
+        if key in meta['files'] or self._is_ignored(key):
+            return False
+        path = self._abs_of(key)
+        if path.is_dir():
+            return False
         exists = path.is_file()
         record = {
             'path': key,
             'exists': exists,
             'pre_sha256': _sha256(path) if exists else '',
-            'sensitive': self._is_secret(path.name),
+            'sensitive': self._is_secret(Path(key).name),
+            'source': source,
         }
         if exists and not record['sensitive']:
             if path.stat().st_size > self.max_file_bytes:
                 record['unstorable'] = True
             else:
-                dest = node_dir / 'files' / key
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                tmp = dest.with_name(dest.name + f'.tmp{uuid.uuid4().hex[:6]}')
-                shutil.copyfile(path, tmp)
-                tmp.replace(dest)
+                self._store_pre_image(node_dir, key, path.read_bytes())
         meta['files'][key] = record
-        self._write_meta(node_dir, meta)
+        return True
+
+    def _store_pre_image(self, node_dir: Path, key: str, data: bytes) -> None:
+        dest = node_dir / 'files' / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + f'.tmp{uuid.uuid4().hex[:6]}')
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+
+    # ---------- bash / 外部改动的覆盖 ----------
+
+    @staticmethod
+    def _status_keys(lines) -> set[str]:
+        """v1 状态行 → workspace 相对键集合；重命名/复制两侧都算键。
+
+        源路径在节点开始时可能仍存在（copy）或已消失（rename），
+        `_capture_key` 按当时的真实状态记录，回溯语义各自成立。
+        """
+        keys = set()
+        for line in lines or []:
+            if len(line) < 4 or not line.strip():
+                continue
+            name = line[3:].strip()
+            if not name:
+                continue
+            if 'R' in line[:2] or 'C' in line[:2]:
+                pair = _split_rename_paths(name)
+                if pair is not None:
+                    keys.update(path for path in pair if path)
+                    continue
+            name = name.strip().strip('"')
+            if name:
+                keys.add(name)
+        return keys
+
+    def _capture_baseline(self, node_dir: Path, meta: dict) -> None:
+        """把 begin_turn 时已脏/未跟踪的文件预存 pre-image（source='baseline'）。
+
+        这些文件不是本节点改出来的，但「回到节点开始时」必须还原它们的
+        当时内容——bash 在回合里继续改它们时，工具捕获覆盖不到。
+        """
+        if not self.capture_files:
+            return
+        for key in sorted(self._status_keys((meta.get('git') or {}).get('status'))):
+            try:
+                self._capture_key(node_dir, meta, key, source='baseline')
+            except OSError as exc:
+                print(f"  \033[33m[checkpoint] baseline capture failed for {key}: {exc}\033[0m")
+
+    def _capture_external_changes(self, node_dir: Path, meta: dict) -> None:
+        """seal 时补记工具没碰过、但相对 git 基线有变化的文件（source='git'）。
+
+        覆盖 bash / IDE / 其他进程在回合内造成的改动：
+        - 干净跟踪文件被改：pre-image 从 HEAD blob 取（= 节点开始状态）；
+        - 回合内新建（HEAD 里没有）：exists=False，回溯=删除；
+        - bash 删掉的跟踪文件：pre-image 取 blob、post 置空，回溯=重建；
+        - 创建后又删除净变化为零，不记录；敏感文件照旧只留元数据。
+        """
+        if not self.capture_files:
+            return
+        head = (meta.get('git') or {}).get('head') or ''
+        if not head:
+            return   # 非 git 工作区 / unborn HEAD：没有基线可比
+        try:
+            baseline_keys = self._status_keys((meta.get('git') or {}).get('status'))
+            candidates = sorted(self._status_keys(self._git_status()[1]) - baseline_keys)
+        except Exception as exc:   # 外部捕获失败不影响 seal 本身
+            print(f"  \033[33m[checkpoint] external change scan failed: {exc}\033[0m")
+            return
+        if not candidates:
+            return
+        tracked = self._git_tracked(head)
+        captured = False
+        for key in candidates:
+            try:
+                if self._capture_external_key(node_dir, meta, key, head=head,
+                                              exists_now=self._abs_of(key).is_file(),
+                                              tracked=key in tracked):
+                    captured = True
+            except OSError as exc:
+                print(f"  \033[33m[checkpoint] external capture failed for {key}: {exc}\033[0m")
+        if captured:
+            self._write_meta(node_dir, meta)
+
+    def _capture_external_key(self, node_dir: Path, meta: dict, key: str, *,
+                              head: str, exists_now: bool, tracked: bool) -> bool:
+        if key in meta['files'] or self._is_ignored(key):
+            return False
+        path = self._abs_of(key)
+        if path.is_dir():
+            return False
+        record = {
+            'path': key,
+            # exists 语义是「节点开始时是否存在」：候选键都不在基线脏名单里，
+            # tracked ⇒ 基线干净存在（内容=HEAD blob）；未跟踪 ⇒ 回合内新建。
+            'exists': tracked,
+            'pre_sha256': '',
+            'post_sha256': _sha256(path) if exists_now else '',
+            'sensitive': self._is_secret(Path(key).name),
+            'source': 'git',
+        }
+        if not exists_now and not tracked:
+            return False   # 建了又删 / 竞态：净变化为零
+        if exists_now and not tracked:
+            # 回合内新建：节点开始时不存在，回溯应删除（敏感文件也只留元数据）
+            meta['files'][key] = record
+            return True
+        blob = self._git_blob(head, key)
+        if blob is None:
+            # 读不到基线内容：只标记 unstorable，不做无依据的恢复
+            record['unstorable'] = True
+            meta['files'][key] = record
+            return True
+        record['pre_sha256'] = hashlib.sha256(blob).hexdigest()
+        if not record['sensitive'] and len(blob) <= self.max_file_bytes:
+            self._store_pre_image(node_dir, key, blob)
+        elif len(blob) > self.max_file_bytes:
+            record['unstorable'] = True
+        meta['files'][key] = record
+        return True
+
+    def _git_tracked(self, head: str) -> set[str]:
+        """HEAD 提交跟踪的文件集合；-z 下路径不转义。失败返回空集。"""
+        if not head:
+            return set()
+        raw = self._git('ls-tree', '-r', '--name-only', '-z', head)
+        return {path for path in raw.split('\0') if path} if raw else set()
+
+    def _git_blob(self, head: str, key: str) -> bytes | None:
+        """HEAD 里该文件的原始字节；读不到（git 故障/竞态）返回 None。"""
+        with perf_segment('cp.git'):
+            try:
+                result = subprocess.run(
+                    ['git', '--no-optional-locks', 'cat-file', 'blob',
+                     f'{head}:{key}'], cwd=self.workspace,
+                    capture_output=True, timeout=15)
+                return result.stdout if result.returncode == 0 else None
+            except Exception:
+                return None
 
     def seal(self) -> dict | None:
         """结束当前节点：记录每个快照文件写入后的 hash，供冲突检测使用。"""
@@ -372,6 +609,7 @@ class CheckpointManager:
         meta = self.get(cp_id)
         for key, record in meta['files'].items():
             record['post_sha256'] = _sha256(self._abs_of(key))
+        self._capture_external_changes(node_dir, meta)
         meta['status'] = 'sealed'
         meta['sealed_at'] = time.time()
         self._write_meta(node_dir, meta)
@@ -379,6 +617,14 @@ class CheckpointManager:
         return meta
 
     def _summary(self, meta: dict) -> dict:
+        files = []
+        for key, record in (meta.get('files') or {}).items():
+            if record.get('source') == 'baseline' \
+                    and (record.get('pre_sha256') or '') == (record.get('post_sha256') or ''):
+                # 基线脏文件本轮没被改动：不进索引 files，避免污染 last/undo
+                # 的「最近有文件改动的节点」判定。seal 时 post 落定后重算。
+                continue
+            files.append(key)
         return {
             'cp_id': meta['cp_id'],
             'label': meta.get('label', ''),
@@ -389,15 +635,16 @@ class CheckpointManager:
             'parent_id': meta.get('parent_id'),
             'status': meta.get('status', 'open'),
             'created_at': meta.get('created_at', 0),
-            'files': sorted(meta.get('files', {}).keys()),
+            'files': sorted(files),
         }
 
     def changed_files_since(self, start_id: str | None) -> dict[str, str]:
         """start_id 之后（不含它）的节点里，净内容发生变化的文件。
 
         用于回合结束汇总，同时也是非 Git 工作区唯一能拿到改动清单的来源：
-        write/edit/apply_patch 的 pre-image 与 seal 后的 post hash 都在这里。
-        净变化为空的文件不会出现（写了又改回去）。
+        write/edit/apply_patch 的 pre-image 与 seal 后的 post hash 都在这里；
+        Git 工作区里 baseline（source='baseline'）与外部（source='git'）记录
+        让 bash 造成的改动也进入这份清单。净变化为空的文件不会出现。
         """
         if self._active:
             chain = self._chain_to_head(self._active)
@@ -474,29 +721,76 @@ class CheckpointManager:
     def _git(self, *args) -> str:
         with perf_segment('cp.git'):
             try:
-                result = subprocess.run(['git', *args], cwd=self.workspace,
-                                        capture_output=True, text=True, timeout=15)
+                # --no-optional-locks：status 可能刷新并写回 .git/index；快照是
+                # 只读观察者，不跟用户/其他进程抢索引锁。
+                result = subprocess.run(
+                    ['git', '--no-optional-locks', *args], cwd=self.workspace,
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=15)
                 return result.stdout.rstrip('\r\n')
             except Exception:
                 return ''
 
-    def _git_baseline(self) -> dict:
-        """一次 git 进程同时取 HEAD 与工作区状态（原先是两次进程调用）。
+    def _git_status(self) -> tuple[str, list[str]]:
+        """一次 git 进程取 HEAD 与工作区状态（porcelain v2 -z → v1 行）。
 
-        `status --porcelain=v2 --branch` 的头行给出 branch.oid（=HEAD），
-        条目行转回 v1 行格式（`XY <path>`）——`_drift_files` 的基线对比
-        依赖 v1 行结构（line[3:] 取路径），不能直接存 v2 原文。
-        非 git 目录/命令失败时维持原行为：head=''、status=[]。
+        -z 会关掉 quotePath 转义，unicode / 空格路径原样保留——v1 输出会把
+        非ASCII 路径转义成 `\\346...`，拿去做文件键会错位甚至误删；
+        `--untracked-files=all` 让未跟踪文件逐个列出（目录折叠会让基线
+        漏掉目录里的新文件）。输出行格式与旧版存储兼容：`XY <path>`、
+        重命名 `XY <orig> -> <path>`，含空格的路径由 _v1_path 统一加引号。
+        非 git 目录返回 ('', [])。
         """
         from workspace_diff import repo_root
 
         workspace = getattr(self, 'workspace', None)
         if workspace is not None and repo_root(workspace) is None:
             # 非 git 工作区：没必要为每轮快照起一个注定失败的 git 进程。
-            return {'head': '', 'status': []}
-        raw = self._git('status', '--porcelain=v2', '--branch')
+            return '', []
+        raw = self._git('status', '--porcelain=v2', '--branch', '-z',
+                        '--untracked-files=all')
+        # Keep compatibility with older Git builds, wrappers and callers/tests
+        # that return porcelain-v1 text despite the requested v2/-z format.
+        if raw and '\0' not in raw:
+            head = ''
+            status = []
+            for line in raw.splitlines():
+                if line.startswith('# branch.oid '):
+                    head = line[len('# branch.oid '):]
+                    if head == '(initial)':
+                        head = ''
+                    continue
+                if line.startswith(('#', '!')):
+                    continue
+                if line.startswith('2 ') and '\t' in line:
+                    fields = line.split(None, 9)
+                    if len(fields) == 10:
+                        destination, original = fields[9].split('\t', 1)
+                        code = fields[1].replace('.', ' ')
+                        status.append(
+                            f'{code} {_v1_path(original)} -> {_v1_path(destination)}')
+                    continue
+                if len(line) < 4:
+                    continue
+                code, name = line[:2], line[3:].strip()
+                if 'R' in code or 'C' in code:
+                    original, separator, destination = name.partition(' -> ')
+                    if separator:
+                        original = _v1_path(original.strip().strip('"'))
+                        destination = _v1_path(destination.strip().strip('"'))
+                        name = f'{original} -> {destination}'
+                else:
+                    name = _v1_path(name.strip().strip('"'))
+                status.append(f'{code} {name}')
+            return head, sorted(status)
         head, status = '', []
-        for line in raw.splitlines():
+        tokens = raw.split('\0')
+        index = 0
+        while index < len(tokens):
+            line = tokens[index]
+            index += 1
+            if not line:
+                continue
             if line.startswith('# branch.oid '):
                 head = line[len('# branch.oid '):]
                 if head == '(initial)':
@@ -510,16 +804,31 @@ class CheckpointManager:
                 if len(parts) == 9:
                     # v2 用 '.' 表示未变一侧，v1 用空格
                     status.append(f'{parts[1].replace(".", " ")} {_v1_path(parts[8])}')
-            elif line.startswith('2 '):   # 重命名：v2 用 <path>\t<origPath>
+            elif line.startswith('2 '):   # 重命名/复制
                 parts = line.split(None, 9)
-                if len(parts) == 10:
+                if len(parts) != 10:
+                    continue
+                if '\t' in parts[9]:   # 兜底：个别 git 未按 -z 拆分字段
                     path, original = parts[9].split('\t', 1)
-                    status.append(f'{parts[1].replace(".", " ")} {_v1_path(original)} -> {_v1_path(path)}')
+                else:
+                    # -z 下 origPath 是独立的 NUL 字段
+                    original = tokens[index] if index < len(tokens) else ''
+                    index += 1
+                    path = parts[9]
+                if original:
+                    status.append(f'{parts[1].replace(".", " ")} '
+                                  f'{_v1_path(original)} -> {_v1_path(path)}')
             elif line.startswith('u '):
                 parts = line.split(None, 10)
                 if len(parts) == 11:
                     status.append(f'{parts[1]} {_v1_path(parts[10])}')
-        return {'head': head, 'status': sorted(status)}
+        return head, sorted(status)
+
+    def _git_baseline(self) -> dict:
+        """v2 转回 v1 行格式——`_drift_files` 的基线对比与 `_status_keys`
+        都依赖 v1 行结构（line[3:] 取路径），不能直接存 v2 原文。"""
+        head, status = self._git_status()
+        return {'head': head, 'status': status}
 
     # ---------- 回溯 ----------
 
@@ -573,6 +882,11 @@ class CheckpointManager:
                 entry.update(action='skip', reason='file too large: content not stored')
             elif record['exists'] and record.get('pre_sha256') == current:
                 entry.update(action='noop', reason='already at checkpoint content')
+            elif (record['exists'] and record.get('pre_sha256')
+                  and not (self._node_dir(node_id) / 'files' / key).is_file()):
+                # 有 hash 但内容没了（节点目录被手删/损坏）：诚实跳过，
+                # 避免计划显示 restore、执行时才发现 pre-image 缺失。
+                entry.update(action='skip', reason='pre-image content missing')
             elif record['exists']:
                 entry.update(action='restore', reason='restore pre-image')
             elif current:
@@ -610,10 +924,16 @@ class CheckpointManager:
         }
 
     def _drift_files(self, meta: dict, touched: set) -> list[str]:
-        """bash / 外部改动导致、且不在 checkpoint 清单里的文件（只提示，不恢复）。"""
+        """bash / 外部改动导致、且不在 checkpoint 清单里的文件（只提示，不恢复）。
+
+        当前侧与基线同用 `_git_status`（v2 -z → v1 行 + -uall），保证
+        行格式逐字可比——旧实现用裸 `status --porcelain`，非ASCII 路径
+        会被转义成与基线不同的行，造成假 drift。
+        """
         baseline = set((meta.get('git') or {}).get('status') or [])
+        _, current = self._git_status()
         drift = []
-        for line in sorted(set(self._git('status', '--porcelain').splitlines()) - baseline):
+        for line in sorted(set(current) - baseline):
             name = line[3:]
             if 'R' in line[:2] or 'C' in line[:2]:
                 name = name.split(' -> ', 1)[-1]

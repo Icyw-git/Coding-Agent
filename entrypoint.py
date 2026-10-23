@@ -87,6 +87,7 @@ def main(argv=None) -> int:
         raise SystemExit(f'[config] {exc}') from exc
 
     harness.load_durable_jobs()
+    harness.start_storage_maintenance()
     # 后台预热 LLM 客户端（openai SDK import ~1.5s）：用户敲第一条消息时已就绪
     threading.Thread(target=harness.client.warmup, daemon=True).start()
     threading.Thread(target=harness.cron_scheduler_loop, daemon=True).start()

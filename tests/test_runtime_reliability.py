@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -162,6 +163,27 @@ def test_idle_poll_claims_and_acks_mailbox(tmp_path, monkeypatch):
                            for message in bus.claim_inbox('worker')])
 
 
+def test_idle_poll_auto_claims_task_with_lease(tmp_path, monkeypatch):
+    task_dir = tmp_path / 'tasks'
+    monkeypatch.setattr(task_system, 'TASK_DIR', task_dir)
+    monkeypatch.setattr(task_system, 'TASKS_DIR', task_dir)
+    monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path / 'mailbox')
+    monkeypatch.setattr(autonomous_agent, 'IDLE_POLL_INTERVAL', 1)
+    monkeypatch.setattr(autonomous_agent, 'IDLE_TIMEOUT', 1)
+    monkeypatch.setattr(autonomous_agent.time, 'sleep', lambda seconds: None)
+    task = task_system.create_task('auto work')
+    messages = []
+    wt_ctx = {}
+
+    assert autonomous_agent.idle_poll('worker', messages, 'tester', wt_ctx) == 'work'
+
+    loaded = task_system.load_task(task.id)
+    assert loaded.status == 'in_progress' and loaded.owner == 'worker'
+    assert loaded.lease_expires > time.time()
+    assert f"Task {task.id}" in messages[-1]['content']
+    assert wt_ctx['task_id'] == task.id   # teammate 循环据此按轮续租
+
+
 def test_idle_poll_acks_shutdown_before_returning(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_teams, 'MAILBOX_DIR', tmp_path)
     monkeypatch.setattr(autonomous_agent, 'IDLE_POLL_INTERVAL', 1)
@@ -177,6 +199,38 @@ def test_idle_poll_acks_shutdown_before_returning(tmp_path, monkeypatch):
     replies = bus.replay_unacked('lead')
     assert [message['type'] for message in replies] == ['shutdown_response']
     bus.ack('lead', [message['id'] for message in replies])
+
+
+def test_storage_maintenance_migrates_and_reclaims(tmp_path, monkeypatch):
+    """启动维护：旧快照压缩迁移 + 孤儿子日志回收，在后台线程各跑一次。"""
+    checkpoint_dir = tmp_path / 'checkpoints'
+    sessions_dir = tmp_path / 'sessions'
+    node = checkpoint_dir / 'sid' / 'cp1'
+    node.mkdir(parents=True)
+    plain = node / 'messages.jsonl'
+    plain.write_text(json.dumps({'role': 'user', 'content': 'old'}) + '\n',
+                     encoding='utf-8')
+    orphan_dir = sessions_dir / 'teammates'
+    orphan_dir.mkdir(parents=True)
+    orphan = orphan_dir / 'session_teammate_lost.jsonl'
+    orphan.write_text('{"type": "teammate_started"}\n', encoding='utf-8')
+    old = time.time() - 40 * 86400
+    os.utime(orphan, (old, old))
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', checkpoint_dir)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions_dir)
+    lines = []
+
+    harness.start_storage_maintenance(emit=lines.append)
+    for thread in threading.enumerate():
+        if thread.name == 'storage-maintenance':
+            thread.join(5)
+            assert not thread.is_alive()
+
+    assert (node / 'messages.jsonl.gz').is_file()
+    assert not plain.exists()
+    assert not orphan.exists()
+    assert any('旧快照迁移完成' in line for line in lines)
+    assert any('孤儿子日志' in line for line in lines)
 
 
 def test_message_bus_rejects_path_traversal_agent_names(tmp_path, monkeypatch):

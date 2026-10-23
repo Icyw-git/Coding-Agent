@@ -276,8 +276,9 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'required': ['task_id']}}},
  {'type': 'function',
   'function': {'name': 'claim_task',
-               'description': 'Claim a pending task (set to in_progress). Fails if its '
-                              'dependencies are not completed.',
+               'description': 'Claim a pending task or recover an expired in-progress lease '
+                              '(sets a one-hour lease). Fails if dependencies are not completed '
+                              "or another owner's lease is still active.",
                'parameters': {'type': 'object',
                               'properties': {'task_id': {'type': 'string',
                                                          'description': 'Task id to claim'}},

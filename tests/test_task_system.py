@@ -4,6 +4,8 @@ Run with:
     python -m pytest test_task_system.py -v
 """
 
+import time
+
 import pytest
 
 import task_system
@@ -80,6 +82,88 @@ def test_claim_completed_task_is_rejected(isolated_tasks):
     result = task_system.claim_task(task.id, owner="alice")
     assert "cannot claim" in result
     assert task_system.load_task(task.id).status == "completed"
+
+
+def test_expired_lease_can_be_recovered(isolated_tasks):
+    task = task_system.create_task("Recover me")
+    task_system.claim_task(task.id, owner="alice", lease_seconds=60)
+    active = task_system.load_task(task.id)
+    active.lease_expires = time.time() - 1
+    task_system.save_task(active)
+
+    result = task_system.claim_task(task.id, owner="bob")
+
+    assert "Claimed" in result and "recovered" in result
+    loaded = task_system.load_task(task.id)
+    assert loaded.owner == "bob"
+    assert loaded.status == "in_progress"
+    assert loaded.attempts == 2
+    assert loaded.lease_expires > time.time()
+
+
+def test_active_lease_blocks_another_owner(isolated_tasks):
+    task = task_system.create_task("Busy")
+    task_system.claim_task(task.id, owner="alice", lease_seconds=3600)
+
+    result = task_system.claim_task(task.id, owner="bob")
+
+    assert "cannot claim" in result
+    assert task_system.load_task(task.id).owner == "alice"
+
+
+def test_complete_task_rejects_wrong_owner(isolated_tasks):
+    task = task_system.create_task("Owned")
+    task_system.claim_task(task.id, owner="alice", lease_seconds=3600)
+
+    result = task_system.complete_task(task.id, owner="bob")
+
+    assert "owned by alice" in result
+    assert task_system.load_task(task.id).status == "in_progress"
+    assert "Completed" in task_system.complete_task(task.id, owner="alice")
+
+
+def test_claim_next_task_prefers_pending_then_expired(isolated_tasks):
+    first = task_system.create_task("Old task")
+    second = task_system.create_task("New task")
+    task_system.claim_task(first.id, owner="alice", lease_seconds=0)
+
+    claimed = task_system.claim_next_task("bob")
+
+    assert claimed.id == second.id
+    recovered = task_system.claim_next_task("carol")
+    assert recovered.id == first.id
+    assert recovered.owner == "carol"
+    assert recovered.attempts == 2
+    assert task_system.claim_next_task("dave") is None
+
+
+def test_renew_lease_extends_expiry_and_keeps_history(isolated_tasks):
+    task = task_system.create_task("Long running")
+    task_system.claim_task(task.id, owner="alice", lease_seconds=10)
+    before = task_system.load_task(task.id)
+
+    result = task_system.renew_lease(task.id, owner="alice", lease_seconds=3600)
+
+    assert "Renewed" in result
+    renewed = task_system.load_task(task.id)
+    assert renewed.lease_expires > before.lease_expires
+    assert renewed.attempts == before.attempts
+    assert renewed.claimed_at == before.claimed_at
+    assert renewed.owner == "alice"
+
+
+def test_renew_lease_rejects_wrong_owner_and_inactive_tasks(isolated_tasks):
+    task = task_system.create_task("Mine")
+    task_system.claim_task(task.id, owner="alice")
+    original = task_system.load_task(task.id).lease_expires
+
+    assert "owned by alice" in task_system.renew_lease(task.id, owner="bob")
+    assert task_system.load_task(task.id).lease_expires == original
+
+    pending = task_system.create_task("Pending")
+    assert "is pending" in task_system.renew_lease(pending.id, owner="alice")
+    task_system.complete_task(task.id, owner="alice")
+    assert "is completed" in task_system.renew_lease(task.id, owner="alice")
 
 
 def test_claim_blocked_task_is_rejected(isolated_tasks):
