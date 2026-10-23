@@ -1170,15 +1170,9 @@ def _batch_bash_commands(tool_calls):
 
 
 def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
-    """执行一批 tool_call：全部无副作用时并行，任一可变则整批串行兜底。
-
-    无副作用 = 只读白名单工具，或整批 bash 且每条命令都落在只读命令白名单
-    （git status / ls / cat…，无重定向、无解释器、无外发 —— 判据与策略层
-    read-only 档同源，exec_policy.is_readonly_command）。write/edit 不并行：
-    同文件冲突与 checkpoint 前像顺序不值得冒，Codex 也串行。
-    started 事件与结果**始终按模型给定的原序**写回 store —— append-only
-    回放要求 tool 结果顺序与 assistant.tool_calls 对齐，乱序会产生孤儿。
-    线程内用 copy_context 传播 checkpoint/perf 的 ContextVar。"""
+    """执行工具批次，并记录不含工具内容的批次与单工具耗时。"""
+    profile_started = time.perf_counter()
+    tool_timings = {}
     parallel = (len(tool_calls) > 1
                 and all(tc.function.name in PARALLEL_SAFE_TOOLS for tc in tool_calls))
     if not parallel and len(tool_calls) > 1:
@@ -1191,9 +1185,12 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
             session_store.append_tool_started(tool_call)   # 原序登记全部 started
 
         def run_parallel(tc):
-            return contextvars.copy_context().run(
+            started = time.perf_counter()
+            result = contextvars.copy_context().run(
                 exec_tool_call, tc, on_event=on_event,
                 on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
+            tool_timings[tc.id] = round((time.perf_counter() - started) * 1000, 3)
+            return result
 
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
@@ -1206,9 +1203,12 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
         executed = []
         for tool_call in tool_calls:
             session_store.append_tool_started(tool_call)
+            started = time.perf_counter()
             executed.append(exec_tool_call(
                 tool_call, on_event=on_event,
                 on_activity=_print_tool_activity))
+            tool_timings[tool_call.id] = round(
+                (time.perf_counter() - started) * 1000, 3)
     for _, _, tool_message, _images in executed:   # 原序写回结果
         tool_messages.append(tool_message)
         session_store.append_message(tool_message)
@@ -1219,6 +1219,11 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
             attachment = image_attachment_message(images)
             tool_messages.append(attachment)
             session_store.append_message(attachment)
+    session_store.append('tool_profile', duration_ms=round(
+        (time.perf_counter() - profile_started) * 1000, 3),
+        parallel=parallel, tool_count=len(tool_calls),
+        tools=[{'name': tc.function.name,
+                'duration_ms': tool_timings.get(tc.id)} for tc in tool_calls])
 
 def _record_compaction(session_store, compacted_messages, strategy):
     summary = next(
@@ -1951,6 +1956,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                       for m in messages]
 
 
+        round_started = time.perf_counter()
         messages, skip_micro_rounds = pre_compact_messages(
             messages, skip_micro_rounds,
             on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
@@ -1983,6 +1989,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
         request_messages = expand_image_parts(
             inject_memories(messages, memories_content, system))
+        prepare_ms = round((time.perf_counter() - round_started) * 1000, 3)
+        prompt_message_count = len(request_messages)
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
         _report_cache_prefix(
             session_store.session_id, messages,
@@ -1990,10 +1998,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             system=system)
 
         request_started = time.monotonic()
+        profile_timing = {'prepare_ms': prepare_ms}
         stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
         ui_emit('activity', state='thinking', detail='Requesting model response')
 
-        def _create(): #创建模型回复函数
+        def _create(profile_timing=profile_timing): #创建模型回复函数
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
@@ -2007,7 +2016,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             if on_delta is None and not streaming_enabled():
                 return client.chat.completions.create(**kwargs)
 
-            def _delta_hook(part, probe=stream_probe, hook=on_delta):  # noqa: B023
+            _probe = stream_probe  # noqa: B023
+            def _delta_hook(part, probe=_probe, hook=on_delta,
+                            timing=profile_timing, started=request_started):  # noqa: B023
+                if 'ttfb_ms' not in timing:
+                    timing['ttfb_ms'] = round((time.monotonic() - started) * 1000, 3)
                 if turn_control.cancel_requested():
                     raise KeyboardInterrupt
                 if not probe['started']:
@@ -2019,7 +2032,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     hook(part)
 
             streamed_parts.clear()   # 标记只反映最近一次调用
-            return _stream_completion(kwargs, _delta_hook)
+            stream_started = time.monotonic()
+            response = _stream_completion(kwargs, _delta_hook)
+            profile_timing['stream_ms'] = round(
+                (time.monotonic() - stream_started) * 1000, 3)
+            return response
 
         try: #错误恢复逻辑
             with perf_segment('llm.main'):
@@ -2033,6 +2050,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 detail['system_fp'] = hashlib.sha1(
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
                 detail['tools_fp'] = _tools_fingerprint()
+                detail.update(profile_timing)
+                detail['request_ms'] = round((time.monotonic() - request_started) * 1000, 3)
+                detail.setdefault('ttfb_ms', None)
+                detail['prompt_message_count'] = prompt_message_count
                 turn_tokens += detail['total']
                 for _k in ('prompt','completion','cached','total','reasoning'):
                     turn_usage[_k] += detail[_k]
