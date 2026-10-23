@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import statistics
 import sys
@@ -29,10 +30,18 @@ def summarize(paths: list[Path]) -> dict:
     prompt = sum(int(row.get('prompt', 0) or 0) for row in usage_rows)
     cached = sum(int(row.get('cached', 0) or 0) for row in usage_rows)
     timings = {}
-    for field in ('prepare_ms', 'request_ms', 'ttfb_ms', 'stream_ms'):
+    for field in ('memory_load_ms', 'compact_ms', 'prompt_assembly_ms',
+                  'prepare_ms', 'request_ms', 'ttfb_ms', 'stream_ms'):
         values = [float(row[field]) for row in usage_rows if row.get(field) is not None]
         timings[field] = {'count': len(values), 'p50': statistics.median(values) if values else None,
                           'p95': percentile(values, .95)}
+    prefix_status = collections.Counter(
+        row.get('cache_prefix_status') for row in usage_rows
+        if row.get('cache_prefix_status'))
+    low_hit_by_prefix = collections.Counter(
+        row.get('cache_prefix_status') for row in usage_rows
+        if row.get('cache_prefix_status') and int(row.get('prompt', 0) or 0) > 0
+        and int(row.get('cached', 0) or 0) / int(row['prompt']) < .5)
     return {
         'sessions': len(paths), 'model_calls': len(usage_rows),
         'profiled_calls': sum('request_ms' in row for row in usage_rows),
@@ -42,6 +51,9 @@ def summarize(paths: list[Path]) -> dict:
             1 for row in usage_rows if int(row.get('prompt', 0) or 0) > 0
             and int(row.get('cached', 0) or 0) / int(row['prompt']) < .5),
         'timings_ms': timings,
+        'cache_prefix_status': dict(prefix_status),
+        'low_hit_by_prefix_status': dict(low_hit_by_prefix),
+        'cache_prefix_diagnostic_calls': sum(prefix_status.values()),
         'tool_batches': len(tool_rows),
         'tool_batch_ms': {
             'p50': statistics.median([float(row['duration_ms']) for row in tool_rows]) if tool_rows else None,

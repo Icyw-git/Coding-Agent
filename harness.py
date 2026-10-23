@@ -833,19 +833,31 @@ def _report_cache_prefix(session_id: str, request_messages: list,
     if len(_LAST_REQUESTS) > _CACHE_DEBUG_SESSIONS:
         _LAST_REQUESTS.pop(next(iter(_LAST_REQUESTS)))
     if previous is None:
-        return
+        return {'cache_prefix_status': 'first',
+                'cache_prefix_index': None,
+                'cache_prefix_previous_messages': 0,
+                'cache_prefix_current_messages': len(current)}
     previous_fingerprints, previous_heads = previous
     index = first_cache_divergence(previous_fingerprints, current)
-    if index >= len(previous_fingerprints):
-        return
-    # 当前请求更短（历史被压缩/截断）时，断裂点可能落在末尾之外。
-    truncated = index >= len(current)
+    previous_len = len(previous_fingerprints)
+    current_len = len(current)
+    if index == previous_len == current_len:
+        return {'cache_prefix_status': 'unchanged',
+                'cache_prefix_index': index,
+                'cache_prefix_previous_messages': previous_len,
+                'cache_prefix_current_messages': current_len}
+    if index == previous_len:
+        return {'cache_prefix_status': 'appended',
+                'cache_prefix_index': index,
+                'cache_prefix_previous_messages': previous_len,
+                'cache_prefix_current_messages': current_len}
+    truncated = index >= current_len
     record = {
         'ts': time.time(),
         'session_id': session_id,
         'index': index,
-        'previous_len': len(previous_fingerprints),
-        'current_len': len(current),
+        'previous_len': previous_len,
+        'current_len': current_len,
         'truncated': truncated,
         'system_chars': len(system),
         'system_fingerprint': hashlib.sha1(
@@ -865,6 +877,10 @@ def _report_cache_prefix(session_id: str, request_messages: list,
             handle.write(json.dumps(record, ensure_ascii=False) + '\n')
     except OSError:
         pass
+    return {'cache_prefix_status': 'truncated' if truncated else 'rewritten',
+            'cache_prefix_index': index,
+            'cache_prefix_previous_messages': previous_len,
+            'cache_prefix_current_messages': current_len}
 
 
 # 子代理与技能工具在这里接入统一注册表。
@@ -1913,8 +1929,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
+    memory_load_started = time.perf_counter()
     with perf_segment('mem.load'):
         memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
+    memory_load_ms = round((time.perf_counter() - memory_load_started) * 1000, 3)
+    memory_profile_pending = True
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
     restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
@@ -1956,7 +1975,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                       for m in messages]
 
 
-        round_started = time.perf_counter()
+        compact_started = time.perf_counter()
         messages, skip_micro_rounds = pre_compact_messages(
             messages, skip_micro_rounds,
             on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
@@ -1964,6 +1983,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             size=ctx_tokens,
             snip_state=snip_state,
         ) #压缩预处理流程（判据优先用真实用量，见 pre_compact_messages）
+        compact_ms = round((time.perf_counter() - compact_started) * 1000, 3)
 
         if rounds_since_todo >=8 and messages:
             reminder = {
@@ -1987,18 +2007,24 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
         # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，
         # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
+        prompt_assembly_started = time.perf_counter()
         request_messages = expand_image_parts(
             inject_memories(messages, memories_content, system))
-        prepare_ms = round((time.perf_counter() - round_started) * 1000, 3)
+        prompt_assembly_ms = round(
+            (time.perf_counter() - prompt_assembly_started) * 1000, 3)
         prompt_message_count = len(request_messages)
+        prepare_ms = compact_ms + prompt_assembly_ms
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
-        _report_cache_prefix(
+        cache_prefix_profile = _report_cache_prefix(
             session_store.session_id, messages,
             recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '',
-            system=system)
+            system=system) or {}
 
         request_started = time.monotonic()
-        profile_timing = {'prepare_ms': prepare_ms}
+        profile_timing = {'prepare_ms': prepare_ms,
+                          'compact_ms': compact_ms,
+                          'prompt_assembly_ms': prompt_assembly_ms,
+                          **cache_prefix_profile}
         stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
         ui_emit('activity', state='thinking', detail='Requesting model response')
 
@@ -2051,6 +2077,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
                 detail['tools_fp'] = _tools_fingerprint()
                 detail.update(profile_timing)
+                if memory_profile_pending:
+                    detail['memory_load_ms'] = memory_load_ms
+                    memory_profile_pending = False
                 detail['request_ms'] = round((time.monotonic() - request_started) * 1000, 3)
                 detail.setdefault('ttfb_ms', None)
                 detail['prompt_message_count'] = prompt_message_count
