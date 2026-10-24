@@ -2,9 +2,9 @@
 
 边界与取舍：
 - PDF 只解析文本层，依赖 pypdf；不做 OCR。扫描件会明确提示，而不是返回空文本。
-- OOXML 解析在 document_formats.py：本质是 zip + XML，用标准库即可，不引入
-  python-docx、python-pptx、openpyxl 这类重量依赖；表格/幻灯片/工作表边界
-  保留为纯文本。
+- OOXML 解析经 document_formats 门面分发到 document_docx/pptx/xlsx：本质是
+  zip + XML，用标准库即可，不引入 python-docx、python-pptx、openpyxl 这类
+  重量依赖；表格/幻灯片/工作表边界保留为纯文本。
 - 输出有字符预算；读取方（工具层）还会做入口截断与落盘，两层职责不混。
 - 所有 zip 成员读取都设上限，避免文档炸弹把内存/上下文撑爆。
 """

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-import document_formats
+import document_ooxml
 import documents
 import exec_policy
 import harness
@@ -262,9 +262,9 @@ def test_legacy_office_binary_is_reported():
 
 
 def test_zip_member_size_limit(monkeypatch):
-    # 上限由解析器所在模块读取，补丁也要打在 document_formats 上；
-    # documents 里的同名常量只是兼容 re-export。
-    monkeypatch.setattr(document_formats, 'MAX_ZIP_MEMBER_BYTES', 16)
+    # 上限由实际读取成员的 document_ooxml 持有；document_formats / documents
+    # 里的同名常量只是兼容 re-export，补丁打在那里不会生效。
+    monkeypatch.setattr(document_ooxml, 'MAX_ZIP_MEMBER_BYTES', 16)
     data = _docx()
     with pytest.raises(documents.DocumentError, match='too large'):
         documents.extract_document(data, 'big.docx')

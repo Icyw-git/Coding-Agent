@@ -18,6 +18,7 @@
 | `src/agent_runtime.py`    | 会话服务（列表/恢复/分叉/搜索/重命名），摘要缓存归属于此                                             |
 | `src/harness_api.py`      | FastAPI 应用工厂：鉴权/限流中间件与生命周期；路由按域拆到 `api_sessions` / `api_streams` / `api_tasks` / `api_policy`（模型在 `api_models`） |
 | `src/tools.py` + registry | 工具接线与注册表；schema 在 tool_schemas.py，实现分域在 tool_*.py；统一走 exec_tool_call             |
+| `src/document_formats.py` | OOXML 兼容门面；共享 zip/XML 防护与页选择在 `document_ooxml`，DOCX/PPTX/XLSX 解析按格式分模块          |
 | 任务子系统                | `task_manager`（.cache/os_tasks）、`cron_scheduler`、`background_task` 各自拥有存储与锁              |
 | 传输网关                  | `feishu_gateway` / `gateway_sim` 只做协议适配，不持有业务状态                                        |
 
