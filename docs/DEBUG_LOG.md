@@ -4394,3 +4394,22 @@ Ruff、`py_compile`、`git diff --check` 通过。
 
 测试：图片落盘 + `view_image` 提示、PDF 落盘 + `read_document` 提示、超限拒绝、不支持
 类型提示、多批次工具摘要渲染。全量 **1564 passed / 1 skipped**。
+
+## 附件下载 234001：用错了消息资源接口
+
+现象：发图片后回复 `[附件] 下载失败：feishu image download failed: 234001
+Invalid request param`。
+
+原因：消息事件里的 `image_key` / `file_key` 是**消息资源**，必须用
+`GET /im/v1/messages/{message_id}/resources/{file_key}?type=image|file` 下载；
+我最初调的是 `im/v1/images/{image_key}`（那是应用自己上传图片后拿回的 key 的接口），
+服务端把它当非法参数，返回 234001。dsh-im 的 `resource-download.mjs` 也走
+`messages/{id}/resources/{key}`。
+
+修法：`LarkTransport.download_message_resource(message_id, key, kind)` 使用
+`GetMessageResourceRequest`（message_id / file_key / type），`_handle_attachment`
+把入站 `message_id` 传给下载；传输层没有该方法或缺少 message_id 时明确提示，
+不再拿 image_key 去试另一个接口。README 的飞书说明保持“图片/.cache/feishu-inbox”不变。
+
+测试：真实 SDK 请求对象断言（message_id/file_key/type 均正确），加图片/PDF 下载替身回归。
+全量 **1565 passed / 1 skipped**。

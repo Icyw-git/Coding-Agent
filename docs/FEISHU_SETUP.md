@@ -84,7 +84,7 @@ python src/feishu_gateway.py
 
 ## 发图片 / 文件
 
-- 直接发**图片**：网关下载到会话工作区 `.cache/feishu-inbox/`，然后让 agent 用
+- 直接发**图片**：网关经消息资源接口（`messages/{id}/resources`）下载到会话工作区 `.cache/feishu-inbox/`，然后让 agent 用
   `view_image` 查看（支持 PNG/JPG/GIF/WEBP）。
 - 直接发**文件**：同样落到 `.cache/feishu-inbox/`，agent 用 `read_document` 读取
   PDF / Word / Excel / PPT（DOCX/PPTX 转换需要服务端装 LibreOffice），文本文件也可用

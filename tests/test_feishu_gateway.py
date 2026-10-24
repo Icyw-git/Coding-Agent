@@ -1427,13 +1427,9 @@ class AttachmentTransport(FakeTransport):
         self.file = file
         self.downloaded = []
 
-    def download_image(self, image_key):
-        self.downloaded.append(('image', image_key))
-        return self.image
-
-    def download_file(self, file_key):
-        self.downloaded.append(('file', file_key))
-        return self.file
+    def download_message_resource(self, message_id, key, kind):
+        self.downloaded.append((message_id, key, kind))
+        return self.image if kind == 'image' else self.file
 
 
 class AttachmentAPI:
@@ -1474,6 +1470,7 @@ def test_image_attachment_saved_to_workspace_with_view_image_hint(tmp_path):
     hint = api.sent[-1][1]
     assert 'view_image' in hint and str(files[0]) in hint
     assert gw.bindings['chat-img'] == 'att-session'
+    assert transport.downloaded == [('om_1', 'img_1', 'image')]
 
 
 def test_document_attachment_hint_points_at_read_document(tmp_path):
@@ -1509,3 +1506,30 @@ def test_unsupported_message_type_gets_hint(tmp_path):
                        bindings_path=tmp_path / 'bindings.json')
     gw._unsupported_message('chat-audio', 'audio')
     assert '暂不支持 audio' in fake.last() and '图片、文件' in fake.last()
+
+
+def test_lark_transport_downloads_via_message_resource_endpoint():
+    """消息里的图片/文件必须走 messages/{id}/resources；用 images 接口会 234001。"""
+    import io
+    from types import SimpleNamespace
+
+    from feishu_gateway import LarkTransport
+
+    captured = {}
+
+    class Resource:
+        def get(self, request):
+            captured['request'] = request
+            return SimpleNamespace(success=lambda: True,
+                                   file=io.BytesIO(b'image-bytes'))
+
+    transport = LarkTransport.__new__(LarkTransport)
+    transport._client = SimpleNamespace(im=SimpleNamespace(
+        v1=SimpleNamespace(message_resource=Resource())))
+    data = transport.download_message_resource('om_1', 'img_1', 'image')
+
+    assert data == b'image-bytes'
+    request = captured['request']
+    assert request.message_id == 'om_1'
+    assert request.file_key == 'img_1'
+    assert request.type == 'image'

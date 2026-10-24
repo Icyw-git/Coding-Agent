@@ -295,20 +295,23 @@ class LarkTransport:
         }
         return json.dumps(card, ensure_ascii=False)
 
-    def download_image(self, image_key: str) -> bytes:
-        from lark_oapi.api.im.v1 import GetImageRequest
-        request = GetImageRequest.builder().image_key(image_key).build()
-        response = self._client.im.v1.image.get(request)
-        if not response.success():
-            raise RuntimeError(f'feishu image download failed: {response.code} {response.msg}')
-        return self._read_bytes(response)
+    def download_message_resource(self, message_id: str, key: str,
+                                  kind: str) -> bytes:
+        """下载消息里的图片/文件。
 
-    def download_file(self, file_key: str) -> bytes:
-        from lark_oapi.api.im.v1 import GetFileRequest
-        request = GetFileRequest.builder().file_key(file_key).build()
-        response = self._client.im.v1.file.get(request)
+        必须用 `messages/{message_id}/resources/{key}`：消息里的 image_key 调
+        `im/v1/images` 会报 234001 Invalid request param，这个接口才是消息资源入口。
+        """
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+        request = (GetMessageResourceRequest.builder()
+                   .message_id(message_id)
+                   .file_key(key)
+                   .type('image' if kind == 'image' else 'file')
+                   .build())
+        response = self._client.im.v1.message_resource.get(request)
         if not response.success():
-            raise RuntimeError(f'feishu file download failed: {response.code} {response.msg}')
+            raise RuntimeError(
+                f'feishu resource download failed: {response.code} {response.msg}')
         return self._read_bytes(response)
 
     @staticmethod
@@ -1779,13 +1782,12 @@ class FeishuGateway:
             with self._bindings_lock:
                 self.bindings[chat_id] = session_id
                 self._save_bindings()
-        download = getattr(self.transport, 'download_image' if kind == 'image'
-                           else 'download_file', None)
-        if download is None:
+        download = getattr(self.transport, 'download_message_resource', None)
+        if download is None or not message_id:
             self._reply(chat_id, '当前传输层不支持下载附件。')
             return
         try:
-            data = download(key)
+            data = download(message_id, key, kind)
         except Exception as exc:
             print(f'[feishu] attachment download failed: {exc}')
             self._reply(chat_id, f'[附件] 下载失败：{exc}')
