@@ -5,6 +5,7 @@ import contextlib
 import os
 import sys
 import threading
+from pathlib import Path
 
 import harness
 
@@ -40,6 +41,25 @@ def build_parser() -> argparse.ArgumentParser:
         help='attach an image to the prompt (repeatable; implies -p)',
     )
     return parser
+
+
+def _warn_legacy_sessions() -> None:
+    """旧行为把 .cache 放在启动目录；home 切换后给出一条可操作的提示。"""
+    import harness
+
+    legacy = Path.cwd() / '.cache' / 'sessions'
+    try:
+        if legacy.resolve() == harness.SESSIONS_DIR.resolve():
+            return
+        if not legacy.is_dir() or not any(legacy.glob('session_*.jsonl')):
+            return
+        if any(harness.SESSIONS_DIR.glob('session_*.jsonl')):
+            return
+    except OSError:
+        return
+    print(f'[home] 当前目录存在旧会话缓存 {legacy}，但 agent home 是 '
+          f'{harness.HOME_DIR}；如需沿用请设置 HARNESS_HOME={Path.cwd()}',
+          file=sys.stderr)
 
 
 def _headless_requested(args) -> bool:
@@ -87,6 +107,7 @@ def main(argv=None) -> int:
         raise SystemExit(f'[config] {exc}') from exc
 
     harness.load_durable_jobs()
+    _warn_legacy_sessions()
     harness.start_storage_maintenance()
     # 后台预热 LLM 客户端（openai SDK import ~1.5s）：用户敲第一条消息时已就绪
     threading.Thread(target=harness.client.warmup, daemon=True).start()

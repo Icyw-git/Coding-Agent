@@ -141,12 +141,35 @@ def build_router(client, runtime):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {'removed': removed}
 
+    @router.post("/v1/sessions/{session_id}/steer")
+    def steer_session(session_id: str, request: SendMessageRequest):
+        """活动回合中插入消息；空闲时降级为普通消息（返回 status=sent）。"""
+        try:
+            return runtime.steer(session_id, request.content)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/v1/sessions/{session_id}/interrupt")
+    def interrupt_session(session_id: str):
+        """请求取消本进程内该会话的活动回合；无活动回合返回 idle。"""
+        try:
+            return runtime.interrupt(session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @router.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):
+        from agent_runtime import TurnCancelled
         from turn_coordinator import TurnBusy
 
         try:
             response = client.messages.create(session_id, request.content)
+        except TurnCancelled as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except TurnBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:

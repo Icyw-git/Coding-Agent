@@ -25,6 +25,7 @@ from pathlib import Path
 
 import harness
 import tools
+from agent_runtime import TurnCancelled
 from workspace_context import use_workspace
 
 EXIT_OK = 0
@@ -218,6 +219,10 @@ def run(args, *, runtime=None, stdout=None, stderr=None) -> int:
                 runtime = harness.create_runtime(initialize_tools=False)
             return _run(args, runtime, real_stdout, emitter)
         except KeyboardInterrupt:
+            print('[headless] interrupted', file=error_stream)
+            emitter.emit('error', {'code': EXIT_INTERRUPT, 'message': 'interrupted'})
+            return EXIT_INTERRUPT
+        except TurnCancelled:
             print('[headless] interrupted', file=error_stream)
             emitter.emit('error', {'code': EXIT_INTERRUPT, 'message': 'interrupted'})
             return EXIT_INTERRUPT

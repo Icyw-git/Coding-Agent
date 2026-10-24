@@ -89,15 +89,34 @@
 - 真实终端与真实 daemon 验收（手机/TUI 竞争、SIGTERM 关闭、手机审批端到端）。
 - 阶段 1 的 turn_id/终态事件、steer/interrupt、watcher、至少一次投递。
 
-### 阶段 1：远程控制闭环（监视、插话、中断、通知）
+### 阶段 1：远程控制闭环（进行中，2026-10-24 完成第一块）
 
-- **回合标识和终态事件**：为每个执行生成 `turn_id`，持久化 `turn_started` 与唯一终态事件，终态至少包含 `completed`、`failed`、`cancelled`、来源和时间。模型单次请求失败可能被重试，不作为最终失败通知。
-- **Steer 端点**：`POST /v1/sessions/{id}/steer` 使用有界的每会话待注入队列。活动回合中在下一次模型请求边界注入；回合即将结束时必须原子地决定“已入本回合”或“作为下一条普通消息”，不能返回成功后丢失。空闲降级为普通消息时，返回明确的实际处理状态和消息/turn ID；请求支持幂等键，避免客户端重试重复注入。
-- **Interrupt 端点**：`POST /v1/sessions/{id}/interrupt` 只取消当前匹配会话的活动回合；无匹配活动回合返回明确状态，不影响其他回合。实现使用按回合的 cancellation token/context，或由阶段 0 的全局单回合协调器校验活动 session 后定向取消；不得直接把现有全局 Event 当成可按会话取消。API 回合需要对称地 begin/end 生命周期并清理取消状态。
-- **飞书 watcher**：复用会话 SSE `after` 游标和断线重连，只消费增量；按绑定/会话保存游标与投递记录，写入需原子化。监听 `turn_id` 终态和有界的无进度状态，按来源过滤，避免对已通过手机流式回复的回合重复推送。游标可与绑定存储关联，但不要把“已读事件”误当“已成功送达”。
-- **投递语义**：本地事件游标和飞书发送不在同一事务内，无法承诺断电情况下绝不重放且绝不漏发。采用至少一次投递，记录 `(session_id, turn_id, terminal_status)` 和发送尝试；发送成功与落盘之间发生崩溃时允许重复通知，后续利用可用的消息更新/幂等能力降低重复。验收明确记录这个崩溃窗口。
-- **错误通知**：失败/取消必须有最终终态事件，watcher 不能只凭长时间无进展推断失败。无进展阈值只发”仍在运行/可能卡住”的提示，不伪造失败结论。审批链路同理：网关不在线或超时导致的审批拒绝（`decide_queued` 超时路径）要作为带原因的显式事件进入会话流，远程端能区分”agent 主动拒绝”与”无人应答”，watcher 可选推送。
-- **测试**：steer 的轮间注入与回合结束竞态、同会话幂等重试；两个会话的中断隔离；TUI/API/cron 共享协调器；watcher 断线续传、终态错误、重复投递窗口、游标损坏恢复及通知来源去重。
+已完成：
+
+- **回合身份与终态事件**：`agent_loop` 生成 `turn_id`，会话流写入
+  `turn_started{turn_id, source}`；成功时 `turn_completed` 后紧跟
+  `turn_terminal{status='completed'}`，失败/取消时在 finally 记录
+  `turn_terminal{status='failed'|'cancelled', error_type}`。`turn_completed` 保留给既有
+  进度/测试消费者，watcher 只需消费唯一的 `turn_terminal`。来源已覆盖
+  `cli / tui / api / cron / steer`。
+- **按回合取消**：`turn_control` 引入 `TurnToken`（turn_id/session/source）与进程内活动
+  注册表；同线程重入复用 token，`request_cancel()` 优先命中活动 token，避免旧全局位
+  泄漏到下一回合；`end_turn()` 清位。TUI/CLI 的 Esc 仍走同一入口。
+- **steer**：`POST /v1/sessions/{id}/steer`。活动回合返回 `queued`（带 turn_id/source），
+  在下一次模型请求边界注入；空闲时降级为普通消息返回 `sent`；活动回合不属于本进程
+  （例如 TUI 在另一个进程）返回 409，不假装入队。
+- **interrupt**：`POST /v1/sessions/{id}/interrupt`，只取消本进程内匹配会话的活动回合，
+  无活动回合返回 `idle`。`runtime.send` 把取消收敛为 `TurnCancelled`，普通消息端点
+  返回 409，流式端点发 `event: cancelled`。
+- **测试**：终态事件（成功/失败/取消）；steer 空闲降级与活动注入；interrupt 取消并
+  返回 turn_id；API steer/interrupt/取消流事件；四个 409 路径。
+
+仍然欠缺（阶段 1 剩余）：
+
+- steer 的幂等键（客户端重试去重）与“回合即将结束”的原子归属。
+- 跨进程 steer/interrupt（目前只覆盖同进程的 daemon 回合；TUI 回合返回 409）。
+- 飞书 watcher（SSE 增量 + 持久游标 + 至少一次投递与重复窗口记录）。
+- 无进展提示（只提示“可能卡住”，不推断失败）与来源去重。
 
 ### 阶段 2：主动性与安全边界
 

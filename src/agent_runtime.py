@@ -6,6 +6,8 @@ runtime 只负责会话编排，实际回合执行由调用方注入；CLI、SDK
 
 from __future__ import annotations
 
+import collections
+import inspect
 import threading
 import uuid
 from dataclasses import dataclass
@@ -31,6 +33,10 @@ class AgentResult:
 
 class SessionAlreadyExistsError(ValueError):
     """调用方试图创建已存在的会话 ID。"""
+
+
+class TurnCancelled(RuntimeError):
+    """回合被 /interrupt 或本地取消请求终止。"""
 
 
 # 会话摘要缓存 (path, size, mtime_ns) → summary：飞书 /sessions 每次列表都要
@@ -73,6 +79,9 @@ class AgentRuntime:
         workspace_file: Path | None = None,
     ) -> None:
         self._run_turn = run_turn
+        # 测试/外部注入的 run_turn 可能只有 (messages, session_store)；按需传扩展参数，
+        # 避免为了 steer/source 强迫所有调用方改签名。
+        self._turn_params = self._accepted_params(run_turn)
         self._session_store_cls = session_store_cls
         self._sessions_dir = Path(sessions_dir)
         self._resolve_session_path = resolve_session_path
@@ -82,9 +91,26 @@ class AgentRuntime:
         self._before_session_change = before_session_change
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
+        # steer 只对“本进程正在跑的回合”有效：队列键是 session_id，由 send 注册。
+        self._steer_queues: dict[str, collections.deque] = {}
+        self._steer_lock = threading.Lock()
         self._default_workspace = Path(workspace or Path.cwd()).resolve()
         self._workspace_roots: list[Path] | None = None
         self._workspace_file = Path(workspace_file).expanduser() if workspace_file else None
+
+    @staticmethod
+    def _accepted_params(fn) -> set[str] | None:
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return None   # 无法检查：按“全支持”处理
+        if any(param.kind is inspect.Parameter.VAR_KEYWORD
+               for param in params.values()):
+            return None
+        return set(params)
+
+    def _supports(self, name: str) -> bool:
+        return self._turn_params is None or name in self._turn_params
 
     @property
     def sessions_dir(self) -> Path:
@@ -195,6 +221,7 @@ class AgentRuntime:
         attachments: list[dict] | None = None,
         on_event=None,
         housekeeping: bool = True,
+        source: str = 'api',
     ) -> AgentResult:
         """追加一条用户消息，执行一个回合，返回 assistant 内容。
 
@@ -215,30 +242,85 @@ class AgentRuntime:
                 with session_write(self._sessions_dir, session_id,
                                    timeout=0.0, action='发送消息'):
                     messages = store.rebuild_openai_history(recover_pending=True)
-                message = {'role': 'user', 'content': content}
-                messages.append(message)
-                store.append_message(message)
-                if attachments:
-                    attachment = image_attachment_message(attachments)
-                    messages.append(attachment)
-                    store.append_message(attachment)
-                turn_kwargs = {}
-                if on_delta is not None:
-                    turn_kwargs['on_delta'] = on_delta
-                if on_event is not None:
-                    turn_kwargs['on_event'] = on_event
-                if not housekeeping:
-                    turn_kwargs['housekeeping'] = False
-                with use_workspace(workspace):
-                    # 与 TUI 对称的回合生命周期：进入时清掉可能残留的取消位
-                    # （上一个入口的 Esc 不应取消这一轮），退出时复位。
-                    turn_control.begin_turn()
+                    message = {'role': 'user', 'content': content}
+                    messages.append(message)
+                    store.append_message(message)
+                    if attachments:
+                        attachment = image_attachment_message(attachments)
+                        messages.append(attachment)
+                        store.append_message(attachment)
+                    turn_kwargs = {'turn_source': source} if self._supports('turn_source') else {}
+                    if on_delta is not None:
+                        turn_kwargs['on_delta'] = on_delta
+                    if on_event is not None:
+                        turn_kwargs['on_event'] = on_event
+                    if not housekeeping:
+                        turn_kwargs['housekeeping'] = False
+                    pending = collections.deque()
+                    with self._steer_lock:
+                        self._steer_queues[session_id] = pending
+
+                    def drain_steer():
+                        with self._steer_lock:
+                            items = list(pending)
+                            pending.clear()
+                        return items
+
+                    if self._supports('steer_provider'):
+                        turn_kwargs['steer_provider'] = drain_steer
+                    else:
+                        with self._steer_lock:
+                            self._steer_queues.pop(session_id, None)
+                    # 回合 token 在进入执行器之前登记：/interrupt 与 /steer 需要在
+                    # agent_loop 真正开始前就能找到这个回合（agent_loop 会复用同线程
+                    # token，只补全身份，不会生成第二个）。
+                    token = turn_control.begin_turn(session_id=session_id,
+                                                    source=source)
                     try:
-                        result = self._run_turn(messages, session_store=store,
-                                                **turn_kwargs)
+                        with use_workspace(workspace):
+                            result = self._run_turn(messages, session_store=store,
+                                                    **turn_kwargs)
+                    except KeyboardInterrupt as exc:
+                        raise TurnCancelled('回合已取消') from exc
                     finally:
-                        turn_control.end_turn()
+                        turn_control.end_turn(token)
+                        with self._steer_lock:
+                            self._steer_queues.pop(session_id, None)
                 return AgentResult(session_id=store.session_id, content=result)
+
+    def steer(self, session_id: str, content: str) -> dict:
+        """把一条消息插入活动回合；没有活动回合时降级为普通消息。
+
+        返回 ``status``：``queued``（已排入当前回合）、``sent``（空闲，已作为新回合
+        发送）；活动回合不属于本进程（例如 TUI 在别的进程）时抛 ``RuntimeError``，
+        调用方应映射成 409，而不是假装入队成功。
+        """
+        import turn_control
+
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError('steer content must be a non-empty string')
+        token = turn_control.first_token(session_id)
+        if token is None:
+            result = self.send(session_id, content, source='steer')
+            return {'status': 'sent', 'session_id': result.session_id}
+        with self._steer_lock:
+            queue = self._steer_queues.get(session_id)
+            if queue is None:
+                raise RuntimeError('当前回合不支持 steer（由其他入口执行）')
+            queue.append(content)
+        return {'status': 'queued', 'session_id': session_id,
+                'turn_id': token.turn_id, 'source': token.source}
+
+    def interrupt(self, session_id: str) -> dict:
+        """请求取消本进程内该会话的活动回合；没有活动回合时返回 idle。"""
+        import turn_control
+
+        token = turn_control.first_token(session_id)
+        if token is None:
+            return {'status': 'idle', 'session_id': session_id}
+        token.request_cancel()
+        return {'status': 'cancelling', 'session_id': session_id,
+                'turn_id': token.turn_id, 'source': token.source}
 
     def history(self, session_id: str) -> list[dict]:
         """返回持久化会话可回放的 OpenAI 历史。"""

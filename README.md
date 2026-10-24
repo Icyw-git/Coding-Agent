@@ -373,6 +373,20 @@ git clone <你的 GitHub 仓库地址>
 cd harness-agent
 ```
 
+### 1.1 数据目录（agent home）
+
+会话、记忆、快照、任务、cron 与工具缓存都放在 **agent home** 的 `.cache` 下，默认是仓库根，
+**不再跟随启动目录**。在任意目录运行 `python <repo>/entrypoint.py`，看到的都是同一批会话；
+工具执行、`@` 补全与项目技能仍跟随当前工作区。
+
+```bash
+# 可选：自定义 home（例如放到用户目录，或用不同 home 做隔离）
+HARNESS_HOME=~/.harness-agent
+```
+
+旧版本把 `.cache` 放在启动目录；如果当前目录还留着旧会话，启动时会打印一条提示，
+按提示设置 `HARNESS_HOME` 即可沿用。`--doctor` 会显示 home 与 sessions 的实际路径。
+
 ### 2. 配置模型服务
 
 在项目根目录创建 `.env`，示例：
@@ -420,6 +434,9 @@ HARNESS_OS_SANDBOX=off
 # 可选：额外授权的工作区根，os.pathsep 分隔（Windows 为 ;，Linux/macOS 为 :）
 # 与 HARNESS_WORKSPACE 一起构成服务端的全部授权根；登记表不参与授权。
 HARNESS_WORKSPACE_ROOTS=D:\Projects;E:\Work
+
+# 可选：agent 数据目录（会话/记忆/快照/任务/cron）；默认仓库根
+# HARNESS_HOME=~/.harness-agent
 
 # 可选：工作区登记表位置；默认 SESSIONS_DIR 的父目录下 workspaces.json
 HARNESS_WORKSPACE_FILE=.cache/workspaces.json

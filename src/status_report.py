@@ -174,6 +174,8 @@ def run_doctor() -> int:
         ('git repository', (workspace / '.git').exists()),
     ])
     cache_root = h.SESSIONS_DIR.parent
+    print(f'[home] {h.HOME_DIR}（会话/记忆/快照的根，可用 HARNESS_HOME 覆盖）')
+    print(f'[sessions] {h.SESSIONS_DIR}')
     for directory in (h.SESSIONS_DIR, h.CHECKPOINT_DIR, h.MEMORY_DIR, h.TOOL_RESULTS_DIR):
         try:
             directory.mkdir(parents=True, exist_ok=True)

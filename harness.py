@@ -50,6 +50,7 @@ import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import llm_config
 import llm_route
+import paths
 import recovery
 import sandbox
 import status_report
@@ -194,6 +195,8 @@ load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
 WORKDIR = Path.cwd().resolve()   # CLI 当前工作区的进程级回退值，唯一写入方是 set_workspace
 APP_DIR = Path(__file__).resolve().parent
+HOME_DIR = paths.home_dir()      # agent 数据目录：HARNESS_HOME，默认仓库根
+CACHE_DIR = paths.cache_dir()    # 会话/记忆/快照都在这里，与 cwd 解耦
 
 
 def get_workdir() -> Path:
@@ -346,7 +349,7 @@ _SESSION_SUMMARY_CACHE_MAX = 512
 
 # ---------- 记忆系统配置 ----------
 MEMORY_TYPES=['user','feedback','project','reference']
-MEMORY_DIR=WORKDIR/'.cache'/'memories'
+MEMORY_DIR=CACHE_DIR/'memories'
 MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
 CONSOLIDATE_THRESHOLD=10
 
@@ -417,12 +420,12 @@ PERSIST_THERSHOLD=10000
 TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）
 
 # ---------- 缓存目录 ----------
-TOOL_RESULTS_DIR=WORKDIR/'.cache'/'tool_results'
-TRANSCRIPT_DIR=WORKDIR/'.cache'/'transcripts'
-SESSIONS_DIR=WORKDIR/'.cache'/'sessions'
+TOOL_RESULTS_DIR=CACHE_DIR/'tool_results'
+TRANSCRIPT_DIR=CACHE_DIR/'transcripts'
+SESSIONS_DIR=CACHE_DIR/'sessions'
 
 # ---------- Checkpoint / Rewind 配置 ----------
-CHECKPOINT_DIR=WORKDIR/'.cache'/'checkpoints'
+CHECKPOINT_DIR=CACHE_DIR/'checkpoints'
 CHECKPOINT_MAX_NODES=20          # 保留最近 N 个节点（由 /checkpoint-gc 触发回收）
 CHECKPOINT_KEEP_LABELED=True     # 带 label 的显式节点不被 GC
 CHECKPOINT_CAPTURE_FILES=True    # 关闭后退化为纯会话回溯
@@ -1126,6 +1129,25 @@ def _continue_after_length(state: _TurnState, response) -> bool:
     return True
 
 
+def _append_turn_terminal(session_store, token, status: str, *,
+                          error_type: str | None = None,
+                          detail: str | None = None) -> dict:
+    """记录回合终态；这是 watcher/通知该消费的唯一 `turn_terminal` 事件。
+
+    ``turn_completed`` 保留给既有消费者（网关进度、测试），终态事件紧跟其后，
+    一次成功回合因此只会有一个 ``turn_terminal(status='completed')``。
+    """
+    payload = {'status': status}
+    if token is not None:
+        payload['turn_id'] = token.turn_id
+        payload['source'] = token.source
+    if error_type:
+        payload['error_type'] = error_type
+    if detail:
+        payload['detail'] = str(detail)[:200]
+    return session_store.append('turn_terminal', **payload)
+
+
 def _finish_response(state: _TurnState, message, *, pre_compress: list,
                      housekeeping: bool) -> str | None:
     """收尾一个非工具回复；返回 None 表示本轮还要继续（steer / Stop 注入）。"""
@@ -1173,7 +1195,10 @@ def _finish_response(state: _TurnState, message, *, pre_compress: list,
              'old': entry.get('old')}
             for entry in changes
         ])
-    state.session_store.append('turn_completed')
+    token = turn_control.current_token()
+    state.session_store.append('turn_completed', **(
+        {'turn_id': token.turn_id, 'source': token.source} if token else {}))
+    _append_turn_terminal(state.session_store, token, 'completed')
     # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
     # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
     # 无头一次性进程没有「下一次启动」可等，跑这些线程只会被退出截断，
@@ -1288,7 +1313,8 @@ def _run_tool_calls(state: _TurnState, message) -> bool:
 
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None, *,
-               on_event=None, housekeeping=True, steer_provider=None):
+               on_event=None, housekeeping=True, steer_provider=None,
+               turn_source='cli', turn_id=None):
     """Run one OpenAI session, recording an append-only event stream for recovery.
 
     ``on_event`` mirrors tool execution for one-shot transports; ``housekeeping``
@@ -1302,6 +1328,11 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             session_store.append_message(initial_message)
         print(f'[session log:{session_store.path}]')
     session_store.record_workspace(get_workdir())
+    token = turn_control.begin_turn(session_id=session_store.session_id,
+                                    turn_id=turn_id or '',
+                                    source=turn_source)
+    session_store.append('turn_started', turn_id=token.turn_id,
+                         source=token.source)
     wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
     set_session(session_store.session_id)
     set_agent('lead')   # 子代理会临时覆盖，退出后恢复
@@ -1338,142 +1369,156 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         turn_cp_start=_safe_checkpoint(checkpoint_manager.head),
     )
 
-    while True:
-        if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
-            raise KeyboardInterrupt
-        _drain_steering(state)
-        # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
-        _safe_checkpoint(checkpoint_manager.begin_turn, state.messages, session_store)
+    outcome = {'status': 'completed'}
+    try:
+        while True:
+            if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
+                raise KeyboardInterrupt
+            _drain_steering(state)
+            # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
+            _safe_checkpoint(checkpoint_manager.begin_turn, state.messages, session_store)
 
-        # 压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
-        pre_compress = [m if isinstance(m, dict)
-                        else {'role': m.get('role', ''), 'content': str(m.get('content', ''))}
-                        for m in state.messages]
+            # 压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
+            pre_compress = [m if isinstance(m, dict)
+                            else {'role': m.get('role', ''), 'content': str(m.get('content', ''))}
+                            for m in state.messages]
 
-        compact_started = time.perf_counter()
-        state.messages, state.skip_micro_rounds = pre_compact_messages(
-            state.messages, state.skip_micro_rounds,
-            on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
-            session_store=session_store,
-            size=state.ctx_tokens,
-            snip_state=state.snip_state,
-        ) #压缩预处理流程（判据优先用真实用量，见 pre_compact_messages）
-        compact_ms = round((time.perf_counter() - compact_started) * 1000, 3)
+            compact_started = time.perf_counter()
+            state.messages, state.skip_micro_rounds = pre_compact_messages(
+                state.messages, state.skip_micro_rounds,
+                on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
+                session_store=session_store,
+                size=state.ctx_tokens,
+                snip_state=state.snip_state,
+            ) #压缩预处理流程（判据优先用真实用量，见 pre_compact_messages）
+            compact_ms = round((time.perf_counter() - compact_started) * 1000, 3)
 
-        if state.rounds_since_todo >= 8 and state.messages:
-            reminder = {
-                'role': 'user',
-                'content': "<reminder>Update your todos.</reminder>",
-            }
-            state.messages.append(reminder)
-            session_store.append_message(reminder)
-            state.rounds_since_todo = 0
+            if state.rounds_since_todo >= 8 and state.messages:
+                reminder = {
+                    'role': 'user',
+                    'content': "<reminder>Update your todos.</reminder>",
+                }
+                state.messages.append(reminder)
+                session_store.append_message(reminder)
+                state.rounds_since_todo = 0
 
-        fired = consume_cron_queue()   # 消费 cron 任务列
-        for job in fired:
-            cron_message = {
-                'role': 'user',
-                'content': f'[Scheduled] {job.prompt}',
-            }
-            state.messages.append(cron_message)
-            session_store.append_message(cron_message)
-            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+            fired = consume_cron_queue()   # 消费 cron 任务列
+            for job in fired:
+                cron_message = {
+                    'role': 'user',
+                    'content': f'[Scheduled] {job.prompt}',
+                }
+                state.messages.append(cron_message)
+                session_store.append_message(cron_message)
+                print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
 
-        # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
-        # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，
-        # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
-        prompt_assembly_started = time.perf_counter()
-        request_messages = expand_image_parts(
-            inject_memories(state.messages, state.memories_content, state.system))
-        prompt_assembly_ms = round(
-            (time.perf_counter() - prompt_assembly_started) * 1000, 3)
-        prompt_message_count = len(request_messages)
-        prepare_ms = compact_ms + prompt_assembly_ms
-        # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
-        cache_prefix_profile = _report_cache_prefix(
-            session_store.session_id, state.messages,
-            active_model(state.recovery_state),
-            system=state.system) or {}
+            # 记忆注入 + system 前置（副本不污染 messages；SDK 不支持 system= 关键字参数）
+            # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，
+            # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
+            prompt_assembly_started = time.perf_counter()
+            request_messages = expand_image_parts(
+                inject_memories(state.messages, state.memories_content, state.system))
+            prompt_assembly_ms = round(
+                (time.perf_counter() - prompt_assembly_started) * 1000, 3)
+            prompt_message_count = len(request_messages)
+            prepare_ms = compact_ms + prompt_assembly_ms
+            # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
+            cache_prefix_profile = _report_cache_prefix(
+                session_store.session_id, state.messages,
+                active_model(state.recovery_state),
+                system=state.system) or {}
 
-        request_started = time.monotonic()
-        profile_timing = {'prepare_ms': prepare_ms,
-                          'compact_ms': compact_ms,
-                          'prompt_assembly_ms': prompt_assembly_ms,
-                          **cache_prefix_profile}
-        stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
-        ui_emit('activity', state='thinking', detail='Requesting model response')
+            request_started = time.monotonic()
+            profile_timing = {'prepare_ms': prepare_ms,
+                              'compact_ms': compact_ms,
+                              'prompt_assembly_ms': prompt_assembly_ms,
+                              **cache_prefix_profile}
+            stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
+            ui_emit('activity', state='thinking', detail='Requesting model response')
 
-        try:   # 错误恢复逻辑
-            response = _run_llm_request(state, request_messages, profile_timing,
-                                        stream_probe, request_started)
-            state.reactive_retries = 0
-            request_ms = round((time.monotonic() - request_started) * 1000, 3)
-            _record_request_result(
-                state, response, profile_timing=profile_timing,
-                request_started=request_started, request_ms=request_ms,
-                prompt_message_count=prompt_message_count)
-        except Exception as e:
-            request_ms = round((time.monotonic() - request_started) * 1000, 3)
-            _record_request_failure(
-                state, e, profile_timing=profile_timing,
-                request_ms=request_ms, prompt_message_count=prompt_message_count)
-            if (recovery.is_prompt_too_long_error(e)
-                    and state.reactive_retries < MAX_REACTIVE_RETRIES):
-                # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
-                attempts = ((6, None), (3, 12_000), (1, 4_000))
-                keep, budget = attempts[min(state.reactive_retries, len(attempts) - 1)]
-                state.reactive_retries += 1
-                print(f'  [compact] 请求超限，已自动压缩历史并重试'
-                      f'（第 {state.reactive_retries}/{MAX_REACTIVE_RETRIES} 次，保留 {keep} 条）')
-                state.messages[:] = reactive_compact(
-                    state.messages, keep=keep, budget_tokens=budget)
-                _record_compaction(session_store, state.messages, 'reactive')
-                state.skip_micro_rounds = 3
-                if state.ctx_tokens is not None:
-                    state.ctx_tokens = estimate_size(state.messages)   # 整体替换历史后重估
+            try:   # 错误恢复逻辑
+                response = _run_llm_request(state, request_messages, profile_timing,
+                                            stream_probe, request_started)
+                state.reactive_retries = 0
+                request_ms = round((time.monotonic() - request_started) * 1000, 3)
+                _record_request_result(
+                    state, response, profile_timing=profile_timing,
+                    request_started=request_started, request_ms=request_ms,
+                    prompt_message_count=prompt_message_count)
+            except Exception as e:
+                request_ms = round((time.monotonic() - request_started) * 1000, 3)
+                _record_request_failure(
+                    state, e, profile_timing=profile_timing,
+                    request_ms=request_ms, prompt_message_count=prompt_message_count)
+                if (recovery.is_prompt_too_long_error(e)
+                        and state.reactive_retries < MAX_REACTIVE_RETRIES):
+                    # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
+                    attempts = ((6, None), (3, 12_000), (1, 4_000))
+                    keep, budget = attempts[min(state.reactive_retries, len(attempts) - 1)]
+                    state.reactive_retries += 1
+                    print(f'  [compact] 请求超限，已自动压缩历史并重试'
+                          f'（第 {state.reactive_retries}/{MAX_REACTIVE_RETRIES} 次，保留 {keep} 条）')
+                    state.messages[:] = reactive_compact(
+                        state.messages, keep=keep, budget_tokens=budget)
+                    _record_compaction(session_store, state.messages, 'reactive')
+                    state.skip_micro_rounds = 3
+                    if state.ctx_tokens is not None:
+                        state.ctx_tokens = estimate_size(state.messages)   # 整体替换历史后重估
+                    continue
+                raise
+
+
+            message=response.choices[0].message
+            if hasattr(message, 'model_dump'):
+                assistant_message = message.model_dump()
+            else:
+                assistant_message = {
+                    'role': 'assistant',
+                    'content': message.content,
+                    'tool_calls': [
+                        {'id': call.id, 'type': call.type,
+                         'function': {'name': call.function.name,
+                                      'arguments': call.function.arguments}}
+                        for call in (message.tool_calls or [])
+                    ] or None,
+                }
+            state.messages.append(assistant_message)   # 添加模型回复到上下文
+            session_store.append_message(assistant_message)
+            if stream_probe['started']:
+                ui_emit('assistant_end', mid=stream_probe['mid'])
+            elif assistant_message.get('content'):
+                ui_emit('assistant_text', text=str(assistant_message['content']))
+            if state.ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
+                state.ctx_tokens += estimate_size([assistant_message])
+
+            # 输出被截断：升级到加大 max_tokens 并提示续写
+            if _continue_after_length(state, response):
                 continue
-            raise
+
+            if response.choices[0].finish_reason != "tool_calls":
+                result = _finish_response(state, message, pre_compress=pre_compress,
+                                          housekeeping=housekeeping)
+                if result is None:
+                    continue
+                return result
 
 
-        message=response.choices[0].message
-        if hasattr(message, 'model_dump'):
-            assistant_message = message.model_dump()
-        else:
-            assistant_message = {
-                'role': 'assistant',
-                'content': message.content,
-                'tool_calls': [
-                    {'id': call.id, 'type': call.type,
-                     'function': {'name': call.function.name,
-                                  'arguments': call.function.arguments}}
-                    for call in (message.tool_calls or [])
-                ] or None,
-            }
-        state.messages.append(assistant_message)   # 添加模型回复到上下文
-        session_store.append_message(assistant_message)
-        if stream_probe['started']:
-            ui_emit('assistant_end', mid=stream_probe['mid'])
-        elif assistant_message.get('content'):
-            ui_emit('assistant_text', text=str(assistant_message['content']))
-        if state.ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
-            state.ctx_tokens += estimate_size([assistant_message])
-
-        # 输出被截断：升级到加大 max_tokens 并提示续写
-        if _continue_after_length(state, response):
-            continue
-
-        if response.choices[0].finish_reason != "tool_calls":
-            result = _finish_response(state, message, pre_compress=pre_compress,
-                                      housekeeping=housekeeping)
-            if result is None:
+            # compact 工具、checkpoint 标签与普通工具批次的顺序处理都在 _run_tool_calls；
+            # 返回 True 表示历史已被 compact，需要重开一轮。
+            if _run_tool_calls(state, message):
                 continue
-            return result
 
 
-        # compact 工具、checkpoint 标签与普通工具批次的顺序处理都在 _run_tool_calls；
-        # 返回 True 表示历史已被 compact，需要重开一轮。
-        if _run_tool_calls(state, message):
-            continue
+    except BaseException as exc:
+        outcome['status'] = ('cancelled' if isinstance(exc, KeyboardInterrupt)
+                             else 'failed')
+        outcome['error_type'] = type(exc).__name__
+        raise
+    finally:
+        if outcome['status'] != 'completed':
+            _append_turn_terminal(session_store, token, outcome['status'],
+                                  error_type=outcome.get('error_type'))
+        turn_control.end_turn(token)
 
 
 def resume_agent_loop(session_path: Path):
@@ -1577,13 +1622,11 @@ def run_agent_turn_locked():
                 return
             prompts = [f'[Scheduled] {job.prompt}' for job in fired]
             print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
-            turn_control.begin_turn()
             try:
-                agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
+                agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}],
+                           turn_source='cron')
             except KeyboardInterrupt:
                 print('\n[会话已中断]')
-            finally:
-                turn_control.end_turn()
     except TurnBusy:
         return   # 别的入口在跑：本轮跳过，任务仍在 cron_queue
 

@@ -367,3 +367,38 @@ def test_real_agent_loop_end_to_end_skips_housekeeping(tmp_path, monkeypatch):
     assert events[-1]['type'] == 'turn.completed'
     assert events[-1]['content'] == 'listed'
     assert 'housekeeping must be disabled' not in stderr
+
+
+def test_headless_reports_cancelled_turn_as_interrupt(tmp_path):
+    import argparse
+
+    from agent_runtime import TurnCancelled
+    from headless import EXIT_INTERRUPT, run
+
+    class CancelledRuntime:
+        def create_session(self, session_id=None, workspace=None):
+            return 'cancelled-session'
+
+        def get_workspace(self, session_id):
+            return str(tmp_path)
+
+        def open_session(self, session_id):
+            class Store:
+                last_seq = 0
+            return Store()
+
+        def send(self, session_id, content, **kwargs):
+            raise TurnCancelled('回合已取消')
+
+    args = argparse.Namespace(prompt='x', session=None, workspace=None,
+                              image=[], json=False)
+    assert run(args, runtime=CancelledRuntime(), stdout=_Sink(),
+               stderr=_Sink()) == EXIT_INTERRUPT
+
+
+class _Sink:
+    def write(self, text):
+        return len(text)
+
+    def flush(self):
+        pass

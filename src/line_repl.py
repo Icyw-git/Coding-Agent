@@ -169,7 +169,6 @@ def _run_turn(line: str, messages: list, session_store) -> None:
     from turn_coordinator import TurnBusy, turn_slot
 
     h.ui_emit('user_message', text=line)
-    h.turn_control.begin_turn()
     ticker = None
     if sys.stdout.isatty():
         from turn_progress import ProgressTicker, TurnProgress
@@ -193,7 +192,8 @@ def _run_turn(line: str, messages: list, session_store) -> None:
     try:
         # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
         with turn_slot(Path(h.SESSIONS_DIR).parent):
-            h.agent_loop(messages, session_store=session_store, on_delta=on_delta)
+            h.agent_loop(messages, session_store=session_store,
+                         on_delta=on_delta, turn_source='cli')
     except TurnBusy:
         h.ui_emit('error', msg='另一个入口正在执行回合，本条未发送')
         print('\n[busy] 另一个入口正在执行回合，本条未发送。')
@@ -204,7 +204,6 @@ def _run_turn(line: str, messages: list, session_store) -> None:
         h.ui_emit('error', msg=f'{type(exc).__name__}: {exc}')
         print(f'\n[error] {type(exc).__name__}: {exc}')
     finally:
-        h.turn_control.end_turn()
         if ticker is not None:
             ticker.stop()
             h.ACTIVE_TICKER = None

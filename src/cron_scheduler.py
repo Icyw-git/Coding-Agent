@@ -4,7 +4,8 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
+
+import paths
 
 
 @dataclass
@@ -20,7 +21,7 @@ cron_queue:list[CronJob]=[] #任务队列
 cron_lock=threading.RLock() # 任务队列锁，用于保护任务队列
 agent_lock=threading.RLock() # 代理锁；允许同一线程在 REPL 入口与降级路径重复获取
 _last_fired:dict[str,str]={} # id -> last fired time
-DURABLE_PATH=Path(__file__).resolve().parents[1]/'.cache'/'crons.json'
+DURABLE_PATH=paths.cache_path('crons.json')
 
 def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间，支持通配符、范围、步长
     if field=="*":

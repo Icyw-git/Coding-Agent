@@ -221,3 +221,102 @@ def test_registered_workspace_does_not_widen_authorization(tmp_path):
     assert row['allowed'] is False
     with pytest.raises(ValueError, match='outside the allowed root'):
         runtime.create_session(workspace=str(outside))
+
+
+def test_steer_falls_back_to_a_new_turn_when_idle(tmp_path):
+    calls = []
+
+    def run_turn(messages, session_store, **kwargs):
+        calls.append(list(messages))
+        return 'ok'
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session()
+
+    result = runtime.steer(session_id, 'later please')
+
+    assert result['status'] == 'sent'
+    assert calls and calls[0][-1]['content'] == 'later please'
+
+
+def test_steer_injects_into_the_active_turn(tmp_path):
+    import threading
+    import time
+
+    import turn_control
+
+    started = threading.Event()
+    received = []
+
+    def run_turn(messages, session_store, steer_provider=None, **kwargs):
+        started.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            items = steer_provider() if steer_provider else []
+            if items:
+                received.extend(items)
+                return 'ok'
+            time.sleep(0.01)
+        raise AssertionError('steer never arrived')
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session()
+
+    result = []
+    thread = threading.Thread(target=lambda: result.append(runtime.send(session_id, 'go')))
+    thread.start()
+    try:
+        assert started.wait(5), 'turn did not start'
+        status = runtime.steer(session_id, 'also check docs')
+        assert status['status'] == 'queued'
+        assert status['turn_id']
+    finally:
+        thread.join(10)
+    assert not thread.is_alive()
+    assert received == ['also check docs']
+    assert result and result[0].content == 'ok'
+    assert turn_control.first_token(session_id) is None
+
+
+def test_interrupt_cancels_the_active_turn(tmp_path):
+    import threading
+    import time
+
+    import turn_control
+    from agent_runtime import TurnCancelled
+
+    started = threading.Event()
+
+    def run_turn(messages, session_store, **kwargs):
+        started.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if turn_control.cancel_requested():
+                raise KeyboardInterrupt
+            time.sleep(0.01)
+        raise AssertionError('interrupt never arrived')
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session()
+
+    errors = []
+    thread = threading.Thread(target=lambda: errors.append(_send(runtime, session_id)))
+    thread.start()
+    try:
+        assert started.wait(5), 'turn did not start'
+        status = runtime.interrupt(session_id)
+        assert status['status'] == 'cancelling'
+        assert status['turn_id']
+    finally:
+        thread.join(10)
+    assert not thread.is_alive()
+    assert errors and isinstance(errors[0], TurnCancelled)
+    assert runtime.interrupt(session_id)['status'] == 'idle'
+
+
+def _send(runtime, session_id):
+    try:
+        runtime.send(session_id, 'long turn')
+    except BaseException as exc:
+        return exc
+    raise AssertionError('send should have been cancelled')

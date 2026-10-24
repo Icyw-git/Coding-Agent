@@ -8,10 +8,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
 
+import paths
 from file_lock import exclusive_file_lock
 
 # 任务持久化目录：与仓库 .cache 约定一致，保存时按需自动创建
-TASK_DIR = Path(__file__).resolve().parents[1] / '.cache' / 'tasks'
+TASK_DIR = paths.cache_path('tasks')
 TASKS_DIR = TASK_DIR
 DEFAULT_LEASE_SECONDS = 3600
 task_lock = threading.RLock()

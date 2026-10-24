@@ -541,7 +541,6 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                 self._messages.append({'role': 'user', 'content': text})
                 self._ui_call(self._refresh_queue)
                 answer = None
-                turn_control.begin_turn()
                 try:
                     with harness.agent_lock:
                         harness.permission_gate.use_ui = True
@@ -553,13 +552,13 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                             }
                             if self._store is not None:
                                 kwargs['session_store'] = self._store
-                            answer = harness.agent_loop(self._messages, **kwargs)
+                            answer = harness.agent_loop(
+                                self._messages, turn_source='tui', **kwargs)
                 except KeyboardInterrupt:
                     pass
                 except Exception as exc:
                     answer = f'Error: {type(exc).__name__}: {exc}'
                 finally:
-                    turn_control.end_turn()
                     harness.permission_gate.use_ui = False
                 try:
                     self.call_from_thread(self._sync_final_answer, answer)
@@ -572,6 +571,9 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                     break
         finally:
             self._busy = False
+            # agent_loop 自己管理 token；这里再清一次全局取消位，覆盖
+            # agent_loop 被测试替身短路（没有 end_turn）的情况。
+            turn_control.end_turn()
             if turn is not None:
                 turn.close()
 

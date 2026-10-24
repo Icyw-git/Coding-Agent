@@ -563,3 +563,77 @@ def test_api_rename_and_fork_return_409_when_session_is_busy(api_client):
     response = client.post('/v1/sessions/busy-meta/fork',
                            json={}, headers=headers)
     assert response.status_code == 409
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_steer_and_interrupt_routes(api_client):
+    class TurnRuntime(FakeRuntime):
+        def steer(self, session_id, content):
+            if session_id not in self.sessions:
+                raise FileNotFoundError(session_id)
+            return {'status': 'queued', 'session_id': session_id,
+                    'turn_id': 't-1', 'source': 'api'}
+
+        def interrupt(self, session_id):
+            return ({'status': 'cancelling', 'session_id': session_id,
+                     'turn_id': 't-1'} if session_id == 'busy-turn'
+                    else {'status': 'idle', 'session_id': session_id})
+
+    runtime = TurnRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'busy-turn'},
+                       headers=headers).status_code == 201
+
+    response = client.post('/v1/sessions/busy-turn/steer',
+                           json={'content': 'also check docs'}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()['status'] == 'queued'
+    assert response.json()['turn_id'] == 't-1'
+
+    response = client.post('/v1/sessions/busy-turn/interrupt', headers=headers)
+    assert response.status_code == 200
+    assert response.json()['status'] == 'cancelling'
+
+    response = client.post('/v1/sessions/busy-turn/interrupt',
+                           headers={'Authorization': 'Bearer t'})
+    assert response.status_code == 200
+
+    missing = client.post('/v1/sessions/missing/steer',
+                          json={'content': 'x'}, headers=headers)
+    assert missing.status_code == 404
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_steer_returns_409_when_turn_cannot_be_steered(api_client):
+    class Unsteerable(FakeRuntime):
+        def steer(self, session_id, content):
+            raise RuntimeError('当前回合不支持 steer（由其他入口执行）')
+
+    runtime = Unsteerable()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 's1'},
+                       headers=headers).status_code == 201
+    response = client.post('/v1/sessions/s1/steer',
+                           json={'content': 'x'}, headers=headers)
+    assert response.status_code == 409
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_stream_reports_cancelled_turn(api_client):
+    from agent_runtime import TurnCancelled
+
+    class CancelRuntime(FakeRuntime):
+        def send(self, session_id, content, on_delta=None):
+            raise TurnCancelled('回合已取消')
+
+    runtime = CancelRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'c1'},
+                       headers=headers).status_code == 201
+    response = client.post('/v1/sessions/c1/messages/stream',
+                           json={'content': 'x'}, headers=headers)
+    assert response.status_code == 200
+    assert 'event: cancelled' in response.text

@@ -50,6 +50,7 @@ import httpx
 
 import approval_view
 import llm_route
+import paths
 from exec_policy import approval_class
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
 from gateway_sim import GatewayClient
@@ -59,7 +60,7 @@ from session_views import group_sessions, session_details
 from turn_progress import format_duration
 from workspace_choices import find_workspace
 
-BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS', '.cache/feishu_bindings.json'))
+BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS') or paths.cache_path('feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须重新 /new

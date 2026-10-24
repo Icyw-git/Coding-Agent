@@ -395,7 +395,10 @@ class SessionActionsMixin:
         import harness
         rows = harness.session_rows(limit=None, include_empty=False)
         if not rows:
-            self._notice('No saved sessions.')
+            # 空列表容易被误读成“会话丢了”：把实际使用的目录和 home 一起报出来。
+            self._notice(
+                f'No saved sessions. 会话目录：{harness.SESSIONS_DIR}'
+                f'（home={harness.HOME_DIR}；可用 HARNESS_HOME 指定）')
             return
         current_workspace = harness.get_workdir()
         self.push_screen(

@@ -102,7 +102,10 @@ def test_event_order_assistant_tool_turn_completed(tmp_path, monkeypatch):
     events = store.read_events()
     kinds = [event['type'] for event in events]
     assert kinds.count('turn_completed') == 1
-    assert kinds[-1] == 'turn_completed'
+    assert kinds.count('turn_terminal') == 1
+    assert kinds[-1] == 'turn_terminal'
+    assert events[-1]['status'] == 'completed'
+    assert events[-1]['turn_id']
 
     def _index(predicate):
         return next(i for i, event in enumerate(events) if predicate(event))
@@ -222,3 +225,42 @@ def test_stream_completion_patch_point_still_applies(tmp_path, monkeypatch):
                               session_store=store,
                               housekeeping=False) == 'streamed'
     assert seen['kwargs']['tools'] is harness.TOOLS
+
+
+def test_failed_turn_records_a_terminal_event(tmp_path, monkeypatch):
+    store = SessionEventStore(tmp_path / 'sessions', session_id='failed')
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('provider exploded')
+
+    monkeypatch.setattr(harness, '_run_llm_request', boom)
+    with pytest.raises(RuntimeError):
+        harness.agent_loop([{'role': 'user', 'content': 'go'}],
+                           session_store=store, housekeeping=False)
+
+    events = store.read_events()
+    kinds = [event['type'] for event in events]
+    assert 'turn_started' in kinds
+    assert 'turn_completed' not in kinds
+    terminal = events[-1]
+    assert terminal['type'] == 'turn_terminal'
+    assert terminal['status'] == 'failed'
+    assert terminal['error_type'] == 'RuntimeError'
+    assert terminal['turn_id'] and terminal['source'] == 'cli'
+
+
+def test_cancelled_turn_records_a_cancelled_terminal(tmp_path, monkeypatch):
+    store = SessionEventStore(tmp_path / 'sessions', session_id='cancelled')
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(harness, '_run_llm_request', interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        harness.agent_loop([{'role': 'user', 'content': 'go'}],
+                           session_store=store, housekeeping=False)
+
+    terminal = store.read_events()[-1]
+    assert terminal['type'] == 'turn_terminal'
+    assert terminal['status'] == 'cancelled'
+    assert terminal['turn_id']

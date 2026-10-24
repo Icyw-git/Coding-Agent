@@ -87,6 +87,7 @@ def build_router(client, runtime, logger):
     @router.post("/v1/sessions/{session_id}/messages/stream")
     def stream_message(session_id: str, request: SendMessageRequest):
         """Run one turn and emit text deltas as SSE frames."""
+        from agent_runtime import TurnCancelled
         from turn_coordinator import TurnBusy
 
         deltas: queue.Queue = queue.Queue()
@@ -108,6 +109,10 @@ def build_router(client, runtime, logger):
                                      "content": response.content,
                                      "duration_ms": duration_ms,
                                      "duration": format_duration(duration_ms / 1000)}))
+            except TurnCancelled as exc:
+                deltas.put(("cancelled", {'detail': str(exc),
+                                          'duration_ms': round((time.monotonic() - started) * 1000),
+                                          'duration': format_duration(time.monotonic() - started)}))
             except TurnBusy as exc:
                 deltas.put(("error", {'detail': str(exc), 'code': 'turn_busy',
                                        'duration_ms': round((time.monotonic() - started) * 1000),
@@ -142,6 +147,9 @@ def build_router(client, runtime, logger):
                     yield f"event: delta\ndata: {json.dumps({'text': payload}, ensure_ascii=False)}\n\n"
                 elif kind == "done":
                     yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif kind == "cancelled":
+                    yield ("event: cancelled\ndata: "
+                           + json.dumps(payload, ensure_ascii=False) + "\n\n")
                 elif kind == "error":
                     yield f"event: error\ndata: {json.dumps({'detail': payload}, ensure_ascii=False)}\n\n"
                 elif kind == 'close':

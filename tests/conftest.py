@@ -25,6 +25,39 @@ _TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
 
 
 @pytest.fixture(autouse=True)
+def _block_unstubbed_llm_calls(monkeypatch):
+    """测试默认禁止真实模型请求：没打桩就失败，而不是悄悄产生费用。
+
+    项目根的 .env 会设置真实的 base_url/model；agent_loop 的非流式路径或
+    多 provider 客户端会绕过 ``harness.client`` 的补丁。这里同时封住
+    ``llm_config.get_client``，让漏打的测试立刻显形。
+    """
+    def blocked(*args, **kwargs):
+        raise AssertionError(
+            'test attempted a real LLM request; patch harness.client / '
+            '_stream_completion / _run_llm_request instead')
+
+    # 只封主客户端的请求入口：get_client 需要保持真实，供多 provider/缓存测试使用。
+    monkeypatch.setattr(harness.client.chat.completions, 'create', blocked)
+
+
+@pytest.fixture(autouse=True)
+def _reset_turn_control_state():
+    """回合取消位/活动 token 是进程级状态：用例之间必须清零。
+
+    生产语义保留“启动前按下的 Esc 会取消即将开始的回合”，所以不在 begin_turn
+    里无条件清位；测试需要自己保证不把上一个用例的取消位带进下一个。
+    """
+    import turn_control
+
+    turn_control.reset()
+    try:
+        yield
+    finally:
+        turn_control.reset()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_storage_dirs(tmp_path):
     """把会话/快照/转录/工具结果目录指向临时目录。
 
@@ -43,16 +76,20 @@ def _isolate_storage_dirs(tmp_path):
     _restore_permission_backend 的注释：teardown 顺序必须保证最后还原。
     """
     saved = (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR,
-             harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR)
+             harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR,
+             harness.MEMORY_DIR, harness.MEMORY_INDEX)
     harness.SESSIONS_DIR = tmp_path / 'sessions'
     harness.CHECKPOINT_DIR = tmp_path / 'checkpoints'
     harness.TRANSCRIPT_DIR = tmp_path / 'transcripts'
     harness.TOOL_RESULTS_DIR = tmp_path / 'tool_results'
+    harness.MEMORY_DIR = tmp_path / 'memories'
+    harness.MEMORY_INDEX = harness.MEMORY_DIR / 'MEMORY.md'
     try:
         yield
     finally:
         (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR,
-         harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR) = saved
+         harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR,
+         harness.MEMORY_DIR, harness.MEMORY_INDEX) = saved
 
 
 @pytest.fixture(autouse=True)

@@ -4067,3 +4067,73 @@ API rename/fork 409。全量 **1496 passed / 1 skipped**，Ruff、`py_compile`�
 
 仍未做：真实终端 / 真 daemon 验收（手机与 TUI 抢同一会话、SIGTERM 关闭、审批端到端）；
 阶段 1 的 turn_id、终态事件、steer/interrupt、watcher。
+
+## Personal Agent 阶段 1 第一块：turn_id、终态事件、steer 与 interrupt
+
+阶段 1 的前置是“一个回合能被唯一识别、能被精确取消”。原先只有进程级的取消 Event，
+而且成功回合并发一个 `turn_completed`，失败/取消没有任何终态记录；watcher 无法区分
+“还在跑”和“已经结束”。
+
+**回合身份**：`agent_loop` 开始时生成 `turn_id` 并写 `turn_started{turn_id, source}`。
+`turn_source` 由入口传入（cli/tui/api/cron/steer）；`AgentRuntime.send(source=...)` 透传。
+成功路径在 `_finish_response` 里保留 `turn_completed`（旧消费者），紧跟唯一的
+`turn_terminal{status='completed', turn_id, source}`；失败/取消在调用边界记录
+`turn_terminal{status='failed'|'cancelled', error_type}` 后原样抛出。测试断言失败回合没有
+`turn_completed`、取消回合终态是 `cancelled`。
+
+**按回合取消**：`TurnToken` + 活动注册表。`begin_turn()` 同线程重入时复用 token（测试会先
+`begin_turn()` 再进 `agent_loop`），`request_cancel()` 优先取消活动 token、没有活动回合才
+落到全局位；`end_turn()` 清位，避免“上一回合的 Esc 取消下一回合”。`AgentRuntime.send` 在
+进入执行器前登记 token，使 `/interrupt` 和 `/steer` 在 `agent_loop` 真正开始前就能命中。
+
+**steer**：`runtime.steer()` 在活动回合时把消息放进本回合的队列（`send` 注册
+`steer_provider`），空闲时降级为普通 `send`。不属于本进程的回合（TUI 在别的进程）返回
+409，而不是返回成功后丢失。`runtime.send` 会检查注入的 `run_turn` 是否接受
+`steer_provider`/`turn_source`，避免强迫测试替身改签名。
+
+**interrupt**：`runtime.interrupt()` 只取消按会话匹配的活动 token；`send` 把
+`KeyboardInterrupt` 收敛成 `TurnCancelled`，普通端点映射 409，流式端点新增
+`event: cancelled`。头文件还补充了 `headless` 的取消退出码处理。
+
+**测试环境的一个真实风险**：项目根的 `.env` 配了真实 `LLM_BASE_URL`，而 `agent_loop`
+在“目标模型不支持流式”时会走 `api.chat.completions.create`，绕过 `_stream_completion`
+补丁——本轮排查时确实有测试打到了真实模型。`conftest` 现在默认把
+`harness.client.chat.completions.create` 换成直接 `AssertionError` 的桩，没打桩就会显形；
+`llm_config.get_client` 保持真实，供多 provider/缓存测试使用。
+
+全量 **1505 passed / 1 skipped**；Ruff、`py_compile`、`git diff --check` 通过。
+阶段 1 剩余：steer 幂等键、跨进程 steer/interrupt、飞书 watcher 与至少一次投递。
+
+## 「换个目录启动就看不到会话」：把 agent home 和 workspace 分开
+
+现象：在另一个目录运行 `entrypoint.py`，会话选择器显示 “No saved sessions”，记忆、快照
+也跟着“消失”。根因不是选择器：`harness.py` 里所有状态目录都从
+`WORKDIR = Path.cwd()` 推导——`SESSIONS_DIR = WORKDIR/'.cache'/'sessions'`，于是启动目录
+决定了去哪读历史。换目录等于换了一套 home；而在同一进程里 `set_workspace` 切工作区时
+又不会（也不该）搬动这些目录，两个概念一直混在一起。
+
+**改法**（`src/paths.py`）：显式区分两个根。
+
+- **home**：`HARNESS_HOME`，默认仓库根（`harness.py` 所在目录）；
+- **workspace**：仍是 `Path.cwd()` / `use_workspace`，只影响工具执行、`@` 补全、项目技能；
+- 会话、记忆、快照、transcript、工具结果、tasks、crons、邮箱、飞书绑定、API 日志统一
+  放到 `<home>/.cache`。
+
+`cron_scheduler.DURABLE_PATH`、`task_system.TASK_DIR`、`cli_input` 的 cache-debug、
+`feishu_gateway.BINDINGS_PATH`、`workspaces.default_path()`、`harness_api` 的 os_tasks 与
+访问日志，原本各写各的 `Path(__file__).parents[1]` 或相对 `.cache`，现在都走
+`paths.cache_path()`，`HARNESS_HOME` 一处生效。工作区级的 `sandbox-tmp` 保持不动。
+`agent_teams.MAILBOX_DIR` 也归 home，并顺带修了 `mkdir()` 缺 `parents=True`——全新 home
+首次导入会因 `.cache` 不存在直接 FileNotFoundError。
+
+**避免静默“丢数据”**：`--doctor` 输出 `[home]` 与 `[sessions]` 实际路径；会话选择器为空时
+提示里带上 `SESSIONS_DIR` 和 `HOME_DIR`；启动时如果当前目录还留着旧 `.cache/sessions` 而
+home 里没有会话，stderr 打一条 `HARNESS_HOME=<当前目录>` 的迁移提示。没有自动合并两套
+目录——那会把不同 home 的历史混成一个，且并发写无法仲裁。
+
+**测试**：新增 `tests/test_paths.py`，包含真实子进程用例——在 `work-a` 创建会话、在
+`work-b` 列出，断言两者都用同一个 home 且 `work-a/.cache/sessions` 不存在；`--doctor`
+的路径输出与选择器空态提示也在同一路径约定下。`conftest` 补隔离 `MEMORY_DIR`。
+全量 **1510 passed / 1 skipped**；Ruff、`py_compile`、`git diff --check` 通过。
+
+使用方式：默认无需配置；要在多个 home 间切换或迁移旧目录，设置 `HARNESS_HOME=<目录>`。

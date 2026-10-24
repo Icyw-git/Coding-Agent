@@ -28,7 +28,8 @@ def default_path(sessions_dir=None) -> Path:
         return Path(override).expanduser()
     if sessions_dir:
         return Path(sessions_dir).expanduser().parent / 'workspaces.json'
-    return Path('.cache') / 'workspaces.json'
+    import paths
+    return paths.cache_path('workspaces.json')
 
 
 def workspace_id(path) -> str:

@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 import llm_config
 import llm_route
+import paths
 from autonomous_agent import idle_poll
 from file_lock import exclusive_file_lock
 from subagent_events import TeammateRecorder
@@ -22,8 +23,8 @@ from worktree import WORKTREES_DIR
 
 load_dotenv()
 WORKDIR = Path.cwd().resolve()
-MAILBOX_DIR = WORKDIR / '.mailbox'
-MAILBOX_DIR.mkdir(exist_ok=True)
+MAILBOX_DIR = paths.cache_path('mailbox')   # agent home 下的共享邮箱，与 cwd 无关
+MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _main_model() -> str | None:

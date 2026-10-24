@@ -342,7 +342,8 @@ class SlashCompleter(Completer):
 def _history_path():
     """跨会话的命令历史；不可写时退回无历史，不影响启动。"""
     try:
-        base = Path(__file__).resolve().parents[1] / '.cache'
+        import paths
+        base = paths.cache_dir()
         base.mkdir(parents=True, exist_ok=True)
         return base / 'cli_history'
     except OSError:

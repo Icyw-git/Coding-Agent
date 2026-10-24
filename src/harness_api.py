@@ -54,8 +54,10 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     runtime = _default_runtime() if owns_runtime else runtime
     client = HarnessClient(runtime)
     # 独立命名空间：.cache/tasks 已被 task_system（agent TODO 列表）占用
+    import paths
+
     task_base = Path(task_root or os.getenv("HARNESS_TASK_ROOT")
-                     or Path.cwd() / ".cache" / "os_tasks")
+                     or paths.cache_path("os_tasks"))
     allowed_roots = workspace_roots(
         workspace or os.getenv("HARNESS_WORKSPACE") or Path.cwd())
     tasks = TaskManager(
@@ -72,9 +74,8 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     permission_gate.backend = 'remote'
 
     logger = logging.Logger("harness.api.access", level=logging.INFO)
-    access_log_path = access_log_path or os.getenv(
-        "HARNESS_API_LOG", ".cache/api/api-access.log"
-    )
+    access_log_path = (access_log_path or os.getenv("HARNESS_API_LOG")
+                       or paths.cache_path("api", "api-access.log"))
     @asynccontextmanager
     async def lifespan(app):
         scheduler = None
