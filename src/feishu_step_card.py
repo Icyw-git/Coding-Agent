@@ -45,6 +45,26 @@ def _panel(title: str, lines: list[str], *, expanded: bool = False) -> dict:
     }
 
 
+def menu_row() -> dict:
+    """完成后卡片底部的常驻入口：随时打开控制台。"""
+    return {
+        'tag': 'column_set',
+        'flex_mode': 'none',
+        'columns': [{
+            'tag': 'column',
+            'width': 'weighted',
+            'weight': 1,
+            'elements': [{
+                'tag': 'button',
+                'text': _plain('⚙️ 控制台'),
+                'type': 'default',
+                'width': 'fill',
+                'behaviors': [{'type': 'callback', 'value': {'panel': 'menu'}}],
+            }],
+        }],
+    }
+
+
 def tool_lines(tool_counts: dict[str, int] | None,
                tool_errors: list[dict] | None,
                *, total_ms: float = 0) -> list[str]:

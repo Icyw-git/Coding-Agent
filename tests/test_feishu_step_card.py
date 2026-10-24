@@ -111,6 +111,11 @@ def test_gateway_streams_step_card_and_reports_tools(monkeypatch):
     text = _all_markdown(final)
     assert '已完成 · 总用时' in text
     assert '工具摘要（1）' in text and '`bash` × 1' in text
+    buttons = [element for element in final['body']['elements']
+               if element.get('tag') == 'column_set']
+    assert buttons, '完成后卡片应带常驻控制台入口'
+    assert buttons[-1]['columns'][0]['elements'][0]['behaviors'][0]['value'] == {
+        'panel': 'menu'}
     assert 'SEARCH_FAILED' in text, '工具失败要出现在过程详情里'
 
 

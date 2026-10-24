@@ -55,7 +55,7 @@ import paths
 from exec_policy import approval_class
 from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
-from feishu_step_card import step_card
+from feishu_step_card import menu_row, step_card
 from gateway_sim import GatewayClient
 from perf import record as perf_record
 from perf import reset as perf_reset
@@ -691,7 +691,9 @@ class FeishuGateway:
         duration = getattr(self.api, 'last_duration', None)
         if step_mode:
             elapsed = duration or format_duration(time.monotonic() - _t_entry)
-            final_payload = _payload(reply, running=False, note=f'已完成 · 总用时 {elapsed}')
+            final_payload = _payload(reply, running=False,
+                                     note=f'已完成 · 总用时 {elapsed}')
+            final_payload['body']['elements'].append(menu_row())
         else:
             if duration:
                 reply = reply + chr(10) + chr(10) + f'已完成 · 总用时 {duration}'
@@ -994,6 +996,8 @@ class FeishuGateway:
             self._panel_stop(chat_id)
         elif action == 'status':
             self._panel_status(chat_id)
+        elif action in ('menu', 'panel'):
+            self._send_panel(chat_id, intro='常用操作：')
         else:
             self._reply(chat_id, self._help_text())
 
@@ -1724,23 +1728,26 @@ class FeishuGateway:
         chat_id = self._chat_for_session(session_id)
         if chat_id is None or self.transport is None:
             raise RuntimeError('no bound chat for session')
-        turn = str(payload.get('turn_id') or '')[:8]
-        short = session_id[:8]
         if kind == 'stalled':
             minutes = max(1, round(float(payload.get('elapsed_s') or 0) / 60))
-            head = f'⏳ 回合仍在运行（约 {minutes} 分钟），可能在等待审批或卡住。'
-            text = head + chr(10) + f'会话 {short} · turn {turn}'
+            text = f'⏳ 回合仍在运行（约 {minutes} 分钟），可能在等待审批或卡住。'
         else:
             status = str(payload.get('status') or 'completed')
-            source = str(payload.get('source') or '?')
             if status == 'completed':
-                head = '✅ 回合完成'
+                text = '✅ 回合完成'
             elif status == 'cancelled':
-                head = '⏹ 回合已取消'
+                text = '⏹ 回合已取消'
             else:
-                head = '⚠️ 回合失败（' + str(payload.get('error_type') or 'error') + '）'
-            text = head + chr(10) + f'会话 {short} · turn {turn} · 来源 {source}'
+                text = '⚠️ 回合失败（' + str(payload.get('error_type') or 'error') + '）'
         self.transport.send_text(chat_id, text)
+
+    def announce_startup(self) -> int:
+        """服务启动时给已绑定的聊天发一次常驻控制台入口。"""
+        with self._bindings_lock:
+            chats = list(self.bindings)
+        for chat_id in chats:
+            self._send_panel(chat_id, intro='服务已就绪；下面的按钮随时可用。')
+        return len(chats)
 
     def start_watcher(self) -> bool:
         return self.watcher.start()
@@ -1916,6 +1923,10 @@ class FeishuGateway:
         self.start_permission_poller()
         self.start_dispatcher()
         self.start_watcher()
+        try:
+            self.announce_startup()
+        except Exception as exc:
+            print(f'[feishu] startup panel failed: {exc}')
         print('[feishu] long connection started; Ctrl+C to exit')
         ws_client.start()   # blocks
 

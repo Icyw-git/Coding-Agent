@@ -1142,7 +1142,7 @@ def test_watcher_pushes_turn_terminal_from_other_sources(gateway, tmp_path):
     result = gw.watcher.poll_once(session_id)
     assert result['notified'] == 1
     text = fake.last()
-    assert '回合完成' in text and session_id[:8] in text
+    assert text == '✅ 回合完成', '完成通知不应带会话/turn/来源'
 
     # 同一个终态再拉一次（SSE 重放）不会重复推送
     assert gw.watcher.poll_once(session_id)['notified'] == 0
@@ -1170,6 +1170,7 @@ def test_watcher_skips_feishu_turns_and_reports_failures(gateway, tmp_path):
                  source='cron', error_type='APIStatusError', ts=time.time())
     assert gw.watcher.poll_once(session_id)['notified'] == 1
     assert '回合失败' in fake.last() and 'APIStatusError' in fake.last()
+    assert 'turn' not in fake.last() and '来源' not in fake.last()
 
 
 def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
@@ -1211,6 +1212,28 @@ def _last_card_text(fake) -> str:
     import json
 
     return json.dumps(fake.cards[-1][1], ensure_ascii=False) if fake.cards else ''
+
+
+def test_startup_announces_control_panel_to_bound_chats(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-boot-1', 'hi')
+    gw.on_message('chat-boot-2', 'hi')
+    fake.cards.clear()
+    assert gw.announce_startup() == 2
+    assert len(fake.cards) == 2
+    assert all(card['header']['title']['content'] == 'Harness 控制台'
+               for _, card in fake.cards)
+
+
+def test_panel_menu_action_opens_control_panel(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-menu', 'hi')
+    fake.cards.clear()
+    toast, ok = gw.handle_card_action('ou_me', {'panel': 'menu'}, 'om_m',
+                                      chat_id='chat-menu')
+    assert ok
+    gw._handle_panel_action('chat-menu', 'menu')
+    assert fake.cards and fake.cards[-1][1]['header']['title']['content'] == 'Harness 控制台'
 
 
 def _panel_actions(card: dict) -> list[str]:
