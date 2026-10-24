@@ -82,6 +82,11 @@
   的旧行不会误取到下一条；Esc 取消仍取回全部。
 - P7：`src/ui/app.py`、`ui_textual.py` 和 `textual-legacy` 路由已删除；
   默认交互入口改为 Textual，`ansi` 保留为显式降级；旧专属测试已删除或迁到新 App。
+- P7a：会话管理动作（工作区切换、跨会话搜索、归档/恢复/删除）下沉到
+  `src/ui/session_admin_actions.py` 的 `SessionAdminActionsMixin`，与核心层
+  `session_admin.py` 同口径；斜杠命令路由与模型切换下沉到
+  `src/ui/command_actions.py` 的 `CommandActionsMixin`。`harness_app.py` 从
+  1943 行降到 1408 行，App 只保留视图、事件分发与回合控制。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
