@@ -26,11 +26,13 @@ REPL commands:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 import httpx
 
@@ -53,6 +55,22 @@ def format_event(event: dict) -> str:
     return f'[live] {kind} (seq={event.get("seq")})'
 
 
+def _is_loopback(base_url: str) -> bool:
+    """API 在本机时不要走系统代理。
+
+    httpx 的 trust_env 在 Windows 上会读注册表里的系统代理；本机正跑着代理
+    （例如 127.0.0.1:10090）时，连 127.0.0.1:8000 也会被转发，SSE 往往直接
+    502/被缓冲。loopback 一律直连，远端 API 仍尊重环境/系统代理配置。
+    """
+    host = (urlparse(base_url).hostname or '').strip().lower()
+    if host in ('localhost', '::1'):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class GatewayClient:
     """Thin httpx wrapper over the Harness HTTP API."""
 
@@ -64,6 +82,7 @@ class GatewayClient:
             headers={'Authorization': f'Bearer {token}'},
             timeout=httpx.Timeout(600.0, connect=10.0),
             transport=transport,
+            trust_env=not _is_loopback(self.base_url),
         )
         self.session_id: str | None = None
         self._stream_stop = threading.Event()

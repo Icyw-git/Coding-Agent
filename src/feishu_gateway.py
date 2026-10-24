@@ -1603,6 +1603,9 @@ class FeishuGateway:
                 self.bindings.pop(chat, None)
             if chats:
                 self._save_bindings()
+        if not chats:
+            return
+        print(f'[feishu] session {session_id[:8]} missing; unbound {len(chats)} chat(s)')
         for chat in chats:
             self._reply(chat, '原会话已不存在（可能被删除或换了数据目录），'
                               '已解除绑定；直接发消息会新建会话。')
