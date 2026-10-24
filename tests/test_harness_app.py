@@ -1074,8 +1074,9 @@ def test_ctrl_c_copies_selection_instead_of_quitting(monkeypatch):
 
 def test_malformed_markdown_falls_back_to_text(monkeypatch):
     from ui import harness_app as module
+    from ui import rendering
 
-    monkeypatch.setattr(module, 'RichMarkdown',
+    monkeypatch.setattr(rendering, 'RichMarkdown',
                         lambda text: (_ for _ in ()).throw(ValueError('bad link')))
     lines = module._render_markdown('[broken](', 40)
     assert 'broken' in '\n'.join(str(line) for line in lines)
@@ -1647,7 +1648,7 @@ def test_cache_profile_command_uses_storage_profile(monkeypatch):
 
 
 def test_markdown_console_cache_is_bounded():
-    from ui import harness_app as module
+    from ui import rendering as module
 
     module._CONSOLES.clear()
     try:

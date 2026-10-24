@@ -9,15 +9,11 @@ import contextlib
 import io
 import os
 import queue
-import re
 import threading
 import time
 from functools import partial
 
-from rich.console import Console
-from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
-from rich.theme import Theme
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -31,27 +27,14 @@ from ui.modals.approval import PermissionModal
 from ui.modals.confirm import ConfirmModal
 from ui.modals.queue import QueueModal
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
+from ui.rendering import _render_lines, _render_markdown, _short_count, _streaming_markdown_source
 from ui.session_actions import SessionActionsMixin
 from ui.session_admin_actions import SessionAdminActionsMixin
-from ui.transcript import ConversationModel, TranscriptLayout, VirtualTranscript
+from ui.transcript import ConversationModel, TranscriptLayout
+from ui.widgets import SUGGESTION_LIMIT, CompletionPopup, Composer, PendingQueue, Transcript
 from ui_events import UIEvent, bus
 
-
-def _short_count(value) -> str:
-    """12345 -> 12.3k，避免状态栏在窄终端被挤掉。"""
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if number >= 1_000_000:
-        return f'{number / 1_000_000:.1f}m'
-    if number >= 10_000:
-        return f'{number / 1000:.1f}k'
-    return str(number)
-
-
 FOLLOW_END = True
-SUGGESTION_LIMIT = 6
 # 首次只把最近一段历史转成 UI 块；完整消息仍保留在 _messages 供 Agent 使用。
 # 滚动到顶部或 /more 时按页向前补，和 Codex 的分页 history、Pi 的 active
 # branch 投影一样，避免启动时把整份长历史渲染进内存。
@@ -70,271 +53,6 @@ STREAM_MIN_INTERVAL = 0.05
 STREAM_MAX_INTERVAL = 0.30
 STREAM_DEFAULT_INTERVAL = 0.12
 SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
-
-# TUI 的 Rich Markdown 主题：避免默认的 “cyan on black” 代码块在深色终端上
-# 显得突兀，也让正文/标题/链接与 Textual dark 主题一致。
-MARKDOWN_THEME = Theme({
-    'markdown.paragraph': '#d7d7d7',
-    'markdown.h1': 'bold #ffffff',
-    'markdown.h2': 'bold #ffffff',
-    'markdown.h3': 'bold #eeeeee',
-    'markdown.h4': 'bold #eeeeee',
-    'markdown.h5': 'bold #dddddd',
-    'markdown.h6': 'bold #dddddd',
-    'markdown.strong': 'bold #ffffff',
-    'markdown.em': 'italic #d7d7d7',
-    'markdown.code': 'bold #87d7ff',
-    'markdown.code_block': '#d7d7d7 on #1c1c1c',
-    'markdown.block_quote': 'italic #a7a7a7',
-    'markdown.item.bullet': '#d7af5f',
-    'markdown.item.number': '#d7af5f',
-    'markdown.link': 'underline #5fafff',
-    'markdown.link_url': 'dim #5fafff',
-    'markdown.table.border': '#5f8787',
-    'markdown.hr': '#5f8787',
-})
-
-
-
-_FENCE_OPEN = re.compile(r'^( {0,3})(`{3,}|~{3,})([^\r\n]*)(\r?\n)?$')
-_FENCE_CLOSE = re.compile(r'^ {0,3}(`{3,}|~{3,})[ \t]*(\r?\n)?$')
-
-
-def _streaming_markdown_source(source: str) -> tuple[str, bool]:
-    """Avoid expensive syntax lexing for labeled fenced code during streaming."""
-    if '```' not in source and '~~~' not in source:
-        return source, False
-    output = []
-    fence_char = None
-    fence_size = 0
-    changed = False
-    for line in source.splitlines(keepends=True):
-        if fence_char is None:
-            match = _FENCE_OPEN.match(line)
-            if match:
-                fence = match.group(2)
-                info = match.group(3)
-                if fence[0] == '`' and '`' in info:
-                    output.append(line)  # CommonMark: backticks invalidate this fence.
-                    continue
-                fence_char, fence_size = fence[0], len(fence)
-                if info.strip() and info.split()[0] != 'text':
-                    output.append(f'{match.group(1)}{fence}text{match.group(4) or ""}')
-                    changed = True
-                    continue
-        else:
-            close = _FENCE_CLOSE.match(line)
-            if close:
-                fence = close.group(1)
-                if fence[0] == fence_char and len(fence) >= fence_size:
-                    fence_char, fence_size = None, 0
-        output.append(line)
-    return (''.join(output), changed) if changed else (source, False)
-
-
-def _render_markdown(text: str, width: int) -> list[Text]:
-    """Markdown 渲染兜底：畸形链接/超长表格等不能让整帧崩溃。"""
-    try:
-        return _render_lines(RichMarkdown(text), width)
-    except Exception:
-        return _render_lines(Text(text), width)
-
-
-_CONSOLES: dict[int, Console] = {}
-
-
-def _console_for(width: int) -> Console:
-    console = _CONSOLES.get(width)
-    if console is None:
-        # 拖动窗口会不断产生新宽度；缓存只保留最近用过的少量 Console。
-        if len(_CONSOLES) >= 16:
-            _CONSOLES.clear()
-        console = Console(width=width, force_terminal=True,
-                          color_system='truecolor', legacy_windows=False,
-                          safe_box=True, theme=MARKDOWN_THEME)
-        _CONSOLES[width] = console
-    return console
-
-
-def _render_lines(renderable, width: int) -> list[Text]:
-    """把 Rich renderable 渲染成固定宽度的 Text 行（虚拟视口用）。"""
-    console = _console_for(width)
-    options = console.options.update(max_width=width, min_width=width)
-    lines = console.render_lines(renderable, options, pad=False)
-    result = []
-    for segments in lines:
-        result.append(Text.assemble(*[
-            (segment.text, segment.style) for segment in segments
-            if segment.text]))
-    return result or [Text('')]
-
-
-class PendingQueue:
-    """待发送消息队列：worker 取头部，用户可取回最后一条编辑。"""
-
-    def __init__(self) -> None:
-        self._items: list[str | None] = []
-        self._lock = threading.RLock()
-        self._cv = threading.Condition(self._lock)
-
-    def put(self, item: str | None) -> None:
-        with self._cv:
-            self._items.append(item)
-            self._cv.notify()
-
-    def get(self) -> str | None:
-        with self._cv:
-            while not self._items:
-                self._cv.wait()
-            return self._items.pop(0)
-
-    def take_last(self) -> str | None:
-        with self._lock:
-            if not self._items:
-                return None
-            item = self._items[-1]
-            if item is None:
-                return None
-            self._items.pop()
-            return item
-
-    def take_at(self, index: int, expected: str | None = None) -> str | None:
-        """按位置取走一条；expected 不匹配说明队列已被消费，拒绝误取。"""
-        with self._lock:
-            if not 0 <= index < len(self._items):
-                return None
-            item = self._items[index]
-            if item is None or (expected is not None and item != expected):
-                return None
-            return self._items.pop(index)
-
-    def snapshot(self) -> list[str]:
-        with self._lock:
-            return [item for item in self._items if item is not None]
-
-    def drain(self) -> list[str]:
-        """取走全部消息（用于 steer 注入或 Esc 取回）。"""
-        with self._lock:
-            items = [item for item in self._items if item is not None]
-            self._items.clear()
-            return items
-
-    def __len__(self) -> int:
-        return len(self.snapshot())
-
-
-class Composer(TextArea):
-    """多行输入：Enter 排队/发送、Ctrl-J 换行、Alt+Enter 立即插队、Ctrl+G 管理队列。"""
-
-    BINDINGS = [
-        Binding('enter', 'submit', 'Send', show=False, priority=True),
-        Binding('ctrl+j', 'newline', 'Newline', show=False, priority=True),
-        Binding('tab', 'complete', 'Complete', show=False),
-        Binding('alt+up', 'queued_prev', 'Manage queue', show=False),
-        Binding('alt+down', 'queued_next', 'Next', show=False),
-        Binding('alt+enter', 'submit_now', 'Send now', show=False,
-                priority=True),
-        Binding('ctrl+g', 'dequeue', 'Manage queue', show=False, priority=True),
-        Binding('up', 'suggest_prev', 'Prev', show=False),
-        Binding('down', 'suggest_next', 'Next', show=False),
-        Binding('ctrl+o', 'expand_tool', 'Expand tool', show=False,
-                priority=True),
-        Binding('escape', 'escape', 'Close', show=False, priority=True),
-    ]
-
-    def action_submit(self) -> None:
-        # 忙时 Enter 只排队到本回合结束；空闲时直接发送。
-        self.app.submit_composer(mode='followup')
-
-    def action_submit_now(self) -> None:
-        # Alt+Enter：忙时进入 steering，Agent 下一次消费时注入当前回合。
-        self.app.submit_composer(mode='steer')
-
-    def action_newline(self) -> None:
-        self.insert(chr(10))
-
-    def action_complete(self) -> None:
-        self.app.accept_suggestion()
-
-    def action_suggest_prev(self) -> None:
-        if self.app.has_suggestions():
-            self.app.cycle_suggestion(-1)
-            return
-        self.move_cursor_relative(rows=-1)
-
-    def action_suggest_next(self) -> None:
-        if self.app.has_suggestions():
-            self.app.cycle_suggestion(1)
-            return
-        self.move_cursor_relative(rows=1)
-
-    def action_queued_prev(self) -> None:
-        if self.app.has_suggestions():
-            self.app.cycle_suggestion(-1)
-        else:
-            self.app.open_queue_picker()
-
-    def action_queued_next(self) -> None:
-        if self.app.has_suggestions():
-            self.app.cycle_suggestion(1)
-
-    def action_dequeue(self) -> None:
-        self.app.open_queue_picker()
-
-    def action_escape(self) -> None:
-        if self.app.has_suggestions():
-            self.app.close_suggestions()
-        else:
-            self.app.cancel_turn()
-
-    def action_expand_tool(self) -> None:
-        self.app.toggle_last_tool()
-
-
-class CompletionPopup(Static):
-    """绝对定位的补全浮层；不抢焦点，键盘由 Composer 分发，鼠标点击可选。"""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._items: list[tuple[str, str]] = []
-
-    def show(self, items: list[tuple[str, str]], index: int) -> None:
-        self._items = list(items)
-        lines = []
-        for position, (_value, label) in enumerate(items[:SUGGESTION_LIMIT]):
-            marker = '▸' if position == index else ' '
-            lines.append(f' {marker} {label}')
-        if len(items) > SUGGESTION_LIMIT:
-            lines.append(f'   … {len(items) - SUGGESTION_LIMIT} more')
-        self.update(Text('\n'.join(lines)))
-        self.display = True
-
-    def on_click(self, event: events.Click) -> None:
-        limit = min(len(self._items), SUGGESTION_LIMIT)
-        if 0 <= event.y < limit:
-            self.app.choose_suggestion(event.y)
-
-    def hide_popup(self) -> None:
-        self.display = False
-
-
-class Transcript(VirtualTranscript):
-    """点击命中工具块；拖选结束后自动复制显示文本。"""
-
-    def on_mouse_up(self, event: events.MouseUp) -> None:
-        if event.button == 1:
-            # 等 Screen 应用最终选区后再取文字，避免复制到拖动的倒数一帧。
-            self.call_after_refresh(self._copy_selection)
-
-    def _copy_selection(self) -> None:
-        if (self.is_attached and self.text_selection is not None
-                and self.app._selected_text()):
-            self.app.action_copy_selection()
-
-    def on_click(self, event: events.Click) -> None:
-        y = event.y + int(self.scroll_offset.y)
-        self.app.on_transcript_click(y)
-
 
 class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                  CommandActionsMixin, App):

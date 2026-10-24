@@ -87,6 +87,11 @@
   `session_admin.py` 同口径；斜杠命令路由与模型切换下沉到
   `src/ui/command_actions.py` 的 `CommandActionsMixin`。`harness_app.py` 从
   1943 行降到 1408 行，App 只保留视图、事件分发与回合控制。
+- P7b：Rich 渲染辅助（Markdown 兜底、流式围栏改写、按宽度复用的 Console）
+  下沉到 `src/ui/rendering.py`；队列/输入框/补全浮层/可选文本视口下沉到
+  `src/ui/widgets.py`。`harness_app.py` 从 1408 行降到 1129 行，只保留
+  App 布局、事件归约、回合控制与状态栏；`harness_app` 继续 re-export
+  `_render_markdown` 等名字，测试 patch 点跟随实现改到 `ui.rendering`。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
