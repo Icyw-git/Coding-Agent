@@ -16,7 +16,7 @@ import os
 import sys
 
 import approval_view
-import llm_config
+import llm_route
 from exec_policy import (
     ASK,
     READ_ONLY_FILE_TOOLS,
@@ -119,17 +119,15 @@ def _judge_model() -> str:
     优先级：HARNESS_MODEL_APPROVAL > 配置 roles.approval >
     HARNESS_JUDGE_MODEL（既有变量）> main。
     """
-    try:
-        return llm_config.get_settings().model_for('approval')
-    except llm_config.ConfigError:
-        return os.getenv(JUDGE_MODEL_ENV) or os.getenv('LLM_MODEL_ID')
+    target = llm_route.target_for('approval')
+    if target is not None:
+        return target.model
+    return os.getenv(JUDGE_MODEL_ENV) or os.getenv('LLM_MODEL_ID')
 
 
 def _judge_client():
     """与 main 同 provider 时复用 harness.client（测试也在这里注入假客户端）。"""
-    from hooks import _h
-    h = _h()
-    return h.client_for('approval') if hasattr(h, 'client_for') else h.client
+    return llm_route.client_for('approval')
 
 
 def _judge_payload(tool: str, args: dict, decision) -> str | None:

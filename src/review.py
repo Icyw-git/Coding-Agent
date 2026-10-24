@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import llm_config
+import llm_route
 import workspace_diff
 from checkpoints import DEFAULT_SECRETS
 from exec_policy import PATH_WORKSPACE, classify_path, is_secret_path
@@ -136,10 +136,7 @@ def _answer(message) -> str:
 
 
 def _create(client, messages: list[dict], tools):
-    try:
-        model = llm_config.get_settings().model_for('main')
-    except llm_config.ConfigError:
-        model = None
+    model = llm_route.model_for('main') or None
     kwargs = {
         'model': model,
         'messages': messages,
@@ -216,7 +213,7 @@ def run_review(
     ]
 
     schemas, handlers = _surface(workspace)
-    api = client or (h.client_for('main') if hasattr(h, 'client_for') else h.client)
+    api = client or llm_route.client_for('main')
     if progress is not None:
         progress(f'  [review] 正在审阅 {len(entries)} 个未提交文件（只读）…')
 

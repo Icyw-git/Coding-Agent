@@ -10,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import llm_config
+import llm_route
 from autonomous_agent import idle_poll
 from file_lock import exclusive_file_lock
 from subagent_events import TeammateRecorder
@@ -27,10 +28,7 @@ MAILBOX_DIR.mkdir(exist_ok=True)
 
 def _main_model() -> str | None:
     """teammate 与主循环同角色；配置缺失时退回旧 LLM_MODEL_ID。"""
-    try:
-        return llm_config.get_settings().model_for('main')
-    except llm_config.ConfigError:
-        return os.getenv('LLM_MODEL_ID')
+    return llm_route.model_for('main') or None
 
 
 # 与 harness 共用角色解析与客户端缓存；openai SDK 仍然延迟到首次调用才加载。

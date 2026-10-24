@@ -8,6 +8,7 @@ import pytest
 
 import harness
 import llm_config
+import llm_route
 import recovery
 
 
@@ -286,3 +287,42 @@ def test_harness_client_for_uses_other_provider_for_configured_role(monkeypatch)
     assert title_client is not harness.client
     assert title_client.kwargs['base_url'] == 'https://budget.test/v1'
     assert title_client.kwargs['api_key'] == 'budget-key'
+
+
+def test_llm_route_model_for_uses_legacy_env(monkeypatch):
+    monkeypatch.delenv('HARNESS_LLM_CONFIG', raising=False)
+    for env_key in llm_config.ROLE_ENV.values():
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv('LLM_API_KEY', 'legacy-key')
+    monkeypatch.setenv('LLM_BASE_URL', 'https://legacy.test/v1')
+    monkeypatch.setenv('LLM_MODEL_ID', 'legacy-model')
+
+    target = llm_route.target_for('main')
+    assert target is not None
+    assert target.model == 'legacy-model'
+    assert llm_route.model_for('summary') == 'legacy-model'
+
+
+def test_llm_route_completion_uses_harness_client_patch(monkeypatch):
+    monkeypatch.delenv('HARNESS_LLM_CONFIG', raising=False)
+    for env_key in llm_config.ROLE_ENV.values():
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv('LLM_API_KEY', 'legacy-key')
+    monkeypatch.setenv('LLM_BASE_URL', 'https://legacy.test/v1')
+    monkeypatch.setenv('LLM_MODEL_ID', 'legacy-model')
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[])
+
+    fake = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(harness, 'client', fake)
+
+    llm_route.completion('summary', messages=[{'role': 'user', 'content': 'hi'}])
+
+    assert len(calls) == 1
+    assert calls[0]['model'] == 'legacy-model'
+    assert calls[0]['messages'] == [{'role': 'user', 'content': 'hi'}]

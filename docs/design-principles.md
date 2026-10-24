@@ -7,7 +7,7 @@
 | 层                        | 职责                                                                                                 |
 | ------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `harness.py` agent_loop   | 唯一 OpenAI 消息主循环：checkpoint、压缩预处理、注入、LLM 调用、工具批次、housekeeping 编排          |
-| `src/agent_core.py`       | 可复用原语：压缩四级流水、记忆系统、hooks 注册表——agent_loop 与 agent_teams 共用同一份，避免双份漂移 |
+| `src/agent_core.py`       | 兼容门面：hooks 注册表；记忆、token 估算、压缩流水分别位于 `memory.py` / `tokens.py` / `compaction.py` |
 | `src/prompt_assembly.py`  | system prompt 分段组装与上下文采集；按 context 指纹缓存，依赖由入口注入                              |
 | `src/session_title.py`    | 会话标题副通道：取材、LLM 调用与本地兜底，client 由入口注入，失败不阻塞回复                          |
 | `src/session_store.py`    | append-only 事件流、确定性回放、分叉与跨会话搜索；唯一恢复真相源                                     |
@@ -63,7 +63,7 @@
 
 其他组件通过 owner 方法更新；跨线程经 ContextVar（checkpoint）或显式参数传递，
 不共享可变全局。压缩判定参数（`CONTEXT_LIMIT`、阈值）集中在 harness.py，
-`agent_core` 通过 `_h()` 回读，测试 monkeypatch 一处生效。
+`memory` / `tokens` / `compaction` 通过 `llm_route.harness()` 回读，测试 monkeypatch 一处生效。
 
 ## 并发与安全
 

@@ -53,6 +53,7 @@ import checkpoint_commands
 import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import llm_config
+import llm_route
 import recovery
 import sandbox
 import tool_cache
@@ -188,13 +189,11 @@ def build_sub_system() -> str:
 
 
 def generate_session_title(messages: list[dict]) -> str:
-    try:
-        target = model_target('title')
-        model = target.model
-    except llm_config.ConfigError:
-        target = model = None
+    target = llm_route.target_for('title')
+    if target is None:
+        return _generate_session_title(messages, client, model=None)
     return _generate_session_title(
-        messages, client_for('title', target), model=model)
+        messages, client_for('title', target), model=target.model)
 
 
 # 兼容旧名字：入口与测试把 `client` 当普通 OpenAI 客户端用，角色解析放在
@@ -210,10 +209,7 @@ def model_target(role: str = 'main') -> llm_config.ModelTarget:
 
 def model_for(role: str = 'main') -> str:
     """状态行/诊断用的模型名；配置缺失时退回旧变量，避免 import 期崩溃。"""
-    try:
-        return model_target(role).model
-    except llm_config.ConfigError:
-        return os.getenv('LLM_MODEL_ID') or ''
+    return llm_route.model_for(role)
 
 
 def client_for(role: str = 'main', target=None):
@@ -247,10 +243,8 @@ def active_model(state=None) -> str:
 
 def format_main_target() -> str:
     """状态页显示 provider/model；旧配置只显示模型名。"""
-    try:
-        return model_target('main').ref
-    except llm_config.ConfigError:
-        return os.getenv('LLM_MODEL_ID') or '未配置'
+    target = llm_route.target_for('main')
+    return target.ref if target is not None else (os.getenv('LLM_MODEL_ID') or '未配置')
 
 # UI 事件总线与权限门：Textual / ANSI 渲染层订阅 bus，并在弹窗里应答审批。
 # 非 UI 模式下 PermissionGate 仍走 stdin，行为与原 console 审批一致。
@@ -1519,18 +1513,17 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f'  [review] 审阅失败：{exc}')
 
     elif command == '/model':
-        try:
-            main = model_target('main')
+        main = llm_route.target_for('main')
+        if main is not None:
             print(f'  当前模型：{main.ref}')
             print(f'  服务地址：{main.base_url or "默认地址"}')
             for _role in ('summary', 'memory', 'title', 'approval'):
-                try:
-                    role_target = model_target(_role)
-                except llm_config.ConfigError:
+                role_target = llm_route.target_for(_role)
+                if role_target is None:
                     continue
                 if (role_target.provider, role_target.model) != (main.provider, main.model):
                     print(f'  {_role}：{role_target.ref}')
-        except llm_config.ConfigError:
+        else:
             print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
             print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
 

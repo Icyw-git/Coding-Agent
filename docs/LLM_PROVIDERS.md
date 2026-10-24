@@ -150,4 +150,8 @@ fallback_cross_provider: false   # 跨 provider 回退默认关闭
 - `/model` 还会列出与 main 不同的角色模型；
 - `HARNESS_LLM_CONFIG` 的相对路径按**进程当前目录**解析；
 - 配置文件改动会在下一次 `get_settings()` 时自动生效（按 mtime/size 判断），
-  无需重启；主角色客户端检测到 provider/base_url/key 变化时会重新构造。
+  无需重启；主角色客户端检测到 provider/base_url/key 变化时会重新构造；
+- 例外是 `CONTEXT_LIMIT`：压缩阈值在 `harness` 导入时计算一次，改动模型
+  context window（或 `HARNESS_CONTEXT_LIMIT`）后需重启进程才生效；
+- 若 `/model` 显示旧值，先确认进程是否长驻：配置按 mtime/size 判断，
+  同一秒内写回且大小不变的改动可能被漏掉，重新保存或重启即可。

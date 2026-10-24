@@ -11,14 +11,17 @@
 | 模块                  | 职责                                                                                             |
 | --------------------- | ------------------------------------------------------------------------------------------------ |
 | `harness.py`          | 主 agent loop、请求构造、工具编排、cron 注入、会话恢复入口                                       |
-| `agent_core.py`       | hooks、记忆、上下文压缩、transcript 快照、记忆注入                                               |
+| `agent_core.py`       | 兼容门面：hooks 注册表；记忆、token 估算、压缩流水见下三行                               |
+| `memory.py`           | 记忆索引、召回（local/llm）、提取与合并                                                  |
+| `tokens.py`           | 文本/图片 token 估算与多模态附件展开                                                     |
+| `compaction.py`       | 压缩四级流水、工具结果预算、transcript 快照与 LLM 摘要                                   |
 | `tools.py`            | 工具接线、路径边界与 `tool_registry`                                                             |
 | `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
 | `tool_recovery.py`    | 中断工具调用的恢复分级（read-only / idempotent / destructive）与恢复提示文本                     |
 | `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收、旧明文快照迁移（见 `CHECKPOINT_DESIGN.md`） |
 | `session_cleanup.py`  | 会话归档/恢复/永久删除，连同任务引用的子代理与 teammate 日志一起移动；孤儿子日志回收           |
-| `recovery.py`         | 429/overload 重试、备用模型、输出截断和上下文超限判断                                            |
+| `recovery.py`         | 错误分类、退避重试、跨供应商回退、输出截断和上下文超限判断                                        |
 | `background_task.py`  | 慢工具后台执行和完成通知收集                                                                     |
 | `cron_scheduler.py`   | cron 时间匹配、持久化、队列生产和队列处理线程                                                    |
 | `mcp_bridge.py`       | MCP server 连接、异步事件循环、动态工具注册                                                      |
@@ -87,19 +90,19 @@ estimate_size > CONTEXT_LIMIT ? compact_history : 继续
 
 ### 3.1 工具结果落盘
 
-[`agent_core.py:449`](agent_core.py:449) 的 `tool_result_budget()` 检查工具结果总量。大型结果由 `persist_large_output()` 写入 `.cache/tool_results/<tool_call_id>.txt`，消息内替换成路径和预览。
+[`compaction.py:181`](compaction.py:181) 的 `tool_result_budget()` 检查工具结果总量。大型结果由 `persist_large_output()` 写入 `.cache/tool_results/<tool_call_id>.txt`，消息内替换成路径和预览。
 
 ### 3.2 消息裁剪
 
-[`agent_core.py:388`](agent_core.py:388) 的 `snip_compact()` 在消息数超过 50 时保留头尾，并插入 `[snipped ...]` 标记。裁剪点会避开 `role=tool`，防止产生孤儿工具结果或未闭合 tool call。
+[`compaction.py:42`](compaction.py:42) 的 `snip_compact()` 在消息数超过 50 时保留头尾，并插入 `[snipped ...]` 标记。裁剪点会避开 `role=tool`，防止产生孤儿工具结果或未闭合 tool call。
 
 ### 3.3 旧工具结果微压缩
 
-[`agent_core.py:427`](agent_core.py:427) 的 `micro_compact()` 保留最近 `KEEP_RECENT` 个结果，更早且较长的结果改成可重新执行提示。LLM 摘要后通过 `skip_micro_rounds` 暂时跳过几轮，保护新结果。
+[`compaction.py:78`](compaction.py:78) 的 `micro_compact()` 保留最近 `KEEP_RECENT` 个结果，更早且较长的结果改成可重新执行提示。LLM 摘要后通过 `skip_micro_rounds` 暂时跳过几轮，保护新结果。
 
 ### 3.4 LLM 摘要压缩
 
-[`agent_core.py:498`](agent_core.py:498) 的 `compact_history()`：
+[`compaction.py:300`](compaction.py:300) 的 `compact_history()`：
 
 1. 调用现有 `write_transcript()` 导出完整消息快照到 `.cache/transcripts/`。
 2. 调用 `summarize_history()` 生成摘要。
@@ -135,7 +138,7 @@ todo 清单按会话隔离，`todo_write` 整表替换并写入 `todos` 事件�
 
 ## 5. 请求构造与记忆注入
 
-[`agent_core.py:519`](agent_core.py:519) 的 `inject_memories()` 返回副本：
+[`memory.py:409`](memory.py:409) 的 `inject_memories()` 返回副本：
 
 ```text
 request_messages =
@@ -208,7 +211,7 @@ auth / invalid_request / unknown`，`with_retry()` 只对可重试类别做指�
 
 代码位置：[`harness.py:425-442`](harness.py:425)。
 
-记忆系统本身位于 [`agent_core.py:195-342`](agent_core.py:195)，分为召回、提取、合并三步。
+记忆系统本身位于 [`memory.py`](memory.py)，分为召回、提取、合并三步。
 
 ## 8. 工具调用路径
 
@@ -313,7 +316,7 @@ synthetic tool result 仍保留 “outcome is unknown”，并附带对应类别
 
 ### 11.4 快照导出
 
-现有 [`agent_core.py:471`](agent_core.py:471) 的 `write_transcript()` 继续作为完整消息快照导出，不承担崩溃恢复职责。
+现有 [`compaction.py:216`](compaction.py:216) 的 `write_transcript()` 继续作为完整消息快照导出，不承担崩溃恢复职责。
 
 ```text
 .cache/sessions/    追加事件流：恢复、重放

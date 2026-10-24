@@ -3,6 +3,7 @@
 import copy
 import os
 
+import llm_route
 from agent_core import _extract_text, expand_image_parts, image_attachment_message, trigger_hooks
 from subagent_events import SubagentRecorder
 from tools import TOOLS
@@ -29,12 +30,8 @@ def _h():
 
 def _main_route():
     """子代理继承 main 角色；配置缺失时退回旧 LLM_MODEL_ID + 模块级 client。"""
-    h = _h()
-    try:
-        target = h.model_target('main') if hasattr(h, 'model_target') else None
-    except Exception:
-        target = None
-    api = h.client_for('main', target) if hasattr(h, 'client_for') else h.client
+    target = llm_route.target_for('main')
+    api = llm_route.client_for('main', target)
     model = target.model if target is not None else os.getenv('LLM_MODEL_ID')
     return api, model
 
