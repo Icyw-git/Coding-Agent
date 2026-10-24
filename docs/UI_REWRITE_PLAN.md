@@ -96,6 +96,9 @@
   下沉到 `src/ui/event_reduction.py` 的 `EventReductionMixin`，历史窗口常量
   与 `HARNESS_HISTORY_*` 环境变量读取一并迁入。`harness_app.py` 从 1129 行
   降到 925 行，App 只保留布局、视图交互、回合控制与工具/后台任务。
+- P7d：队列动作（取回/全部取回、Ctrl+G 选择器、单条删除确认、队列条刷新）
+  下沉到 `src/ui/queue_actions.py` 的 `QueueActionsMixin`；队列对象仍由 App
+  拥有，worker 取头部的语义不变。`harness_app.py` 从 925 行降到 797 行。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
