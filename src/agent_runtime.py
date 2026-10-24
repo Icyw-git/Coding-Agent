@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Type
 
 import turn_control
+import turn_files
 import workspaces
 from agent_core import image_attachment_message
 from session_locks import session_write
@@ -346,21 +347,32 @@ class AgentRuntime:
             self._remember_steer(session_id, request_id, outcome)
             return outcome
 
+        # 回合不在本进程（TUI 在别的进程）：走文件控制通道。
+        info = turn_files.send_steer(self._sessions_dir.parent, session_id,
+                                     content, request_id=request_id)
+        if info is not None:
+            self._remember_steer(session_id, request_id, info)
+            return info
+
         result = self.send(session_id, content, source='steer')
         outcome = {'status': 'sent', 'session_id': result.session_id}
         self._remember_steer(session_id, request_id, outcome)
         return outcome
 
     def interrupt(self, session_id: str) -> dict:
-        """请求取消本进程内该会话的活动回合；没有活动回合时返回 idle。"""
+        """取消该会话的活动回合：本进程直接命中 token，跨进程写 cancel 文件。
+
+        没有活动回合时返回 idle，不影响其他会话。
+        """
         import turn_control
 
         token = turn_control.first_token(session_id)
-        if token is None:
-            return {'status': 'idle', 'session_id': session_id}
-        token.request_cancel()
-        return {'status': 'cancelling', 'session_id': session_id,
-                'turn_id': token.turn_id, 'source': token.source}
+        if token is not None:
+            token.request_cancel()
+            return {'status': 'cancelling', 'session_id': session_id,
+                    'turn_id': token.turn_id, 'source': token.source}
+        info = turn_files.send_cancel(self._sessions_dir.parent, session_id)
+        return info or {'status': 'idle', 'session_id': session_id}
 
     def history(self, session_id: str) -> list[dict]:
         """返回持久化会话可回放的 OpenAI 历史。"""

@@ -56,6 +56,7 @@ import sandbox
 import status_report
 import tool_cache
 import turn_control
+import turn_files
 import workspace_diff
 from agent_core import (
     HOOKS,
@@ -915,6 +916,7 @@ class _TurnState:
     on_delta: object
     on_event: object
     steer_provider: object
+    file_channel: object
     recovery_state: object
     context: dict
     system: str
@@ -938,6 +940,14 @@ class _TurnState:
     memory_profile_pending: bool = True
     turn_baseline: object = None
     baseline_taken: bool = False
+
+
+def _turn_cancelled(state: _TurnState) -> bool:
+    """进程内取消位 + 跨进程 cancel 文件（另一个入口的 /interrupt）。"""
+    if turn_control.cancel_requested():
+        return True
+    channel = state.file_channel
+    return bool(channel is not None and channel.cancel_requested())
 
 
 def _drain_steering(state: _TurnState) -> bool:
@@ -1000,7 +1010,7 @@ def _run_llm_request(state: _TurnState, request_messages: list, profile_timing: 
             if 'ttfb_ms' not in profile_timing:
                 profile_timing['ttfb_ms'] = round(
                     (time.monotonic() - request_started) * 1000, 3)
-            if turn_control.cancel_requested():
+            if _turn_cancelled(state):
                 raise KeyboardInterrupt
             # 已经向用户交付过文本：重试会把同一段再放一遍，recovery 据此拒绝重放
             state.recovery_state.stream_started = True
@@ -1333,6 +1343,12 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                                     source=turn_source)
     session_store.append('turn_started', turn_id=token.turn_id,
                          source=token.source)
+    try:
+        channel = turn_files.TurnChannel(SESSIONS_DIR.parent,
+                                         session_store.session_id, token).start()
+    except BaseException:
+        turn_control.end_turn(token)   # 启动失败也要释放 token，不能让会话卡成“有回合”
+        raise
     wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
     set_session(session_store.session_id)
     set_agent('lead')   # 子代理会临时覆盖，退出后恢复
@@ -1351,12 +1367,23 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
     restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
+    def combined_steer():
+        texts = []
+        if steer_provider is not None:
+            try:
+                texts.extend(steer_provider() or [])
+            except Exception:
+                pass
+        texts.extend(channel.drain_steer())
+        return texts
+
     state = _TurnState(
         messages=messages,
         session_store=session_store,
         on_delta=on_delta,
         on_event=on_event,
-        steer_provider=steer_provider,
+        steer_provider=combined_steer if steer_provider is not None else channel.drain_steer,
+        file_channel=channel,
         recovery_state=recovery.RecoveryState(),
         context=context,
         system=system,
@@ -1372,7 +1399,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     outcome = {'status': 'completed'}
     try:
         while True:
-            if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
+            if _turn_cancelled(state):   # TUI/REPL 的 Esc、Ctrl-C 取消
                 raise KeyboardInterrupt
             _drain_steering(state)
             # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
@@ -1518,7 +1545,10 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         if outcome['status'] != 'completed':
             _append_turn_terminal(session_store, token, outcome['status'],
                                   error_type=outcome.get('error_type'))
-        turn_control.end_turn(token)
+        try:
+            channel.close()
+        finally:
+            turn_control.end_turn(token)
 
 
 def resume_agent_loop(session_path: Path):

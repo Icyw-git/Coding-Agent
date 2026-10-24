@@ -4181,3 +4181,39 @@ Ruff、`py_compile`、`git diff --check` 通过。
   普通消息，返回 `status=sent, reason=turn_ending`，同样受幂等键保护。
 
 全量 **1520 passed / 1 skipped**。
+
+## 跨进程 steer / interrupt：用目录做最小控制面
+
+阶段 1 补完最后一项能力：TUI 在 A 进程、API/daemon 在 B 进程时，手机端也能对 A 的回合
+steer / interrupt。没有引入新守护进程，也不做 socket 协议，而是让回合持有者暴露一个
+小目录（`src/turn_files.py`）：
+
+    <cache>/control/<session_id>/
+        owner.json     {turn_id, session_id, source, pid, started_at}
+        steer/*.json   {content, request_id}
+        cancel         {turn_id, ts}
+
+**回合侧**：`agent_loop` 启动时写 owner，把原有 `steer_provider` 与文件 inbox 合成一个
+provider（下一轮请求前注入）；新增 `_turn_cancelled(state)` 同时看进程内 token 与 cancel
+文件，流式回调与轮循环都改用它。cancel 每 0.5s 才 stat 一次，避免每个 token 都读盘。
+结束/失败/取消都在 finally 里删 owner 与 cancel。
+
+**发送侧**：`AgentRuntime.steer/interrupt` 先查本进程 token（快路径），没有则看 owner：
+有 owner 就写文件并返回 `queued/cancelling`（带对方 turn_id/source），没有 owner 保持原
+语义（steer 降级为普通消息、interrupt 返回 idle）。所以“跨进程”是新增的一条通道，
+不改变同进程行为，也不改变“没有回合时 steer 就是发消息”的约定。
+
+**边界**：只做单机文件协调（和全局单回合协调器一致）；队列有界（50 条、单条 32k 字符），
+超限显式报错而不是丢；owner 超过 1h 视为崩溃残留；cancel 标记带 turn_id，旧标记不会取消
+新回合，因此启动时不必先删标记——顺带消掉了“先删标记再写 owner”之间丢取消的窗口。
+
+**代码质量上的两个修正**：
+1. steer 幂等最初在持有 `threading.Lock` 时重入 → pytest 死锁；改 `RLock`，并让测试用
+   `join(timeout)` 断言，回归会失败而不是挂住。
+2. `TurnChannel.close()` 与 `agent_loop` 启动失败路径都要求释放 token；补了
+   `except BaseException: turn_control.end_turn(token)`，避免异常时留下“永远有回合”的状态。
+
+测试：owner 生命周期、steer 只取一次、request_id 去重、cancel 的 turn_id 匹配、旧标记
+忽略、崩溃残留过期、队列上限、runtime 跨进程路径、agent_loop 注入文件 steer、
+`/cache profile` 识别新目录。全量 **1531 passed / 1 skipped**，Ruff、`py_compile`、
+`git diff --check` 通过。

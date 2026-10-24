@@ -123,11 +123,22 @@
 - **测试**：watcher 游标/去重/失败重试/重启恢复/状态有界/停滞提示；网关用真实 ASGI
   SSE 验证“TUI 回合完成 → 飞书收到卡片”和 feishu 来源跳过、失败卡片带 error_type。
 
-仍然欠缺（阶段 1 剩余）：
+第三批（2026-10-24）：
 
-- steer 的幂等键（客户端重试去重）与“回合即将结束”的原子归属。
-- 跨进程 steer/interrupt（目前只覆盖同进程的 daemon 回合；TUI 回合返回 409）。
-- watcher 只在网关进程内运行；多网关实例需要按会话分配或改用租约（当前单写者假设）。
+- **steer 幂等与收尾竞态**：`request_id` 去重（结果缓存有界）、回合收尾时原子降级为
+  下一条普通消息（`status=sent, reason=turn_ending`），不再“返回成功但消息丢失”。
+- **跨进程 steer/interrupt**（`src/turn_files.py`）：回合持有者在
+  `<cache>/control/<session_id>/` 写 `owner.json`，另一进程按 owner 投递
+  `steer/*.json` 或 `cancel`。owner 侧每轮/每次流式回调轮询（cancel 0.5s TTL），
+  steer 在下一轮请求前注入；`turn_id` 不匹配的旧 cancel 会被忽略，owner 关闭时清理。
+  无 owner 时保持原语义：steer 降级为普通消息，interrupt 返回 idle。队列有界
+  （50 条 / 32k 字符），owner 超过 1h 视为崩溃残留。
+- **存储诊断**：`control/` 与 `turn_watch.json` 纳入 `/cache profile` 分类，不再报未识别。
+
+仍然欠缺：
+
+- 多网关实例的会话分配（当前单写者假设：一个网关一个进程）。
+- 真实终端 / 真实飞书端到端验收（手机审批、steer、interrupt、通知去重）。
 
 ### 阶段 2：主动性与安全边界
 

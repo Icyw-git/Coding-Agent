@@ -28,11 +28,13 @@ _CATEGORIES = (
     ('tmp', '临时缓存', 'temp', '可按天数预览后手动删除'),
     ('api', 'API 访问日志', 'diagnostic', '保留审计；按需轮转'),
     ('sandbox-tmp', '沙箱临时目录', 'temp', '通常可手动清理'),
+    ('control', '跨进程回合控制', 'derived', '保留；回合结束后 owner 自动删除'),
 )
 _KNOWN = {name for name, *_ in _CATEGORIES} | {'cache_debug.jsonl'}
 _ROOT_STATE = {
     'crons.json': ('定时任务状态', 'source', '保留；由定时任务系统维护'),
     'feishu_bindings.json': ('飞书绑定状态', 'source', '保留；由网关维护'),
+    'turn_watch.json': ('回合通知状态', 'source', '保留；watcher 游标与去重'),
     'mcp_servers.json': ('MCP 服务配置', 'source', '保留；由 MCP 配置维护'),
 }
 _KNOWN |= set(_ROOT_STATE)
