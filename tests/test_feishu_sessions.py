@@ -8,7 +8,7 @@ from feishu_gateway import FeishuGateway
 from gateway_sim import GatewayClient
 from harness_api import create_app
 from session_store import SessionEventStore
-from test_feishu_gateway import FakeTransport, _sync_asgi_transport
+from test_feishu_gateway import FakeTransport, _last_card_text, _sync_asgi_transport
 
 
 @pytest.fixture
@@ -31,9 +31,10 @@ def environment(tmp_path):
 def test_list_search_and_switch_uses_names(environment):
     runtime, api, gw, transport = environment
     gw.on_message('chat', '/sessions')
-    assert '检查测试失败原因' in transport.last()
-    assert 'events=' not in transport.last()
-    assert '工作区' in transport.last()
+    card = _last_card_text(transport)
+    assert '检查测试失败原因' in card
+    assert 'events=' not in card
+    assert '工作区' in card
     gw.on_message('chat', '/resume 1')
     assert gw.bindings['chat'] == 'old'
     assert f'工作区: {runtime.get_workspace("old")}' in transport.last()

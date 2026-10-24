@@ -4217,3 +4217,65 @@ provider（下一轮请求前注入）；新增 `_turn_cancelled(state)` 同时�
 忽略、崩溃残留过期、队列上限、runtime 跨进程路径、agent_loop 注入文件 steer、
 `/cache profile` 识别新目录。全量 **1531 passed / 1 skipped**，Ruff、`py_compile`、
 `git diff --check` 通过。
+
+## Personal Agent 阶段 2：cron 管理接口与 occurrence 去重
+
+阶段 2 的第一块是“让定时任务可管理、触发不重复”，先不引入新的执行路径。
+
+**管理接口**（`src/api_crons.py`）：`GET /v1/crons`、`POST /v1/crons`、
+`DELETE /v1/crons/{id}`，直接调用 `cron_scheduler`，不复制调度状态。校验仍然只有
+`validate_cron` 一处：表达式错误 400；`job_id` 已存在 409（`schedule_job` 新增可选
+`job_id` 参数，为稳定 ID/heartbeat 铺路）；删除未知 ID 404。飞书端 `/cron` 做薄封装，
+`/cron add` 同时接受 `"0 9 * * *" 提示词` 与五段裸写——cron 表达式自身含空格，
+用普通 `partition(' ')` 会把表达式切碎。`GatewayClient` 新增三个 cron 方法，并把 4xx
+的 `detail` 透出来，而不是让用户看到 httpx 的通用 400 文案。
+
+**occurrence 去重**：原来 `_last_fired` 只存在内存里，进程在同一分钟内重启会把同一个
+“每日 9 点”任务再触发一次。现在 `CronJob.last_fired` 随 durable job 一起落盘；扫描逻辑
+抽成 `tick(now)`，循环只负责按秒调用，测试可以直接用固定时间验证“同一分钟只触发一次、
+下一分钟继续触发、one-shot 触发后从内存与持久文件里都消失”。`tick` 里所有 durable 变更
+一次性 `save_durable_jobs()`，不做逐任务写盘。
+
+**测试**：新增 `tests/test_cron_management.py`（触发/重启/一次性/稳定 ID/表达式校验）；
+API cron CRUD 走真实 FastAPI；飞书 `/cron` list/add/delete 与错误路径走 ASGI transport。
+`conftest` 增加 cron 全局状态隔离（任务表、队列、`_last_fired`、`crons.json` 路径），
+避免用例之间的定时任务互相污染。全量 **1539 passed / 1 skipped**，Ruff、`py_compile`、
+`git diff --check` 通过。
+
+阶段 2 仍欠：每日心跳（只读摘要）、时区/misfire 策略、副作用任务的授权与审批。
+
+## 飞书接入：3 步 + 按钮优先，不用记命令
+
+原来的接入信息散落在 README，第一次用要自己拼：创建应用 → 配事件/权限 → 填一堆环境变量
+（含自己的 open_id）→ 两个进程分别起。日常操作也几乎全是 `/sessions`、`/new`、`/stop`
+这类斜杠命令，手机上很难用。
+
+参考本机 dsh-im 插件的配置（`integrations/dsh-feishu/config.json`）可以看出它的取舍：
+`ownerOpenIds` 单人所有、`groupResponseMode: mention`、`stepPushMode: streaming_card`
+（进度只更新一张卡）、`slashPanel`（把命令做成面板而不是让用户背），以及
+`seenMessageIds` 去重。这里只借鉴“卡片面板 + 流式单卡 + 自助拿 open_id”，没有搬
+topics/mirrors/watches 那套更重的模型。
+
+**接入缩写为 3 步**（`docs/FEISHU_SETUP.md` + `feishu.env.example`）：
+1. 开放平台建应用：机器人 + 长连接事件 + `im.message.receive_v1` + 卡片回调 + `im:message`；
+2. `.env` 填 `FEISHU_APP_ID / FEISHU_APP_SECRET / HARNESS_API_TOKEN / FEISHU_ALLOWED_USERS`
+   —— 不知道 open_id 就先留空启动，给机器人发消息，它回你 `FEISHU_ALLOWED_USERS=ou_...`；
+3. 起 API（`uvicorn api:create_app --factory --port 8000`）和网关（`python src/feishu_gateway.py`）。
+另加 `python src/feishu_gateway.py --check`：离线检查缺哪些变量并打印步骤，不连飞书。
+
+**日常不用命令**（`src/feishu_panel.py`）：首次私聊自动建会话后发一张「Harness 控制台」卡片，
+按钮是 新会话 / 会话列表 / 停止当前回合 / 当前状态 / 使用说明。按钮走卡片回调 → 分发线程，
+复用现有 `_handle_new`、`_show_sessions`、`api.interrupt`、`get_workspace`，没有为面板另造
+执行路径。没有卡片能力的传输层回退为一行文字提示。`/help` 保留完整命令清单——自动化、
+排障仍然需要，只是不再是日常入口。
+
+**未接受未授权的消息**也改了：以前静默忽略，用户完全不知道为什么没反应；现在回一句
+带自己 `open_id` 的配置提示（不建会话、不接近模型），这是接入时最容易卡住的一步。
+
+没做、也不打算现在做：飞书「应用配置导入」manifest——它的 JSON 格式随平台版本变化，
+写死一份容易在用户那里直接导入失败；`--check` 只做本地校验，不假装能验证开放平台侧配置。
+
+测试：首次私聊必须发控制台卡片且卡片文案不含 `/new`；未授权回复带 open_id；
+面板按钮 new/status/stop 经分发线程生效；无卡片能力时回退文字；`check_setup` 与
+`--check` 退出码；`/help` 仍是完整命令清单。全量 **1545 passed / 1 skipped**，
+Ruff、`py_compile`、`git diff --check` 通过。

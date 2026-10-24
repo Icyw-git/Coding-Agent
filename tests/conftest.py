@@ -25,6 +25,25 @@ _TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cron_state(tmp_path, monkeypatch):
+    """cron 是进程级单例：用例之间清空任务/队列，并把 crons.json 指到临时目录。"""
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    with cron_scheduler.cron_lock:
+        cron_scheduler.scheduled_jobs.clear()
+        cron_scheduler.cron_queue.clear()
+        cron_scheduler._last_fired.clear()
+    try:
+        yield
+    finally:
+        with cron_scheduler.cron_lock:
+            cron_scheduler.scheduled_jobs.clear()
+            cron_scheduler.cron_queue.clear()
+            cron_scheduler._last_fired.clear()
+
+
+@pytest.fixture(autouse=True)
 def _block_unstubbed_llm_calls(monkeypatch):
     """测试默认禁止真实模型请求：没打桩就失败，而不是悄悄产生费用。
 

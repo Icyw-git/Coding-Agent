@@ -15,12 +15,15 @@ class CronJob:
     prompt:str
     recurring:bool
     durable:bool
+    # 本分钟标记（"YYYY-MM-DD HH:MM"）。随 durable job 一起落盘：进程在同一分钟内
+    # 重启不会把同一个 occurrence 再触发一次。
+    last_fired:str=''
 
 scheduled_jobs:dict[str,CronJob]={} # id -> job
 cron_queue:list[CronJob]=[] #任务队列
 cron_lock=threading.RLock() # 任务队列锁，用于保护任务队列
 agent_lock=threading.RLock() # 代理锁；允许同一线程在 REPL 入口与降级路径重复获取
-_last_fired:dict[str,str]={} # id -> last fired time
+_last_fired:dict[str,str]={} # 兼容旧调用：id -> last fired（真实值在 job.last_fired）
 DURABLE_PATH=paths.cache_path('crons.json')
 
 def _cron_field_matches(field:str,value:int)->bool: #判断cron表达式字段是否匹配当前时间，支持通配符、范围、步长
@@ -139,16 +142,21 @@ def load_durable_jobs(): #加载持久化任务，将有效任务添加到schedu
     except Exception as exc:
         print(f"  \033[31m[cron] failed to load durable jobs: {exc}\033[0m")
 
-def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True): #注册一个cron任务
+def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
+                 job_id:str|None=None): #注册一个cron任务
     """
     Register a cron job with the scheduler.
+
+    job_id 可指定稳定 ID（如 heartbeat）：已存在时返回错误字符串，由调用方转成 409。
     """
 
     err=validate_cron(cron)
     if err:
         return err
     with cron_lock: #确保写入scheduled_jobs时线程安全，避免重复注册
-        job_id = f'cron_{uuid.uuid4().hex[:12]}'
+        if job_id and job_id in scheduled_jobs:
+            return f'Job {job_id} already exists'
+        job_id = job_id or f'cron_{uuid.uuid4().hex[:12]}'
         job=CronJob(
             id=job_id,
             cron=cron,
@@ -175,26 +183,41 @@ def cancel_job(job_id:str)->str: #取消一个cron任务
     print(f"  \033[31m[cron cancel] {job_id}\033[0m")
     return f'Cancelled {job_id}'
 
+def tick(now: datetime | None = None) -> list[CronJob]: #扫描一次；返回本次新入队的任务
+    """按当前时间扫描所有任务：到点且本分钟未触发 → 入队。
+
+    触发标记写在任务本身上并随 durable job 落盘，因此 restart 不会在一分钟内重复触发。
+    """
+    now = now or datetime.now()
+    minute_marker = now.strftime("%Y-%m-%d %H:%M")
+    fired: list[CronJob] = []
+    with cron_lock: #确保遍历scheduled_jobs时线程安全，避免并发修改
+        for job in list(scheduled_jobs.values()):
+            try:
+                if not cron_matches(job.cron, now):
+                    continue
+                if job.last_fired == minute_marker:
+                    continue
+                cron_queue.append(job)
+                job.last_fired = minute_marker
+                _last_fired[job.id] = minute_marker
+                fired.append(job)
+                print(f"  [35m[cron fire] {job.id} → "
+                      f"{job.prompt[:40]}[0m")
+                if not job.recurring: # 如果任务不重复执行
+                    scheduled_jobs.pop(job.id, None)
+            except Exception as e:
+                print(f"  [31m[cron error] {job.id}: {e}[0m")
+        if any(job.durable for job in fired):
+            save_durable_jobs()
+    return fired
+
+
 def cron_scheduler_loop(stop_event=None): #cron任务调度循环，每秒检查一次是否有任务到点
     stop_event = stop_event or threading.Event()
     while not stop_event.wait(1.0): # 每秒检查一次；停止信号可立即打断等待
-        now=datetime.now()
-        minute_marker=now.strftime("%Y-%m-%d %H:%M")
-        with cron_lock: #确保遍历scheduled_jobs时线程安全，避免并发修改
-            for job in list(scheduled_jobs.values()):
-                try:
-                    if cron_matches(job.cron,now): # 如果任务到点
-                        if _last_fired.get(job.id)!=minute_marker: # 如果任务未触发过
-                            cron_queue.append(job)
-                            _last_fired[job.id]=minute_marker
-                            print(f"  \033[35m[cron fire] {job.id} → "
-                                  f"{job.prompt[:40]}\033[0m")
-                        if not job.recurring: # 如果任务不重复执行
-                            scheduled_jobs.pop(job.id,None)
-                            if job.durable:
-                                save_durable_jobs()
-                except Exception as e:
-                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+        tick()
+
 
 def consume_cron_queue()->list[CronJob]: #消费cron队列中的任务，返回已触发的任务列表，
     """

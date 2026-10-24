@@ -637,3 +637,36 @@ def test_api_stream_reports_cancelled_turn(api_client):
                            json={'content': 'x'}, headers=headers)
     assert response.status_code == 200
     assert 'event: cancelled' in response.text
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_cron_crud(api_client, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks'))
+    headers = {'Authorization': 'Bearer t'}
+
+    created = client.post('/v1/crons', json={
+        'cron': '0 9 * * *', 'prompt': 'daily report', 'id': 'heartbeat'},
+        headers=headers)
+    assert created.status_code == 201
+    job = created.json()
+    assert job['id'] == 'heartbeat' and job['recurring'] is True
+
+    duplicate = client.post('/v1/crons', json={
+        'cron': '0 10 * * *', 'prompt': 'x', 'id': 'heartbeat'},
+        headers=headers)
+    assert duplicate.status_code == 409
+
+    invalid = client.post('/v1/crons', json={'cron': '* * *', 'prompt': 'x'},
+                          headers=headers)
+    assert invalid.status_code == 400
+
+    listed = client.get('/v1/crons', headers=headers).json()['jobs']
+    assert [item['id'] for item in listed] == ['heartbeat']
+
+    assert client.delete('/v1/crons/heartbeat', headers=headers).status_code == 200
+    assert client.delete('/v1/crons/heartbeat', headers=headers).status_code == 404
+    assert client.get('/v1/crons', headers=headers).json()['jobs'] == []

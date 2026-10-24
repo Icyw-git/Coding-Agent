@@ -644,6 +644,26 @@ python entrypoint.py --workspace D:\work\project -i screenshot.png "复现这个
   `http://<电脑IPv4>:8000/docs`。首次使用时在 Swagger 页面点击 **Authorize**，填入
   `Bearer <HARNESS_API_TOKEN>`。Windows 防火墙需要允许该端口的专用网络访问；不要在公网直接暴露此端口。
 
+### 5. 接入飞书（可选，3 步）
+
+手机端日常使用不需要输入命令：首次私聊机器人就会建会话并弹出控制台卡片
+（新会话 / 会话列表 / 停止 / 状态 / 说明），回复与审批都走卡片按钮。
+
+1. 开放平台创建企业自建应用，开「机器人」+「长连接接收事件」，订阅
+   `im.message.receive_v1`、启用卡片回调、加 `im:message` 权限；
+2. 在 `.env` 填 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`HARNESS_API_TOKEN`、
+   `FEISHU_ALLOWED_USERS`（模板见 `feishu.env.example`；不知道 open_id 时先留空启动，
+   机器人会把你的 ID 回给你）；
+3. 启动 API 与网关：
+
+```bash
+uvicorn api:create_app --factory --port 8000     # 终端 A
+python src/feishu_gateway.py                     # 终端 B
+```
+
+配置自检：`python src/feishu_gateway.py --check`。完整步骤、日常用法和排障见
+[飞书接入](docs/FEISHU_SETUP.md)。
+
 ## 启动可视化界面
 
 ```bash

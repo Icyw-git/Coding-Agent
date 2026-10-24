@@ -21,9 +21,13 @@ from hooks import GATE as permission_gate
 class FakeTransport:
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
+        self.cards: list[tuple[str, dict]] = []
 
     def send_text(self, chat_id: str, text: str) -> None:
         self.sent.append((chat_id, text))
+
+    def send_session_card(self, chat_id: str, card: dict) -> None:
+        self.cards.append((chat_id, card))
 
     def last(self) -> str:
         return self.sent[-1][1] if self.sent else ''
@@ -108,16 +112,16 @@ def test_new_lists_workspaces_and_selects_by_number(gateway, tmp_path):
     bound = gw.bindings['c1']
 
     gw.on_message('c1', '/new')              # 只列候选，不创建会话
-    text = fake.last()
-    assert '选择工作区' in text and 'alpha' in text and '1.' in text
+    card = _last_card_text(fake)
+    assert '选择工作区' in card and 'alpha' in card and '1.' in card
     assert gw.bindings['c1'] == bound
 
     gw.on_message('c1', f'/new "{beta}"')    # 显式路径
     assert gw.api.get_workspace(gw.bindings['c1']) == str(beta)
 
     gw.on_message('c1', '/new')              # 当前 beta + 最近 alpha
-    text = fake.last()
-    assert 'beta' in text and 'alpha' in text
+    card = _last_card_text(fake)
+    assert 'beta' in card and 'alpha' in card
     previous = gw.bindings['c1']
     gw.on_message('c1', '/new 2')            # 序号 2 = alpha
     assert gw.bindings['c1'] != previous
@@ -823,7 +827,8 @@ def test_user_allowlist_blocks_strangers(api_app, tmp_path, monkeypatch):
     try:
         gw.on_message('c1', 'hello', sender_id='ou_stranger')
         assert gw.bindings == {}          # 没有为陌生人建会话
-        assert fake.sent == []            # 没有任何回复
+        # 不再静默：回一条带 open_id 的提示，方便直接配置白名单
+        assert 'FEISHU_ALLOWED_USERS=ou_stranger' in fake.last()
 
         gw.on_message('c1', 'hello', sender_id='ou_me')
         assert 'agent-reply-ok' in fake.last()
@@ -831,7 +836,7 @@ def test_user_allowlist_blocks_strangers(api_app, tmp_path, monkeypatch):
         # 陌生人无法通过 y/n 决议别人的审批（也没有他的 FIFO）
         fake.sent.clear()
         gw.on_message('c1', 'y', sender_id='ou_stranger')
-        assert fake.sent == []
+        assert all('FEISHU_ALLOWED_USERS' in text for _, text in fake.sent)
     finally:
         api.close()
 
@@ -1165,3 +1170,167 @@ def test_watcher_skips_feishu_turns_and_reports_failures(gateway, tmp_path):
                  source='cron', error_type='APIStatusError', ts=time.time())
     assert gw.watcher.poll_once(session_id)['notified'] == 1
     assert '回合失败' in fake.last() and 'APIStatusError' in fake.last()
+
+
+def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+
+    gw.on_message('chat-cron', '/cron')
+    assert '没有定时任务' in fake.last()
+
+    gw.on_message('chat-cron', '/cron add "0 9 * * *" 每日汇报')
+    created = fake.last()
+    assert '已创建 cron_' in created and '每日汇报' in created
+    job_id = created.split('已创建 ', 1)[1].split(':', 1)[0]
+
+    gw.on_message('chat-cron', '/cron list')
+    assert job_id in fake.last() and '每日汇报' in fake.last()
+
+    gw.on_message('chat-cron', '/cron add "* * *" 缺少字段')
+    assert 'Expected 5 fields' in fake.last()
+
+    gw.on_message('chat-cron', f'/cron delete {job_id}')
+    assert '已删除' in fake.last()
+    gw.on_message('chat-cron', '/cron list')
+    assert '没有定时任务' in fake.last()
+
+
+def test_cron_command_usage_and_unknown_job(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-cron2', '/cron add')
+    assert '用法' in fake.last()
+    gw.on_message('chat-cron2', '/cron delete missing-id')
+    assert 'not found' in fake.last() or '404' in fake.last()
+
+
+def _last_card_text(fake) -> str:
+    """把最近一张卡片拍平成字符串，便于断言内容（卡片是结构化 JSON）。"""
+    import json
+
+    return json.dumps(fake.cards[-1][1], ensure_ascii=False) if fake.cards else ''
+
+
+def _panel_actions(card: dict) -> list[str]:
+    actions = []
+    for element in card.get('elements', []):
+        for button in element.get('actions', []) or []:
+            value = button.get('value') or {}
+            if value.get('panel'):
+                actions.append(value['panel'])
+    return actions
+
+
+def test_first_contact_sends_control_panel_without_commands(gateway, tmp_path):
+    gw, fake = gateway
+    gw.on_message('chat-panel', '你好')
+    assert gw.bindings['chat-panel']
+    assert fake.cards, '首次私聊应发控制台卡片'
+    card = fake.cards[-1][1]
+    assert card['header']['title']['content'] == 'Harness 控制台'
+    assert {'new', 'sessions', 'stop', 'status', 'help'} <= set(_panel_actions(card))
+    # 卡片里不应该要求用户输入斜杠命令
+    text = '\n'.join(item.get('text', {}).get('content', '')
+                     for item in card['elements'] if item.get('tag') == 'div')
+    assert '/new' not in text
+
+
+def test_unauthorized_user_gets_their_open_id(gateway):
+    gw, fake = gateway
+    gw.allowed_users = {'ou_boss'}
+    gw.on_message('chat-stranger', 'hi', sender_id='ou_stranger')
+    assert 'chat-stranger' not in gw.bindings
+    assert 'FEISHU_ALLOWED_USERS=ou_stranger' in fake.last()
+
+
+def test_panel_buttons_drive_new_status_and_stop(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-panel2', 'hi')
+    gw.start_dispatcher(workers=1)
+    try:
+        toast, ok = gw.handle_card_action('ou_me', {'panel': 'new'}, 'om_1',
+                                          chat_id='chat-panel2')
+        assert ok and '打开' in toast
+        for _ in range(100):
+            time.sleep(0.01)
+            if any(item.get('tag') == 'action' for item in
+                   (fake.cards[-1][1].get('elements') if fake.cards else [])):
+                break
+
+        toast, ok = gw.handle_card_action('ou_me', {'panel': 'status'}, 'om_2',
+                                          chat_id='chat-panel2')
+        assert ok
+        for _ in range(100):
+            time.sleep(0.01)
+            if '会话 ' in fake.last():
+                break
+        assert gw.bindings['chat-panel2'][:8] in fake.last()
+
+        toast, ok = gw.handle_card_action('ou_me', {'panel': 'stop'}, 'om_3',
+                                          chat_id='chat-panel2')
+        assert ok
+        for _ in range(100):
+            time.sleep(0.01)
+            if '回合' in fake.last():
+                break
+        assert '没有正在执行的回合' in fake.last() or '取消' in fake.last()
+    finally:
+        gw.stop()
+
+
+def test_panel_help_falls_back_to_text_without_card_support(tmp_path):
+    class TextOnly:
+        def __init__(self):
+            self.sent = []
+
+        def send_text(self, chat_id, text):
+            self.sent.append((chat_id, text))
+
+    class API:
+        def create_session(self):
+            return 's1'
+
+        def get_workspace(self, session_id):
+            return str(tmp_path)
+
+        def send(self, text, session_id=None):
+            return 'ok'
+
+    gw = FeishuGateway(API(), transport=TextOnly(),
+                       bindings_path=tmp_path / 'bindings.json')
+    gw.on_message('c', 'hi')
+    assert any('直接发消息即可' in text for _, text in gw.transport.sent)
+
+
+def test_check_setup_reports_missing_and_accepts_allow_any(monkeypatch):
+    from feishu_gateway import check_setup
+
+    monkeypatch.delenv('FEISHU_APP_ID', raising=False)
+    monkeypatch.delenv('FEISHU_APP_SECRET', raising=False)
+    monkeypatch.delenv('HARNESS_API_TOKEN', raising=False)
+    monkeypatch.delenv('FEISHU_ALLOWED_USERS', raising=False)
+    monkeypatch.delenv('FEISHU_ALLOW_ANY_USER', raising=False)
+    problems = check_setup()
+    assert len(problems) == 4
+    env = {'FEISHU_APP_ID': 'a', 'FEISHU_APP_SECRET': 'b',
+           'HARNESS_API_TOKEN': 'c', 'FEISHU_ALLOWED_USERS': 'ou_x'}
+    assert check_setup(env) == []
+    env.pop('FEISHU_ALLOWED_USERS')
+    env['FEISHU_ALLOW_ANY_USER'] = '1'
+    assert check_setup(env) == []
+
+
+def test_check_mode_exits_without_connecting(monkeypatch, capsys):
+    import dotenv
+
+    import feishu_gateway
+
+    monkeypatch.setattr(dotenv, 'load_dotenv', lambda *a, **k: None)
+    for key in ('FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'HARNESS_API_TOKEN',
+                'FEISHU_ALLOWED_USERS', 'FEISHU_ALLOW_ANY_USER'):
+        monkeypatch.delenv(key, raising=False)
+    assert feishu_gateway.main(['--check']) == 1
+    out = capsys.readouterr().out
+    assert 'FEISHU_APP_ID' in out and '飞书接入步骤' in out

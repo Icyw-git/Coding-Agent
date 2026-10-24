@@ -83,6 +83,38 @@ class GatewayClient:
         self.session_id = response.json()['id']
         return self.session_id
 
+    # ---------- crons ----------
+
+    @staticmethod
+    def _json(response, action: str) -> dict:
+        """把服务端 4xx 的 detail 透出来，而不是只给 httpx 的通用文案。"""
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get('detail')
+            except ValueError:
+                detail = response.text
+            raise RuntimeError(f'{action} failed ({response.status_code}): {detail}')
+        return response.json()
+
+    def list_crons(self) -> list[dict]:
+        return self._json(self.http.get('/v1/crons'), 'list crons')['jobs']
+
+    def create_cron(self, cron: str, prompt: str, *,
+                    recurring: bool = True, durable: bool = True,
+                    job_id: str | None = None) -> dict:
+        payload = {'cron': cron, 'prompt': prompt,
+                   'recurring': recurring, 'durable': durable}
+        if job_id:
+            payload['id'] = job_id
+        return self._json(self.http.post('/v1/crons', json=payload), 'create cron')
+
+    def delete_cron(self, job_id: str) -> dict:
+        return self._json(self.http.delete(f'/v1/crons/{job_id}'), 'delete cron')
+
+    def interrupt(self, session_id: str) -> dict:
+        return self._json(self.http.post(f'/v1/sessions/{session_id}/interrupt'),
+                          'interrupt')
+
     def list_sessions(self, limit: int = 20) -> list[dict]:
         response = self.http.get('/v1/sessions', params={'limit': limit})
         response.raise_for_status()

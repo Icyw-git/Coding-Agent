@@ -52,6 +52,7 @@ import approval_view
 import llm_route
 import paths
 from exec_policy import approval_class
+from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
 from gateway_sim import GatewayClient
 from perf import record as perf_record
@@ -173,6 +174,25 @@ def markdown_to_card_md(md_text: str) -> str:
         out.append(line)
         i += 1
     return '\n'.join(out)
+
+
+def _split_cron_add(rest: str) -> tuple[str, str]:
+    """解析 `/cron add` 的参数：支持引号包住表达式，也支持五段裸写。
+
+    cron 表达式本身含空格（5 段），所以不能直接 `partition(' ')`；引号形式
+    `"0 9 * * *" 提示词` 与裸写 `0 9 * * * 提示词` 都接受。
+    """
+    text = rest.strip()
+    if text[:1] in (chr(34), chr(39)):
+        quote = text[0]
+        end = text.find(quote, 1)
+        if end == -1:
+            return '', ''
+        return text[1:end].strip(), text[end + 1:].strip()
+    parts = text.split(None, 5)
+    if len(parts) < 6:
+        return '', ''
+    return ' '.join(parts[:5]), parts[5].strip()
 
 
 class LarkTransport:
@@ -431,9 +451,13 @@ class FeishuGateway:
             print(f'[feishu] ignored {chat_type!r} message in chat {chat_id!r}')
             return
         if self.allowed_users is not None and sender_id not in self.allowed_users:
-            # 未授权用户：静默忽略（不回执、不建会话），避免暴露机器人行为
+            # 不建会话；告诉对方自己的 open_id，省去“去后台翻 ID”这一步。
             print(f'[feishu] ignored message from unauthorized user '
                   f'{sender_id!r} in chat {chat_id!r}')
+            if self.transport is not None:
+                self._reply(chat_id,
+                            '还没有使用权限。把下面这行加入 .env 后重启网关：'
+                            + chr(10) + f'FEISHU_ALLOWED_USERS={sender_id or "ou_xxx"}')
             return
         # 全角归一化（NFKC）：中文输入法的 ／use、／？、Ｙ２ 统一转半角再路由；
         # 发给 agent 的普通消息仍用原文，不受影响
@@ -454,7 +478,8 @@ class FeishuGateway:
             with self._bindings_lock:
                 self.bindings[chat_id] = session_id
                 self._save_bindings()
-            self._reply(chat_id, '已创建新会话。')
+            self._send_panel(chat_id,
+                             intro='已就绪，直接发消息即可；需要切换/停止时点按钮。')
         try:
             self._send_agent_reply(chat_id, session_id, text)
         except Exception as exc:
@@ -800,6 +825,133 @@ class FeishuGateway:
                       f"审批档位: {policy['approval_policy']}\n"
                       '注意：以上是策略级判定（所有执行入口同一套规则），不是 OS 级沙箱。')
 
+    def _model_summary(self) -> str:
+        main = llm_route.target_for('main')
+        return main.ref if main is not None else os.getenv('LLM_MODEL_ID', '未配置')
+
+    def _send_panel(self, chat_id: str, *, intro: str = '') -> None:
+        """控制台卡片；没有卡片能力的传输层回退成文字说明。"""
+        if self.transport is None:
+            return
+        session_id = self.bindings.get(chat_id) or ''
+        workspace = ''
+        if session_id:
+            try:
+                workspace = self.api.get_workspace(session_id)
+            except Exception:
+                workspace = ''
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, control_card(session_id=session_id,
+                                             workspace=workspace,
+                                             model=self._model_summary(),
+                                             intro=intro))
+                return
+            except Exception as exc:
+                print(f'[feishu] panel card failed, fallback to text: {exc}')
+        self._reply(chat_id, (intro + chr(10) if intro else '')
+                    + '直接发消息即可；/new 新会话 · /sessions 会话列表 · '
+                      '/help 全部命令')
+
+    def _handle_panel_action(self, chat_id: str, action: str,
+                             sender_id: str | None = None) -> None:
+        action = str(action or '')
+        if action == 'new':
+            self._handle_new(chat_id, '')
+        elif action == 'sessions':
+            self._show_sessions(chat_id, self.api.list_sessions(limit=1000))
+        elif action == 'stop':
+            self._panel_stop(chat_id)
+        elif action == 'status':
+            self._panel_status(chat_id)
+        else:
+            self._reply(chat_id, self._help_text())
+
+    def _panel_stop(self, chat_id: str) -> None:
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            self._reply(chat_id, '当前聊天还没有会话。')
+            return
+        try:
+            result = self.api.interrupt(session_id)
+        except Exception as exc:
+            self._reply(chat_id, f'[stop] {exc}')
+            return
+        status = result.get('status')
+        self._reply(chat_id, {
+            'cancelling': '已请求取消当前回合。',
+            'idle': '当前没有正在执行的回合。',
+        }.get(status, f'状态: {status}'))
+
+    def _panel_status(self, chat_id: str) -> None:
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            self._reply(chat_id, '还没有会话；直接发一条消息就会自动创建。')
+            return
+        lines = [f'会话 {session_id[:8]}', f'模型 {self._model_summary()}']
+        try:
+            lines.append(f'工作区 {self.api.get_workspace(session_id)}')
+        except Exception as exc:
+            lines.append(f'工作区不可用: {exc}')
+        self._reply(chat_id, chr(10).join(lines))
+
+    def _handle_cron(self, chat_id: str, argument: str) -> None:
+        """/cron：查看/创建/删除定时任务；cron 表达式由服务端校验。"""
+        usage = chr(10).join([
+            '用法:',
+            '/cron                     列出定时任务',
+            '/cron add "<分 时 日 月 周>" <提示词>',
+            '/cron delete <job_id>',
+        ])
+        text = argument.strip()
+
+        if not text or text.casefold() in ('list', 'ls'):
+            try:
+                jobs = self.api.list_crons()
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            if not jobs:
+                self._reply(chat_id, '（没有定时任务）')
+                return
+            lines = ['定时任务:']
+            for job in jobs:
+                kind = 'recurring' if job.get('recurring') else 'one-shot'
+                lines.append(f"  {job['id']}: '{job['cron']}' → "
+                             f"{job.get('prompt', '')[:40]} [{kind}]")
+            self._reply(chat_id, chr(10).join(lines))
+            return
+
+        action, _, rest = text.partition(' ')
+        action = action.casefold()
+        rest = rest.strip()
+        if action in ('add', 'create'):
+            expr, prompt = _split_cron_add(rest)
+            if not expr or not prompt:
+                self._reply(chat_id, usage)
+                return
+            try:
+                job = self.api.create_cron(expr, prompt)
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            self._reply(chat_id, f"已创建 {job['id']}: '{job['cron']}' → "
+                                 f"{job['prompt']}")
+            return
+        if action in ('delete', 'del', 'rm'):
+            if not rest:
+                self._reply(chat_id, usage)
+                return
+            try:
+                self.api.delete_cron(rest)
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            self._reply(chat_id, f'已删除 {rest}')
+            return
+        self._reply(chat_id, usage)
+
     def _help_text(self) -> str:
         return '\n'.join([
             '可用命令:',
@@ -819,6 +971,7 @@ class FeishuGateway:
             '/approvals、/perms       查看待审批操作',
             '/revoke                 撤销当前会话已允许的同类操作',
             '/sandbox [档位|approvals <档位>]  查看/切换执行与审批档位',
+            '/cron [list|add "<表达式>" <提示词>|delete <id>]  定时任务',
             '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
             '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
             '/find <关键词>           跨会话搜索历史内容',
@@ -1182,6 +1335,8 @@ class FeishuGateway:
                 self._reply(chat_id, f'当前模型: {model_text}\n服务地址: {base_text}')
             elif command == '/sandbox':
                 self._change_policy(chat_id, argument)
+            elif command == '/cron':
+                self._handle_cron(chat_id, argument)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
@@ -1349,6 +1504,12 @@ class FeishuGateway:
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理会话操作…', True
+        if (value or {}).get('panel'):
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在打开…', True
         req_id = (value or {}).get('approval')
         if not req_id:
             return '⚠ 无效的审批按钮', False
@@ -1495,7 +1656,9 @@ class FeishuGateway:
                     else:
                         with self._chat_lock(chat_id):
                             if isinstance(text, dict):
-                                if text.get('workspace_view'):
+                                if text.get('panel'):
+                                    self._handle_panel_action(chat_id, text['panel'], sender_id)
+                                elif text.get('workspace_view'):
                                     self._handle_workspace_action(chat_id, text, sender_id)
                                 else:
                                     self._handle_session_action(chat_id, text, sender_id)
@@ -1599,9 +1762,48 @@ class FeishuGateway:
         ws_client.start()   # blocks
 
 
-def main(argv=None) -> int:
+REQUIRED_ENV = ('FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'HARNESS_API_TOKEN')
+
+
+def check_setup(environ=None) -> list[str]:
+    """离线检查启动所需配置；返回问题列表（空表示可以启动）。"""
+    env = os.environ if environ is None else environ
+    problems = [f'缺少 {key}' for key in REQUIRED_ENV
+                if not (env.get(key) or '').strip()]
+    allowed = (env.get('FEISHU_ALLOWED_USERS') or '').strip()
+    allow_any = (env.get('FEISHU_ALLOW_ANY_USER') or '').strip().lower()         in ('1', 'true', 'yes')
+    if not allowed and not allow_any:
+        problems.append('缺少 FEISHU_ALLOWED_USERS（本地测试可设 FEISHU_ALLOW_ANY_USER=1）')
+    return problems
+
+
+def _print_setup_help() -> None:
+    print('飞书接入步骤（详见 docs/FEISHU_SETUP.md）：')
+    print('  1. 飞书开放平台创建企业自建应用，开启「机器人」+「长连接接收事件」')
+    print('  2. 订阅 im.message.receive_v1，添加卡片回调；权限 im:message')
+    print('  3. 启动 API：uvicorn api:create_app --factory --port 8000')
+    print('  4. 启动网关：python src/feishu_gateway.py')
+    print('  首次私聊机器人会回你的 open_id，把它填进 FEISHU_ALLOWED_USERS 即可。')
+
+
+def main(argv=()) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Feishu gateway')
+    parser.add_argument('--check', action='store_true',
+                        help='只检查配置，不连接飞书')
+    args = parser.parse_args(argv)
     from dotenv import load_dotenv
     load_dotenv()   # 与 harness 共用项目根的 .env（FEISHU_*/HARNESS_* 都可放这里）
+    if args.check:
+        problems = check_setup()
+        for problem in problems:
+            print(f'[missing] {problem}')
+        if not problems:
+            print('[ok] 配置齐全，可以启动网关')
+            print(f'  API: {os.getenv("HARNESS_API_URL", "http://127.0.0.1:8000")}')
+        _print_setup_help()
+        return 0 if not problems else 1
     app_id = os.getenv('FEISHU_APP_ID', '')
     app_secret = os.getenv('FEISHU_APP_SECRET', '')
     token = os.getenv('HARNESS_API_TOKEN', '')
@@ -1641,4 +1843,4 @@ def main(argv=None) -> int:
 
 if __name__ == '__main__':
     import sys
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
