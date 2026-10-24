@@ -25,6 +25,20 @@ def test_command_aliases_and_suggestions():
     assert commands.did_you_mean('zzzz') is None
 
 
+def test_model_argument_suggestions_include_registered_config_models(monkeypatch):
+    monkeypatch.setenv('HARNESS_LLM_CONFIG', '''
+providers: {default: {api_key_env: KEY}}
+models:
+  main-ref: {provider: default}
+  other-ref: {provider: default}
+roles: {main: main-ref}
+''')
+    monkeypatch.delenv('HARNESS_MODEL_MAIN', raising=False)
+    monkeypatch.delenv('LLM_MODEL_ID', raising=False)
+    choices = commands.argument_suggestions(commands.find('model'), 'other')
+    assert ('other-ref', 'other-ref') in choices
+
+
 def test_help_lists_all_commands_as_ported():
     text = commands.help_text()
     assert 'TUI commands:' in text

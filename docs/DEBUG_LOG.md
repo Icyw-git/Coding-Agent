@@ -3938,3 +3938,18 @@ HarnessApp 定向 71 passed；全量 **1462 passed / 1 skipped**，Ruff、`py_co
 不替用户执行带参数操作。命令面板快捷键加入 `/hotkeys`。HarnessApp 与命令路由定向回归
 84 passed；全量 **1463 passed / 1 skipped**，Ruff、`py_compile` 与 diff 检查通过，另有 5 条
 飞书 SDK 弃用警告。真实终端快捷键与 80×24 验收仍待执行。
+
+## 模型选择器
+
+选择器原先只列出模型 ID 并默认高亮第一项；`_set_model` 只修改 `LLM_MODEL_ID`，在
+`HARNESS_LLM_CONFIG` 下会被 `roles.main` 覆盖，provider 切换因此无效。现在候选来自模型注册表
+和可解析的内置上下文窗口项，支持 fuzzy 搜索，显示 provider/model 与已登记 context window，
+优先按最近状态事件中的有效模型高亮；没有有效状态时回退到配置解析的当前主角色。切换前先
+解析目标并检查工具能力，再设 `HARNESS_MODEL_MAIN`，
+同步 legacy `LLM_MODEL_ID`，并刷新状态栏的模型、context window 与当前占用。`/model` 参数补全
+同步纳入配置注册表的模型名；Footer 与 `/status` 显示解析后的主角色模型。
+
+没有引入价格标签：配置结构没有价格字段，硬编码价格会失真。也不把主角色的进程环境覆盖
+描述成会话级持久化设置。自动化回归覆盖 legacy 环境变量、多 provider 配置、搜索、当前项、
+参数补全及 context 占用更新；真实终端操作仍待验收。最终全量 **1465 passed / 1 skipped**，
+Ruff、`py_compile` 与 `git diff --check` 均通过；5 条飞书 SDK 弃用警告。

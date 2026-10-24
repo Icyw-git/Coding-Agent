@@ -53,8 +53,10 @@ def _resume_arguments(prefix: str) -> list[tuple[str, str]]:
 def _model_arguments(prefix: str) -> list[tuple[str, str]]:
     try:
         import harness
-        names = set(harness.MODEL_WINDOWS)
-        current = harness.os.getenv('LLM_MODEL_ID', '')
+        settings = harness.llm_config.get_settings()
+        names = set(harness.MODEL_WINDOWS) | set(settings.models)
+        current = (harness.os.getenv('HARNESS_MODEL_MAIN')
+                   or harness.model_for('main'))
         if current:
             names.add(current)
     except Exception:

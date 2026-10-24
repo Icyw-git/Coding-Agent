@@ -90,9 +90,12 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
     #fork-box { width: 76; max-height: 24; padding: 1 2;
                 border: round $accent; background: $boost; }
     #fork-list { height: auto; max-height: 16; }
-    #model-box { width: 60; max-height: 20; padding: 1 2;
-                 border: round $accent; background: $boost; }
-    #model-list { height: auto; max-height: 14; }
+    #model-box { width: 70; max-width: 100%; max-height: 100%;
+                 padding: 1 2; border: round $accent;
+                 background: $boost; }
+    #model-search { margin: 0 0 1 0; }
+    #model-list { height: auto; max-height: 10; }
+    #model-empty { height: auto; }
     .confirmation-body { height: auto; max-height: 10; }
     #confirm-box { width: 78; max-height: 28; padding: 1 2;
                    border: round $warning; background: $boost; }

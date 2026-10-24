@@ -28,7 +28,8 @@ class FooterMixin:
             parts.append(self._title[:28])
         try:
             import harness
-            parts.append(harness.os.getenv('LLM_MODEL_ID', '') or '(model unset)')
+            model = self._status.get('model') or harness.model_for('main')
+            parts.append(model or '(model unset)')
         except Exception:
             pass
         ctx_pct = self._status.get('ctx_pct')

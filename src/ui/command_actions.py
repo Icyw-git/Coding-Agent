@@ -9,7 +9,7 @@ import asyncio
 
 from ui import commands
 from ui.modals.command_palette import CommandPaletteModal
-from ui.modals.models import ModelPickerModal
+from ui.modals.models import ModelChoice, ModelPickerModal
 
 
 class CommandActionsMixin:
@@ -93,7 +93,7 @@ class CommandActionsMixin:
                 self._notice('没有更早的历史了。')
         elif verb in ('status', 'pwd'):
             state = self._display_status()
-            lines = [f"model: {harness.os.getenv('LLM_MODEL_ID', '') or 'unset'}",
+            lines = [f"model: {state.get('model') or harness.model_for('main') or 'unset'}",
                      f'workspace: {harness.get_workdir()}']
             if state.get('ctx_pct') is not None:
                 lines.append(f"context: {state['ctx_pct']:.0f}%")
@@ -233,9 +233,74 @@ class CommandActionsMixin:
 
     def open_model_picker(self) -> None:
         import harness
-        current = harness.os.getenv('LLM_MODEL_ID', '')
-        models = sorted(set(harness.MODEL_WINDOWS) | ({current} if current else set()))
-        self.push_screen(ModelPickerModal(models, current), self._on_model_picked)
+
+        settings = harness.llm_config.get_settings()
+        current_ref = (harness.os.getenv('HARNESS_MODEL_MAIN')
+                       or settings.roles.get('main')
+                       or harness.os.getenv('LLM_MODEL_ID', ''))
+        try:
+            current_target = settings.resolve_for('main')
+        except harness.llm_config.ConfigError:
+            current_target = None
+
+        choices: dict[str, tuple[ModelChoice, object]] = {}
+
+        def add_choice(ref: str, target, context_window: int | None = None) -> None:
+            if not target.supports('tools'):
+                return
+            window = (context_window or target.context_window
+                      or harness.MODEL_WINDOWS.get(target.model)
+                      or harness.MODEL_WINDOWS.get(ref))
+            label = f'{target.provider}/{target.model}'
+            if ref != target.model:
+                label += f' ({ref})'
+            choices[ref] = (ModelChoice(
+                ref=ref, label=label,
+                search=f'{ref} {label} {target.provider} {target.model}',
+                context_window=window), target)
+
+        for ref, config in settings.models.items():
+            add_choice(ref, settings.resolve(ref, role='main'),
+                       config.context_window)
+
+        provider_hint = current_target.provider if current_target else None
+        for ref, window in harness.MODEL_WINDOWS.items():
+            if ref in choices:
+                continue
+            try:
+                target = settings.resolve(ref, role='main',
+                                          provider_hint=provider_hint)
+            except harness.llm_config.ConfigError:
+                continue
+            add_choice(ref, target, window)
+
+        active_model = self._status.get('model')
+        if active_model:
+            active_refs = [ref for ref, (_choice, target) in choices.items()
+                           if target.model == active_model]
+            if len(active_refs) == 1:
+                current_ref = active_refs[0]
+            elif current_target is not None:
+                same_provider = [
+                    ref for ref in active_refs
+                    if choices[ref][1].provider == current_target.provider]
+                if len(same_provider) == 1:
+                    current_ref = same_provider[0]
+
+        if current_target is not None and current_ref not in choices:
+            equivalent = next((ref for ref, (_choice, target) in choices.items()
+                               if (target.provider, target.model)
+                               == (current_target.provider, current_target.model)), None)
+            if equivalent is not None:
+                current_ref = equivalent
+            elif current_ref:
+                add_choice(current_ref, current_target)
+
+        models = sorted((choice for choice, _target in choices.values()),
+                        key=lambda choice: (choice.label.casefold(),
+                                           choice.ref.casefold()))
+        self.push_screen(ModelPickerModal(models, current_ref),
+                         self._on_model_picked)
 
     def _on_model_picked(self, model) -> None:
         if model:
@@ -243,6 +308,27 @@ class CommandActionsMixin:
 
     def _set_model(self, model: str) -> None:
         import harness
-        harness.os.environ['LLM_MODEL_ID'] = model
-        self._notice(f'model: {model}')
+
+        environ = dict(harness.os.environ)
+        environ['HARNESS_MODEL_MAIN'] = model
+        try:
+            target = harness.llm_config.load_settings(environ).resolve_for('main')
+        except harness.llm_config.ConfigError as exc:
+            self._notice(f'Model unchanged: {exc}', level='error')
+            return
+        if not target.supports('tools'):
+            self._notice(f'Model unchanged: {target.ref} does not support tools.',
+                         level='error')
+            return
+
+        harness.os.environ['HARNESS_MODEL_MAIN'] = model
+        harness.os.environ['LLM_MODEL_ID'] = target.model
+        self._status['model'] = target.model
+        window = harness._context_window(target.model)
+        self._status['ctx_window'] = window
+        ctx_tokens = self._status.get('ctx_tokens')
+        self._status['ctx_pct'] = (
+            min(100.0, 100.0 * ctx_tokens / window)
+            if ctx_tokens is not None and window else None)
+        self._notice(f'model: {target.ref}')
         self._refresh_footer()

@@ -952,24 +952,88 @@ def test_cache_command_delegates_to_tool_cache(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_model_picker_updates_env(monkeypatch):
+def test_model_picker_searches_marks_current_and_updates_runtime(monkeypatch):
     _no_agent(monkeypatch)
     monkeypatch.setattr(harness, 'MODEL_WINDOWS',
                         {'alpha': 1000, 'beta': 2000})
-    monkeypatch.delenv('LLM_MODEL_ID', raising=False)
+    monkeypatch.setenv('LLM_MODEL_ID', 'beta')
+    monkeypatch.setenv('HARNESS_MODEL_MAIN', '')
 
     async def scenario():
         app = HarnessApp([])
+        app._status['ctx_tokens'] = 500
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.open_model_picker()
+            await pilot.pause()
+            screen = app.screen
+            box = screen.query_one('#model-box')
+            assert box.region.x >= 0 and box.region.right <= app.size.width
+            assert box.region.y >= 0 and box.region.bottom <= app.size.height
+            options = screen.query_one('#model-list')
+            assert options.option_count == 2
+            assert options.get_option_at_index(options.highlighted).id == 'beta'
+            assert 'current' in str(
+                options.get_option_at_index(options.highlighted).prompt)
+            assert '2,000 tokens' in str(
+                options.get_option_at_index(options.highlighted).prompt)
+
+            search = screen.query_one('#model-search')
+            search.value = 'alp'
+            await pilot.pause()
+            assert options.option_count == 1
+            assert options.get_option_at_index(0).id == 'alpha'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert harness.os.environ['HARNESS_MODEL_MAIN'] == 'alpha'
+            assert harness.os.environ['LLM_MODEL_ID'] == 'alpha'
+            assert app._status['model'] == 'alpha'
+            assert app._status['ctx_window'] == 1000
+            assert app._status['ctx_pct'] == 50
+
+    asyncio.run(scenario())
+
+
+def test_model_picker_switches_configured_provider_and_context(monkeypatch):
+    _no_agent(monkeypatch)
+    config = '''
+providers:
+  default: {api_key_env: MAIN_KEY}
+  alternate: {api_key_env: ALT_KEY}
+models:
+  main-ref: {provider: default, model: main-api, context_window: 100000}
+  other-ref: {provider: alternate, model: other-api, context_window: 200000}
+roles: {main: main-ref}
+'''
+    monkeypatch.setenv('HARNESS_LLM_CONFIG', config)
+    monkeypatch.setenv('HARNESS_MODEL_MAIN', '')
+    monkeypatch.setenv('LLM_MODEL_ID', '')
+    monkeypatch.delenv('LLM_CONTEXT_WINDOW', raising=False)
+
+    async def scenario():
+        app = HarnessApp([])
+        app._status['ctx_tokens'] = 50_000
+        app._status['model'] = 'other-api'
         async with app.run_test(size=(80, 24)) as pilot:
             app.open_model_picker()
             await pilot.pause()
             screen = app.screen
             options = screen.query_one('#model-list')
-            assert options.option_count == 2
-            options.focus()
+            assert options.get_option_at_index(options.highlighted).id == 'other-ref'
+            assert 'alternate/other-api' in str(
+                options.get_option_at_index(options.highlighted).prompt)
+            assert '200,000 tokens' in str(
+                options.get_option_at_index(options.highlighted).prompt)
+            search = screen.query_one('#model-search')
+            search.value = 'main-ref'
+            await pilot.pause()
+            assert options.option_count == 1
             await pilot.press('enter')
             await pilot.pause()
-            assert harness.os.environ['LLM_MODEL_ID'] in ('alpha', 'beta')
+            assert harness.os.environ['HARNESS_MODEL_MAIN'] == 'main-ref'
+            assert harness.os.environ['LLM_MODEL_ID'] == 'main-api'
+            assert harness.model_for('main') == 'main-api'
+            assert app._status['ctx_window'] == 100_000
+            assert app._status['ctx_pct'] == 50
 
     asyncio.run(scenario())
 
@@ -1350,6 +1414,7 @@ def test_footer_shows_context_and_cache_hit_rate():
         app = HarnessApp([])
         async with app.run_test(size=(100, 20)) as pilot:
             app._apply(UIEvent('status', {
+                'model': 'runtime-fallback',
                 'ctx_pct': 25.0, 'ctx_tokens': 50_000,
                 'ctx_window': 200_000, 'tokens': 12_000,
                 'prompt_tokens': 50_000, 'cached_tokens': 25_000,
@@ -1357,6 +1422,7 @@ def test_footer_shows_context_and_cache_hit_rate():
             }))
             await pilot.pause()
             footer = str(app._footer.render())
+            assert 'runtime-fallback' in footer
             assert 'ctx 25%' in footer
             assert 'cache 50%' in footer
 

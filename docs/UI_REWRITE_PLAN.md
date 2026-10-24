@@ -70,6 +70,10 @@
   命令交给现有分发；有参数提示的命令只回填 Composer，不提前执行。Textual 验证覆盖 fuzzy
   搜索、原分发、参数回填、无结果、取消及 80×24 布局；全量 **1463 passed / 1 skipped**，
   Ruff、`py_compile` 与 diff 检查通过。真实终端验收仍待执行。
+- P5s：模型选择器支持 fuzzy 搜索，优先高亮最近状态中生效的模型；无运行时状态时按配置解析
+  context window。切换先解析配置，再设置 `HARNESS_MODEL_MAIN`（主角色运行时覆盖）并同步
+  legacy `LLM_MODEL_ID`；刷新上下文窗口及占用。包含旧环境变量和多 provider 配置回归。
+  配置未提供价格元数据，不显示猜测价格；模型选择不是 per-session 持久化设置。
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
   `textual-legacy`，`textual-next` 作为兼容别名。
 - P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
@@ -298,7 +302,11 @@ src/ui/
   搜索包含完整历史并按需补载较早页面。
 - 命令面板：`Ctrl+Shift+P` 打开；复用 `COMMANDS`、技能命令注册与 `fuzzy_filter`，按命令/
   技能分组。无参数命令走现有分发；有参数提示的命令回填到 Composer，后续补全仍复用现有路径。
-- 模型选择器：列出 `MODEL_WINDOWS` 与价格，切换后写回会话状态。
+- 模型选择器：按配置来源列出 `MODEL_WINDOWS` 和 `llm_config.models` 中可用模型，fuzzy 搜索
+  provider/model；当前主角色项默认高亮，并显示 provider 与已登记 context window。切换解析后
+  写入 `HARNESS_MODEL_MAIN` 主角色运行时覆盖并同步兼容变量 `LLM_MODEL_ID`，更新状态栏模型和
+  context window/占用。当前配置结构没有价格字段，不展示臆测价格；也不把主角色覆盖伪称为
+  per-session 持久化设置。
 
 ## 5. 分阶段实施
 
