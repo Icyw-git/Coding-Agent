@@ -28,9 +28,6 @@ def enforce_trusted_policy_env() -> None:
               f"（档位只认启动进程时的环境，运行中用 /sandbox 切换）", file=sys.stderr)
 
 
-import concurrent.futures
-import contextvars
-import difflib
 import hashlib
 import json
 import re
@@ -38,7 +35,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +45,6 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-import approval_view  # 审批面的参数渲染（/approvals 列表要显示完整命令）
 import checkpoint_commands
 import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
@@ -56,6 +52,7 @@ import llm_config
 import llm_route
 import recovery
 import sandbox
+import status_report
 import tool_cache
 import turn_control
 import workspace_diff
@@ -100,13 +97,11 @@ from background_task import (
     background_lock,
     background_tasks,
     collect_background_results,
-    should_run_background,
-    start_background_task,
 )
 from background_watch import watch_command
 from checkpoint_commands import format_checkpoint_list, format_restore_report, rewind_to
 from checkpoints import CheckpointError, CheckpointManager
-from cli_commands import command_error, format_command_help, parse_command
+from cli_commands import command_error
 from cron_scheduler import (
     agent_lock,
     cancel_job,
@@ -119,8 +114,9 @@ from cron_scheduler import (
     scheduled_jobs,
     wait_for_cron_idle,
 )
-from exec_policy import is_readonly_command, is_secret_path, load_policy, set_tier
+from exec_policy import load_policy
 from git_branch import current_branch
+from line_repl import prompt_text, run_line_repl
 from perf import record as perf_record
 from perf import reset as perf_reset
 from perf import segment as perf_segment
@@ -135,12 +131,33 @@ from prompt_assembly import project_prompt_section as _project_prompt_section
 from prompt_cache_debug import enabled as cache_debug_enabled
 from prompt_cache_debug import fingerprints as cache_fingerprints
 from prompt_cache_debug import first_divergence as first_cache_divergence
+from repl_commands import handle_command
 from session_store import SessionEventStore, SessionReplayError
 from session_title import generate_session_title as _generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
+from status_report import (
+    APPROVAL_POLICY_HELP,
+    SANDBOX_MODE_HELP,
+    _document_extras_status,
+    apply_sandbox_tier,
+    format_pending_approvals,
+    format_sandbox_tier,
+    format_status,
+    format_storage_profile,
+    format_workspace_diff,
+    run_doctor,
+    storage_profile_data,
+)
 from subagent import spawn_subagent
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
-from tools import TOOLS, ImageResult, patch_paths, restore_todos, run_bash, safe_path, tool_registry
+from tool_dispatch import (
+    PARALLEL_SAFE_TOOLS,
+    _print_tool_activity,
+    _run_tool_batch,
+    exec_tool_call,
+    format_tool_output,
+)
+from tools import TOOLS, restore_todos, run_bash, tool_registry
 from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
@@ -581,190 +598,6 @@ def load_transcript(path) -> list[dict]:
     return records
 
 
-# ---------- 执行档位（/sandbox）----------
-# 档位只描述「策略层怎么判」，不代表内核强制：见 exec_policy 模块头的边界说明。
-SANDBOX_MODE_HELP = (
-    ('read-only', '只放公认只读的命令，写改与其余命令都要审批'),
-    ('workspace-write', '默认档：工作区内写改放行，破坏性命令询问'),
-    ('danger-full-access', '取消提示级限制与工作区路径约束，只保留黑名单硬拒'),
-)
-APPROVAL_POLICY_HELP = (
-    ('untrusted', '每条 bash 都要审批'),
-    ('on-request', '默认档：只在策略层判定有风险时询问'),
-    ('never', '不打断；除 danger-full-access 外，需要审批的操作直接失败'),
-)
-
-
-def format_sandbox_tier() -> str:
-    """档位清单 + 当前选中项，/status 与 --doctor 都复用这段说明。"""
-    policy = load_policy()
-    lines = [
-        f'  执行档位：{policy.sandbox_mode} · 审批档位：{policy.approval_policy}',
-        f'  OS 沙箱：{sandbox.status_line()}（{sandbox.ENV}）',
-    ]
-    for title, options, current in (
-            ('执行档位（/sandbox <档位>）', SANDBOX_MODE_HELP, policy.sandbox_mode),
-            ('审批档位（/sandbox approvals <档位>）', APPROVAL_POLICY_HELP,
-             policy.approval_policy)):
-        lines.append(f'  {title}')
-        lines.extend(f'    {"*" if name == current else " "}{name:<20}{note}'
-                     for name, note in options)
-    lines.append('  说明：档位是策略级判定（四个执行入口同一套规则），本身不做 OS 强制，'
-                 '不隔离文件读取与网络。')
-    lines.append('  OS 沙箱独立于此开关：require 时沙箱不可用则拒绝执行；'
-                 '启用后命令以 Low IL 运行，工作区外写入被内核拒绝，读取与网络仍不隔离。')
-    return '\n'.join(lines)
-
-
-def apply_sandbox_tier(argument: str) -> str:
-    """/sandbox <档位> 与 /sandbox approvals <档位>。参数已由 command_error 校验。"""
-    # 档位名大小写不敏感（load_policy 也是 casefold 读的）；分支判定同样要归一，
-    # 否则 '/sandbox APPROVALS never' 校验通过却走进执行档位分支。
-    parts = [part.casefold() for part in argument.split()]
-    previous = load_policy()
-    if parts[0] == 'approvals':
-        policy = set_tier(approval_policy=parts[1])
-        changed = f'审批档位 → {policy.approval_policy}'
-    else:
-        policy = set_tier(sandbox_mode=parts[0])
-        changed = f'执行档位 → {policy.sandbox_mode}'
-    # 档位写进环境：load_policy 即时读取，下一条工具调用就生效，子进程也继承
-    if policy != previous:
-        # 换档本身就是一次安全状态变更：丢掉所有「本会话允许同类」预授权，
-        # 否则切到 read-only 还会吃到 workspace-write 时批下的键（/v1/policy 同理）
-        hooks.GATE.revoke_session()
-    return (f'  已切换 {changed}'
-            f'（当前 {policy.sandbox_mode} · {policy.approval_policy}）')
-
-
-def format_status(session_store) -> str:
-    """Summarize local runtime state for the interactive REPL."""
-    from turn_progress import relative_time
-    manager = get_checkpoint_manager(session_store)
-    with cron_lock:
-        cron_count = len(scheduled_jobs)
-    with background_lock:
-        background_count = len(background_tasks)
-    activity = [f'{count} 个{label}' for label, count in (
-        ('任务', len(list_tasks())), ('定时任务', cron_count),
-        ('后台任务', background_count), ('协作成员', len(active_teammates))) if count]
-    summary = session_store.session_summary()
-    usage = session_store.usage_totals()   # 从 usage 事件聚合，跨重启准确
-    policy = load_policy()
-    usage_line = (f'\n  tokens：{_fmt_tokens(usage["total"])}'
-                  f'（输入 {_fmt_tokens(usage["prompt"])} · 输出 {_fmt_tokens(usage["completion"])}）'
-                  f'{_cache_hit_rate_line(usage)}'
-                  if usage.get('total') else '')
-    return (
-        f"  会话：{summary['title']}\n"
-        f"  最近活跃：{relative_time(summary['updated'])}\n"
-        f'  工作区：{WORKDIR}\n'
-        f'  模型：{format_main_target()}\n'
-        f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy} · '
-        f'OS 沙箱：{sandbox.configured_mode()}'
-        f'{hooks.GATE.judge_summary() if hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
-        f'  快照：{len(manager.list(limit=10_000))} 个\n'
-        f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
-        f'{usage_line}'
-    )
-
-
-def format_workspace_diff(workspace=None, path='', *, max_chars=30000, color=False) -> str:
-    """Return a bounded, read-only view of the workspace changes."""
-    return workspace_diff.format_diff(
-        Path(workspace or get_workdir()), path,
-        max_chars=max_chars, color=color, ignore=CHECKPOINT_IGNORE)
-
-
-def format_pending_approvals() -> str:
-    """Show actionable approval context without exposing internal request IDs."""
-    pending = hooks.GATE.pending()
-    if not pending:
-        return '  没有待审批操作。'
-    lines = ['  待审批操作：']
-    for index, request in enumerate(pending, 1):
-        reason = str(request.reason or '').strip() or '未提供原因'
-        tool = str(request.tool or '未知操作')
-        lines.append(f'    {index}. {approval_view.safe_text(f"{tool} · {reason}")}')
-        # 批的就是这条命令：只列工具名等于让人盲批（旧版就是这样）
-        detail = approval_view.detail(tool, request.args)
-        lines.extend(f'         {line}' for line in detail.splitlines())
-    lines.append('  请使用飞书 /approve 或审批卡片处理；CLI 可回复 /approvals <序号> y|n 决议。')
-    return '\n'.join(lines)
-
-
-def storage_profile_data(*, deep: bool = True) -> dict:
-    """扫描工作区 .cache；TUI、行式 REPL 与 --doctor 共用同一份口径。"""
-    import storage_profile
-    return storage_profile.scan(
-        WORKDIR / '.cache', sessions_dir=SESSIONS_DIR,
-        checkpoint_keep=CHECKPOINT_MAX_NODES, deep=deep)
-
-
-def format_storage_profile(*, deep: bool = True) -> str:
-    import storage_profile
-    return storage_profile.format_profile(storage_profile_data(deep=deep))
-
-
-def run_doctor() -> int:
-    """Report startup prerequisites without contacting the model provider."""
-    try:
-        main = model_target('main')
-        checks = [
-            ('model', True),
-            (f'model target {main.ref}', True),
-            (main.api_key_env or 'api key (not required)',
-             bool(main.api_key) or not main.api_key_env),
-        ]
-    except llm_config.ConfigError as exc:
-        checks = [('model', False)]
-        print(f'[model] {exc}')
-    checks.extend([
-        ('workspace', WORKDIR.is_dir()),
-        ('git repository', (WORKDIR / '.git').exists()),
-    ])
-    for directory in (SESSIONS_DIR, CHECKPOINT_DIR, MEMORY_DIR, TOOL_RESULTS_DIR):
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-            checks.append((f'writable {directory.relative_to(WORKDIR)}', True))
-        except OSError:
-            checks.append((f'writable {directory}', False))
-    for label, passed in checks:
-        print(f'[{"ok" if passed else "missing"}] {label}')
-    # 档位属于运行时配置，诊断输出里必须看得见：否则「以为开了只读其实没开」
-    # 这类误差只能在事故发生后才发现。
-    policy = load_policy()
-    print(f'[policy] sandbox_mode={policy.sandbox_mode} '
-          f'approval_policy={policy.approval_policy}（策略级判定）')
-    print(f'[os-sandbox] {sandbox.ENV}={sandbox.configured_mode()}'
-          f'（Windows 低完整性，仅约束 shell 子进程）')
-    print(f'[optional] documents: {_document_extras_status()}')
-    cache = tool_cache.scan(TOOL_RESULTS_DIR)
-    print(f"[cache] tool_results: {cache['files']} files, "
-          f"{tool_cache.human_size(cache['bytes'])} (use /cache gc)")
-    try:
-        import storage_profile
-        print(storage_profile.format_summary(storage_profile_data(deep=False)))
-    except Exception as exc:
-        print(f'[storage] unavailable: {exc}')
-    return 0 if all(passed for _, passed in checks) else 1
-
-
-def _document_extras_status() -> str:
-    """文档工具是可选依赖：doctor 只报告可用性，缺包不算启动失败。"""
-    from importlib.util import find_spec
-
-    missing = [
-        label for label, module in (
-            ('pypdf', 'pypdf'), ('pypdfium2', 'pypdfium2'), ('Pillow', 'PIL'))
-        if find_spec(module) is None
-    ]
-    if not missing:
-        return 'installed'
-    return (f"missing {', '.join(missing)} "
-            f'(pip install -r requirements-docs.txt)')
-
-
 # ============================================================
 # 全局配置集中区
 # ============================================================
@@ -1041,322 +874,8 @@ def pre_compact_messages(messages, skip_micro_rounds=0, on_compact=None, session
     return messages, skip_micro_rounds
 
 
-_DIFF_TOOLS = frozenset({'write', 'edit', 'apply_patch'})
-_DIFF_MAX_FILE_BYTES = 1_000_000
-_DIFF_MAX_CHARS = 20_000
-
-
-def _diff_targets(name, args):
-    """要比较的文件（写入类工具）；路径解析失败/秘密文件直接跳过。"""
-    try:
-        if name in ('write', 'edit'):
-            raw = str(args.get('path') or '')
-            targets = [safe_path(raw, args.get('cwd'))] if raw else []
-        elif name == 'apply_patch' and args.get('patch'):
-            targets = [safe_path(path, args.get('cwd'))
-                       for path in patch_paths(str(args['patch']))]
-        else:
-            return []
-    except Exception:
-        return []
-    return [path for path in targets
-            if not is_secret_path(path, checkpoints.DEFAULT_SECRETS)]
-
-
-def _file_bytes(path):
-    try:
-        if path.is_file() and path.stat().st_size <= _DIFF_MAX_FILE_BYTES:
-            return path.read_bytes()
-    except OSError:
-        pass
-    return None
-
-
-def _capture_tool_files(name, args):
-    return {str(path): _file_bytes(path) for path in _diff_targets(name, args)}
-
-
-def _tool_diff(before):
-    chunks = []
-    for raw_path, old in before.items():
-        path = Path(raw_path)
-        new = _file_bytes(path)
-        if old == new:
-            continue
-        try:
-            old_text = (old or b'').decode('utf-8')
-            new_text = (new or b'').decode('utf-8')
-        except UnicodeDecodeError:
-            continue    # 二进制/编码不明：不做行 diff
-        diff = list(difflib.unified_diff(
-            old_text.splitlines(), new_text.splitlines(),
-            fromfile=raw_path, tofile=raw_path, lineterm=''))
-        if diff:
-            chunks.append(chr(10).join(diff))
-    return chr(10).join(chunks)[:_DIFF_MAX_CHARS]
-
-
-def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
-                   on_event=None, on_activity=None):
-    """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
-    返回 (name, args, tool 消息 dict, images)。images 是 view_image 的附件引用，
-    由调用方作为独立 user 消息追加（tool 角色里放图片各家支持不一致）。
-    主循环与 teammate 共用同一条安全/兜底路径。
-    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。
-    on_event：无头 JSONL 的事件出口，按 ``(类型, 载荷)`` 回调。
-    on_activity：交互终端的工具活动行出口，参数为
-    ``(name, args, elapsed, failed, background)``。"""
-    name = tool_call.function.name
-    try:
-        args = json.loads(tool_call.function.arguments)
-        if not isinstance(args, dict):
-            raise ValueError('tool arguments must be a JSON object')
-    except (TypeError, ValueError) as exc:
-        # 无头 JSONL 的消费方按 started/completed 配对跟踪工具调用；参数解析失败
-        # 也要配对上报，否则这次调用在事件流里是静默丢失的。
-        message = f'Error: invalid tool arguments: {exc}'
-        if on_event:
-            on_event('tool.started', {'name': name, 'call_id': tool_call.id,
-                                      'arguments': {}})
-            on_event('tool.completed', {'name': name, 'call_id': tool_call.id,
-                                        'status': 'error', 'output': message,
-                                        'images': []})
-        return name, {}, {'role': 'tool', 'tool_call_id': tool_call.id,
-                          'content': message}, []
-    if on_event:
-        on_event('tool.started', {'name': name, 'call_id': tool_call.id,
-                                  'arguments': args})
-    if registry is None:
-        registry = tool_registry
-    if hooks:
-        blocked = trigger_hooks("PreToolUse", name, args)
-    else:
-        blocked = None
-    images = []
-    background_started = False
-    diff_before = (_capture_tool_files(name, args)
-                   if name in _DIFF_TOOLS else {})
-    started = time.perf_counter()
-    ui_emit('tool_start', name=name, args=args, call_id=tool_call.id)
-    if blocked:
-        output = blocked
-    elif name not in registry:
-        output = f"Error: unknown tool {name}"
-    else: #判断是否为后台任务，若为后台任务则启动后台任务，否则直接执行工具
-        try:
-            if background and should_run_background(name, args):
-                bg_id = start_background_task(tool_call, registry)
-                background_started = True
-                output = (f"[Background task {bg_id} started] "
-                          f"Command: {args.get('command', '')}. "
-                          f"Result will be available when complete.")
-            else:
-                output = registry[name](**args)
-                if isinstance(output, ImageResult):
-                    images = output.images
-                    output = output.text
-        except Exception as e:
-            # 模型可能传 schema 之外的参数（如 offset），**args 展开时在函数体外抛错
-            output = f"Error: {e}"
-    elapsed = time.perf_counter() - started
-    text_output = str(output)
-    failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
-    ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
-            output_preview=text_output[:2000], output_len=len(text_output),
-            diff=_tool_diff(diff_before) if diff_before else '',
-            ok=not (blocked or failed),
-            outcome=('denied' if blocked else
-                     'queued' if background_started else
-                     'failed' if failed else 'completed'),
-            background=background_started,
-            duration_ms=round(elapsed * 1000))
-    METRICS.record_tool()
-    if on_activity is not None:
-        from tool_activity import is_failure, result_hint
-        on_activity(name, args, elapsed, is_failure(output),
-                    background_started, result_hint(output), str(output))
-    if hooks:
-        trigger_hooks("PostToolUse", name, args, output)
-    # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
-    # 形态，前缀天然稳定；全量已落盘可恢复）。hooks 拿到的仍是全量输出。
-    content = _bound_tool_output(tool_call.id, output)
-    if on_event:
-        text = str(content)
-        status = ('blocked' if blocked else
-                  'error' if text.startswith(('Error:', 'Permission denied')) else 'ok')
-        on_event('tool.completed', {
-            'name': name, 'call_id': tool_call.id, 'status': status,
-            'output': text,
-            'images': [str(image.get('name') or 'image') for image in images],
-        })
-    return name, args, {"role": "tool", "tool_call_id": tool_call.id,
-                        "content": content}, images
-
-
-# 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。
-# 可变工具（bash/write/edit/任务写入/cron 变更/子代理等）与 loop 行为默认串行；
-# 唯一例外见 _run_tool_batch 的只读 bash 批（exec_policy.is_readonly_command）。
-PARALLEL_SAFE_TOOLS = frozenset({
-    'read', 'view_image', 'read_document', 'glob', 'grep', 'ls', 'list_tasks', 'get_task',
-    'list_crons', 'check_inbox', 'load_skill', 'background_output',
-})
-PARALLEL_MAX_WORKERS = 4
-
-
 ACTIVE_TICKER = None   # 交互回合进行中的进度行；工具活动行借它原子换行
-TOOL_OUTPUTS = {}      # 折叠输出的环形缓存：编号 -> (工具名, 全文)
-TOOL_OUTPUT_LIMIT = 20
-_tool_output_seq = 0
 
-
-def _remember_tool_output(name, output) -> int:
-    """保存被折叠的输出，返回 /expand 用的编号；只保留最近 20 条。"""
-    global _tool_output_seq
-    _tool_output_seq += 1
-    while len(TOOL_OUTPUTS) >= TOOL_OUTPUT_LIMIT:
-        TOOL_OUTPUTS.pop(next(iter(TOOL_OUTPUTS)))
-    TOOL_OUTPUTS[_tool_output_seq] = (name, str(output))
-    return _tool_output_seq
-
-
-def format_tool_output(argument: str) -> str:
-    """/expand <编号>：打印被折叠的工具全文。"""
-    try:
-        number = int(argument.strip())
-    except (TypeError, ValueError):
-        return '  用法：/expand <编号>（编号见工具行末尾的折叠提示）'
-    entry = TOOL_OUTPUTS.get(number)
-    if entry is None:
-        return f'  没有编号为 {number} 的工具输出（只保留最近 {TOOL_OUTPUT_LIMIT} 条）。'
-    return entry[1]
-
-
-def _print_tool_activity(name, args, elapsed, failed, background=False,
-                         hint='', output=''):
-    """交互终端的工具活动行；长输出折叠为头尾 + /expand 提示。"""
-    if not sys.stdout.isatty():
-        return
-    if getattr(permission_gate, 'use_ui', False):
-        # Textual 占用终端：工具块由事件流渲染，行式输出只会刷坏 TUI。
-        return
-    from tool_activity import format_line, preview_lines
-    line = format_line(name, args, elapsed, failed=failed,
-                       background=background, hint=hint)
-    lines, hidden = preview_lines(output)
-    if hidden:
-        number = _remember_tool_output(name, output)
-        block = '\n'.join(
-            [line]
-            + [f'    │ {text}' for text in lines]
-            + [f'    └ … {hidden} 行已折叠 · /expand {number}'])
-    else:
-        block = line
-    if ACTIVE_TICKER is not None:
-        ACTIVE_TICKER.emit_line(block)
-        return
-    try:
-        print(block, flush=True)
-    except UnicodeEncodeError:
-        # 控制台编码（如 GBK）放不下 '•'/'→'：替换后重试，别让展示问题打断回合。
-        encoding = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
-        print(block.encode(encoding, 'replace').decode(encoding, 'replace'),
-              flush=True)
-
-
-def _batch_bash_commands(tool_calls):
-    """整批 bash 的命令文本；混入其他工具或 JSON 解析失败返回 None（串行兜底）。"""
-    commands = []
-    for tool_call in tool_calls:
-        if tool_call.function.name != 'bash':
-            return None
-        try:
-            args = json.loads(tool_call.function.arguments or '{}')
-        except (ValueError, TypeError):
-            return None
-        if not isinstance(args, dict):
-            return None
-        commands.append(str(args.get('command', '') or ''))
-    return commands
-
-
-def _mcp_telemetry_scope(session_store):
-    """MCP 调用遥测只在桥已加载时开启，避免为未使用 MCP 的进程导入 SDK。"""
-    bridge = sys.modules.get('mcp_bridge')
-    if bridge is None:
-        return nullcontext()
-    return bridge.telemetry_sink(
-        lambda event: session_store.append('mcp_call', **event))
-
-
-def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
-    """执行工具批次，并记录不含工具内容的批次与单工具耗时。"""
-    profile_started = time.perf_counter()
-    tool_timings = {}
-    parallel = (len(tool_calls) > 1
-                and all(tc.function.name in PARALLEL_SAFE_TOOLS for tc in tool_calls))
-    if not parallel and len(tool_calls) > 1:
-        commands = _batch_bash_commands(tool_calls)
-        parallel = (commands is not None
-                    and all(is_readonly_command(command) for command in commands))
-    def record_profile(status, error_type=''):
-        session_store.append('tool_profile', duration_ms=round(
-            (time.perf_counter() - profile_started) * 1000, 3),
-            parallel=parallel, status=status, error_type=error_type,
-            tool_count=len(tool_calls),
-            tools=[{'name': tc.function.name,
-                    'duration_ms': tool_timings.get(tc.id)} for tc in tool_calls])
-
-    try:
-        if parallel:
-            activities = {}
-            for tool_call in tool_calls:
-                session_store.append_tool_started(tool_call)   # 原序登记全部 started
-
-            def run_parallel(tc):
-                started = time.perf_counter()
-                try:
-                    with _mcp_telemetry_scope(session_store):
-                        return contextvars.copy_context().run(
-                            exec_tool_call, tc, on_event=on_event,
-                            on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
-                finally:
-                    tool_timings[tc.id] = round(
-                        (time.perf_counter() - started) * 1000, 3)
-
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
-                executed = list(pool.map(run_parallel, tool_calls))
-            for tool_call in tool_calls:   # 并行完成顺序不定，按原序补打活动行
-                activity = activities.get(tool_call.id)
-                if activity is not None:
-                    _print_tool_activity(*activity)
-        else:
-            executed = []
-            for tool_call in tool_calls:
-                session_store.append_tool_started(tool_call)
-                started = time.perf_counter()
-                try:
-                    with _mcp_telemetry_scope(session_store):
-                        executed.append(exec_tool_call(
-                            tool_call, on_event=on_event,
-                            on_activity=_print_tool_activity))
-                finally:
-                    tool_timings[tool_call.id] = round(
-                        (time.perf_counter() - started) * 1000, 3)
-    except BaseException as exc:
-        record_profile('error', type(exc).__name__)
-        raise
-    for _, _, tool_message, _images in executed:   # 原序写回结果
-        tool_messages.append(tool_message)
-        session_store.append_message(tool_message)
-    # 图片附件排在整批 tool 结果之后：并行 tool_calls 要求工具结果连续，
-    # 中间插 user 消息会被部分 API 判成孤儿。附件本身也是 user 消息。
-    for _, _, _tool_message, images in executed:
-        if images:
-            attachment = image_attachment_message(images)
-            tool_messages.append(attachment)
-            session_store.append_message(attachment)
-    record_profile('ok')
 
 def _record_compaction(session_store, compacted_messages, strategy):
     summary = next(
@@ -1464,241 +983,6 @@ def _confirm(prompt:str)->bool:
         return input(f"{prompt} (y/n) ").strip().lower() in ('y','yes')
     except (EOFError,KeyboardInterrupt):
         return False
-
-
-def handle_command(line:str,messages:list,session_store)->None:
-    """REPL 里的 /命令；回溯需要调用方已持有 agent_lock。"""
-    command, argument = parse_command(line)
-    if command == '/undo':
-        command, argument = '/rewind', 'turn --yes'
-    error = command_error(command, argument)
-    if error:
-        print(f'  {error}')
-        return
-    parts = [command, *argument.split()]
-    if command == '/help':
-        print(format_command_help(argument))
-        return
-    manager = (get_checkpoint_manager(session_store)
-               if command in ('/checkpoints', '/checkpoint', '/rewind', '/checkpoint-gc')
-               else None)
-
-    if command=='/checkpoints':
-        print(format_checkpoint_list(manager))
-
-    elif command == '/status':
-        print(format_status(session_store))
-
-    elif command == '/expand':
-        print(format_tool_output(argument))
-
-    elif command == '/watch':
-        print(watch_command(argument))
-
-    elif command == '/diff':
-        print(format_workspace_diff(color=sys.stdout.isatty()))
-
-    elif command == '/cache':
-        if argument.strip().lower() == 'profile':
-            print(format_storage_profile())
-        else:
-            print(tool_cache.handle_cache_command(
-                TOOL_RESULTS_DIR, SESSIONS_DIR, argument))
-
-    elif command == '/review':
-        from review import run_review
-        try:
-            print(run_review(progress=lambda text: print(text, flush=True)))
-        except Exception as exc:
-            print(f'  [review] 审阅失败：{exc}')
-
-    elif command == '/model':
-        main = llm_route.target_for('main')
-        if main is not None:
-            print(f'  当前模型：{main.ref}')
-            print(f'  服务地址：{main.base_url or "默认地址"}')
-            for _role in ('summary', 'memory', 'title', 'approval'):
-                role_target = llm_route.target_for(_role)
-                if role_target is None:
-                    continue
-                if (role_target.provider, role_target.model) != (main.provider, main.model):
-                    print(f'  {_role}：{role_target.ref}')
-        else:
-            print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
-            print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
-
-    elif command == '/sandbox':
-        print(apply_sandbox_tier(argument) if argument else format_sandbox_tier())
-
-    elif command == '/approvals':
-        tokens = argument.split()
-        if tokens:
-            index, choice = int(tokens[0]) - 1, tokens[1]
-            pending = hooks.GATE.pending()
-            if not 0 <= index < len(pending):
-                print('  没有该序号的待审批操作；先运行 /approvals 查看列表。')
-                return
-            req = pending[index]
-            record = hooks.GATE.resolve(req.req_id, choice == 'y', by='cli')
-            print(f'  已决议：{record.status} · {req.tool}')
-        else:
-            print(format_pending_approvals())
-
-    elif command == '/revoke':
-        count = hooks.GATE.revoke_session(hooks.current_session_id() or None)
-        print(f'  已撤销 {count} 条当前会话预授权。')
-
-    elif command == '/compact':
-        if not messages:
-            print('  当前会话没有可压缩的内容。')
-            return
-        before = len(messages)
-        try:
-            compacted = compact_history(messages)
-        except Exception as exc:
-            print(f'  [compact] 压缩失败，原会话未改变：{exc}')
-            return
-        messages[:] = compacted
-        _record_compaction(session_store, messages, 'manual')
-        # compaction 事件回放时会重建 marker 消息本身，不能再追加同一条
-        print(f'  已压缩会话上下文：{before} 条消息 → {len(messages)} 条。完整记录已保存。')
-
-    elif command == '/find':
-        if not argument:
-            print('  用法：/find <关键词>（跨会话搜索历史内容）')
-            return
-        rows = SessionEventStore.search_all(SESSIONS_DIR, argument, limit=8)
-        if not rows:
-            print(f'  没有包含「{argument}」的会话。')
-            return
-        from turn_progress import relative_time
-        for row in rows:
-            print(f"  {row['id'][:12]}  {relative_time(row.get('updated'))}  {row['title']}")
-            print(f"    {row.get('matched', '')}")
-
-    elif command == '/rename':
-        if session_store is None:
-            print('  [rename] 当前没有会话上下文。')
-            return
-        title = session_store.append_session_title(argument.strip()[:80], source='user')
-        print(f"  会话主题已设置为：{title['title']}")
-
-    elif command == '/sessions':
-        print(format_session_list())
-
-    elif command in ('/archive', '/delete'):
-        from cli_input import choose_cleanup_sessions
-
-        # 先等本进程的后台写入落盘，再移动会话日志。
-        wait_for_housekeeping()
-        if housekeeping_busy():
-            print('  会话后台整理尚未结束，请稍后再清理。')
-            return
-        deleting = command == '/delete'
-        restoring = argument == 'restore'
-        action_key = 'delete' if deleting else 'restore' if restoring else 'archive'
-        archive, rows = session_cleanup_plan(command.lstrip('/'), argument,
-                                             session_store.session_id)
-        selected = choose_cleanup_sessions(rows, restore=restoring, delete=deleting)
-        selected_rows = [row for row in rows if row['id'] in selected]
-        if not selected_rows:
-            return
-        action = '永久删除' if deleting else '恢复' if restoring else '归档'
-        print(f'  将{action}以下会话（含关联快照）：')
-        for row in selected_rows:
-            print(f"    {row['title']} · {row['workspace'] or '目录未记录'}")
-        print('  请确认其他 CLI/API 服务没有正在使用这些会话。')
-        if deleting:
-            try:
-                confirmed = input('  不可恢复。输入“删除”确认，其他输入取消：').strip() == '删除'
-            except (EOFError, KeyboardInterrupt):
-                confirmed = False
-        else:
-            confirmed = _confirm(f'确认{action} {len(selected_rows)} 个会话？')
-        if not confirmed:
-            print('  已取消，未执行改动。')
-            return
-        completed, failures = apply_session_cleanup(
-            archive, selected_rows, action_key, session_store.session_id)
-        for row, error in failures:
-            print(f"  未处理 {row['title']}：{error}")
-        print(f'  已{action} {completed} 个会话。' + (
-            '记录及关联快照不可恢复，项目文件未改动。' if deleting else
-            '用 /archive restore 可恢复；项目文件未改动。' if not restoring else '可用 /resume 继续会话。'))
-
-    elif command in ('/workspaces', '/workspace'):
-        handle_workspace_command(command, argument)
-
-    elif command == '/pwd':
-        print(f'  工作区：{WORKDIR}')
-
-    elif command == '/cd':
-        if len(parts) < 2:
-            print(f'  工作区：{WORKDIR}')
-            return
-        try:
-            path = argument
-            if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
-                path = path[1:-1]
-            print(f'  工作区：{set_workspace(path)}')
-            if session_store is not None:
-                session_store.record_workspace(WORKDIR)
-        except ValueError as exc:
-            print(f'  [workspace] {exc}')
-
-    elif command=='/checkpoint':
-        label=' '.join(parts[1:])
-        cp_id=_safe_checkpoint(manager.begin_turn,messages,session_store,label=label,trigger='manual')
-        if cp_id:
-            _safe_checkpoint(manager.seal)
-            print(f"  已创建快照{('：' + label) if label else ''}。用 /rewind head 回溯。")
-
-    elif command=='/rewind':
-        ref=next((p for p in parts[1:] if not p.startswith('--')),'turn')
-        force='--force' in parts
-        scope='session' if '--session' in parts else 'all'
-        try:
-            cp_id=manager.resolve(ref)
-        except CheckpointError as e:
-            print(f"  \033[31m[rewind] {e}\033[0m")
-            return
-        if not manager.snapshot_path(cp_id).exists():
-            print(f"  \033[31m[rewind] snapshot missing for {cp_id}\033[0m")
-            return
-
-        # 先预览（plan_restore 不落盘），再确认执行
-        preview=_safe_checkpoint(manager.plan_restore,cp_id,scope=scope)
-        if preview is None:
-            return
-        preview['scope']=scope
-        print(format_restore_report(preview))
-        if preview['conflicts'] and not force:
-            print(f"  \033[33m[rewind] 未执行任何改动；确认可覆盖后重试 "
-                  f"/rewind {cp_id} --force\033[0m")
-            return
-        if '--yes' not in parts and not _confirm('确认回溯？'):
-            print('  已取消回溯，未执行改动。')
-            return
-        _safe_checkpoint(rewind_to,messages,session_store,manager,cp_id,
-                         force=force,scope=scope,report=False)
-
-    elif command=='/checkpoint-gc':
-        try:
-            preview = checkpoint_gc_preview(manager, argument)
-        except ValueError as exc:
-            print(f'  {exc}')
-            return
-        print(format_checkpoint_gc(preview))
-        if not preview['removed']:
-            return
-        if preview['mode'] == 'all' and not _confirm('确认清理这些旧快照？'):
-            print('  已取消，未删除任何快照。')
-            return
-        result = checkpoint_gc_execute(manager, argument)
-        print(format_checkpoint_gc(result, done=True))
-
-    else:
-        print(f"  unknown command: {command}")
 
 
 def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn_no=1):
@@ -2444,33 +1728,8 @@ def run_agent_turn_locked():
         print('\n[会话已中断]')
 
 
-def prompt_text() -> str:
-    """提示符带上工作区名、分支与档位：多会话/多目录/多分支时不容易发错地方。"""
-    workspace = get_workdir()
-    mode = load_policy().sandbox_mode
-    mark = {'read-only': 'ro', 'workspace-write': 'rw',
-            'danger-full-access': '!!'}.get(mode, mode)
-    branch = current_branch(workspace)
-    label = workspace.name or str(workspace)
-    if branch:
-        label = f'{label} ({branch})'
-    return f'\n{label} [{mark}] > '
 
 
-_REPL_RENDERER_ATTACHED = False
-
-
-def _attach_repl_renderer() -> None:
-    """TTY 行式 REPL 订阅事件总线；非 TTY（测试/管道）保持纯文本。
-
-    只 attach 一次：同一进程多次 run_repl 时不重复订阅。
-    """
-    global _REPL_RENDERER_ATTACHED
-    if _REPL_RENDERER_ATTACHED or not sys.stdout.isatty():
-        return
-    from renderer import ReplRenderer
-    bus.subscribe(ReplRenderer().on_event)
-    _REPL_RENDERER_ATTACHED = True
 
 
 def run_repl(initial_messages:list, session_store=None):
@@ -2510,222 +1769,8 @@ def run_repl(initial_messages:list, session_store=None):
                       f'{type(exc).__name__}: {exc}')
 
     with agent_lock:
-        _run_line_repl(messages, session_store)
+        run_line_repl(messages, session_store)
 
-
-def _run_line_repl(messages, session_store):
-    _attach_repl_renderer()
-    policy = load_policy()
-    print(f"  会话 {session_store.session_id[:8]} · "
-          f"{session_store.session_summary()['title']}")
-    print(f"  模型 {format_main_target()} · 工作区 {WORKDIR}")
-    print(f'  档位 {policy.sandbox_mode} / 审批 {policy.approval_policy} · '
-          f'沙箱 {sandbox.configured_mode()}')
-    print('  输入消息开始；/ 命令 · /resume 恢复 · Ctrl-C 中断 · Ctrl-D 退出')
-
-    from cli_input import choose_session, create_reader
-
-    def session_choices():
-        for row in session_rows(limit=None):
-            from turn_progress import relative_time
-            yield row['id'], (f"{row['title']} · {relative_time(row.get('updated'))}"
-                              f" · {row['workspace'] or '工作目录未记录'} · {row['preview']}")
-
-    read_line = create_reader(lambda: WORKDIR, session_choices)
-
-    from contextlib import nullcontext
-
-    from prompt_toolkit.patch_stdout import patch_stdout
-
-    # TTY 下输入线程持有提示符：回合内与命令输出都打印到提示符上方。
-    stdout_guard = patch_stdout(raw=True) if sys.stdout.isatty() else nullcontext()
-    with stdout_guard:
-        interrupted = 0
-        while True:
-            try:
-                line=read_line(prompt_text()).strip()
-                interrupted = 0
-            except EOFError:
-                print('\n[会话已结束]')
-                break
-            except KeyboardInterrupt:
-                # Codex 习惯：第一次 Ctrl-C 只提示，第二次才退出，避免误触丢会话。
-                if interrupted:
-                    print('\n[会话已结束]')
-                    break
-                interrupted += 1
-                print('\n  再按一次 Ctrl-C 退出（Ctrl-D 也可退出）。')
-                continue
-            if not line:
-                continue
-            if line.startswith('!') and line[1:].strip():
-                # `!cmd`：直接执行 shell，输出只显示在终端，不进入模型上下文。
-                command = line[1:].strip()
-                try:
-                    print(run_bash(command))
-                except Exception as exc:
-                    print(f'Error: {exc}')
-                continue
-            if line.startswith('/') or line == 'cd' or line.startswith('cd '):
-                if line == 'cd' or line.startswith('cd '):
-                    line = '/' + line
-                command, argument = parse_command(line)
-                error = command_error(command, argument)
-                if error:
-                    print(f'  {error}')
-                    continue
-                line = f'{command} {argument}'.rstrip()
-                if command in ('/exit','/quit'):
-                    break
-                if command in ('/r', '/resume', '/sessions'):
-                    parts = line.split(maxsplit=1)
-                    argument = parts[1].strip() if len(parts) > 1 else ''
-                    try:
-                        if argument == 'last':
-                            rows = session_rows(limit=1, include_empty=False)
-                            if not rows:
-                                print('  [session] 没有可恢复的会话。')
-                                continue
-                            if rows[0]['id'] == session_store.session_id:
-                                print(f"  [session] 最近会话就是当前会话：{rows[0]['title']}")
-                                continue
-                            path = resolve_session_path(rows[0]['id'])
-                        elif not argument:
-                            identifier = choose_session(session_rows(limit=None, include_empty=True),
-                                                        session_store.session_id, WORKDIR)
-                            if identifier is None:
-                                continue
-                            path = resolve_session_path(identifier)
-                        else:
-                            rows = session_rows(include_empty=False, query=argument)
-                            matches = [SESSIONS_DIR / f"session_{row['id']}.jsonl" for row in rows]
-                            if len(matches) == 1:
-                                path = matches[0]
-                            elif len(matches) > 1:
-                                selected = choose_session(rows, session_store.session_id)
-                                if selected is None:
-                                    continue
-                                path = resolve_session_path(selected)
-                            else:
-                                path = resolve_session_path(argument)
-                        candidate = SessionEventStore.open(path)
-                        history = candidate.rebuild_openai_history(recover_pending=True)
-                        summary = candidate.session_summary()
-                        if summary['workspace']:
-                            set_workspace(summary['workspace'])
-                        else:
-                            print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
-                        session_store = candidate
-                        messages = history
-                        print(f"  已恢复：{summary['title']}\n  工作区：{WORKDIR}")
-                    except (FileNotFoundError, ValueError, SessionReplayError) as exc:
-                        print(f'  [session] {exc}')
-                    continue
-                if command in ('/n', '/new'):
-                    parts = line.split(maxsplit=1)
-                    requested = parts[1].strip() if len(parts) > 1 else None
-                    target = WORKDIR
-                    session_id = None
-                    lowered = requested.lower() if requested else ''
-                    if lowered.startswith('--'):
-                        if lowered != '--ws' and not lowered.startswith('--ws '):
-                            print('  [workspace] 未知参数；用法：'
-                                  '/new [--ws <序号|名称|路径>|会话ID]')
-                            continue
-                        selector = requested[4:].strip()
-                        if not selector:
-                            print('  [workspace] 用法：/new --ws <序号|名称|路径>')
-                            continue
-                        try:
-                            target = find_workspace(registered_workspaces(), selector)['path']
-                        except ValueError as exc:
-                            # 直接给路径也允许（未登记时不必先 /workspace add）
-                            candidate = Path(selector).expanduser()
-                            if not candidate.is_absolute():
-                                candidate = WORKDIR / candidate
-                            if candidate.is_dir():
-                                target = str(candidate.resolve())
-                            else:
-                                print(f'  [workspace] {exc}')
-                                continue
-                    elif requested:
-                        if not requested.replace('-', '').replace('_', '').isalnum():
-                            print('  [session] invalid session id')
-                            continue
-                        session_id = requested
-                    else:
-                        target = _workspace_for_new_session()
-                        if target is None:
-                            print('  [session] 已取消新建会话。')
-                            continue
-                    try:
-                        session_store = start_new_session(workspace=target, session_id=session_id)
-                    except (ValueError, FileExistsError) as exc:
-                        print(f'  [session] {exc}')
-                        continue
-                    messages = []
-                    print(f'  已开始新会话，工作区：{WORKDIR}')
-                    continue
-                if command == '/fork':
-                    parts = line.split(maxsplit=1)
-                    upto = None
-                    if len(parts) > 1:
-                        if not parts[1].strip().isdigit():
-                            print('  [fork] 用法：/fork [事件序号]，缺省复制全部历史。')
-                            continue
-                        upto = int(parts[1].strip())
-                    try:
-                        forked = SessionEventStore.fork(session_store, upto_seq=upto)
-                    except (FileExistsError, OSError, SessionReplayError) as exc:
-                        print(f'  [fork] 分叉失败：{exc}')
-                        continue
-                    session_store = forked
-                    messages = session_store.rebuild_openai_history()
-                    print(f'  已分叉出新会话 {forked.session_id}（原会话保留），后续对话在新会话进行。')
-                    continue
-                handle_command(line,messages,session_store)
-                continue
-            messages[:] = session_store.rebuild_openai_history(recover_pending=True)
-            messages.append({'role':'user','content':line})
-            session_store.append_message(messages[-1])
-            ui_emit('user_message', text=line)
-            global ACTIVE_TICKER
-            turn_control.begin_turn()
-            ticker = None
-            if sys.stdout.isatty():
-                from turn_progress import ProgressTicker, TurnProgress
-                progress = TurnProgress()
-                try:
-                    progress.follow(session_store, session_store.path.stat().st_size)
-                except OSError:
-                    progress.follow(session_store, 0)
-                ticker = ProgressTicker(progress).start()
-                ACTIVE_TICKER = ticker
-
-            def on_delta(part):
-                nonlocal ticker
-                if turn_control.cancel_requested():
-                    raise KeyboardInterrupt
-                if ticker is not None:
-                    ticker.stop()   # 正文开始上屏前清掉进度行
-                    ticker = None
-                print(part, end='', flush=True)
-
-            try:
-                # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
-                agent_loop(messages, session_store=session_store, on_delta=on_delta)
-            except KeyboardInterrupt:
-                ui_emit('activity', state='cancelled', detail='Request cancelled')
-                print('\n[会话已中断]')
-            except Exception as exc:   # 让 UI 看到失败，同时保留终端可读性
-                ui_emit('error', msg=f'{type(exc).__name__}: {exc}')
-                print(f'\n[error] {type(exc).__name__}: {exc}')
-            finally:
-                turn_control.end_turn()
-                if ticker is not None:
-                    ticker.stop()
-                    ACTIVE_TICKER = None
-            messages[:]=session_store.rebuild_openai_history(recover_pending=True)
 
 
 if __name__ == '__main__':

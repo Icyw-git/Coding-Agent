@@ -15,6 +15,10 @@
 | `memory.py`           | 记忆索引、召回（local/llm）、提取与合并                                                  |
 | `tokens.py`           | 文本/图片 token 估算与多模态附件展开                                                     |
 | `compaction.py`       | 压缩四级流水、工具结果预算、transcript 快照与 LLM 摘要                                   |
+| `status_report.py`    | 只读状态与诊断：`/status`、`/sandbox` 说明、`/approvals`、`/cache profile` 与 `--doctor`   |
+| `repl_commands.py`    | 行式 REPL 的斜杠命令分发与本地确认；运行时状态经 `_h()` 回读 `harness`                    |
+| `line_repl.py`        | 行式 REPL 主循环：提示符、`/resume`/`/new`/`/fork`、流式回合与 ticker 生命周期           |
+| `tool_dispatch.py`    | 工具执行层：单次调用、并行只读批、后台任务、写入前后 diff 与终端活动行                     |
 | `tools.py`            | 工具接线、路径边界与 `tool_registry`                                                             |
 | `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
@@ -810,9 +814,11 @@ seal()                                  # 记录每个文件写入后的 hash，
 节点按 loop 迭代生成，一个用户回合常有两个节点（改文件的那次迭代 + 只输出回答的那次迭代），
 后者不带任何 pre-image，所以 `last` 与 `head` 特意区分开。
 
-这些命令由 [`harness.py`](harness.py) 的 `handle_command` 处理，入口是 `__main__` 里的最小 REPL
-`run_repl`：普通输入追加 user 消息后调用 `agent_loop(messages, session_store=...)`，
-`/` 开头的输入不进 LLM。REPL 整体持有 `agent_lock`，回溯因此不会与 cron turn 并发。
+这些命令由 [`repl_commands.py`](repl_commands.py) 的 `handle_command` 处理（`harness` 再导出以保持调用点不变），
+入口是 `__main__` 里的最小 REPL `run_repl`，其循环实现在 [`line_repl.py`](line_repl.py) 的 `run_line_repl`：
+普通输入追加 user 消息后调用 `agent_loop(messages, session_store=...)`，
+`/` 开头的输入不进 LLM；`/resume`、`/new`、`/fork` 有各自的辅助函数，流式回合封装在 `_run_turn`。
+REPL 整体持有 `agent_lock`，回溯因此不会与 cron turn 并发。
 `/rewind` 先打印 `plan_restore()` 的计划，确认后执行，执行完只补一行实际改动（`applied: ...`）。
 
 ### 22.4 边界

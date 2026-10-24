@@ -8,11 +8,15 @@
 | ------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `harness.py` agent_loop   | 唯一 OpenAI 消息主循环：checkpoint、压缩预处理、注入、LLM 调用、工具批次、housekeeping 编排          |
 | `src/agent_core.py`       | 兼容门面：hooks 注册表；记忆、token 估算、压缩流水分别位于 `memory.py` / `tokens.py` / `compaction.py` |
+| `src/status_report.py`    | 只读状态与诊断汇总；路径、计数器与客户端经 `_h()` 调用期回读，不持有可变状态                           |
+| `src/repl_commands.py`    | 行式 REPL 的斜杠命令分发；目录、快照配置与执行函数经 `_h()` 回读，保留 `harness` patch 点                |
+| `src/line_repl.py`        | 行式 REPL 主循环：提示符、会话切换、流式回合；`agent_loop`/`run_bash` 等经 `_h()` 回读                    |
+| `src/tool_dispatch.py`    | 工具执行层：单次/批量调用、并行只读白名单、写入前后 diff 与终端活动行；registry/hooks/UI 经 `_h()` 回读      |
 | `src/prompt_assembly.py`  | system prompt 分段组装与上下文采集；按 context 指纹缓存，依赖由入口注入                              |
 | `src/session_title.py`    | 会话标题副通道：取材、LLM 调用与本地兜底，client 由入口注入，失败不阻塞回复                          |
 | `src/session_store.py`    | append-only 事件流、确定性回放、分叉与跨会话搜索；唯一恢复真相源                                     |
 | `src/agent_runtime.py`    | 会话服务（列表/恢复/分叉/搜索/重命名），摘要缓存归属于此                                             |
-| `src/harness_api.py`      | FastAPI 控制面 + SSE 进度流（直接 tail 会话 JSONL，无事件总线）                                      |
+| `src/harness_api.py`      | FastAPI 应用工厂：鉴权/限流中间件与生命周期；路由按域拆到 `api_sessions` / `api_streams` / `api_tasks` / `api_policy`（模型在 `api_models`） |
 | `src/tools.py` + registry | 工具接线与注册表；schema 在 tool_schemas.py，实现分域在 tool_*.py；统一走 exec_tool_call             |
 | 任务子系统                | `task_manager`（.cache/os_tasks）、`cron_scheduler`、`background_task` 各自拥有存储与锁              |
 | 传输网关                  | `feishu_gateway` / `gateway_sim` 只做协议适配，不持有业务状态                                        |
