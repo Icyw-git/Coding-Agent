@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ui.modals.confirm import ConfirmModal
 from ui.modals.forks import ForkPickerModal
-from ui.modals.sessions import SessionPickerModal
+from ui.modals.sessions import RenameSessionModal, SessionPickerModal
 from workspace_choices import find_workspace
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
@@ -393,9 +393,45 @@ class SessionActionsMixin:
             SessionPickerModal(rows, current_workspace=current_workspace),
             self._on_session_picked)
 
-    def _on_session_picked(self, row) -> None:
-        if row:
-            asyncio.create_task(self._resume_session_row(row))
+    def _on_session_picked(self, result) -> None:
+        if not result:
+            return
+        if isinstance(result, dict) and '_session_picker_action' in result:
+            action = result['_session_picker_action']
+            row = result['row']
+            if action == 'rename':
+                self.push_screen(
+                    RenameSessionModal(str(row.get('title') or '')),
+                    partial(self._rename_picker_session, row=row))
+            else:
+                self.start_picker_session_action(action, row)
+            return
+        asyncio.create_task(self._resume_session_row(result))
+
+    def _rename_picker_session(self, title: str | None, row: dict) -> None:
+        if not title:
+            return
+        if self._busy:
+            self._notice('Cannot rename a session while a request is running.')
+            return
+        import harness
+        if title == str(row.get('title') or ''):
+            self._notice('Session title is unchanged.')
+            return
+        try:
+            if row['id'] == self._session_id and self._store is not None:
+                store = self._store
+            else:
+                store = harness.SessionEventStore.open(
+                    harness.resolve_session_path(row['id']))
+            event = store.append_session_title(title[:80], source='user')
+        except Exception as exc:
+            self._notice(f'Session rename failed: {exc}', level='error')
+            return
+        if row['id'] == self._session_id:
+            self._title = event['title']
+            self._refresh_footer()
+        self._notice(f"Session title: {event['title']}")
 
     async def _resume_by_argument(self, argument: str) -> None:
         import harness

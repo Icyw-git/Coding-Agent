@@ -3900,8 +3900,20 @@ failed、UI gate 与 busy 状态恢复；忙时再次提交 shell 命令不会�
 `SessionPickerModal` 使用已有 session summary 支持最近更新/创建时间/名称排序、当前/全部
 工作区范围、摘要搜索和随高亮变化的预览；`Alt+S`/`Alt+W` 在搜索框焦点时仍可用。当前
 工作区按规范化路径比较，缺少 workspace 元数据的旧会话只出现在“全部工作区”。弹窗和
-列表高度限制已覆盖 80×24、15 条结果；管理操作仍由既有命令及其确认流程负责。
+列表高度限制已覆盖 80×24、15 条结果。P5p 进一步把管理动作接入同一选择器，详见下节。
 
 `test_session_picker_sort_scope_search_and_preview` 验证排序、范围、搜索、预览和小屏边界。
-最终全量回归 1458 passed / 1 skipped；Ruff、py_compile 与 diff 检查通过。真实终端验收
+全量回归 1458 passed / 1 skipped；Ruff、py_compile 与 diff 检查通过。真实终端验收
 按既定要求仍未执行。
+
+## 会话选择器管理操作
+
+选择器通过 `Alt+V` 异步切换活动/已归档列表。活动列表用 `Alt+R` 重命名、`Alt+A` 归档；
+归档列表 Enter 恢复、`Alt+D` 删除。重命名写入现有 `session_title` 事件，不改历史消息。
+归档/恢复/删除重新扫描选中项并复用 `session_cleanup_plan`、共享确认与后台执行；当前
+会话不能归档，不提供直接删除活动会话，永久删除仍要求输入“删除”。归档存储读取在后台
+线程执行，且没有新增存储格式或持久化状态。
+
+临时存储端到端测试覆盖重命名、拒绝归档当前会话、取消/确认归档、恢复，以及错误删除
+短语无副作用和正确短语删除。定向 UI/会话清理回归 101 passed；全量 1461 passed /
+1 skipped，Ruff、py_compile 与 diff 检查通过。真实终端验收仍按既定要求待执行。

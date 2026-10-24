@@ -325,6 +325,192 @@ def test_session_picker_sort_scope_search_and_preview(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def _picker_session(sessions_dir, session_id, text, workspace):
+    store = harness.SessionEventStore(sessions_dir, session_id=session_id)
+    store.record_workspace(workspace)
+    store.append_message({'role': 'user', 'content': text})
+    return store
+
+
+def test_session_picker_renames_selected_session(tmp_path, monkeypatch):
+    sessions_dir = tmp_path / 'sessions'
+    checkpoints_dir = tmp_path / 'checkpoints'
+    current = _picker_session(sessions_dir, 'current', 'current request', tmp_path)
+    target = _picker_session(sessions_dir, 'rename-target', 'target request', tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions_dir)
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', checkpoints_dir)
+
+    async def scenario():
+        app = HarnessApp(current.rebuild_openai_history(),
+                         session_id=current.session_id, session_store=current)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.open_session_picker()
+            await pilot.pause()
+            search = app.screen.query_one('#session-search')
+            search.value = 'rename-target'
+            await pilot.pause()
+            await pilot.press('alt+r')
+            await pilot.pause()
+            assert type(app.screen).__name__ == 'RenameSessionModal'
+            editor = app.screen.query_one('#rename-session-input')
+            editor.value = 'Renamed target'
+            await pilot.press('enter')
+            await pilot.pause()
+            updated = harness.SessionEventStore.open(
+                harness.resolve_session_path(target.session_id))
+            assert updated.session_summary()['title'] == 'Renamed target'
+            assert app.model.snapshot()[-1].payload['text'] == (
+                'Session title: Renamed target')
+
+    asyncio.run(scenario())
+
+
+def test_session_picker_archive_confirms_and_protects_current(tmp_path, monkeypatch):
+    sessions_dir = tmp_path / 'sessions'
+    checkpoints_dir = tmp_path / 'checkpoints'
+    current = _picker_session(sessions_dir, 'current', 'current request', tmp_path)
+    target = _picker_session(sessions_dir, 'archive-target', 'target request', tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions_dir)
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', checkpoints_dir)
+    monkeypatch.setattr(harness, 'wait_for_housekeeping', lambda: None)
+    monkeypatch.setattr(harness, 'housekeeping_busy', lambda: False)
+
+    async def wait_for_screen(pilot, name):
+        for _ in range(80):
+            await pilot.pause()
+            await asyncio.sleep(0.01)
+            if type(app.screen).__name__ == name:
+                return
+        raise AssertionError(f'{name} did not open')
+
+    async def scenario():
+        nonlocal app
+        app = HarnessApp(current.rebuild_openai_history(),
+                         session_id=current.session_id, session_store=current)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.open_session_picker()
+            await pilot.pause()
+            search = app.screen.query_one('#session-search')
+            search.value = current.session_id
+            await pilot.pause()
+            await pilot.press('alt+a')
+            await pilot.pause()
+            assert current.path.is_file()
+            assert 'Cannot archive the current session.' in _notice_texts(app)[-1]
+
+            app.open_session_picker()
+            await pilot.pause()
+            search = app.screen.query_one('#session-search')
+            search.value = target.session_id
+            await pilot.pause()
+            await pilot.press('alt+a')
+            await wait_for_screen(pilot, 'ConfirmModal')
+            await pilot.press('n')
+            await pilot.pause()
+            assert target.path.is_file()
+            archive_dir = sessions_dir / '.archive' / target.session_id
+            assert not archive_dir.exists()
+
+            app.open_session_picker()
+            await pilot.pause()
+            search = app.screen.query_one('#session-search')
+            search.value = target.session_id
+            await pilot.pause()
+            await pilot.press('alt+a')
+            await wait_for_screen(pilot, 'ConfirmModal')
+            await pilot.press('y')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if (archive_dir / target.path.name).is_file():
+                    break
+            assert not target.path.exists()
+            assert (archive_dir / target.path.name).is_file()
+
+    app = None
+    asyncio.run(scenario())
+
+
+def test_archived_picker_restores_and_requires_phrase_to_delete(tmp_path, monkeypatch):
+    sessions_dir = tmp_path / 'sessions'
+    checkpoints_dir = tmp_path / 'checkpoints'
+    current = _picker_session(sessions_dir, 'current', 'current request', tmp_path)
+    target = _picker_session(sessions_dir, 'archived-target', 'target request', tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions_dir)
+    monkeypatch.setattr(harness, 'CHECKPOINT_DIR', checkpoints_dir)
+    monkeypatch.setattr(harness, 'wait_for_housekeeping', lambda: None)
+    monkeypatch.setattr(harness, 'housekeeping_busy', lambda: False)
+    from session_cleanup import SessionArchive
+
+    archive = SessionArchive(sessions_dir, checkpoints_dir)
+    archive.archive(target.session_summary(), current.session_id)
+    archive_dir = sessions_dir / '.archive' / target.session_id
+
+    async def wait_for_archived_rows(pilot):
+        for _ in range(80):
+            await pilot.pause()
+            await asyncio.sleep(0.01)
+            if (app.screen.query_one('#session-list').option_count
+                    and app.screen.query_one('#session-list').get_option_at_index(0).id
+                    == target.session_id):
+                return
+        raise AssertionError('archived session did not load')
+
+    async def wait_for_screen(pilot, name):
+        for _ in range(80):
+            await pilot.pause()
+            await asyncio.sleep(0.01)
+            if type(app.screen).__name__ == name:
+                return
+        raise AssertionError(f'{name} did not open')
+
+    async def scenario():
+        nonlocal app
+        app = HarnessApp(current.rebuild_openai_history(),
+                         session_id=current.session_id, session_store=current)
+        async with app.run_test(size=(90, 28)) as pilot:
+            app.open_session_picker()
+            await pilot.pause()
+            await pilot.press('alt+v')
+            await wait_for_archived_rows(pilot)
+            await pilot.press('enter')
+            await wait_for_screen(pilot, 'ConfirmModal')
+            await pilot.press('y')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if target.path.is_file():
+                    break
+            assert target.path.is_file()
+            assert not archive_dir.exists()
+
+            archive.archive(target.session_summary(), current.session_id)
+            app.open_session_picker()
+            await pilot.pause()
+            await pilot.press('alt+v')
+            await wait_for_archived_rows(pilot)
+            await pilot.press('alt+d')
+            await wait_for_screen(pilot, 'TypedConfirmModal')
+            typed = app.screen.query_one('#typed-input')
+            typed.value = 'wrong'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert archive_dir.exists()
+            assert '请输入“删除”' in str(
+                app.screen.query_one('#typed-error').render())
+            typed.value = '删除'
+            await pilot.press('enter')
+            for _ in range(100):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if not archive_dir.exists():
+                    break
+            assert not archive_dir.exists()
+
+    app = None
+    asyncio.run(scenario())
+
+
 def test_permission_request_opens_modal_and_resolves():
     resolved = []
 

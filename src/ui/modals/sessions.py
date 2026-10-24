@@ -57,6 +57,41 @@ class SessionSearchInput(Input):
             pass
 
 
+class RenameSessionModal(ModalScreen):
+    """输入新的会话标题；取消时不写入会话日志。"""
+
+    BINDINGS = [Binding('escape', 'cancel', 'Cancel')]
+
+    def __init__(self, title: str):
+        super().__init__()
+        self.title_text = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id='rename-session-box'):
+            yield Static('Rename session', classes='modal-title')
+            yield Input(value=self.title_text, id='rename-session-input',
+                        max_length=80)
+            yield Static('Enter save · Esc cancel · 80 characters maximum',
+                         classes='modal-hint')
+            yield Static('', id='rename-session-error', classes='modal-hint')
+
+    def on_mount(self) -> None:
+        editor = self.query_one('#rename-session-input', Input)
+        self.call_after_refresh(editor.focus)
+        self.call_after_refresh(editor.select_all)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        title = event.value.strip()[:80]
+        if not title:
+            self.query_one('#rename-session-error', Static).update(
+                'Title cannot be empty.')
+            return
+        self.dismiss(title)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SessionPickerModal(ModalScreen):
     """以搜索、排序、工作区范围和预览选择会话并恢复。"""
 
@@ -65,6 +100,14 @@ class SessionPickerModal(ModalScreen):
         Binding('alt+s', 'cycle_sort', 'Sort', show=False, priority=True),
         Binding('alt+w', 'toggle_workspace_scope', 'Workspace scope',
                 show=False, priority=True),
+        Binding('alt+v', 'toggle_archive_view', 'Active / archived',
+                show=False, priority=True),
+        Binding('alt+r', 'rename_session', 'Rename', show=False,
+                priority=True),
+        Binding('alt+a', 'archive_session', 'Archive', show=False,
+                priority=True),
+        Binding('alt+d', 'delete_session', 'Delete archived', show=False,
+                priority=True),
     ]
 
     def __init__(self, rows: list[dict], current_workspace=None):
@@ -74,10 +117,16 @@ class SessionPickerModal(ModalScreen):
         self.current_workspace = _workspace_key(current_workspace)
         self._sort = 'updated'
         self._workspace_scope = 'all'
+        self._view = 'active'
+        self._archive_rows: list[dict] | None = None
+        self._archive_error = ''
+        self._archive_loading = False
+        self._visible: list[dict] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id='session-box'):
-            yield Static('Resume session', classes='modal-title')
+            yield Static('Active sessions', id='session-title',
+                         classes='modal-title')
             yield SessionSearchInput(
                 placeholder='搜索标题 / 工作区 / 会话 ID / 摘要',
                 id='session-search')
@@ -91,23 +140,14 @@ class SessionPickerModal(ModalScreen):
         # 等 screen 激活后再抢焦点，避免打开瞬间按键仍落在 Composer。
         self.call_after_refresh(search.focus)
 
-    def _ordered_rows(self) -> list[dict]:
-        key_by_sort = {
-            'updated': lambda row: (row.get('updated') or 0,
-                                   str(row.get('id') or '')),
-            'created': lambda row: (row.get('created') or 0,
-                                    str(row.get('id') or '')),
-            'title': lambda row: ((row.get('title') or '').casefold(),
-                                  str(row.get('id') or '')),
-        }
-        return sorted(self.rows, key=key_by_sort[self._sort],
-                      reverse=self._sort != 'title')
-
     def _visible_rows(self, query: str) -> list[dict]:
         needle = (query or '').strip().casefold()
         current_key = self.current_workspace
+        source = (self.rows if self._view == 'active'
+                  else self._archive_rows or [])
         result = []
-        for row in self._ordered_rows():
+        for row in sorted(source, key=self._sort_key,
+                          reverse=self._sort != 'title'):
             row_workspace = _workspace_key(row.get('workspace'))
             if self._workspace_scope == 'current':
                 if not current_key or not row_workspace or row_workspace != current_key:
@@ -119,10 +159,37 @@ class SessionPickerModal(ModalScreen):
             result.append(row)
         return result
 
+    def _sort_key(self, row: dict):
+        return {
+            'updated': (row.get('updated') or 0, str(row.get('id') or '')),
+            'created': (row.get('created') or 0, str(row.get('id') or '')),
+            'title': ((row.get('title') or '').casefold(),
+                      str(row.get('id') or '')),
+        }[self._sort]
+
+    def set_archived_rows(self, rows: list[dict], error: str = '') -> None:
+        self._archive_rows = None if error else list(rows)
+        self._archive_error = error
+        self._archive_loading = False
+        if self.is_mounted and self._view == 'archived':
+            search = self.query_one('#session-search', Input)
+            self._filter(search.value)
+
     def _filter(self, query: str) -> None:
         options = self.query_one('#session-list', OptionList)
-        rows = self._visible_rows(query)
         options.clear_options()
+        loading = self._view == 'archived' and self._archive_rows is None
+        self.query_one('#session-title', Static).update(
+            'Archived sessions' if self._view == 'archived' else 'Active sessions')
+        if loading:
+            self._visible = []
+            self._by_id = {}
+            self._show_preview(None)
+            self._update_controls()
+            return
+        rows = self._visible_rows(query)
+        self._visible = rows
+        self._by_id = {str(row['id']): row for row in rows}
         for row in rows:
             workspace = row.get('workspace') or 'workspace unrecorded'
             label = (f"{row.get('title') or 'Untitled'}  ·  {workspace}"
@@ -139,7 +206,13 @@ class SessionPickerModal(ModalScreen):
     def _show_preview(self, row: dict | None) -> None:
         preview = self.query_one('#session-preview', Static)
         if row is None:
-            preview.update('No matching sessions.')
+            if self._view == 'archived' and self._archive_error:
+                message = self._archive_error
+            elif self._view == 'archived' and self._archive_rows is None:
+                message = 'Loading archived sessions…'
+            else:
+                message = 'No matching sessions.'
+            preview.update(message)
             return
         title = str(row.get('title') or 'Untitled session')
         summary = ' '.join(str(row.get('preview') or 'No preview available.').split())
@@ -147,12 +220,53 @@ class SessionPickerModal(ModalScreen):
         preview.update(Text(f'{title}\n{summary}\nCreated {created}'))
 
     def _update_controls(self) -> None:
+        count = self.query_one('#session-list', OptionList).option_count
         scope = 'current workspace' if self._workspace_scope == 'current' else 'all workspaces'
         sort = _SORT_LABELS[self._sort]
+        if self._view == 'active':
+            actions = 'Enter resume · Alt+R rename · Alt+A archive'
+        elif self._archive_rows is None:
+            actions = ('Alt+V retry archive list' if self._archive_error
+                       else 'Loading archived sessions…')
+        else:
+            actions = 'Enter restore · Alt+D delete'
         self.query_one('#session-controls', Static).update(
-            f'{self.query_one("#session-list", OptionList).option_count} sessions'
-            f' · sort: {sort} · scope: {scope}'
-            ' · Alt+S sort · Alt+W scope · Enter resume · Esc close')
+            f'{count} sessions · {sort} · {scope} · Alt+S sort · Alt+W workspace'
+            f' · Alt+V active/archived · {actions} · Esc close')
+
+    def action_toggle_archive_view(self) -> None:
+        self._view = 'archived' if self._view == 'active' else 'active'
+        query = self.query_one('#session-search', Input).value
+        self._filter(query)
+        if self._view == 'archived' and self._archive_rows is None:
+            if self._archive_loading:
+                return
+            self._archive_loading = True
+            self.app.load_archived_session_rows(self)
+
+    def _selected_row(self) -> dict | None:
+        options = self.query_one('#session-list', OptionList)
+        if options.highlighted is None:
+            return None
+        option = options.get_option_at_index(options.highlighted)
+        return self._by_id.get(str(option.id))
+
+    def _dispatch_action(self, action: str) -> None:
+        row = self._selected_row()
+        if row is not None:
+            self.dismiss({'_session_picker_action': action, 'row': row})
+
+    def action_rename_session(self) -> None:
+        if self._view == 'active':
+            self._dispatch_action('rename')
+
+    def action_archive_session(self) -> None:
+        if self._view == 'active':
+            self._dispatch_action('archive')
+
+    def action_delete_session(self) -> None:
+        if self._view == 'archived':
+            self._dispatch_action('delete')
 
     def action_cycle_sort(self) -> None:
         index = _SORTS.index(self._sort)
@@ -177,4 +291,7 @@ class SessionPickerModal(ModalScreen):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         row = self._by_id.get(str(event.option.id))
         if row is not None:
-            self.dismiss(row)
+            if self._view == 'archived':
+                self.dismiss({'_session_picker_action': 'restore', 'row': row})
+            else:
+                self.dismiss(row)

@@ -19,6 +19,89 @@ from ui.modals.confirm import ConfirmModal
 class SessionAdminActionsMixin:
     """HarnessApp 的工作区、搜索与清理命令。"""
 
+    def load_archived_session_rows(self, modal) -> None:
+        """Load archived summaries without blocking the picker UI."""
+        threading.Thread(target=self._scan_picker_archives,
+                         args=(modal,), daemon=True).start()
+
+    def _scan_picker_archives(self, modal) -> None:
+        import harness
+        from session_cleanup import SessionArchive
+        try:
+            archive = SessionArchive(
+                harness.SESSIONS_DIR, harness.CHECKPOINT_DIR)
+            rows = archive.list(emit=lambda _text: None)
+            error = ''
+        except Exception as exc:
+            rows = []
+            error = f'Unable to load archived sessions: {exc}'
+        try:
+            self.call_from_thread(self._picker_archives_loaded,
+                                  modal, rows, error)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _picker_archives_loaded(modal, rows: list[dict], error: str) -> None:
+        if modal.is_mounted:
+            modal.set_archived_rows(rows, error)
+
+    def start_picker_session_action(self, action: str, row: dict) -> None:
+        """Confirm a single picker action through the shared cleanup pipeline."""
+        if self._busy:
+            self._notice('Cannot manage sessions while a request is running.')
+            return
+        if action not in ('archive', 'restore', 'delete'):
+            self._notice('Unknown session action.', level='error')
+            return
+        if action == 'archive' and row.get('id') == self._session_id:
+            self._notice('Cannot archive the current session.')
+            return
+        threading.Thread(target=self._scan_picker_session_action,
+                         args=(action, dict(row), self._session_id),
+                         daemon=True).start()
+
+    def _scan_picker_session_action(self, action: str, selected: dict,
+                                    current_id: str) -> None:
+        import harness
+        try:
+            harness.wait_for_housekeeping()
+            if harness.housekeeping_busy():
+                raise RuntimeError('会话后台整理尚未结束，请稍后重试。')
+            if action == 'archive':
+                command, argument = 'archive', 'all'
+            elif action == 'restore':
+                command, argument = 'archive', 'restore'
+            else:
+                command, argument = 'delete', ''
+            archive, rows = harness.session_cleanup_plan(
+                command, argument, current_id, emit=lambda _text: None)
+            match = next((item for item in rows
+                          if item.get('id') == selected.get('id')), None)
+            if match is None:
+                raise ValueError('会话已变化或不再可用，请重新打开选择器。')
+            result = (archive, match)
+            error = ''
+        except Exception as exc:
+            result = None
+            error = f'{type(exc).__name__}: {exc}'
+        try:
+            self.call_from_thread(self._picker_session_action_ready,
+                                  action, selected, current_id, result, error)
+        except Exception:
+            pass
+
+    def _picker_session_action_ready(self, action: str, selected: dict,
+                                     current_id: str, result, error: str) -> None:
+        if error:
+            self._notice(f'Session action failed: {error}', level='error')
+            return
+        if self._busy or self._session_id != current_id:
+            self._notice('会话状态已变化，请重新打开选择器。')
+            return
+        archive, row = result
+        self._on_cleanup_selected([row['id']], archive, [row], action)
+
     # ---------- 工作区 ----------
 
     def show_workspaces(self) -> None:
