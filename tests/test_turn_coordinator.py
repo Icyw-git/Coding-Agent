@@ -202,3 +202,54 @@ def test_scheduler_service_loads_durable_jobs_once(monkeypatch, tmp_path):
         assert len(loads) == 2   # 每次 start 一组，stop 后重启才再加载
     finally:
         service.stop(timeout=3)
+
+
+def test_runtime_metadata_rejects_while_session_lock_is_held(tmp_path):
+    from session_locks import SessionBusy, lock_path
+
+    runtime = agent_runtime.AgentRuntime(
+        run_turn=lambda messages, **kwargs: 'ok',
+        session_store_cls=SessionEventStore,
+        sessions_dir=tmp_path / 'sessions')
+    session_id = runtime.create_session()
+
+    from file_lock import exclusive_file_lock
+
+    lock = lock_path(runtime.sessions_dir, session_id)
+    with exclusive_file_lock(lock, timeout=0):
+        for call in (
+                lambda: runtime.set_workspace(session_id, str(tmp_path)),
+                lambda: runtime.rename_session(session_id, '新标题'),
+                lambda: runtime.fork_session(session_id),
+                lambda: runtime.manage_session('archive', {'id': session_id})):
+            with pytest.raises(SessionBusy):
+                call()
+
+
+def test_cleanup_reports_busy_session_instead_of_moving_it(tmp_path):
+    from file_lock import exclusive_file_lock
+    from session_admin import apply_session_cleanup
+    from session_locks import lock_path
+
+    moved = []
+
+    class Archive:
+        def delete(self, row, current_id):
+            moved.append(('delete', row['id']))
+
+        def restore(self, session_id):
+            moved.append(('restore', session_id))
+
+        def archive(self, row, current_id):
+            moved.append(('archive', row['id']))
+
+    sessions_dir = tmp_path / 'sessions'
+    sessions_dir.mkdir()
+    rows = [{'id': 'busy-session'}]
+    lock = lock_path(sessions_dir, 'busy-session')
+    with exclusive_file_lock(lock, timeout=0):
+        completed, failures = apply_session_cleanup(
+            Archive(), rows, 'archive', current_id='other')
+    assert completed == 0
+    assert failures and '执行任务' in failures[0][1]
+    assert moved == []

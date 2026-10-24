@@ -4034,3 +4034,36 @@ B 被 `TurnBusy` 拒绝，随后 B 串行执行”，继续断言各自 prompt�
 结果：全量 **1492 passed / 1 skipped**；Ruff、`py_compile`、`git diff --check` 通过。
 仍欠：会话元数据（rename/workspace/fork/archive/delete）的跨进程互斥、TUI 退出时等待
 活动回合与 housekeeping、真实终端/daemon 验收。
+
+## Personal Agent 阶段 0 第二批：会话写锁、回合生命周期与 TUI 关闭
+
+单回合槽只保证“同一时刻一个回合”，并不阻止另一个进程同时 rename / 切 workspace /
+归档同一会话；而 `SessionEventStore` 的 seq 去重只是进程内的 `_path_lock`，跨进程同时
+追加会算出相同 seq，回放时直接报错。第二批补这层。
+
+**会话写锁**（`src/session_locks.py`）：`locks/sessions/<id>.lock`。回合（`AgentRuntime.send`、
+TUI worker、cron）整轮持有；rename / set_workspace / fork / manage_session 以
+`timeout=0` 获取，失败抛 `SessionBusy`。API 映射 409（rename、fork 新增；workspace 与
+session-action 原来就按 RuntimeError → 409）；TUI `/rename` 提示“会话正在执行任务”；
+共享的 `apply_session_cleanup` 逐条拿锁、冲突记为失败并跳过，不会把正在写入的会话
+文件移走。回合后的 title 写入是单次追加，用 5s 超时的锁，拿不到就跳过本轮标题。
+
+**回合生命周期对称化**：`AgentRuntime.send` 与 cron `run_agent_turn_locked` 现在显式
+`turn_control.begin_turn()/end_turn()`。这修掉一个真实 bug：上一个入口（比如 TUI 的
+Esc）留下的取消位会让下一个入口的第一轮直接 `KeyboardInterrupt`——之前被“测试恰好
+先跑过 TUI 用例”掩盖。进入回合清位、退出复位，也满足方案里“API 回合需要对称生命周期”
+的前置条件。
+
+**TUI 关闭**：`HarnessApp.wait_for_shutdown()` 置退出标志、`request_cancel()`、有界 join
+worker，再 `wait_for_housekeeping(timeout)`；`ui.harness_app.run()` 在事件循环结束后调用，
+之后才把事件总线交还 ANSI 渲染器。worker → UI 的 `call_from_thread` 收口到 `_ui_call`，
+事件循环已退出时静默丢弃，避免退出瞬间的线程异常噪音。`run()` 对注入的 app 用
+`getattr(..., 'wait_for_shutdown', None)`，保持测试替身可用。
+
+测试：runtime 四个元数据操作在锁被占用时抛 `SessionBusy`；清理冲突不移动文件；
+TUI rename 显示忙碌提示；`wait_for_shutdown` 会取消并 join worker、调用 housekeeping 等待；
+API rename/fork 409。全量 **1496 passed / 1 skipped**，Ruff、`py_compile`、
+`git diff --check` 通过。
+
+仍未做：真实终端 / 真 daemon 验收（手机与 TUI 抢同一会话、SIGTERM 关闭、审批端到端）；
+阶段 1 的 turn_id、终态事件、steer/interrupt、watcher。

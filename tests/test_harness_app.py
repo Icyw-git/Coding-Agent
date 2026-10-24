@@ -1,5 +1,6 @@
 """新 TUI 骨架：历史 → 块模型 → 虚拟视口；流式与工具事件。"""
 import asyncio
+import threading
 
 import pytest
 
@@ -2366,5 +2367,55 @@ def test_streaming_render_interval_adapts_to_frame_cost(monkeypatch):
                 app._flush_layout(force=True)
             assert app._stream_interval == pytest.approx(0.06)
             app._busy = False
+
+    asyncio.run(scenario())
+
+
+def test_rename_reports_busy_session(monkeypatch):
+    from file_lock import exclusive_file_lock
+    from session_locks import lock_path
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            store = harness.SessionEventStore(harness.SESSIONS_DIR,
+                                              session_id='rename-busy')
+            store.append('session_created')
+            app._store = store
+            with exclusive_file_lock(
+                    lock_path(harness.SESSIONS_DIR, 'rename-busy'), timeout=0):
+                app.rename_session('另一个标题')
+            await pilot.pause()
+            notices = [block.payload.get('text', '')
+                       for block in app.model.snapshot()
+                       if block.kind == 'notice']
+            assert any('执行任务' in text for text in notices)
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_shutdown_cancels_worker_and_waits_housekeeping(monkeypatch):
+    waited = []
+    monkeypatch.setattr(harness, 'wait_for_housekeeping',
+                        lambda timeout=30.0: waited.append(timeout))
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)):
+            started, release = threading.Event(), threading.Event()
+
+            def slow_worker():
+                started.set()
+                release.wait(5)
+
+            worker = threading.Thread(target=slow_worker, daemon=True)
+            worker.start()
+            assert started.wait(5)
+            app._worker = worker
+            release.set()
+            app.wait_for_shutdown(timeout=2)
+            assert app._exiting
+            assert not worker.is_alive()
+            assert waited, '退出时应等待回合后整理线程'
 
     asyncio.run(scenario())

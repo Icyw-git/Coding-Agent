@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Type
 
+import turn_control
 import workspaces
 from agent_core import image_attachment_message
+from session_locks import session_write
 from turn_coordinator import turn_slot
 from workspace_choices import RECENT_LIMIT, workspace_choices
 from workspace_context import resolve_workspace, use_workspace
@@ -150,11 +152,13 @@ class AgentRuntime:
         if not lock.acquire(blocking=False):
             raise RuntimeError('会话正在执行任务，请稍后切换工作区')
         try:
-            store = self._open_session(session_id)
-            base = Path(store.session_summary()['workspace'] or self._default_workspace)
-            workspace = resolve_workspace(path, base=base, allowed_roots=self._workspace_roots)
-            store.record_workspace(workspace)
-            return str(workspace)
+            with session_write(self._sessions_dir, session_id,
+                               action='切换工作区'):
+                store = self._open_session(session_id)
+                base = Path(store.session_summary()['workspace'] or self._default_workspace)
+                workspace = resolve_workspace(path, base=base, allowed_roots=self._workspace_roots)
+                store.record_workspace(workspace)
+                return str(workspace)
         finally:
             lock.release()
 
@@ -207,7 +211,10 @@ class AgentRuntime:
             # 全局单回合：与 TUI / cron / 其他进程互斥。竞争立即失败，且不写入任何
             # 会话事件——不能让被拒绝的消息看起来像已发送。
             with turn_slot(self._sessions_dir.parent):
-                messages = store.rebuild_openai_history(recover_pending=True)
+                # 整轮持有会话写锁：元数据操作（rename/workspace/归档）不能插进来。
+                with session_write(self._sessions_dir, session_id,
+                                   timeout=0.0, action='发送消息'):
+                    messages = store.rebuild_openai_history(recover_pending=True)
                 message = {'role': 'user', 'content': content}
                 messages.append(message)
                 store.append_message(message)
@@ -223,7 +230,14 @@ class AgentRuntime:
                 if not housekeeping:
                     turn_kwargs['housekeeping'] = False
                 with use_workspace(workspace):
-                    result = self._run_turn(messages, session_store=store, **turn_kwargs)
+                    # 与 TUI 对称的回合生命周期：进入时清掉可能残留的取消位
+                    # （上一个入口的 Esc 不应取消这一轮），退出时复位。
+                    turn_control.begin_turn()
+                    try:
+                        result = self._run_turn(messages, session_store=store,
+                                                **turn_kwargs)
+                    finally:
+                        turn_control.end_turn()
                 return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:
@@ -262,18 +276,20 @@ class AgentRuntime:
 
     def fork_session(self, session_id: str, upto_seq: int | None = None) -> str:
         """从既有会话分叉出新会话（原会话不动），返回新会话 ID。"""
-        source = self.open_session(session_id)
-        forked = self._session_store_cls.fork(source, upto_seq=upto_seq)
-        return forked.session_id
+        with session_write(self._sessions_dir, session_id, action='分叉会话'):
+            source = self.open_session(session_id)
+            forked = self._session_store_cls.fork(source, upto_seq=upto_seq)
+            return forked.session_id
 
     def rename_session(self, session_id: str, title: str) -> str:
         """设置会话主题（覆盖自动生成的标题），返回生效后的标题。"""
         title = (title or '').strip()
         if not title:
             raise ValueError('标题不能为空')
-        store = self._open_session(session_id)
-        store.append_session_title(title[:80], source='user')  # 用户命名：异步重生成永不覆盖
-        return store.session_summary()['title']
+        with session_write(self._sessions_dir, session_id, action='重命名会话'):
+            store = self._open_session(session_id)
+            store.append_session_title(title[:80], source='user')  # 用户命名：异步重生成永不覆盖
+            return store.session_summary()['title']
 
     def manage_session(self, action: str, row: dict):
         if action not in ('archive', 'restore', 'delete'):
@@ -289,16 +305,17 @@ class AgentRuntime:
         if not lock.acquire(blocking=False):
             raise RuntimeError('会话正在执行任务，请稍后重试')
         try:
-            if self._before_session_change:
-                self._before_session_change()
-            if action == 'restore':
-                if row not in self.archive.list():
-                    raise ValueError('归档已变化，请重新选择')
-                self.archive.restore(row['id'])
-            elif action == 'archive':
-                self.archive.archive(row, '')
-            else:
-                self.archive.delete(row, '')
+            with session_write(self._sessions_dir, session_id, action='整理会话'):
+                if self._before_session_change:
+                    self._before_session_change()
+                if action == 'restore':
+                    if row not in self.archive.list():
+                        raise ValueError('归档已变化，请重新选择')
+                    self.archive.restore(row['id'])
+                elif action == 'archive':
+                    self.archive.archive(row, '')
+                else:
+                    self.archive.delete(row, '')
         finally:
             lock.release()
 

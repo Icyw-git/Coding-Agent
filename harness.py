@@ -754,7 +754,16 @@ def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn
         if source != 'user' and (not saved or (turn_no > 1 and turn_no % 8 == 0)):
             title = generate_session_title(messages_snapshot)
             if title != '(untitled session)' and title != saved:
-                session_store.append_session_title(title, source='auto')
+                # 回合已结束，但另一个进程可能正在 rename/归档：title 是单次追加，
+                # 用带超时的会话锁避免跨进程 seq 竞争；拿不到就跳过本轮标题。
+                from session_locks import SessionBusy, session_write
+                try:
+                    with session_write(session_store.directory,
+                                       session_store.session_id,
+                                       timeout=5.0, action='写入标题'):
+                        session_store.append_session_title(title, source='auto')
+                except SessionBusy as exc:
+                    print(f'  [33m[title] skipped: {exc}[0m')
     except Exception as exc:
         print(f'  \033[33m[title] skipped: {exc}\033[0m')
     try:
@@ -1568,10 +1577,13 @@ def run_agent_turn_locked():
                 return
             prompts = [f'[Scheduled] {job.prompt}' for job in fired]
             print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+            turn_control.begin_turn()
             try:
                 agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
             except KeyboardInterrupt:
                 print('\n[会话已中断]')
+            finally:
+                turn_control.end_turn()
     except TurnBusy:
         return   # 别的入口在跑：本轮跳过，任务仍在 cron_queue
 

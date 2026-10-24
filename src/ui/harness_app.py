@@ -153,6 +153,7 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         self._dirty = True
         self._busy = False
         self._operation = 'agent'
+        self._worker = None
         self._cleanup_block_id = None
         self._exiting = False
         self._status: dict = {}
@@ -426,8 +427,8 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             self._pending.put(text)
             self._refresh_queue()
             return
-        slot = self._acquire_turn_slot()
-        if slot is None:
+        turn = self._acquire_turn()
+        if turn is None:
             self._restore_unsent([text])
             return
         try:
@@ -436,19 +437,53 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             self._flush_layout(force=True)  # 先画出用户消息，不必等 50ms 定时器
             self._pending.put(text)
             self._refresh_queue()
-            self._start_worker(slot)
+            self._start_worker(turn)
         except BaseException:
-            slot.release()
+            turn.close()
             raise
 
-    def _acquire_turn_slot(self):
-        """拿全局回合槽；被其他进程/线程占用时返回 None（不排队、不落消息）。"""
+    def _acquire_turn(self):
+        """拿全局回合槽 + 当前会话写锁；任一竞争失败返回 None（不排队、不落消息）。"""
+        import contextlib
+
         import harness
-        from turn_coordinator import TurnBusy, acquire
+        from session_locks import SessionBusy, session_write
+        from turn_coordinator import TurnBusy, turn_slot
+
+        stack = contextlib.ExitStack()
         try:
-            return acquire(harness.SESSIONS_DIR.parent)
-        except TurnBusy:
+            stack.enter_context(turn_slot(harness.SESSIONS_DIR.parent))
+            session_id = self._store.session_id if self._store is not None else None
+            if session_id is not None:
+                stack.enter_context(session_write(
+                    harness.SESSIONS_DIR, session_id, action='执行回合'))
+        except (TurnBusy, SessionBusy):
+            stack.close()
             return None
+        return stack
+
+    def _ui_call(self, callback, *args) -> None:
+        """worker → UI 调用；事件循环已退出时静默丢弃，避免退出噪音。"""
+        try:
+            self.call_from_thread(callback, *args)
+        except Exception:
+            pass
+
+    def wait_for_shutdown(self, timeout: float = 5.0) -> None:
+        """事件循环退出后：取消并等待活动回合，再等待回合后整理线程（有界）。"""
+        import harness
+        import turn_control
+
+        self._exiting = True
+        self._pending.put(None)
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            turn_control.request_cancel()
+            worker.join(timeout=timeout)
+        try:
+            harness.wait_for_housekeeping(timeout=timeout)
+        except Exception:
+            pass
 
     def _restore_unsent(self, texts: list[str]) -> None:
         """被拒绝的消息退回输入框，不静默写进会话。"""
@@ -474,10 +509,10 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             content += chr(10) + chr(10) + argument.strip()
         self._send_user(content)
 
-    def _start_worker(self, slot=None) -> None:
-        if slot is None:
-            slot = self._acquire_turn_slot()
-            if slot is None:
+    def _start_worker(self, turn=None) -> None:
+        if turn is None:
+            turn = self._acquire_turn()
+            if turn is None:
                 self._restore_unsent(self._pending.drain())
                 return
         self._operation = 'agent'
@@ -486,14 +521,16 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         self._refresh_footer()
         self._tick_border_status()   # 立即显示 Working，不等 0.2s 定时器
         try:
-            threading.Thread(target=self._run_agent, args=(slot,),
-                             daemon=True).start()
+            worker = threading.Thread(target=self._run_agent, args=(turn,),
+                                      daemon=True)
+            self._worker = worker
+            worker.start()
         except BaseException:
-            slot.release()
+            turn.close()
             self._busy = False
             raise
 
-    def _run_agent(self, slot=None) -> None:
+    def _run_agent(self, turn=None) -> None:
         import harness
         import turn_control
         try:
@@ -502,7 +539,7 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                 if text is None:
                     break
                 self._messages.append({'role': 'user', 'content': text})
-                self.call_from_thread(self._refresh_queue)
+                self._ui_call(self._refresh_queue)
                 answer = None
                 turn_control.begin_turn()
                 try:
@@ -528,15 +565,15 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                     self.call_from_thread(self._sync_final_answer, answer)
                 except Exception:
                     pass
-                self.call_from_thread(self._refresh_queue)
-                self.call_from_thread(self._refresh_footer)
+                self._ui_call(self._refresh_queue)
+                self._ui_call(self._refresh_footer)
                 if len(self._pending) == 0:
                     self._busy = False
                     break
         finally:
             self._busy = False
-            if slot is not None:
-                slot.release()
+            if turn is not None:
+                turn.close()
 
     def _sync_final_answer(self, answer) -> None:
         """兜底：事件流丢失 assistant_end/text 时，用 agent_loop 返回值补最后一答。"""
@@ -578,8 +615,14 @@ def run(messages: list | None = None, session_id: str | None = None,
     from renderer import default_renderer
 
     bus.unsubscribe(default_renderer.on_event)
+    app = HarnessApp(messages or [], session_id=session_id, title=title,
+                     session_store=session_store)
     try:
-        HarnessApp(messages or [], session_id=session_id, title=title,
-                   session_store=session_store).run()
+        app.run()
     finally:
+        # 先让 worker 收敛并等回合后整理，再把总线交还 ANSI 渲染器；
+        # 否则退出瞬间的 title/记忆写入可能被进程直接截断。
+        shutdown = getattr(app, 'wait_for_shutdown', None)
+        if shutdown is not None:
+            shutdown()
         bus.subscribe(default_renderer.on_event)

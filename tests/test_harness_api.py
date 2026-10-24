@@ -539,3 +539,27 @@ def test_injected_runtime_does_not_start_scheduler(monkeypatch, tmp_path):
     with TestClient(app):
         pass
     assert events == []
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_rename_and_fork_return_409_when_session_is_busy(api_client):
+    from session_locks import SessionBusy
+
+    class BusyRuntime(FakeRuntime):
+        def rename_session(self, session_id, title):
+            raise SessionBusy('会话正在执行任务')
+
+        def fork_session(self, session_id, upto_seq=None):
+            raise SessionBusy('会话正在执行任务')
+
+    runtime = BusyRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'busy-meta'},
+                       headers=headers).status_code == 201
+    response = client.post('/v1/sessions/busy-meta/title',
+                           json={'title': 'x'}, headers=headers)
+    assert response.status_code == 409
+    response = client.post('/v1/sessions/busy-meta/fork',
+                           json={}, headers=headers)
+    assert response.status_code == 409

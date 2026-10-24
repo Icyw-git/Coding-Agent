@@ -274,19 +274,27 @@ def session_cleanup_plan(command: str, argument: str, current_id: str, *, emit=p
 
 
 def apply_session_cleanup(archive, rows, action: str, current_id: str):
-    """执行已确认的归档/恢复/删除，返回 (completed, [(row, error), ...])。"""
+    """执行已确认的归档/恢复/删除，返回 (completed, [(row, error), ...])。
+
+    逐会话拿跨进程写锁：回合进行中或另一个进程正在整理时会记为失败并跳过，
+    不会把正在写入的会话文件移走。
+    """
+    from session_locks import SessionBusy, session_write
+
+    h = _h()
     completed = 0
     failures = []
     for row in rows:
         try:
-            if action == 'delete':
-                archive.delete(row, current_id)
-            elif action == 'restore':
-                archive.restore(row['id'])
-            else:
-                archive.archive(row, current_id)
+            with session_write(h.SESSIONS_DIR, row['id'], action='整理会话'):
+                if action == 'delete':
+                    archive.delete(row, current_id)
+                elif action == 'restore':
+                    archive.restore(row['id'])
+                else:
+                    archive.archive(row, current_id)
             completed += 1
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, SessionBusy) as exc:
             failures.append((row, str(exc)))
     return completed, failures
 

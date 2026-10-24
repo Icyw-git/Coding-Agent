@@ -68,13 +68,26 @@
   并发（与全局单回合冲突），改为“A 在模型调用中时 B 被拒绝、随后 B 串行执行”，保留
   prompt/工具/checkpoint 归属断言。
 
-仍欠（下一批）：
+第二批（2026-10-24）：
 
-- **会话写入保护**：rename / workspace / fork / archive / delete 与活动回合的跨进程互斥
-  （当前仍是进程内 session RLock）。
-- **关闭与 housekeeping**：TUI 退出时等待活动回合与 `wait_for_housekeeping`（API 已停
-  scheduler，但未等待回合与整理线程）。
-- 真实终端与真实 daemon 验收（手机/TUI 竞争、SIGTERM 关闭）。
+- **会话写入保护**：新增 `src/session_locks.py`（`locks/sessions/<id>.lock`）。回合
+  （`AgentRuntime.send`、TUI worker、cron）整轮持有会话写锁；rename / workspace / fork /
+  archive / delete 非阻塞获取，失败抛 `SessionBusy`（API 映射 409，TUI 提示，清理逐条
+  记账跳过）。TUI `/rename`、共享的 `apply_session_cleanup`、回合后 title 写入（带 5s
+  超时）都已接锁。
+- **回合生命周期对称化**：`AgentRuntime.send` 与 cron 回合显式
+  `begin_turn()/end_turn()`，进入时清掉上一个入口遗留的取消位（修复跨测试/跨入口
+  的 Esc 误取消），退出时复位。
+- **TUI 关闭**：`HarnessApp.wait_for_shutdown()` 置退出标志、请求取消、有界 join worker，
+  再 `wait_for_housekeeping(timeout)`；`ui.harness_app.run` 在事件循环结束后调用它。
+  worker 的 `call_from_thread` 收口到 `_ui_call`，退出后不再抛噪音。
+- **测试**：会话锁竞争（runtime 四个元数据操作、清理记账、TUI rename 提示）、
+  关闭等待、API rename/fork 409。
+
+仍欠：
+
+- 真实终端与真实 daemon 验收（手机/TUI 竞争、SIGTERM 关闭、手机审批端到端）。
+- 阶段 1 的 turn_id/终态事件、steer/interrupt、watcher、至少一次投递。
 
 ### 阶段 1：远程控制闭环（监视、插话、中断、通知）
 

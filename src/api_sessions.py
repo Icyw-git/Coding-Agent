@@ -60,8 +60,12 @@ def build_router(client, runtime):
 
     @router.post("/v1/sessions/{session_id}/fork")
     def fork_session(session_id: str, request: ForkSessionRequest):
+        from session_locks import SessionBusy
+
         try:
             new_id = client.sessions.fork(session_id, request.upto_seq)
+        except SessionBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileExistsError as exc:
@@ -70,9 +74,13 @@ def build_router(client, runtime):
 
     @router.post("/v1/sessions/{session_id}/title")
     def rename_session(session_id: str, request: RenameSessionRequest):
-        """设置会话主题；404=会话不存在，400=标题为空。"""
+        """设置会话主题；404=会话不存在，400=标题为空，409=会话正忙。"""
+        from session_locks import SessionBusy
+
         try:
             title = client.sessions.rename(session_id, request.title)
+        except SessionBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

@@ -103,7 +103,16 @@ class SessionActionsMixin:
         if not argument:
             self._notice('用法：/rename <标题>', level='error')
             return
-        title = self._store.append_session_title(argument[:80], source='user')
+        import harness
+        from session_locks import SessionBusy, session_write
+
+        try:
+            with session_write(harness.SESSIONS_DIR, self._store.session_id,
+                               action='重命名会话'):
+                title = self._store.append_session_title(argument[:80], source='user')
+        except SessionBusy as exc:
+            self._notice(str(exc), level='error')
+            return
         self._title = title['title']
         self._refresh_footer()
         self._notice(f"Session title: {self._title}")
