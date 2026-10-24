@@ -93,7 +93,13 @@ class AgentRuntime:
         self._locks_guard = threading.Lock()
         # steer 只对“本进程正在跑的回合”有效：队列键是 session_id，由 send 注册。
         self._steer_queues: dict[str, collections.deque] = {}
-        self._steer_lock = threading.Lock()
+        # RLock：steer() 在持有锁时调用 _remember_steer（也要拿同一把锁）。
+        self._steer_lock = threading.RLock()
+        # 幂等：request_id → 结果（有界）。覆盖 queued / sent 两条路径，客户端重试不会
+        # 重复注入或重复开一个回合。
+        self._steer_results: dict[tuple[str, str], dict] = {}
+        self._steer_order: collections.deque = collections.deque()
+        self._steer_result_limit = 256
         self._default_workspace = Path(workspace or Path.cwd()).resolve()
         self._workspace_roots: list[Path] | None = None
         self._workspace_file = Path(workspace_file).expanduser() if workspace_file else None
@@ -288,28 +294,62 @@ class AgentRuntime:
                             self._steer_queues.pop(session_id, None)
                 return AgentResult(session_id=store.session_id, content=result)
 
-    def steer(self, session_id: str, content: str) -> dict:
+    def _remember_steer(self, session_id: str, request_id: str | None,
+                        result: dict) -> None:
+        if not request_id:
+            return
+        key = (session_id, request_id)
+        with self._steer_lock:
+            self._steer_results[key] = dict(result)
+            self._steer_order.append(key)
+            while len(self._steer_order) > self._steer_result_limit:
+                old = self._steer_order.popleft()
+                self._steer_results.pop(old, None)
+
+    def steer(self, session_id: str, content: str, *,
+              request_id: str | None = None) -> dict:
         """把一条消息插入活动回合；没有活动回合时降级为普通消息。
 
-        返回 ``status``：``queued``（已排入当前回合）、``sent``（空闲，已作为新回合
-        发送）；活动回合不属于本进程（例如 TUI 在别的进程）时抛 ``RuntimeError``，
-        调用方应映射成 409，而不是假装入队成功。
+        返回 ``status``：``queued``（已排入当前回合）、``sent``（空闲/回合刚结束，
+        已作为新回合发送）、``duplicate``（同 request_id 已处理过）。
+
+        活动回合存在但不在本进程（例如 TUI 在别的进程）时抛 ``RuntimeError``，调用方
+        映射成 409。回合正在收尾、注入队列已移除时不再报错，而是原子地降级为下一条
+        普通消息——否则客户端会收到“成功”却什么都没发生。
         """
         import turn_control
 
         if not isinstance(content, str) or not content.strip():
             raise ValueError('steer content must be a non-empty string')
+        key = (session_id, request_id) if request_id else None
+        if key is not None:
+            with self._steer_lock:
+                cached = self._steer_results.get(key)
+            if cached is not None:
+                cached['duplicate'] = True
+                return cached
+
         token = turn_control.first_token(session_id)
-        if token is None:
+        if token is not None:
+            with self._steer_lock:
+                queue = self._steer_queues.get(session_id)
+                if queue is not None:
+                    queue.append(content)
+                    result = {'status': 'queued', 'session_id': session_id,
+                              'turn_id': token.turn_id, 'source': token.source}
+                    self._remember_steer(session_id, request_id, result)
+                    return result
+            # 回合已在收尾：按普通消息处理，返回真实处理结果而不是丢失。
             result = self.send(session_id, content, source='steer')
-            return {'status': 'sent', 'session_id': result.session_id}
-        with self._steer_lock:
-            queue = self._steer_queues.get(session_id)
-            if queue is None:
-                raise RuntimeError('当前回合不支持 steer（由其他入口执行）')
-            queue.append(content)
-        return {'status': 'queued', 'session_id': session_id,
-                'turn_id': token.turn_id, 'source': token.source}
+            outcome = {'status': 'sent', 'session_id': result.session_id,
+                       'reason': 'turn_ending'}
+            self._remember_steer(session_id, request_id, outcome)
+            return outcome
+
+        result = self.send(session_id, content, source='steer')
+        outcome = {'status': 'sent', 'session_id': result.session_id}
+        self._remember_steer(session_id, request_id, outcome)
+        return outcome
 
     def interrupt(self, session_id: str) -> dict:
         """请求取消本进程内该会话的活动回合；没有活动回合时返回 idle。"""

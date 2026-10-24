@@ -22,6 +22,11 @@ if BaseModel is not None:
     class SendMessageRequest(BaseModel):
         content: str = Field(min_length=1)
 
+    class SteerRequest(BaseModel):
+        content: str = Field(min_length=1)
+        # 客户端重试去重：同一 request_id 只入队/发送一次（见 AgentRuntime.steer）。
+        request_id: str | None = Field(default=None, max_length=120)
+
     class SessionActionRequest(BaseModel):
         action: str
         session: dict

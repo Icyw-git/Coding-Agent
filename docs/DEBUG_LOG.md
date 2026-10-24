@@ -4137,3 +4137,47 @@ home 里没有会话，stderr 打一条 `HARNESS_HOME=<当前目录>` 的迁移�
 全量 **1510 passed / 1 skipped**；Ruff、`py_compile`、`git diff --check` 通过。
 
 使用方式：默认无需配置；要在多个 home 间切换或迁移旧目录，设置 `HARNESS_HOME=<目录>`。
+
+## Personal Agent 阶段 1 第二块：飞书 watcher（终态通知 + 至少一次投递）
+
+手机端此前只能看到“自己发起的回合”的流式回写；TUI / cron / 其他客户端跑完的回合，
+手机上没有任何提示。补法分两层：`src/turn_watcher.py` 负责游标/去重/重试，网关负责
+“拉 SSE + 发飞书”。
+
+**增量而不重放**：每个绑定会话保存 `cursor`（已处理的最大 `seq`），网关用
+`GET /v1/sessions/{id}/stream?after=…&once=1` 拉快照。只消费阶段 1 引入的
+`turn_terminal`；`source='feishu'` 的回合跳过，因为手机上已经看过流式输出。
+
+**至少一次而不是“恰好一次”**：顺序是「发送 → 写游标 + 已通知键」。发送失败就不推进
+游标，下一轮重试；进程在发送成功、落盘之前崩溃会重复发一次。`attempts` 记录
+`(session, turn, status)` 的发送次数，便于事后确认重复窗口。SSE 重放和进程重启由
+`notified` 集合去重；集合与游标一起原子写入 `turn_watch.json`（与 bindings 分开，
+不破坏后者严格的 `chat_id -> session_id` 结构）。
+
+**无进展只提示、不判失败**：`turn_started` 超过 `FEISHU_WATCH_STALLED`（默认 300s）
+且没有终态时发一条“仍在运行，可能在等待审批或卡住”；同一 turn 只发一次，不写终态。
+
+**生命周期**：watcher 线程随网关启动/停止（`start_watcher/stop_watcher`），轮询间隔
+`FEISHU_WATCH_POLL` 默认 1s。`stop()` 会先停 watcher 再断分发线程。
+
+测试：核心 watcher 覆盖重放去重、feishu 来源跳过、发送失败重试且游标不动、重启后状态
+恢复、通知记录有界（200 条）、停滞提示只发一次；网关测试用真实 ASGI SSE 验证
+“TUI 回合完成 → 飞书收到卡片”和失败卡片带 `error_type`。全量 **1518 passed / 1 skipped**，
+Ruff、`py_compile`、`git diff --check` 通过。
+
+阶段 1 仍欠：steer 幂等键、跨进程 steer/interrupt、多网关实例的会话分配。
+
+## steer 幂等键与一个自锁 bug
+
+按计划补 steer 的幂等语义时，把结果缓存写在了 `_steer_lock` 临界区里：`steer()` 持锁
+调用 `_remember_steer()`，后者再次 `with self._steer_lock` —— `threading.Lock` 不可重入，
+第一个“同 request_id 连发两次”的用例直接死锁，pytest 卡住不返回。改成 `RLock` 后恢复；
+测试也加了 `join(timeout)` 断言，以后同类回归会失败而不是挂住。
+
+功能本身：
+- `POST /v1/sessions/{id}/steer` 接受可选 `request_id`；同 `(session, request_id)` 只入队/
+  发送一次，第二次返回 `duplicate: true`。结果缓存 256 条（有界）。
+- 回合收尾窗口（token 还在、注入队列已被移除）不再报 409 丢消息，而是原子降级为下一条
+  普通消息，返回 `status=sent, reason=turn_ending`，同样受幂等键保护。
+
+全量 **1520 passed / 1 skipped**。

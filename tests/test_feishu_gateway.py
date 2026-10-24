@@ -1116,3 +1116,52 @@ def test_workspaces_lists_all_registered_entries_beyond_the_picker_limit(
 
     gw.on_message('c1', '/workspace remove ws0')
     assert '已移除' in fake.last()
+
+
+def test_watcher_pushes_turn_terminal_from_other_sources(gateway, tmp_path):
+    """TUI/API 跑完的回合 → watcher 通过 SSE 增量发现并主动发卡。"""
+    import time
+
+    from session_store import SessionEventStore
+
+    gw, fake = gateway
+    gw.on_message('chat-watch', '帮我看看')
+    session_id = gw.bindings['chat-watch']
+
+    store = SessionEventStore.open(
+        tmp_path / 'sessions' / f'session_{session_id}.jsonl')
+    store.append('turn_started', turn_id='t-watch', source='tui')
+    store.append('turn_terminal', turn_id='t-watch', status='completed',
+                 source='tui', ts=time.time())
+
+    result = gw.watcher.poll_once(session_id)
+    assert result['notified'] == 1
+    text = fake.last()
+    assert '回合完成' in text and session_id[:8] in text
+
+    # 同一个终态再拉一次（SSE 重放）不会重复推送
+    assert gw.watcher.poll_once(session_id)['notified'] == 0
+    assert fake.all_text().count('回合完成') == 1
+
+
+def test_watcher_skips_feishu_turns_and_reports_failures(gateway, tmp_path):
+    import time
+
+    from session_store import SessionEventStore
+
+    gw, fake = gateway
+    gw.on_message('chat-skip', 'hi')
+    session_id = gw.bindings['chat-skip']
+    store = SessionEventStore.open(
+        tmp_path / 'sessions' / f'session_{session_id}.jsonl')
+
+    store.append('turn_started', turn_id='t-feishu', source='feishu')
+    store.append('turn_terminal', turn_id='t-feishu', status='completed',
+                 source='feishu', ts=time.time())
+    assert gw.watcher.poll_once(session_id)['notified'] == 0
+
+    store.append('turn_started', turn_id='t-fail', source='cron')
+    store.append('turn_terminal', turn_id='t-fail', status='failed',
+                 source='cron', error_type='APIStatusError', ts=time.time())
+    assert gw.watcher.poll_once(session_id)['notified'] == 1
+    assert '回合失败' in fake.last() and 'APIStatusError' in fake.last()

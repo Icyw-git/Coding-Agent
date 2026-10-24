@@ -320,3 +320,71 @@ def _send(runtime, session_id):
     except BaseException as exc:
         return exc
     raise AssertionError('send should have been cancelled')
+
+
+def test_steer_request_id_is_idempotent(tmp_path):
+    import threading
+    import time
+
+    started = threading.Event()
+    received = []
+
+    def run_turn(messages, session_store, steer_provider=None, **kwargs):
+        started.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            items = steer_provider() if steer_provider else []
+            if items:
+                received.extend(items)
+                return 'ok'
+            time.sleep(0.01)
+        raise AssertionError('steer never arrived')
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session()
+    result = []
+    thread = threading.Thread(target=lambda: result.append(runtime.send(session_id, 'go')))
+    thread.start()
+    steered = []
+
+    def _steer_twice():
+        steered.append(runtime.steer(session_id, 'one', request_id='req-1'))
+        steered.append(runtime.steer(session_id, 'one', request_id='req-1'))
+
+    try:
+        assert started.wait(5), 'first turn did not start'
+        steer_thread = threading.Thread(target=_steer_twice)
+        steer_thread.start()
+        steer_thread.join(10)
+        assert not steer_thread.is_alive(), 'steer 死锁（锁不可重入）'
+    finally:
+        thread.join(10)
+    assert steered[0]['status'] == 'queued'
+    assert steered[1]['status'] == 'queued' and steered[1]['duplicate'] is True
+    assert received == ['one']
+
+
+def test_steer_falls_back_to_send_when_turn_is_ending(tmp_path):
+    import turn_control
+
+    calls = []
+
+    def run_turn(messages, session_store, **kwargs):
+        calls.append(list(messages))
+        return 'ok'
+
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session()
+
+    # 模拟“回合已有 token、注入队列已移除”的收尾窗口。
+    token = turn_control.begin_turn(session_id=session_id, source='tui')
+    try:
+        result = runtime.steer(session_id, 'late message', request_id='late-1')
+    finally:
+        turn_control.end_turn(token)
+
+    assert result['status'] == 'sent'
+    assert result.get('reason') == 'turn_ending'
+    assert calls and calls[-1][-1]['content'] == 'late message'
+    assert runtime.steer(session_id, 'late message',
+                         request_id='late-1')['duplicate'] is True

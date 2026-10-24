@@ -568,7 +568,7 @@ def test_api_rename_and_fork_return_409_when_session_is_busy(api_client):
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_steer_and_interrupt_routes(api_client):
     class TurnRuntime(FakeRuntime):
-        def steer(self, session_id, content):
+        def steer(self, session_id, content, *, request_id=None):
             if session_id not in self.sessions:
                 raise FileNotFoundError(session_id)
             return {'status': 'queued', 'session_id': session_id,
@@ -607,7 +607,7 @@ def test_api_steer_and_interrupt_routes(api_client):
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_steer_returns_409_when_turn_cannot_be_steered(api_client):
     class Unsteerable(FakeRuntime):
-        def steer(self, session_id, content):
+        def steer(self, session_id, content, *, request_id=None):
             raise RuntimeError('当前回合不支持 steer（由其他入口执行）')
 
     runtime = Unsteerable()

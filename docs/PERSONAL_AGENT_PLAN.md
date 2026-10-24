@@ -111,12 +111,23 @@
 - **测试**：终态事件（成功/失败/取消）；steer 空闲降级与活动注入；interrupt 取消并
   返回 turn_id；API steer/interrupt/取消流事件；四个 409 路径。
 
+- **飞书 watcher**（`src/turn_watcher.py` + 网关 `_watch_fetch/_watch_notify`）：
+  每个绑定会话用 SSE `after` 游标拉增量（`once=1` 快照），只消费 `turn_terminal`；
+  `source='feishu'` 的回合不再重复推送；状态存 `turn_watch.json`
+  （独立文件，避免破坏 bindings 严格结构），原子替换。
+- **投递语义**：先发送、后写游标与已通知键；发送失败不推进游标，下一轮重试
+  （至少一次）。按 `(session, turn_id, status)` 去重，SSE 重放/进程重启不会重复；
+  崩溃窗口内允许重复，`attempts` 记录发送次数便于诊断。
+- **无进展提示**：`turn_started` 超过阈值（默认 300s）只发“仍在运行，可能卡住”，
+  不是终态、不推断失败；同一回合只发一次。
+- **测试**：watcher 游标/去重/失败重试/重启恢复/状态有界/停滞提示；网关用真实 ASGI
+  SSE 验证“TUI 回合完成 → 飞书收到卡片”和 feishu 来源跳过、失败卡片带 error_type。
+
 仍然欠缺（阶段 1 剩余）：
 
 - steer 的幂等键（客户端重试去重）与“回合即将结束”的原子归属。
 - 跨进程 steer/interrupt（目前只覆盖同进程的 daemon 回合；TUI 回合返回 409）。
-- 飞书 watcher（SSE 增量 + 持久游标 + 至少一次投递与重复窗口记录）。
-- 无进展提示（只提示“可能卡住”，不推断失败）与来源去重。
+- watcher 只在网关进程内运行；多网关实例需要按会话分配或改用租约（当前单写者假设）。
 
 ### 阶段 2：主动性与安全边界
 

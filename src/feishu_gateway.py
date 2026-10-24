@@ -58,6 +58,7 @@ from perf import record as perf_record
 from perf import reset as perf_reset
 from session_views import group_sessions, session_details
 from turn_progress import format_duration
+from turn_watcher import TurnWatcher, WatchState
 from workspace_choices import find_workspace
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS') or paths.cache_path('feishu_bindings.json'))
@@ -370,6 +371,18 @@ class FeishuGateway:
         self._dispatch_stop = threading.Event()
         self._dispatch_threads: list[threading.Thread] = []
         self._last_card_patch = 0.0   # 实例级合流：多会话逐秒刷新共用一个节拍
+        # 回合终态主动通知：状态与 bindings 分开存，避免改动后者严格的 chat->session 结构
+        state_path = Path(os.getenv('FEISHU_WATCH_STATE')
+                          or self.bindings_path.with_name('turn_watch.json'))
+        self.watch_state = WatchState(state_path)
+        self.watcher = TurnWatcher(
+            self.watch_state,
+            fetch=self._watch_fetch,
+            notify=self._watch_notify,
+            sessions=self._watched_sessions,
+            poll_interval=float(os.getenv('FEISHU_WATCH_POLL', '1.0')),
+            stalled_after=float(os.getenv('FEISHU_WATCH_STALLED', '300')),
+        )
 
     # ---------- 绑定持久化 ----------
 
@@ -1361,6 +1374,64 @@ class FeishuGateway:
                 print(f'[feishu] approval card update failed: {exc}')
         return f'已{verb}{session_note}', True
 
+    # ---------- 回合终态主动通知（TUI/API/cron 发起的回合） ----------
+
+    def _watched_sessions(self) -> list[str]:
+        with self._bindings_lock:
+            return sorted(set(self.bindings.values()))
+
+    def _chat_for_session(self, session_id: str) -> str | None:
+        with self._bindings_lock:
+            for chat_id, bound in self.bindings.items():
+                if bound == session_id:
+                    return chat_id
+        return None
+
+    def _watch_fetch(self, session_id: str, after: int):
+        """拉一次增量：复用 SSE 的 after 游标 + 一次性快照模式。"""
+        events: list[dict] = []
+        latest = after
+        with self.api.http.stream(
+                'GET', f'/v1/sessions/{session_id}/stream',
+                params={'after': after, 'once': 1, 'poll': 0.05}) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith('data:'):
+                    continue
+                payload = json.loads(line[5:].strip())
+                if 'seq' in payload:
+                    latest = max(latest, int(payload['seq']))
+                    events.append(payload)
+        return events, latest
+
+    def _watch_notify(self, session_id: str, kind: str, payload: dict) -> None:
+        chat_id = self._chat_for_session(session_id)
+        if chat_id is None or self.transport is None:
+            raise RuntimeError('no bound chat for session')
+        turn = str(payload.get('turn_id') or '')[:8]
+        short = session_id[:8]
+        if kind == 'stalled':
+            minutes = max(1, round(float(payload.get('elapsed_s') or 0) / 60))
+            head = f'⏳ 回合仍在运行（约 {minutes} 分钟），可能在等待审批或卡住。'
+            text = head + chr(10) + f'会话 {short} · turn {turn}'
+        else:
+            status = str(payload.get('status') or 'completed')
+            source = str(payload.get('source') or '?')
+            if status == 'completed':
+                head = '✅ 回合完成'
+            elif status == 'cancelled':
+                head = '⏹ 回合已取消'
+            else:
+                head = '⚠️ 回合失败（' + str(payload.get('error_type') or 'error') + '）'
+            text = head + chr(10) + f'会话 {short} · turn {turn} · 来源 {source}'
+        self.transport.send_text(chat_id, text)
+
+    def start_watcher(self) -> bool:
+        return self.watcher.start()
+
+    def stop_watcher(self, timeout: float = 5.0) -> bool:
+        return self.watcher.stop(timeout=timeout)
+
     def start_permission_poller(self) -> threading.Thread:
         def loop() -> None:
             while not self._poll_stop.wait(PERMISSION_POLL_INTERVAL):
@@ -1373,6 +1444,10 @@ class FeishuGateway:
     def stop(self) -> None:
         self._poll_stop.set()
         self._dispatch_stop.set()
+        try:
+            self.stop_watcher()
+        except Exception as exc:
+            print(f'[feishu] watcher stop failed: {exc}')
         for thread in self._dispatch_threads:
             thread.join(timeout=3)
         self._dispatch_threads.clear()
@@ -1519,6 +1594,7 @@ class FeishuGateway:
             log_level=lark.LogLevel.INFO)
         self.start_permission_poller()
         self.start_dispatcher()
+        self.start_watcher()
         print('[feishu] long connection started; Ctrl+C to exit')
         ws_client.start()   # blocks
 

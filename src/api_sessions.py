@@ -10,6 +10,7 @@ from api_models import (
     RenameSessionRequest,
     SendMessageRequest,
     SessionActionRequest,
+    SteerRequest,
     WorkspaceRequest,
 )
 
@@ -142,10 +143,11 @@ def build_router(client, runtime):
         return {'removed': removed}
 
     @router.post("/v1/sessions/{session_id}/steer")
-    def steer_session(session_id: str, request: SendMessageRequest):
-        """活动回合中插入消息；空闲时降级为普通消息（返回 status=sent）。"""
+    def steer_session(session_id: str, request: SteerRequest):
+        """活动回合中插入消息；空闲时降级为普通消息；同 request_id 幂等。"""
         try:
-            return runtime.steer(session_id, request.content)
+            return runtime.steer(session_id, request.content,
+                                 request_id=request.request_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
