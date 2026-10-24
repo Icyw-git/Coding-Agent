@@ -236,3 +236,66 @@ def test_agent_loop_injects_steering_messages_between_requests(tmp_path, monkeyp
                        steer_provider=take)
     assert seen
     assert 'steered note' in seen[0]
+
+
+def _reasoning_stream(chunks):
+    from types import SimpleNamespace
+
+    class FakeStream:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    events = []
+    for kind, text in chunks:
+        delta = SimpleNamespace(content=None, reasoning_content=None,
+                                tool_calls=None)
+        if kind == 'reasoning':
+            delta.reasoning_content = text
+        else:
+            delta.content = text
+        events.append(SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+            usage=None))
+    return FakeStream(events)
+
+
+def test_reasoning_phase_emits_activity_without_dumping_content(monkeypatch):
+    events = _collect()
+    api = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: _reasoning_stream([
+            ('reasoning', '第一步' * 200),
+            ('reasoning', '第二步'),
+            ('content', '答案'),
+        ]))))
+    seen = []
+    try:
+        response = harness._stream_completion(
+            {'messages': []}, lambda part: seen.append(part), api=api)
+    finally:
+        ui_events.bus.unsubscribe(events.append)
+    assert seen == ['答案']
+    assert response.choices[0].message.content == '答案'
+    activities = [event for event in events if event.type == 'activity']
+    assert activities, '思考阶段应产生 activity 事件'
+    detail = activities[0].payload.get('detail', '')
+    assert '思考中' in detail
+    assert '第一步' not in str(activities[0].payload), '不能把推理正文带进事件'
+
+
+def test_cancel_works_during_reasoning_phase():
+    import pytest as _pytest
+
+    import turn_control
+
+    api = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: _reasoning_stream([
+            ('reasoning', '长思考'),
+            ('content', '答案'),
+        ]))))
+    turn_control.request_cancel()
+    with _pytest.raises(KeyboardInterrupt):
+        harness._stream_completion({'messages': []}, lambda part: None, api=api)
+    turn_control.end_turn()

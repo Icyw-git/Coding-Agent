@@ -176,6 +176,14 @@ def markdown_to_card_md(md_text: str) -> str:
     return '\n'.join(out)
 
 
+def _is_missing_session(exc: BaseException) -> bool:
+    """把“会话不存在”从其它失败里分出来：404 / FileNotFoundError。"""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    response = getattr(exc, 'response', None)
+    return getattr(response, 'status_code', None) == 404
+
+
 def _split_cron_add(rest: str) -> tuple[str, str]:
     """解析 `/cron add` 的参数：支持引号包住表达式，也支持五段裸写。
 
@@ -400,6 +408,7 @@ class FeishuGateway:
             fetch=self._watch_fetch,
             notify=self._watch_notify,
             sessions=self._watched_sessions,
+            on_missing=self._watch_missing,
             poll_interval=float(os.getenv('FEISHU_WATCH_POLL', '1.0')),
             stalled_after=float(os.getenv('FEISHU_WATCH_STALLED', '300')),
         )
@@ -545,13 +554,23 @@ class FeishuGateway:
                 label = '正在处理'
             update_partial(f'{label} · 已用时 {elapsed}\n\n' + ''.join(parts))
 
-        try:
+        def _invoke(target_session: str):
             streamer = getattr(self.api, 'send_stream', None)
             if streamer is not None:
-                reply = streamer(text, session_id=session_id, on_delta=on_delta,
-                                 on_progress=on_progress)
-            else:
-                reply = self.api.send(text, session_id=session_id)
+                return streamer(text, session_id=target_session,
+                                on_delta=on_delta, on_progress=on_progress)
+            return self.api.send(text, session_id=target_session)
+
+        try:
+            try:
+                reply = _invoke(session_id)
+            except Exception as exc:
+                if not _is_missing_session(exc):
+                    raise
+                # 老绑定指向已删除的会话：新建一个再重试，不把 404 丢给用户。
+                session_id = self._rebind_new_session(chat_id)
+                parts.clear()
+                reply = _invoke(session_id)
         except Exception as exc:
             print(f'[feishu] agent reply failed: {exc}')
             failed = f'处理未完成：{exc}\n请先核实任务状态，再决定是否重试。\n\n' + ''.join(parts)
@@ -1555,6 +1574,8 @@ class FeishuGateway:
         with self.api.http.stream(
                 'GET', f'/v1/sessions/{session_id}/stream',
                 params={'after': after, 'once': 1, 'poll': 0.05}) as response:
+            if response.status_code == 404:
+                raise FileNotFoundError(session_id)
             response.raise_for_status()
             for line in response.iter_lines():
                 if not line.startswith('data:'):
@@ -1564,6 +1585,27 @@ class FeishuGateway:
                     latest = max(latest, int(payload['seq']))
                     events.append(payload)
         return events, latest
+
+    def _rebind_new_session(self, chat_id: str) -> str:
+        session_id = self.api.create_session()
+        with self._bindings_lock:
+            self.bindings[chat_id] = session_id
+            self._save_bindings()
+        self._reply(chat_id, '原会话已不存在，已新建会话继续。')
+        return session_id
+
+    def _watch_missing(self, session_id: str) -> None:
+        """绑定指向的会话已不存在：解除绑定并提示一次（下条消息会新建会话）。"""
+        with self._bindings_lock:
+            chats = [chat for chat, bound in self.bindings.items()
+                     if bound == session_id]
+            for chat in chats:
+                self.bindings.pop(chat, None)
+            if chats:
+                self._save_bindings()
+        for chat in chats:
+            self._reply(chat, '原会话已不存在（可能被删除或换了数据目录），'
+                              '已解除绑定；直接发消息会新建会话。')
 
     def _watch_notify(self, session_id: str, kind: str, payload: dict) -> None:
         chat_id = self._chat_for_session(session_id)

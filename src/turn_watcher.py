@@ -127,12 +127,15 @@ class TurnWatcher:
     """轮询各绑定会话的增量事件，把终态转成通知。"""
 
     def __init__(self, state: WatchState, *, fetch, notify,
-                 sessions=None, poll_interval: float = 1.0,
+                 sessions=None, on_missing=None,
+                 poll_interval: float = 1.0,
                  stalled_after: float = 300.0, clock=time.time) -> None:
         self.state = state
         self._fetch = fetch               # (session_id, after) -> (events, next_after)
         self._notify = notify             # (session_id, kind, payload) -> None，失败抛异常
         self._sessions = sessions         # () -> list[str]；None 表示由调用方驱动
+        self._on_missing = on_missing     # (session_id) -> None：绑定指向的会话已不存在
+        self._missing: set[str] = set()
         self.poll_interval = max(0.2, poll_interval)
         self.stalled_after = stalled_after
         self._clock = clock
@@ -148,18 +151,32 @@ class TurnWatcher:
     def _session_ids(self) -> list[str]:
         if callable(self._sessions):
             try:
-                return [str(item) for item in self._sessions()]
+                items = [str(item) for item in self._sessions()]
             except Exception:
                 return []
-        return list(self._sessions or [])
+        else:
+            items = list(self._sessions or [])
+        return [item for item in items if item not in self._missing]
 
     # ---------- 单次扫描（可测试入口） ----------
 
     def poll_once(self, session_id: str) -> dict:
         """拉一次增量；返回统计信息（不抛异常，除非状态写盘失败）。"""
+        if session_id in self._missing:
+            return {'session': session_id, 'error': 'missing', 'notified': 0}
         after = self.state.cursor(session_id)
         try:
             events, next_after = self._fetch(session_id, after)
+        except FileNotFoundError:
+            # 绑定指向的会话已被删除/归档，或换了数据目录：只报一次，之后不再轮询，
+            # 避免每秒打一条 404。真正的清理由 on_missing（解除绑定）负责。
+            self._missing.add(session_id)
+            if self._on_missing is not None:
+                try:
+                    self._on_missing(session_id)
+                except Exception as exc:
+                    print(f'[watch] missing-session handler failed: {exc}')
+            return {'session': session_id, 'error': 'missing', 'notified': 0}
         except Exception as exc:
             return {'session': session_id, 'error': type(exc).__name__, 'notified': 0}
         notified = 0

@@ -1334,3 +1334,62 @@ def test_check_mode_exits_without_connecting(monkeypatch, capsys):
     assert feishu_gateway.main(['--check']) == 1
     out = capsys.readouterr().out
     assert 'FEISHU_APP_ID' in out and '飞书接入步骤' in out
+
+
+def test_stale_binding_is_unbound_and_warns_once(gateway):
+    gw, fake = gateway
+    gw.bindings['chat-stale'] = 'missing-session'
+    gw._watch_missing('missing-session')
+    assert 'chat-stale' not in gw.bindings
+    assert '已解除绑定' in fake.last()
+
+
+def test_send_to_stale_session_rebinds_and_retries(api_app, tmp_path, monkeypatch):
+    """老绑定指向已删除会话时，发消息应自动新建会话并继续，而不是报 404。"""
+    monkeypatch.setattr(permission_gate, 'backend', 'remote')
+    calls = {'n': 0}
+
+    class NotFound(Exception):
+        class response:
+            status_code = 404
+
+    class API(gateway_sim.GatewayClient):
+        def send_stream(self, content, session_id=None, on_delta=None,
+                        on_progress=None):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise NotFound()
+            if on_delta:
+                on_delta('ok')
+            return 'ok'
+
+    api = API('http://test', 't', transport=_sync_asgi_transport(api_app))
+    fake = FakeTransport()
+    gw = FeishuGateway(api, transport=fake,
+                       bindings_path=tmp_path / 'bindings.json')
+    try:
+        old = gw.api.create_session()
+        gw.bindings['chat-retry'] = old
+        # 把会话文件删掉，模拟“绑定指向已删除会话”
+        (tmp_path / 'sessions' / f'session_{old}.jsonl').unlink()
+        gw.on_message('chat-retry', '继续')
+        assert gw.bindings['chat-retry'] != old
+        assert '已新建会话' in fake.all_text()
+        assert 'ok' in fake.all_text()
+    finally:
+        api.close()
+        monkeypatch.setattr(permission_gate, 'backend', 'console')
+
+
+def test_missing_session_error_detection():
+    from feishu_gateway import _is_missing_session
+
+    class Response:
+        status_code = 404
+
+    class HTTPError(Exception):
+        response = Response()
+
+    assert _is_missing_session(FileNotFoundError('x'))
+    assert _is_missing_session(HTTPError())
+    assert not _is_missing_session(RuntimeError('boom'))

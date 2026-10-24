@@ -155,9 +155,11 @@ class EventReductionMixin:
             self._refresh_footer()
         elif kind == 'status':
             self._status.update(payload)
+            self._status.pop('activity_detail', None)
             self._refresh_footer()
         elif kind == 'activity':
             self._status['phase'] = payload.get('state')
+            self._status['activity_detail'] = payload.get('detail')
             self._refresh_footer()
 
     def _append_history_message(self, message: dict, *, prepend: bool = False,

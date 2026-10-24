@@ -861,6 +861,8 @@ def _stream_completion(create_kwargs, on_delta, api=None):
     tool_calls = {}
     finish_reason = None
     usage = None
+    reasoning_chars = 0
+    last_reasoning_note = 0.0
     for chunk in stream:
         usage = getattr(chunk, 'usage', None) or usage
         if not getattr(chunk, 'choices', None):
@@ -868,6 +870,19 @@ def _stream_completion(create_kwargs, on_delta, api=None):
         choice = chunk.choices[0]
         finish_reason = choice.finish_reason or finish_reason
         delta = choice.delta
+        reasoning = getattr(delta, 'reasoning_content', None)
+        if reasoning:
+            # 推理模型先吐 reasoning、后吐正文：这段时间 UI 只有 Working，
+            # 看起来像卡住。只暴露“思考中 + 字数”，不把推理内容写进会话/日志；
+            # 同时在这里检查取消，否则思考阶段的 Esc 要等正文开始才生效。
+            if turn_control.cancel_requested():
+                raise KeyboardInterrupt
+            reasoning_chars += len(reasoning)
+            now = time.monotonic()
+            if now - last_reasoning_note >= 0.5:
+                last_reasoning_note = now
+                ui_emit('activity', state='thinking',
+                        detail=f'模型思考中（{reasoning_chars} 字）')
         if getattr(delta, 'content', None):
             if not _ttfb_done:   # 模型首个文本块到达；客户端显示延迟另计
                 perf_record('llm.ttfb', time.perf_counter() - _t0)

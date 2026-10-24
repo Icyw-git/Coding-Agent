@@ -4279,3 +4279,31 @@ topics/mirrors/watches 那套更重的模型。
 面板按钮 new/status/stop 经分发线程生效；无卡片能力时回退文字；`check_setup` 与
 `--check` 退出码；`/help` 仍是完整命令清单。全量 **1545 passed / 1 skipped**，
 Ruff、`py_compile`、`git diff --check` 通过。
+
+## 404 轮询风暴与“Working 6–7 秒才出字”
+
+**404**：网关绑定里有一个会话（`26de36de…`）在 agent home 的 `.cache/sessions` 里不存在——
+典型的旧目录/换 home 前创建的绑定，或会话被归档删除。watcher 每秒拉一次
+`/v1/sessions/{id}/stream`，于是 API 访问日志里堆满 404，用户侧只看到“没反应”。
+
+修法（不做静默吞错）：
+- `_watch_fetch` 把 404 转成 `FileNotFoundError`；watcher 对“会话不存在”只报告一次，
+  之后跳过该会话，不再每秒打 API。
+- 网关的 `on_missing` 解除该会话的所有聊天绑定，并在对应聊天里说明一次；下一条消息会
+  新建会话，不会继续对着不存在的 id 发。
+- 如果用户直接发消息时绑定已失效（404），`_send_agent_reply` 会**新建会话并重试一次**，
+  聊天里看到的是“原会话已不存在，已新建会话继续”，而不是 `[error] 404`。
+- 仅把 404/FileNotFoundError 当作“会话不存在”；其它错误仍然走失败提示，不掩盖故障。
+
+**“Working 6–7 秒才出字”**：实测当前模型（deepseek-flash）的流里先来 47 个
+`reasoning_content` 块、4.37s 后才出现第一个正文块（总 4.89s）。`_stream_completion`
+此前只转发正文，思考阶段 UI 只有 Working，看着就像卡住。现在：
+- 推理块到达时每 0.5s 发一次 `activity(state='thinking', detail='模型思考中（N 字）')`，
+  TUI 的边框状态显示 `Working 6.2s · 模型思考中（120 字）`；只报字数，不把推理正文写进
+  事件/日志/会话。
+- 取消检查移到了推理分支：以前思考阶段按 Esc 要等正文开始才生效，现在立即中断。
+- 正文仍走原来的 delta 渲染，行为不变。
+
+测试：watcher 缺失只报一次并停止轮询、网关解绑与发送重试、`_is_missing_session` 判定、
+推理阶段 activity 不带正文、思考阶段可取消、边框状态显示思考进度。全量
+**1552 passed / 1 skipped**，Ruff、`py_compile`、`git diff --check` 通过。

@@ -136,3 +136,20 @@ def test_notified_history_is_bounded(tmp_path):
     assert len(data['notified']) <= 200
     assert 'k259' in data['notified']
     assert 'k0' not in data['notified']
+
+
+def test_missing_session_is_reported_once_and_skipped(tmp_path):
+    missing = []
+
+    def fetch(session_id, after):
+        raise FileNotFoundError(session_id)
+
+    state = WatchState(tmp_path / 'watch.json')
+    watcher = TurnWatcher(state, fetch=fetch, notify=lambda *a: None,
+                          sessions=lambda: ['gone'],
+                          on_missing=missing.append)
+    assert watcher.poll_once('gone')['error'] == 'missing'
+    assert missing == ['gone']
+    assert watcher.poll_once('gone')['error'] == 'missing'
+    assert missing == ['gone'], '同一会话只报告一次'
+    assert watcher.poll_all() == [], '不再轮询已缺失会话'

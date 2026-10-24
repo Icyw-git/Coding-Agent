@@ -1,6 +1,7 @@
 """新 TUI 骨架：历史 → 块模型 → 虚拟视口；流式与工具事件。"""
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -2417,5 +2418,20 @@ def test_wait_for_shutdown_cancels_worker_and_waits_housekeeping(monkeypatch):
             assert app._exiting
             assert not worker.is_alive()
             assert waited, '退出时应等待回合后整理线程'
+
+    asyncio.run(scenario())
+
+
+def test_border_status_shows_reasoning_progress():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)):
+            app._busy = True
+            app._turn_started = time.monotonic()
+            app._apply(UIEvent('activity', {'state': 'thinking',
+                                            'detail': '模型思考中（120 字）'}))
+            app._tick_border_status()
+            title = app._composer.border_title
+            assert 'Working' in title and '思考中' in title
 
     asyncio.run(scenario())

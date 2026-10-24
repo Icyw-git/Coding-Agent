@@ -30,6 +30,9 @@ class StatusMixin:
         spinner = SPINNERS[int(time.monotonic() * 8) % len(SPINNERS)]
         queued = len(self._pending) + len(self._steering)
         title = f'{spinner} Working {elapsed:4.1f}s'
+        detail = str(self._status.get('activity_detail') or '')
+        if detail:
+            title += f' · {detail[:28]}'
         if queued:
             title += f' · {queued} queued'
         self._composer.border_title = title
