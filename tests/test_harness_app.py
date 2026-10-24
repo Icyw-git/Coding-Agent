@@ -7,7 +7,7 @@ pytest.importorskip('textual')
 
 import harness  # noqa: E402
 import ui_events  # noqa: E402
-from ui import harness_app as app_module  # noqa: E402
+from ui.event_reduction import HISTORY_INITIAL_MESSAGES, HISTORY_PAGE_MESSAGES  # noqa: E402
 from ui.harness_app import HarnessApp  # noqa: E402
 from ui_events import UIEvent  # noqa: E402
 
@@ -30,7 +30,7 @@ def test_history_renders_through_virtual_transcript():
                 await asyncio.sleep(0.02)
                 if app.view.content_line_count:
                     break
-            loaded = min(len(messages), app_module.HISTORY_INITIAL_MESSAGES)
+            loaded = min(len(messages), HISTORY_INITIAL_MESSAGES)
             assert len(app.model) == loaded
             assert app.view.content_line_count >= loaded
             assert app.model.snapshot()[0].payload['text'] == f'history-{300 - loaded}'
@@ -1693,10 +1693,10 @@ def test_history_starts_with_recent_window_and_loads_older_page():
         app = HarnessApp(messages)
         async with app.run_test(size=(80, 20)) as pilot:
             await pilot.pause()
-            initial_start = len(messages) - app_module.HISTORY_INITIAL_MESSAGES
-            page = app_module.HISTORY_PAGE_MESSAGES
+            initial_start = len(messages) - HISTORY_INITIAL_MESSAGES
+            page = HISTORY_PAGE_MESSAGES
             assert len(app._messages) == 1000
-            assert len(app.model) == app_module.HISTORY_INITIAL_MESSAGES
+            assert len(app.model) == HISTORY_INITIAL_MESSAGES
             assert app.model.snapshot()[0].payload['text'] == f'history-{initial_start}'
             assert app._history_start == initial_start
 
@@ -1732,7 +1732,7 @@ def test_scrolling_to_top_loads_older_history():
                 await asyncio.sleep(0.01)
                 if app._history_auto_armed and app._history_last_offset > 0:
                     break
-            initial_start = len(messages) - app_module.HISTORY_INITIAL_MESSAGES
+            initial_start = len(messages) - HISTORY_INITIAL_MESSAGES
             assert app._history_start == initial_start
             app.view.scroll_home(animate=False)
             for _ in range(80):
@@ -1741,7 +1741,7 @@ def test_scrolling_to_top_loads_older_history():
                 if app._history_start < initial_start:
                     break
             expected_start = max(
-                0, initial_start - app_module.HISTORY_PAGE_MESSAGES)
+                0, initial_start - HISTORY_PAGE_MESSAGES)
             assert app._history_start == expected_start
             assert len(app.model) == len(messages) - expected_start
 
