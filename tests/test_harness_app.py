@@ -100,6 +100,57 @@ def test_submit_queues_and_calls_agent(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_turn_slot_busy_keeps_text_in_composer(monkeypatch):
+    import turn_coordinator
+
+    def busy(*args, **kwargs):
+        raise turn_coordinator.TurnBusy('另一个入口正在执行回合')
+
+    monkeypatch.setattr(turn_coordinator, 'acquire', busy)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('keep me')
+            await pilot.pause()
+            assert app._composer.text == 'keep me'
+            assert not [block for block in app.model.snapshot()
+                        if block.kind == 'user']
+            notices = [block.payload.get('text', '')
+                       for block in app.model.snapshot()
+                       if block.kind == 'notice']
+            assert any('另一个入口' in text for text in notices)
+            assert not app._busy
+
+    asyncio.run(scenario())
+
+
+def test_turn_slot_released_after_turn(monkeypatch):
+    """worker 结束后释放槽：下一个提交仍能执行。"""
+    calls = []
+
+    def fake_loop(messages, **kwargs):
+        calls.append(len(messages))
+        return 'ok'
+
+    monkeypatch.setattr(harness, 'agent_loop', fake_loop)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            for text in ('one', 'two'):
+                app.submit_text(text)
+                for _ in range(80):
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                    if len(calls) >= (1 if text == 'one' else 2):
+                        break
+                assert not app._busy, text
+            assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
 def test_completion_overlay_and_accept():
     from ui.composer.completions import apply_suggestion, suggestions
 

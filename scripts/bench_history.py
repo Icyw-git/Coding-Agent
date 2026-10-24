@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ui import event_reduction  # noqa: E402
 from ui import harness_app as module  # noqa: E402
 
 
@@ -27,7 +28,7 @@ def _messages(count: int) -> list[dict]:
 
 
 async def _measure(label: str, limit: int, messages: list[dict]) -> dict:
-    module.HISTORY_INITIAL_MESSAGES = limit
+    event_reduction.HISTORY_INITIAL_MESSAGES = limit
     gc.collect()
     tracemalloc.start()
     started = time.perf_counter()
@@ -57,7 +58,7 @@ async def _measure(label: str, limit: int, messages: list[dict]) -> dict:
 
 async def main_async(count: int) -> list[dict]:
     messages = _messages(count)
-    initial_messages = module.HISTORY_INITIAL_MESSAGES
+    initial_messages = event_reduction.HISTORY_INITIAL_MESSAGES
     full = await _measure('full', 10 ** 9, messages)
     paged = await _measure('paged', initial_messages, messages)
     return [full, paged]

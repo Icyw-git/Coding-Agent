@@ -148,3 +148,36 @@ def test_recent_requests_are_bounded(monkeypatch, tmp_path):
     assert len(harness._LAST_REQUESTS) == harness._CACHE_DEBUG_SESSIONS
     assert 's0' not in harness._LAST_REQUESTS
     assert f's{total - 1}' in harness._LAST_REQUESTS
+
+
+def test_sample_every_parsing(monkeypatch):
+    from prompt_cache_debug import sample_every
+
+    monkeypatch.delenv('HARNESS_DEBUG_CACHE_SAMPLE', raising=False)
+    assert sample_every() == 1
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE_SAMPLE', '5')
+    assert sample_every() == 5
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE_SAMPLE', '0')
+    assert sample_every() == 1
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE_SAMPLE', 'abc')
+    assert sample_every() == 1
+
+
+def test_sampling_skips_fingerprint_work(monkeypatch, tmp_path):
+    import harness
+
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE', '1')
+    monkeypatch.setenv('HARNESS_DEBUG_CACHE_SAMPLE', '3')
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    harness._LAST_REQUESTS.clear()
+    harness._CACHE_DEBUG_COUNTS.clear()
+    messages = [{'role': 'user', 'content': 'a'}]
+
+    assert harness._report_cache_prefix('s1', messages)['cache_prefix_status'] == 'first'
+    assert harness._report_cache_prefix('s1', messages) is None      # 2
+    status = harness._report_cache_prefix('s1', messages)           # 3：第 N 个
+    assert status['cache_prefix_status'] == 'unchanged'
+    assert status['cache_prefix_previous_messages'] == 1
+    assert harness._report_cache_prefix('s1', messages) is None      # 4
+    assert harness._report_cache_prefix('s1', messages) is None      # 5
+    assert harness._report_cache_prefix('s1', messages)['cache_prefix_status'] == 'unchanged'

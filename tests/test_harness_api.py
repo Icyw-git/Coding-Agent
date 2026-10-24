@@ -416,3 +416,126 @@ def test_http_task_is_gated_by_the_policy_tier(tmp_path, api_client, monkeypatch
     assert record['status'] == 'cancelled'
     assert record['detail'] == 'Permission denied by user'
     assert client.get(f"/v1/tasks/{record['id']}/logs", headers=headers).text == ''
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_message_returns_409_when_turn_is_busy(api_client):
+    from turn_coordinator import TurnBusy
+
+    class BusyRuntime(FakeRuntime):
+        def send(self, session_id, content, on_delta=None):
+            raise TurnBusy('另一个入口正在执行回合')
+
+    runtime = BusyRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'busy'},
+                       headers=headers).status_code == 201
+    response = client.post('/v1/sessions/busy/messages',
+                           json={'content': 'hello'}, headers=headers)
+    assert response.status_code == 409
+    assert '执行回合' in response.json()['detail']
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_stream_reports_turn_busy_as_error_event(api_client):
+    from turn_coordinator import TurnBusy
+
+    class BusyRuntime(FakeRuntime):
+        def send(self, session_id, content, on_delta=None):
+            raise TurnBusy('另一个入口正在执行回合')
+
+    runtime = BusyRuntime()
+    client = api_client(create_app(runtime, api_token='t'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/sessions', json={'id': 'busy-stream'},
+                       headers=headers).status_code == 201
+    response = client.post('/v1/sessions/busy-stream/messages/stream',
+                           json={'content': 'hello'}, headers=headers)
+    assert response.status_code == 200
+    assert 'event: error' in response.text
+    assert 'turn_busy' in response.text
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_lifespan_starts_and_stops_scheduler(monkeypatch, tmp_path):
+    import harness as harness_module
+    import harness_api
+
+    events = []
+
+    class FakeService:
+        def __init__(self, run_turn):
+            self.run_turn = run_turn
+
+        def start(self):
+            events.append('start')
+            return True
+
+        def stop(self, timeout=None):
+            events.append('stop')
+            return True
+
+    monkeypatch.setattr(harness_api, 'SchedulerService', FakeService)
+    monkeypatch.setattr(harness_module, 'initialize_mcp_tools', lambda: None)
+    monkeypatch.setattr(harness_module, 'shutdown_mcp', lambda: None)
+    monkeypatch.setattr(harness_module.client, 'warmup', lambda: None)
+    monkeypatch.setenv('HARNESS_SCHEDULER', '1')
+    from fastapi.testclient import TestClient
+
+    app = create_app(api_token='t', task_root=tmp_path / 'tasks')
+    with TestClient(app):
+        assert events == ['start']
+    assert events == ['start', 'stop']
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_lifespan_skips_scheduler_when_disabled(monkeypatch, tmp_path):
+    import harness as harness_module
+    import harness_api
+
+    events = []
+
+    class FakeService:
+        def __init__(self, run_turn):
+            events.append('init')
+
+        def start(self):
+            events.append('start')
+
+        def stop(self, timeout=None):
+            events.append('stop')
+
+    monkeypatch.setattr(harness_api, 'SchedulerService', FakeService)
+    monkeypatch.setattr(harness_module, 'initialize_mcp_tools', lambda: None)
+    monkeypatch.setattr(harness_module, 'shutdown_mcp', lambda: None)
+    monkeypatch.setattr(harness_module.client, 'warmup', lambda: None)
+    monkeypatch.setenv('HARNESS_SCHEDULER', '0')
+    from fastapi.testclient import TestClient
+
+    app = create_app(api_token='t', task_root=tmp_path / 'tasks')
+    with TestClient(app):
+        pass
+    assert events == []
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_injected_runtime_does_not_start_scheduler(monkeypatch, tmp_path):
+    import harness_api
+
+    events = []
+
+    class FakeService:
+        def __init__(self, run_turn):
+            events.append('init')
+
+        def start(self):
+            events.append('start')
+
+    monkeypatch.setattr(harness_api, 'SchedulerService', FakeService)
+    from fastapi.testclient import TestClient
+
+    app = create_app(FakeRuntime(), api_token='t', task_root=tmp_path / 'tasks')
+    with TestClient(app):
+        pass
+    assert events == []

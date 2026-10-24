@@ -44,14 +44,37 @@
 
 ## 4. 分阶段实施
 
-### 阶段 0：常驻服务与单回合协调
+### 阶段 0：常驻服务与单回合协调（进行中，2026-10-24 完成第一批）
 
-- **可控的 scheduler 生命周期**：将 cron scheduler 和 queue processor 封装为服务，支持启动、停止信号和有界 join；API lifespan 只在拥有默认 runtime 且启用 scheduler 时启动，并在关闭时停止。durable jobs 在服务启动时加载一次；同一进程内防止重复启动。注入 runtime 的 app 由注入方负责服务生命周期。
-- **统一回合协调器**：TUI、`AgentRuntime.send`、CLI 回合和 cron worker 都经过同一个协调器。协调器包含进程内互斥和跨进程 OS lock；竞争时立即拒绝。禁止 API `send` 绕过 cron 使用的协调锁。锁文件可放 `.cache/locks/agent-turn.lock`。
-- **会话写入保护**：对 session 事件流的写操作、rename、workspace 更新、fork 的一致性读取以及 archive/delete 使用统一会话锁策略。纯读取可保持并发，但必须能容忍回合进行中的增量事件。
-- **TUI 拒绝体验**：若锁竞争失败，不把消息伪装成已发送或写入会话；把原文留在 Composer，并说明会话/代理正在忙碌。
-- **关闭与 housekeeping**：应用关闭前停止接受新回合、等待活动回合按超时策略结束，并调用有界 `wait_for_housekeeping`；超时需日志记录，不能静默假定后台记忆写入完成。
-- **测试**：真实子进程争抢回合锁、进程被强制终止后锁可重新获取；TUI/API/cron 竞争同一全局回合锁；会话变更与回合冲突；重复进入 API lifespan 不产生重复线程；关闭时 scheduler 与 housekeeping 可收敛。移除 `wait_for_cron_idle` 的 server 测试：有 recurring job 时它按现有定义不会 idle，改测服务停止和 join。
+已完成：
+
+- **可控的 scheduler 生命周期**：新增 `src/scheduler_service.py`；两个循环接受 `stop_event`，
+  置位后立即退出等待。API lifespan 在拥有默认 runtime 且未设 `HARNESS_SCHEDULER=0` 时启动，
+  关闭时停止并有界 join（超时记录 warning）；注入 runtime 的 app 不起服务；重复 start 幂等。
+  CLI 入口仍用 daemon 线程直接启动（进程退出即回收），不改其测试 patch 点。
+- **统一回合协调器**：新增 `src/turn_coordinator.py`（进程内 RLock + 跨进程
+  `.cache/locks/agent-turn.lock`，同线程重入、跨线程/跨进程立即 `TurnBusy`）。已接入
+  `AgentRuntime.send`、TUI worker、ANSI REPL 的 `_run_turn`、cron `run_agent_turn_locked`
+  与 headless（走 runtime）。cron 先拿槽再消费队列，竞争时任务留在队列里。
+- **API 契约**：`POST /v1/sessions/{id}/messages` 在竞争时返回 `409`；流式端点返回
+  `event: error` + `code: turn_busy`。
+- **TUI 拒绝体验**：拿槽失败时消息退回 Composer 并提示，不写会话事件；`_send_user` 在
+  空闲时先拿槽再落块，避免“看起来已发送”。
+- **测试**：新增 `tests/test_turn_coordinator.py`（子进程持锁/竞争/崩溃释放/陈旧锁文件、
+  runtime 被拒绝时不写事件、cron 任务不丢、服务幂等启停、durable jobs 只加载一次）；
+  API 新增 409 与流式 busy 事件、lifespan 启停/禁用/注入 runtime 不启动；
+  TUI 新增保留输入与回合结束释放槽。
+  原 `test_concurrent_real_turns_use_their_own_tools_prompt_and_checkpoints` 依赖两个真实回合
+  并发（与全局单回合冲突），改为“A 在模型调用中时 B 被拒绝、随后 B 串行执行”，保留
+  prompt/工具/checkpoint 归属断言。
+
+仍欠（下一批）：
+
+- **会话写入保护**：rename / workspace / fork / archive / delete 与活动回合的跨进程互斥
+  （当前仍是进程内 session RLock）。
+- **关闭与 housekeeping**：TUI 退出时等待活动回合与 `wait_for_housekeeping`（API 已停
+  scheduler，但未等待回合与整理线程）。
+- 真实终端与真实 daemon 验收（手机/TUI 竞争、SIGTERM 关闭）。
 
 ### 阶段 1：远程控制闭环（监视、插话、中断、通知）
 
@@ -60,7 +83,7 @@
 - **Interrupt 端点**：`POST /v1/sessions/{id}/interrupt` 只取消当前匹配会话的活动回合；无匹配活动回合返回明确状态，不影响其他回合。实现使用按回合的 cancellation token/context，或由阶段 0 的全局单回合协调器校验活动 session 后定向取消；不得直接把现有全局 Event 当成可按会话取消。API 回合需要对称地 begin/end 生命周期并清理取消状态。
 - **飞书 watcher**：复用会话 SSE `after` 游标和断线重连，只消费增量；按绑定/会话保存游标与投递记录，写入需原子化。监听 `turn_id` 终态和有界的无进度状态，按来源过滤，避免对已通过手机流式回复的回合重复推送。游标可与绑定存储关联，但不要把“已读事件”误当“已成功送达”。
 - **投递语义**：本地事件游标和飞书发送不在同一事务内，无法承诺断电情况下绝不重放且绝不漏发。采用至少一次投递，记录 `(session_id, turn_id, terminal_status)` 和发送尝试；发送成功与落盘之间发生崩溃时允许重复通知，后续利用可用的消息更新/幂等能力降低重复。验收明确记录这个崩溃窗口。
-- **错误通知**：失败/取消必须有最终终态事件，watcher 不能只凭长时间无进展推断失败。无进展阈值只发“仍在运行/可能卡住”的提示，不伪造失败结论。
+- **错误通知**：失败/取消必须有最终终态事件，watcher 不能只凭长时间无进展推断失败。无进展阈值只发”仍在运行/可能卡住”的提示，不伪造失败结论。审批链路同理：网关不在线或超时导致的审批拒绝（`decide_queued` 超时路径）要作为带原因的显式事件进入会话流，远程端能区分”agent 主动拒绝”与”无人应答”，watcher 可选推送。
 - **测试**：steer 的轮间注入与回合结束竞态、同会话幂等重试；两个会话的中断隔离；TUI/API/cron 共享协调器；watcher 断线续传、终态错误、重复投递窗口、游标损坏恢复及通知来源去重。
 
 ### 阶段 2：主动性与安全边界
@@ -68,8 +91,8 @@
 - **cron 管理**：复用现有 cron 工具，增加 API 与飞书 `/cron` 的 list/create/delete。命令只允许授权用户使用，复用当前飞书白名单和 API bearer 策略；创建、删除结果返回稳定 job ID 和明确权限错误。
 - **任务触发状态**：job 配置持久化不代表触发记录持久化。为每次触发计算稳定 occurrence ID，定义本地时区或显式时区、停机期间的 misfire 策略（跳过/补跑/仅补最近一次）、并发时是否合并，以及失败重试上限。确保默认心跳使用稳定 job ID，上线/重启不会重复注册。
 - **心跳摘要**：默认每日一次，初始仅只读汇总任务板、最近改动和待审批数量，不自动执行写操作；内容不包含不必要的命令正文、凭据或敏感工具参数。仅在明确授权的定时任务中开放副作用。审批等待必须有超时和通知策略，不能无限占用唯一回合槽。
-- **记忆安全**：`extract_memories` 和阈值触发的 `consolidate_memories` 已随成功回合的 housekeeping 执行；不再额外加 cron 重复触发。先修复合并流程：校验完整 JSON schema、名称/路径安全、条数和字段限制；在临时目录生成并验证完整的新集合，成功后原子替换索引和文件，失败保留旧记忆。给所有记忆提取/合并/索引更新加跨线程及跨进程互斥，避免不同会话 housekeeping 相互覆盖。
-- **测试**：稳定 job ID 重启不重复注册；occurrence 重启/错过/失败语义；心跳只读约束和副作用审批；无效或空模型输出、写入中途失败、并发提取与合并、服务关闭时 housekeeping 超时恢复。
+- **记忆安全**：`extract_memories` 和阈值触发的 `consolidate_memories` 已随成功回合的 housekeeping 执行；不再额外加 cron 重复触发。合并流程已改为「校验 → 暂存 → 先落新文件再删旧文件」：校验 schema、类型、条数与重名，暂存文件回读校验后才替换，失败保留旧记忆；写入已加进程内 RLock 与跨进程 OS 锁，单文件与索引都是临时文件 + 原子替换（2026-10-24 完成）。仍欠：daemon 关闭时等待或记录未完成的 housekeeping。
+- **测试**：稳定 job ID 重启不重复注册；occurrence 重启/错过/失败语义；心跳只读约束和副作用审批；无效或空模型输出、写入中途失败、并发提取与合并、服务关闭时 housekeeping 超时恢复。记忆部分的故障测试已完成（`tests/test_memory_safety.py`），调度与关闭部分待开工。
 
 ### 阶段 3（可选，单独评估）：TUI 转客户端
 

@@ -418,17 +418,49 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             self._steering.put(text)
             self._refresh_queue()
             return
-        self.model.append('user', {'text': text})
-        self._mark_dirty()
-        self._flush_layout(force=True)      # 先画出用户消息，不必等 50ms 定时器
         if self._busy:
-            # Enter：进入下回合队列，不打断正在进行的回答。
+            # Enter：进入下回合队列，不打断正在进行的回答（槽已由当前 worker 持有）。
+            self.model.append('user', {'text': text})
+            self._mark_dirty()
+            self._flush_layout(force=True)
             self._pending.put(text)
             self._refresh_queue()
             return
-        self._pending.put(text)
-        self._refresh_queue()
-        self._start_worker()
+        slot = self._acquire_turn_slot()
+        if slot is None:
+            self._restore_unsent([text])
+            return
+        try:
+            self.model.append('user', {'text': text})
+            self._mark_dirty()
+            self._flush_layout(force=True)  # 先画出用户消息，不必等 50ms 定时器
+            self._pending.put(text)
+            self._refresh_queue()
+            self._start_worker(slot)
+        except BaseException:
+            slot.release()
+            raise
+
+    def _acquire_turn_slot(self):
+        """拿全局回合槽；被其他进程/线程占用时返回 None（不排队、不落消息）。"""
+        import harness
+        from turn_coordinator import TurnBusy, acquire
+        try:
+            return acquire(harness.SESSIONS_DIR.parent)
+        except TurnBusy:
+            return None
+
+    def _restore_unsent(self, texts: list[str]) -> None:
+        """被拒绝的消息退回输入框，不静默写进会话。"""
+        text = chr(10).join(item for item in texts if item)
+        if not text:
+            return
+        self._notice('另一个入口正在执行回合；消息保留在输入框，未发送。',
+                     level='error')
+        if self._composer is not None:
+            current = self._composer.text
+            self._composer.text = text + (chr(10) + current if current else '')
+            self._composer.focus()
 
     def submit_skill(self, name: str, argument: str = '') -> None:
         """`/skill:<name> args`：把技能正文展开成一条 user 消息（同 Pi）。"""
@@ -442,15 +474,26 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             content += chr(10) + chr(10) + argument.strip()
         self._send_user(content)
 
-    def _start_worker(self) -> None:
+    def _start_worker(self, slot=None) -> None:
+        if slot is None:
+            slot = self._acquire_turn_slot()
+            if slot is None:
+                self._restore_unsent(self._pending.drain())
+                return
         self._operation = 'agent'
         self._busy = True
         self._turn_started = time.monotonic()
         self._refresh_footer()
         self._tick_border_status()   # 立即显示 Working，不等 0.2s 定时器
-        threading.Thread(target=self._run_agent, daemon=True).start()
+        try:
+            threading.Thread(target=self._run_agent, args=(slot,),
+                             daemon=True).start()
+        except BaseException:
+            slot.release()
+            self._busy = False
+            raise
 
-    def _run_agent(self) -> None:
+    def _run_agent(self, slot=None) -> None:
         import harness
         import turn_control
         try:
@@ -492,6 +535,8 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                     break
         finally:
             self._busy = False
+            if slot is not None:
+                slot.release()
 
     def _sync_final_answer(self, answer) -> None:
         """兜底：事件流丢失 assistant_end/text 时，用 agent_loop 返回值补最后一答。"""

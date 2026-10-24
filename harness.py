@@ -130,6 +130,7 @@ from prompt_assembly import project_prompt_section as _project_prompt_section
 from prompt_cache_debug import enabled as cache_debug_enabled
 from prompt_cache_debug import fingerprints as cache_fingerprints
 from prompt_cache_debug import first_divergence as first_cache_divergence
+from prompt_cache_debug import sample_every as cache_sample_every
 from repl_commands import handle_command
 from session_admin import (
     _session_catalog,
@@ -469,6 +470,7 @@ MAX_REACTIVE_RETRIES=3   # 逐次缩尾重试（keep/budget 见 agent_loop 的 a
 
 
 _CACHE_DEBUG_SESSIONS = 32
+_CACHE_DEBUG_COUNTS: dict[str, int] = {}
 # 只保留消息摘要而不是整份请求：开关开着跑长会话时，内存不随历史增长。
 _LAST_REQUESTS: dict[str, tuple[list[str], list[dict]]] = {}
 
@@ -489,9 +491,21 @@ def _report_cache_prefix(session_id: str, request_messages: list,
     位置都不同——把它算进来，每次工具结果追加都会被误报成前缀改写（实测每一轮
     都会报一次）。真正的 `history_snipped` 会改动历史中部，仍然会被抓到。
     只观测、不改请求；stderr 之外再写一份 `.cache/cache_debug.jsonl`。
+
+    `HARNESS_DEBUG_CACHE_SAMPLE=N`（默认 1）只对每 N 个请求采样；首个请求总会
+    采样以建立基准。返回 None 表示本次未采样（调用方按“无诊断数据”处理）。
     """
     if not cache_debug_enabled():
         return
+    every = cache_sample_every()
+    count = _CACHE_DEBUG_COUNTS.get(session_id, 0) + 1
+    _CACHE_DEBUG_COUNTS[session_id] = count
+    if len(_CACHE_DEBUG_COUNTS) > _CACHE_DEBUG_SESSIONS:
+        _CACHE_DEBUG_COUNTS.pop(next(iter(_CACHE_DEBUG_COUNTS)))
+    # 采样：首个请求必测（建立基准），之后每 N 个测一次。跳过的请求不计算指纹，
+    # 下一次采样与上次「已采样」请求比较——跨度变长，但仍能抓到中段改写。
+    if every > 1 and count % every and count != 1:
+        return None
     probe = ([{'role': 'system', 'content': system}] if system else [])
     probe.extend(request_messages)
     current = cache_fingerprints(probe)
@@ -1539,16 +1553,27 @@ def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
 
 def run_agent_turn_locked():
     """持锁状态下执行一轮对话（供 queue_processor_loop 调用）：
-    消费 cron 队列 → 构造 user 消息 → agent_loop。"""
-    fired = consume_cron_queue()
-    if not fired:
-        return
-    prompts = [f'[Scheduled] {job.prompt}' for job in fired]
-    print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+    消费 cron 队列 → 构造 user 消息 → agent_loop。
+
+    先拿全局回合槽再消费队列：槽被 TUI/API 占用时直接返回，任务留在队列里，
+    不能先清掉队列再执行失败。
+    """
+    from turn_coordinator import TurnBusy, turn_slot
+
     try:
-        agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
-    except KeyboardInterrupt:
-        print('\n[会话已中断]')
+        slot = turn_slot(Path(SESSIONS_DIR).parent)
+        with slot:
+            fired = consume_cron_queue()
+            if not fired:
+                return
+            prompts = [f'[Scheduled] {job.prompt}' for job in fired]
+            print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+            try:
+                agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}])
+            except KeyboardInterrupt:
+                print('\n[会话已中断]')
+    except TurnBusy:
+        return   # 别的入口在跑：本轮跳过，任务仍在 cron_queue
 
 
 

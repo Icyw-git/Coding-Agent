@@ -2,44 +2,169 @@
 
 可变状态（MEMORY_DIR / MEMORY_INDEX / CONSOLIDATE_THRESHOLD）由 harness 持有，
 这里通过 ``llm_route.harness()`` 在运行时读取，测试 monkeypatch harness 即可生效。
+
+写入约束：所有改文件的操作都走 ``_write_guard``（进程内 RLock + 跨进程 OS 锁），
+并且先写临时文件再 ``os.replace``。合并（consolidate）额外采用「先落新文件、再删旧
+文件」的顺序：中途失败只会多出文件，不会把旧记忆删空。
 """
 import json
 import os
 import re
+import shutil
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 
 import yaml
 
 import llm_route
+from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
+
+_MEMORY_LOCK = threading.RLock()
+_WRITE_DEPTH = 0   # 同一线程重入时不重复抢 OS 锁（否则 flock 会自锁）
+_WRITE_LOCK_NAME = '.memory-write.lock'
+_SLUG_RE = re.compile(r'[^a-z0-9._-]+')
+_MAX_MEMORY_ITEMS = 50   # 提示词要求 <30；留出余量但仍给删除范围设上界
+
+# 记忆文件解析缓存：key 是路径，value 是 ((size, mtime_ns), meta, body, raw)。
+# 每轮 load_memories 都要扫全部记忆；21 个文件时 YAML 解析约 7 ms，直接缓存
+# 解析结果能把固定开销降到读 stat。写入路径主动失效，外部修改靠 size/mtime 兜底。
+_FRONTMATTER_CACHE: dict[str, tuple[tuple[int, int], dict, str, str]] = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_MAX = 256
+
+
+@contextmanager
+def _write_guard():
+    """串行化记忆写操作（进程内 + 跨进程）；可重入。"""
+    global _WRITE_DEPTH
+    with _MEMORY_LOCK:
+        if _WRITE_DEPTH:
+            _WRITE_DEPTH += 1
+            try:
+                yield
+            finally:
+                _WRITE_DEPTH -= 1
+            return
+        memory_dir = _h().MEMORY_DIR
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with exclusive_file_lock(memory_dir / _WRITE_LOCK_NAME, timeout=10.0):
+                _WRITE_DEPTH = 1
+                try:
+                    yield
+                finally:
+                    _WRITE_DEPTH = 0
+        except FileLockTimeout as exc:
+            raise RuntimeError(f'memory store is busy: {exc}') from exc
+
+
+def _slug(name: str) -> str:
+    """把记忆名收敛成安全文件名；不允许穿越目录或逃出 MEMORY_DIR。"""
+    slug = _SLUG_RE.sub('-', str(name or '').strip().lower()).strip('.-')
+    slug = slug[:80]
+    return slug or f'memory-{int(time.time())}'
+
+
+def _cache_drop(path) -> None:
+    with _CACHE_LOCK:
+        _FRONTMATTER_CACHE.pop(str(path), None)
+
+
+def _cache_clear() -> None:
+    with _CACHE_LOCK:
+        _FRONTMATTER_CACHE.clear()
+
+
+def _cached_entry(path):
+    """返回 (meta, body, raw)；stat 未变时直接复用上次解析结果。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    signature = (stat.st_size, stat.st_mtime_ns)
+    key = str(path)
+    with _CACHE_LOCK:
+        hit = _FRONTMATTER_CACHE.get(key)
+    if hit is not None and hit[0] == signature:
+        return hit[1], hit[2], hit[3]
+    try:
+        raw = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return None
+    meta, body = _parse_frontmatter(raw)
+    with _CACHE_LOCK:
+        if len(_FRONTMATTER_CACHE) >= _CACHE_MAX:
+            _FRONTMATTER_CACHE.clear()
+        _FRONTMATTER_CACHE[key] = (signature, meta, body, raw)
+    return meta, body, raw
+
+
+def _memory_path(filename: str):
+    """把模型给的文件名限制在 MEMORY_DIR 内；越界返回 None。"""
+    h = _h()
+    root = h.MEMORY_DIR.resolve()
+    path = (h.MEMORY_DIR / str(filename)).resolve()
+    return path if path.parent == root else None
+
+
+def _atomic_write(path, text: str) -> None:
+    """先写同目录临时文件再替换：崩溃时只会留下完整旧文件或完整新文件。"""
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(text, encoding='utf-8')
+    try:
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _render_memory(name: str, mem_type: str, description: str, body: str) -> str:
+    """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。"""
+    def one_line(value) -> str:
+        return ' '.join(str(value or '').split())
+
+    return (f"---\nname: {one_line(name)}\ndescription: {one_line(description)}\n"
+            f"type: {one_line(mem_type)}\n---\n\n{body}\n")
 
 
 def write_memory_file(name: str, mem_type: str, description: str, body: str):  # 保存记忆文件
+    with _write_guard():
+        return _write_memory_file_unlocked(name, mem_type, description, body)
+
+
+def _write_memory_file_unlocked(name: str, mem_type: str, description: str, body: str):
     h = _h()
     h.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    slug = name.lower().replace(' ', '-').replace('/', '-')
-    filename = f'{slug}.md'
-    filepath = h.MEMORY_DIR / filename
-    filepath.write_text(
-        f'---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n',
-        encoding='utf-8',
-    )
-    _rebuild_index()  # 重建记忆索引
+    filepath = h.MEMORY_DIR / f'{_slug(name)}.md'
+    _atomic_write(filepath, _render_memory(name, mem_type, description, body))
+    _cache_drop(filepath)
+    _rebuild_index_unlocked()  # 重建记忆索引
     return filepath
 
 
 def _rebuild_index():
+    with _write_guard():
+        _rebuild_index_unlocked()
+
+
+def _rebuild_index_unlocked():
     h = _h()
     lines = []
     for f in sorted(h.MEMORY_DIR.glob('*.md')):
         if f.name == 'MEMORY.md':
             continue
-        raw = f.read_text(encoding='utf-8', errors='replace')
-        meta, body = _parse_frontmatter(raw)
+        entry = _cached_entry(f)
+        if entry is None:
+            continue
+        meta, body, _raw = entry
         name = meta.get('name', f.name)
-        desc = meta.get('description', raw.split('\n')[0][:80])
+        desc = meta.get('description', (body.splitlines() or [''])[0][:80])
         lines.append(f'- [{name}({f.name}) - {desc}]')  # 索引结构：[名称](文件名) - 描述
-    h.MEMORY_INDEX.write_text('\n'.join(lines) + '\n' if lines else '', encoding='utf-8')
+    h.MEMORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(h.MEMORY_INDEX, '\n'.join(lines) + '\n' if lines else '')
 
 
 def read_memory_index() -> str:  # 读取记忆索引
@@ -51,11 +176,11 @@ def read_memory_index() -> str:  # 读取记忆索引
 
 
 def read_memory_file(filename: str):  # 读取记忆文件
-    h = _h()
-    path = h.MEMORY_DIR / filename
-    if not path.exists():
+    path = _memory_path(filename)
+    if path is None:
         return None
-    return path.read_text(encoding='utf-8', errors='replace')
+    entry = _cached_entry(path)
+    return entry[2] if entry is not None else None
 
 
 def list_memory_files() -> list:  # 列出所有记忆文件
@@ -64,8 +189,10 @@ def list_memory_files() -> list:  # 列出所有记忆文件
     for f in sorted(h.MEMORY_DIR.glob('*.md')):
         if f.name == 'MEMORY.md':
             continue
-        raw = f.read_text(encoding='utf-8', errors='replace')
-        meta, body = _parse_frontmatter(raw)
+        entry = _cached_entry(f)
+        if entry is None:
+            continue
+        meta, body, _raw = entry
         results.append({
             'filename': f.name,
             'name': meta.get('name', f.stem),
@@ -300,10 +427,14 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             return
         count = 0
         for mem in items:
-            name = mem.get('name', f'memory_{int(time.time())}')
-            mem_type = mem.get('type', 'user')
-            desc = mem.get('description', '')
-            body = mem.get('body', '')
+            if not isinstance(mem, dict):
+                continue
+            name = str(mem.get('name') or f'memory_{int(time.time())}')
+            mem_type = str(mem.get('type') or 'user')
+            if mem_type not in _h().MEMORY_TYPES:
+                mem_type = 'user'   # schema 外的类型不落盘，避免污染后续合并
+            desc = ' '.join(str(mem.get('description') or '').split())
+            body = str(mem.get('body') or '').strip()
             if desc and body:
                 write_memory_file(name, mem_type, desc, body)  # 写入新记忆文件
                 count += 1
@@ -313,6 +444,76 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             print(f"[Memory: extract returned {len(items)} items but none had desc+body]")
     except Exception as e:
         print(f"[Memory: extract error: {e}]")
+
+
+def _validate_consolidated(items) -> list[dict]:
+    """校验合并输出；任意一条不合格就整批放弃。
+
+    合并会删旧文件，所以不能像提取那样「跳过坏项继续写」：只写回一部分
+    也等于丢数据。这里只做纯数据校验，不碰磁盘。
+    """
+    h = _h()
+    if not isinstance(items, list) or not items:
+        raise ValueError('result is not a non-empty list')
+    if len(items) > _MAX_MEMORY_ITEMS:
+        raise ValueError(f'{len(items)} memories exceeds limit {_MAX_MEMORY_ITEMS}')
+    prepared = []
+    seen = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f'item {index} is not an object')
+        name = str(item.get('name') or '').strip()
+        mem_type = str(item.get('type') or '').strip()
+        if not mem_type:
+            mem_type = 'user'   # 缺省按提取路径的约定；显式错误类型仍整批拒绝
+        description = ' '.join(str(item.get('description') or '').split())
+        body = str(item.get('body') or '').strip()
+        if not name or not description or not body:
+            raise ValueError(f'item {index} is missing name/description/body')
+        if mem_type not in h.MEMORY_TYPES:
+            raise ValueError(f'item {index} has invalid type {mem_type!r}')
+        slug = _slug(name)
+        if slug in seen:
+            raise ValueError(f'duplicate memory name {name!r}')
+        seen.add(slug)
+        prepared.append({'slug': slug, 'name': name, 'type': mem_type,
+                         'description': description, 'body': body})
+    return prepared
+
+
+def _replace_memory_files(prepared: list[dict]) -> None:
+    """用校验过的集合替换旧记忆：先落新文件，全部成功后才删旧文件。
+
+    崩溃/写入失败发生在删除之前时，磁盘上只会多出文件（重复），不会缺文件；
+    遗留的重复项下次合并仍会收敛。索引在最后重建，最后一步也是原子替换。
+    """
+    h = _h()
+    with _write_guard():
+        memory_dir = h.MEMORY_DIR
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        staging = memory_dir / f'.staging-{uuid.uuid4().hex}'
+        staging.mkdir()
+        try:
+            staged = {}
+            for item in prepared:
+                path = staging / f"{item['slug']}.md"
+                _atomic_write(path, _render_memory(
+                    item['name'], item['type'], item['description'], item['body']))
+                meta, _body = _parse_frontmatter(path.read_text(encoding='utf-8'))
+                if (str(meta.get('name')) != item['name']
+                        or str(meta.get('type')) != item['type']):
+                    raise ValueError(f"staged file failed verification: {path.name}")
+                staged[path.name] = path
+            for filename, path in staged.items():
+                path.replace(memory_dir / filename)
+            for old in memory_dir.glob('*.md'):
+                if old.name == 'MEMORY.md' or old.name in staged:
+                    continue
+                old.unlink(missing_ok=True)
+            _cache_clear()   # 文件集合已变：旧缓存可能对应已删除/旧版文件
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        _rebuild_index_unlocked()
 
 
 def consolidate_memories():
@@ -372,21 +573,12 @@ def consolidate_memories():
             # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
             print("[Memory: consolidate returned empty - aborting (would delete all memories)]")
             return
-
-        # Remove old memory files (keep MEMORY.md)
-        for f in h.MEMORY_DIR.glob("*.md"):
-            if f.name != "MEMORY.md":
-                f.unlink()
-
-        for mem in items:
-            name = mem.get("name", f"memory_{int(time.time())}")
-            mem_type = mem.get("type", "user")
-            desc = mem.get("description", "")
-            body = mem.get("body", "")
-            if desc and body:
-                write_memory_file(name, mem_type, desc, body)  # 边写边更新索引
-
-        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+        prepared = _validate_consolidated(items)
+        _replace_memory_files(prepared)
+        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(prepared)} memories]\033[0m")
+    except ValueError as exc:
+        # 整批校验失败：此时还没动过任何旧文件
+        print(f"[Memory: consolidate aborted - {exc}; existing memories kept]")
     except Exception as e:
         print(f"[Memory: consolidate error: {e}]")
 

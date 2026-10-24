@@ -67,13 +67,22 @@ def test_workspace_is_restored_after_failed_turn(tmp_path):
         assert current_workspace(None) == tmp_path.parent
 
 
-def test_concurrent_real_turns_use_their_own_tools_prompt_and_checkpoints(tmp_path, monkeypatch):
+def test_single_turn_gate_keeps_each_session_prompt_and_checkpoints(tmp_path, monkeypatch):
+    """阶段 0 的全局单回合：并发发送被拒绝，串行回合仍各自使用自己的 workspace。
+
+    旧用例同时跑两个真实回合来验证 workspace 隔离；全局单回合协调落地后这条路被
+    有意关闭，这里改为「A 在模型调用中时 B 被 409 拒绝，随后 B 串行执行」，保留
+    原用例对 prompt/工具/checkpoint 归属的断言。
+    """
+    import turn_coordinator
+
     harness, root = _loop_env(tmp_path, monkeypatch)
     roots = {name: root / name for name in ('a', 'b')}
     for directory in roots.values():
         directory.mkdir()
         (directory / 'shared.txt').write_text('original', encoding='utf-8')
-    barrier = threading.Barrier(2)
+    entered = threading.Event()
+    release = threading.Event()
     command = 'cd' if sys.platform == 'win32' else 'pwd'
 
     def create(**kwargs):
@@ -86,7 +95,8 @@ def test_concurrent_real_turns_use_their_own_tools_prompt_and_checkpoints(tmp_pa
             assert 'shared.txt' in results['glob']
             assert results['bash'] == str(roots[name])
             return make_text_response('done')
-        barrier.wait(5)
+        entered.set()
+        assert release.wait(10), 'test did not release the first turn'
         return make_tool_response([
             ('write', 'write', json.dumps({'path': 'shared.txt', 'content': name})),
             ('read', 'read', '{"path":"shared.txt"}'),
@@ -98,22 +108,22 @@ def test_concurrent_real_turns_use_their_own_tools_prompt_and_checkpoints(tmp_pa
     runtime = harness.create_runtime(initialize_tools=False)
     for name, directory in roots.items():
         runtime.create_session(name, workspace=str(directory))
-    failures = []
 
-    def turn(name):
-        try:
-            assert runtime.send(name, name).content == 'done'
-        except BaseException as exc:
-            failures.append(exc)
-
-    threads = [threading.Thread(target=turn, args=(name,)) for name in roots]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
+    first = []
+    thread = threading.Thread(target=lambda: first.append(runtime.send('a', 'a')))
+    thread.start()
+    try:
+        assert entered.wait(5), 'first turn did not reach the model call'
+        with pytest.raises(turn_coordinator.TurnBusy):
+            runtime.send('b', 'b')
+    finally:
+        release.set()
         thread.join(10)
+    assert not thread.is_alive()
+    assert first and first[0].content == 'done'
+
+    assert runtime.send('b', 'b').content == 'done'
     harness.wait_for_housekeeping()
-    assert not any(thread.is_alive() for thread in threads)
-    assert not failures
     assert harness.WORKDIR == root and harness.get_workdir() == root
     for name, directory in roots.items():
         assert (directory / 'shared.txt').read_text(encoding='utf-8') == name

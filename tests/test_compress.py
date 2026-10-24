@@ -274,6 +274,37 @@ def test_estimate_size_units():
     assert abs(cjk_est - 1000) < 30            # 1300/1.3 = 1000（旧算法 ≈1690）
 
 
+def test_estimate_size_matches_reference_counting():
+    """encode('ascii','ignore') 计数必须与逐字符 ord() 完全一致（含图片引用）。"""
+    import re
+
+    from tokens import _env_image_token_estimate, image_token_cost
+
+    def reference(msgs):
+        raw = str(msgs)
+        text = re.sub(r'data:[^;\s]+;base64,[A-Za-z0-9+/=]+', '[image]', raw)
+        ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+        cjk = len(text) - ascii_chars
+        image_tokens, seen = image_token_cost(msgs)
+        raw_images = raw.count("'harness_image'") + raw.count("'image_url'")
+        image_tokens += max(0, raw_images - seen) * _env_image_token_estimate()
+        return max(1, int(ascii_chars / 3.5 + cjk / 1.3) + image_tokens)
+
+    cases = [
+        [{'role': 'user', 'content': 'a' * 3500}],
+        [{'role': 'user', 'content': ['中文段落', {'type': 'text', 'text': 'mixed 中英 🎉'}]}],
+        [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {
+            'url': 'data:image/png;base64,' + 'A' * 4000}}]}],
+        [{'role': 'user', 'content': [{'type': 'harness_image', 'path': 'x.png',
+                                        'tokens': 321}]}],
+        [{'role': 'assistant', 'content': None,
+          'tool_calls': [{'id': 'c1', 'type': 'function',
+                          'function': {'name': 'bash', 'arguments': '{"command": "ls"}'}}]}],
+    ]
+    for messages in cases:
+        assert harness.estimate_size(messages) == reference(messages), messages
+
+
 def test_snip_threshold_scales_with_window(monkeypatch):
     """消息数安全阀随窗口缩放：默认窗口阈值 50，1M 窗口 262——
     大窗口下 snip 不应再中途触发（滑动窗口是前缀缓存杀手）。"""

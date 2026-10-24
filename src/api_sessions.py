@@ -135,8 +135,12 @@ def build_router(client, runtime):
 
     @router.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):
+        from turn_coordinator import TurnBusy
+
         try:
             response = client.messages.create(session_id, request.content)
+        except TurnBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

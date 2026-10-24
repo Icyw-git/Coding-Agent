@@ -8,10 +8,22 @@ import hashlib
 import os
 
 ENV = 'HARNESS_DEBUG_CACHE'
+SAMPLE_ENV = 'HARNESS_DEBUG_CACHE_SAMPLE'
 
 
 def enabled() -> bool:
     return (os.getenv(ENV) or '').strip().casefold() in ('1', 'true', 'yes', 'on')
+
+
+def sample_every() -> int:
+    """HARNESS_DEBUG_CACHE_SAMPLE=N：每 N 个请求采样一次；默认 1（全采样）。"""
+    raw = (os.getenv(SAMPLE_ENV) or '').strip()
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
 
 
 def message_fingerprint(message: dict) -> str:

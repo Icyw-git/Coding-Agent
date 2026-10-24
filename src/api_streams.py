@@ -87,6 +87,8 @@ def build_router(client, runtime, logger):
     @router.post("/v1/sessions/{session_id}/messages/stream")
     def stream_message(session_id: str, request: SendMessageRequest):
         """Run one turn and emit text deltas as SSE frames."""
+        from turn_coordinator import TurnBusy
+
         deltas: queue.Queue = queue.Queue()
         finished = object()
 
@@ -106,6 +108,10 @@ def build_router(client, runtime, logger):
                                      "content": response.content,
                                      "duration_ms": duration_ms,
                                      "duration": format_duration(duration_ms / 1000)}))
+            except TurnBusy as exc:
+                deltas.put(("error", {'detail': str(exc), 'code': 'turn_busy',
+                                       'duration_ms': round((time.monotonic() - started) * 1000),
+                                       'duration': format_duration(time.monotonic() - started)}))
             except Exception as exc:
                 logger.exception('streamed agent turn failed session=%s', session_id)
                 deltas.put(("error", {'detail': str(exc),

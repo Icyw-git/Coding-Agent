@@ -227,8 +227,14 @@ def estimate_size(msgs):
     # token 启发式：英文约 3.5 字符/token，中文约 1.3 字符/token（与 CONTEXT_LIMIT 同单位）
     raw = str(msgs)
     # 历史里正常只有引用；万一是旧消息里的 data URI，也不能按字符数把上下文算爆。
-    text = re.sub(r'data:[^;\s]+;base64,[A-Za-z0-9+/=]+', '[image]', raw)
-    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    # 仅在可能出现 data URI 时才跑正则：长会话里 str(msgs) 再加一次全串替换是纯开销。
+    if 'data:' in raw:
+        text = re.sub(r'data:[^;\s]+;base64,[A-Za-z0-9+/=]+', '[image]', raw)
+    else:
+        text = raw
+    # 逐个 ord() 在纯 Python 里是长会话的主要成本；encode('ascii','ignore')
+    # 用 C 层过滤出 ASCII 字符，计数结果与 `sum(1 for ch if ord(ch) < 128)` 一致。
+    ascii_chars = len(text.encode('ascii', 'ignore'))
     cjk = len(text) - ascii_chars
     image_tokens, seen = image_token_cost(msgs)
     # 旧历史里若有字符串形态的图片引用，遍历不到：按 part 出现次数补齐。

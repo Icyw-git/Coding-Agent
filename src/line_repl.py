@@ -166,6 +166,8 @@ def _fork(argument: str, session_store):
 def _run_turn(line: str, messages: list, session_store) -> None:
     """把一条用户输入交给 agent_loop，并把流式文本直接写到终端。"""
     h = _h()
+    from turn_coordinator import TurnBusy, turn_slot
+
     h.ui_emit('user_message', text=line)
     h.turn_control.begin_turn()
     ticker = None
@@ -190,7 +192,11 @@ def _run_turn(line: str, messages: list, session_store) -> None:
 
     try:
         # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
-        h.agent_loop(messages, session_store=session_store, on_delta=on_delta)
+        with turn_slot(Path(h.SESSIONS_DIR).parent):
+            h.agent_loop(messages, session_store=session_store, on_delta=on_delta)
+    except TurnBusy:
+        h.ui_emit('error', msg='另一个入口正在执行回合，本条未发送')
+        print('\n[busy] 另一个入口正在执行回合，本条未发送。')
     except KeyboardInterrupt:
         h.ui_emit('activity', state='cancelled', detail='Request cancelled')
         print('\n[会话已中断]')

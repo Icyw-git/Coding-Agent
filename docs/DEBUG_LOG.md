@@ -3953,3 +3953,84 @@ HarnessApp 定向 71 passed；全量 **1462 passed / 1 skipped**，Ruff、`py_co
 描述成会话级持久化设置。自动化回归覆盖 legacy 环境变量、多 provider 配置、搜索、当前项、
 参数补全及 context 占用更新；真实终端操作仍待验收。最终全量 **1465 passed / 1 skipped**，
 Ruff、`py_compile` 与 `git diff --check` 均通过；5 条飞书 SDK 弃用警告。
+
+## 记忆合并的数据安全与回合固定开销
+
+做 Personal Agent 前置 profile 时定位到两类问题：记忆合并会先删后写，失败就丢记忆；
+每回合的记忆召回与 token 估算在长会话上占 50–130 ms。
+
+**合并改成「校验 → 暂存 → 先落新文件、再删旧文件」**（`memory.py`）。旧实现先
+`unlink` 全部记忆再逐条写入，模型给出非空但字段不全的 JSON、或磁盘写到一半失败，
+都会把旧记忆删空。现在先做纯数据校验（name/description/body 非空、type 在
+`MEMORY_TYPES` 内、条数 ≤50、slug 不重复），任何一条不合格整批放弃；通过后写入
+`MEMORY_DIR/.staging-<uuid>/` 并回读校验 frontmatter，再逐个 `Path.replace` 落盘，
+最后才删除不在新集合里的旧文件。崩溃或写入失败发生在删除之前时，磁盘只会多出文件，
+不会缺文件，下次合并仍能收敛。索引重建在最后一步，同样是临时文件 + 原子替换。
+
+写入统一走 `_write_guard`：进程内 `RLock`（带重入深度，避免 flock 自锁）加
+`exclusive_file_lock(.memory-write.lock)`，因此 daemon 与 TUI 并发写记忆不会互相覆盖
+索引。文件名用 `[^a-z0-9._-] → '-'` 收敛，`../evil`、`..\evil`、`/etc/passwd` 都落在
+`MEMORY_DIR` 内；`read_memory_file` 也加了目录边界检查（读路径原本可被文件名穿越）。
+frontmatter 渲染把 name/description 压成单行，避免多行描述把正文吞掉。
+
+**`estimate_size` 改用 C 层计数**（`tokens.py`）。原来 `sum(1 for ch in text if ord(ch) < 128)`
+对每个字符跑一次 Python 循环；改成 `len(text.encode('ascii','ignore'))`，并在没有
+`data:` 时跳过一次全串正则替换。实测 239 条会话 14.8→2.2 ms、783 条 55.5→7.5 ms；
+对 51 个真实会话以及 data URI、harness_image、emoji、CJK 混合用例逐值相等，单位换算
+与图片成本逻辑未变。
+
+**记忆解析缓存**（`memory.py`）。`list_memory_files`/索引重建每次都重读并 YAML 解析
+全部记忆文件，21 个文件约 19 ms/轮。现在按 `(path, size, mtime_ns)` 缓存
+`(meta, body, raw)`，写入路径主动失效，外部修改靠 stat 兜底，上限 256 条。召回从
+18–24 ms 降到 2–6 ms。缓存顺带让 `read_memory_file` 复用已读文本。
+
+**缓存诊断采样**（`prompt_cache_debug.py` + `harness.py`）。
+`HARNESS_DEBUG_CACHE=1` 时每次请求都要给 system + 全历史算指纹（239 条约 2.3 ms）。
+新增 `HARNESS_DEBUG_CACHE_SAMPLE=N`：首个请求必采样建立基准，之后每 N 个采样一次，
+跳过的请求不计算指纹；未采样返回 `None`，调用方按“无诊断数据”处理。
+
+结果：本地稳态固定开销从 43–130 ms 降到 **7–24 ms/回合**（不含历史重建与模型调用）。
+新增 `tests/test_memory_safety.py` 覆盖合并失败保留旧数据、暂存失败清理、文件名越界、
+多行描述、并发写索引一致、缓存失效与外部修改；压缩测试新增逐值等价断言。
+全量 **1477 passed / 1 skipped**，Ruff、`py_compile`、`git diff --check` 通过。
+TUI 初始窗口默认值未改：实测 200→更小只能省 0.1–0.2 s，但会改变上滚体验，等真实终端验收后再定。
+
+## Personal Agent 阶段 0：常驻服务与全局单回合
+
+开始 Personal Agent 的第一批地基：让 cron 能随 API server 常驻并可停止，同时让
+TUI / API / CLI / cron 不再静默并发写同一份缓存与工作区。
+
+**为什么是全局单回合，而不是按会话加锁**：`turn_control` 的取消位、`METRICS`、
+`permission_gate.use_ui` 都是进程级状态，两个会话并行时互相污染；不同会话还可能同时
+改同一个 workspace。阶段 0 先保守串行，把并行留给“回合状态完全隔离 + 工作区级锁”的
+下一阶段，而不是先造一套多端仲裁。
+
+**协调器**（`src/turn_coordinator.py`）：进程内 `RLock` + 跨进程
+`exclusive_file_lock(.cache/locks/agent-turn.lock)`。同一线程重入只加嵌套计数（TUI 在
+worker 外层持槽），其他线程或进程立即抛 `TurnBusy`，不排队等一个可能几分钟的模型调用。
+锁由 OS 持有，进程崩溃自动释放；锁文件残留不代表仍被占用，因此不做 PID 推断。
+TUI 在空闲提交时先拿槽再画用户块，失败就把原文退回 Composer 并提示——避免“看起来
+已发送、实际没进会话”。`_send_user` 的忙时排队路径不改：槽已由当前 worker 持有。
+
+**cron 不丢任务**：`run_agent_turn_locked` 改成先拿槽、再 `consume_cron_queue()`；
+槽被占用时直接返回，队列原样保留。旧顺序会先清队列再执行，一旦执行被拒绝就永久丢任务。
+
+**API 契约**：普通消息在竞争时返回 `409`（`TurnBusy` 不会被吞成 500）；流式端点发
+`event: error` 并带 `code: turn_busy`，客户端能区分“代理忙”与“回合失败”。
+
+**scheduler 生命周期**（`src/scheduler_service.py`）：两个循环接受 `stop_event`，
+`event.wait(interval)` 取代 `time.sleep`，置位后立即返回。服务 `start()` 幂等、只在首次
+加载 durable jobs；`stop()` 置位并逐个 join，超时会记录 warning。API lifespan 只在
+`owns_runtime` 时启动（`HARNESS_SCHEDULER=0` 可关），关闭时先停 scheduler 再关 MCP，
+避免 cron 回合撞上已关闭的工具。注入 runtime 的 app 由调用方负责生命周期。
+CLI 入口保留原来的 daemon 线程启动：进程退出即回收，而且入口测试 patch 的是
+`harness.cron_scheduler_loop` 这类属性，改成服务反而绕过 patch 点。
+
+**测试取舍**：原用例 `test_concurrent_real_turns_use_their_own_tools_prompt_and_checkpoints`
+靠两个真实回合同时跑验证 workspace 隔离，与全局单回合直接冲突。改为“A 在模型调用中挂起时
+B 被 `TurnBusy` 拒绝，随后 B 串行执行”，继续断言各自 prompt、工具输出与 checkpoint 归属；
+并发语义的回归放在 `tests/test_turn_coordinator.py`。
+
+结果：全量 **1492 passed / 1 skipped**；Ruff、`py_compile`、`git diff --check` 通过。
+仍欠：会话元数据（rename/workspace/fork/archive/delete）的跨进程互斥、TUI 退出时等待
+活动回合与 housekeeping、真实终端/daemon 验收。

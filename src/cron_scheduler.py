@@ -174,9 +174,9 @@ def cancel_job(job_id:str)->str: #取消一个cron任务
     print(f"  \033[31m[cron cancel] {job_id}\033[0m")
     return f'Cancelled {job_id}'
 
-def cron_scheduler_loop(): #cron任务调度循环，每秒检查一次是否有任务到点
-    while True:
-        time.sleep(1) # 每秒检查一次是否有任务到点
+def cron_scheduler_loop(stop_event=None): #cron任务调度循环，每秒检查一次是否有任务到点
+    stop_event = stop_event or threading.Event()
+    while not stop_event.wait(1.0): # 每秒检查一次；停止信号可立即打断等待
         now=datetime.now()
         minute_marker=now.strftime("%Y-%m-%d %H:%M")
         with cron_lock: #确保遍历scheduled_jobs时线程安全，避免并发修改
@@ -208,15 +208,16 @@ def _has_cron_queue()->bool: #检查cron队列是否为空
     with cron_lock:
         return bool(cron_queue)
 
-def queue_processor_loop(run_turn, poll_interval: float = 0.2) -> None:
+def queue_processor_loop(run_turn, poll_interval: float = 0.2, stop_event=None) -> None:
     """后台推送循环：cron 到点且有工作、且 agent 空闲（拿到 agent_lock）时，调用 run_turn 执行一轮。
 
     - run_turn：持锁状态下被调用，应消费 cron 队列并执行一轮对话（如 agent_loop）；
     - 非阻塞抢锁：agent 正在忙（主会话或上一轮 cron 任务）时跳过，绝不排队；
     - 双重检查：拿到锁后队列可能已被取走，避免跑空轮。
+    - stop_event：置位后循环在当前 poll 结束前退出（lifespan 关闭时需要）。
     """
-    while True:
-        time.sleep(poll_interval) # 每 poll_interval 秒检查一次是否有任务到点
+    stop_event = stop_event or threading.Event()
+    while not stop_event.wait(poll_interval): # 每 poll_interval 秒检查一次是否有任务到点
         if not _has_cron_queue(): # 如果队列为空
             continue
         if not agent_lock.acquire(blocking=False):   # 尝试拿锁：agent 忙则跳过这轮，例如主会话中任务正在执行

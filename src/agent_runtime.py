@@ -14,6 +14,7 @@ from typing import Callable, Type
 
 import workspaces
 from agent_core import image_attachment_message
+from turn_coordinator import turn_slot
 from workspace_choices import RECENT_LIMIT, workspace_choices
 from workspace_context import resolve_workspace, use_workspace
 
@@ -203,24 +204,27 @@ class AgentRuntime:
             store = self._open_session(session_id)
             workspace = self._workspace_for(store)
             store.record_workspace(workspace)
-            messages = store.rebuild_openai_history(recover_pending=True)
-            message = {'role': 'user', 'content': content}
-            messages.append(message)
-            store.append_message(message)
-            if attachments:
-                attachment = image_attachment_message(attachments)
-                messages.append(attachment)
-                store.append_message(attachment)
-            turn_kwargs = {}
-            if on_delta is not None:
-                turn_kwargs['on_delta'] = on_delta
-            if on_event is not None:
-                turn_kwargs['on_event'] = on_event
-            if not housekeeping:
-                turn_kwargs['housekeeping'] = False
-            with use_workspace(workspace):
-                result = self._run_turn(messages, session_store=store, **turn_kwargs)
-            return AgentResult(session_id=store.session_id, content=result)
+            # 全局单回合：与 TUI / cron / 其他进程互斥。竞争立即失败，且不写入任何
+            # 会话事件——不能让被拒绝的消息看起来像已发送。
+            with turn_slot(self._sessions_dir.parent):
+                messages = store.rebuild_openai_history(recover_pending=True)
+                message = {'role': 'user', 'content': content}
+                messages.append(message)
+                store.append_message(message)
+                if attachments:
+                    attachment = image_attachment_message(attachments)
+                    messages.append(attachment)
+                    store.append_message(attachment)
+                turn_kwargs = {}
+                if on_delta is not None:
+                    turn_kwargs['on_delta'] = on_delta
+                if on_event is not None:
+                    turn_kwargs['on_event'] = on_event
+                if not housekeeping:
+                    turn_kwargs['housekeeping'] = False
+                with use_workspace(workspace):
+                    result = self._run_turn(messages, session_store=store, **turn_kwargs)
+                return AgentResult(session_id=store.session_id, content=result)
 
     def history(self, session_id: str) -> list[dict]:
         """返回持久化会话可回放的 OpenAI 历史。"""

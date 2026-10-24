@@ -20,8 +20,15 @@ from agent_runtime import AgentRuntime
 from harness_sdk import HarnessClient
 from hooks import GATE as permission_gate
 from hooks import enforce_headless
+from scheduler_service import SchedulerService
 from task_manager import TaskManager
 from workspace_context import workspace_roots
+
+
+def _scheduler_enabled() -> bool:
+    """HARNESS_SCHEDULER=0 关闭；默认在拥有 runtime 的 server 进程里启动。"""
+    raw = (os.getenv('HARNESS_SCHEDULER') or '').strip().casefold()
+    return raw not in ('0', 'false', 'no', 'off')
 
 
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
@@ -70,6 +77,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     )
     @asynccontextmanager
     async def lifespan(app):
+        scheduler = None
         if owns_runtime:
             import harness
         handler = None
@@ -84,8 +92,15 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 await asyncio.to_thread(harness.initialize_mcp_tools)
                 # 后台预热 LLM 客户端（openai SDK import ~1.5s），首个请求不再等待
                 threading.Thread(target=harness.client.warmup, daemon=True).start()
+                if _scheduler_enabled():
+                    # 常驻模式：cron 到点可以自主跑回合；关闭时 stop() 会 join。
+                    scheduler = SchedulerService(harness.run_agent_turn_locked)
+                    scheduler.start()
             yield
         finally:
+            if scheduler is not None:
+                if not scheduler.stop():
+                    logger.warning('cron scheduler threads did not stop in time')
             try:
                 try:
                     await asyncio.to_thread(tasks.close)
