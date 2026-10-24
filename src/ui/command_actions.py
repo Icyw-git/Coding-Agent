@@ -8,11 +8,35 @@ from __future__ import annotations
 import asyncio
 
 from ui import commands
+from ui.modals.command_palette import CommandPaletteModal
 from ui.modals.models import ModelPickerModal
 
 
 class CommandActionsMixin:
     """HarnessApp 的 `/` 命令分发与模型切换。"""
+
+    def action_open_command_palette(self) -> None:
+        self.open_command_palette()
+
+    def open_command_palette(self) -> None:
+        self.close_suggestions()
+        specs = [spec for spec in commands.all_commands() if spec.ported]
+        self.push_screen(CommandPaletteModal(specs),
+                         self._command_palette_selected)
+
+    def _command_palette_selected(
+            self, spec: commands.CommandSpec | None) -> None:
+        if spec is None:
+            return
+        if spec.argument_hint:
+            value = f'/{spec.name} '
+            self.close_suggestions()
+            self._programmatic_text = value
+            self._composer.text = value
+            self._composer.cursor_location = (0, len(value))
+            self._composer.focus()
+        else:
+            self.submit_text(f'/{spec.name}')
 
     def _handle_command(self, text: str) -> bool:
         """返回 True 表示已作为命令处理，不再发给模型。"""

@@ -440,6 +440,8 @@ HOTKEYS = (
     ('Ctrl+Shift+C', '/copy', '复制选中文本（/copy 复制最近工具输出）'),
     ('Alt+↑ / Ctrl+G', '/dequeue', '打开队列选择器：↑↓ 选择、Enter 取回、Delete 删除、Ctrl+R 取回全部'),
     ('Ctrl+O', '展开最近工具块'),
+    ('Ctrl+F', '搜索当前对话；Enter / Shift+Enter 定位下一条 / 上一条命中'),
+    ('Ctrl+Shift+P', '打开命令面板；选择命令运行或回填参数'),
     ('Ctrl+Q', '/quit', '退出'),
 )
 

@@ -750,6 +750,67 @@ def test_unknown_command_suggests_and_hotkeys(monkeypatch):
             await pilot.pause()
             hotkeys = app.model.snapshot()[-1].payload['text']
             assert 'Ctrl+O' in hotkeys and 'Esc' in hotkeys
+            assert 'Ctrl+F' in hotkeys and 'Shift+Enter' in hotkeys
+            assert 'Ctrl+Shift+P' in hotkeys
+
+    asyncio.run(scenario())
+
+
+def test_command_palette_filters_dispatches_and_prefills_arguments():
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press('ctrl+shift+p')
+            await pilot.pause()
+            modal = app.screen
+            assert type(modal).__name__ == 'CommandPaletteModal'
+            box = modal.query_one('#command-palette-box')
+            assert box.region.x >= 0 and box.region.right <= app.size.width
+            assert box.region.y >= 0 and box.region.bottom <= app.size.height
+            options = modal.query_one('#command-palette-list')
+            assert options.get_option_at_index(0).id == 'group:commands'
+            assert options.get_option_at_index(0).disabled
+
+            search = modal.query_one('#command-palette-search')
+            search.value = 'mdl'
+            await pilot.pause()
+            assert options.option_count == 2
+            assert options.get_option_at_index(1).id == 'model'
+
+            search.value = 'find'
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app.screen is app.screen_stack[0]
+            assert app._composer.text == '/find '
+            assert app._composer.cursor_location == (0, len('/find '))
+
+            await pilot.press('ctrl+shift+p')
+            await pilot.pause()
+            modal = app.screen
+            search = modal.query_one('#command-palette-search')
+            search.value = 'status'
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app.screen is app.screen_stack[0]
+            assert app.model.snapshot()[-1].kind == 'notice'
+            assert 'workspace:' in app.model.snapshot()[-1].payload['text']
+
+            await pilot.press('ctrl+shift+p')
+            await pilot.pause()
+            modal = app.screen
+            search = modal.query_one('#command-palette-search')
+            options = modal.query_one('#command-palette-list')
+            search.value = 'zzzz-no-command'
+            await pilot.pause()
+            assert options.option_count == 0
+            assert 'No matching commands' in str(
+                modal.query_one('#command-palette-empty').render())
+
+            await pilot.press('escape')
+            await pilot.pause()
+            assert app.screen is app.screen_stack[0]
 
     asyncio.run(scenario())
 
@@ -2061,6 +2122,78 @@ def test_history_starts_with_recent_window_and_loads_older_page():
             second_start = max(0, first_start - page)
             assert app._history_start == second_start
             assert app.model.snapshot()[0].payload['text'] == f'history-{second_start}'
+
+    asyncio.run(scenario())
+
+
+def test_transcript_search_navigates_full_history_and_highlights():
+    messages = []
+    for index in range(450):
+        role = 'user' if index % 2 == 0 else 'assistant'
+        text = f'history-{index}'
+        if index in (2, 410):
+            text = f'Needle result-{index}'
+        messages.append({'role': role, 'content': text})
+
+    async def scenario():
+        app = HarnessApp(messages)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.model.append('assistant', {'text': 'Live needle result'},
+                             block_id='live-response')
+            app._mark_dirty()
+            app._flush_layout(force=True)
+            await pilot.press('ctrl+f')
+            await pilot.pause()
+            modal = app._transcript_search_modal
+            editor = modal.query_one('#transcript-search-input')
+            editor.value = 'needle'
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                if len(app._transcript_search_hits) == 3:
+                    break
+
+            modal = app._transcript_search_modal
+            assert modal is not None
+            assert app._history_start == 0
+            assert app._transcript_search_hits[0].block_id == 'history:2'
+            assert app.view._search_active_block == 'history:2'
+            status = modal.query_one('#transcript-search-status').render()
+            assert '1 / 3 messages' in str(status)
+            row = app.doc_layout.block_start('history:2')
+            rendered = app.view._strip_for(row, app.view.size.width)
+            assert any('needle' in segment.text.casefold()
+                       and segment.style is not None
+                       and segment.style.bgcolor is not None
+                       for segment in rendered._segments)
+
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._transcript_search_index == 1
+            assert app.view._search_active_block == 'history:410'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._transcript_search_index == 2
+            assert app.view._search_active_block == 'live-response'
+            await pilot.press('enter')
+            await pilot.pause()
+            assert app._transcript_search_index == 0
+            await pilot.press('shift+enter')
+            await pilot.pause()
+            assert app._transcript_search_index == 2
+
+            editor.value = 'not-present'
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                status = modal.query_one('#transcript-search-status').render()
+                if 'No matching messages' in str(status):
+                    break
+            assert not app._transcript_search_hits
+            assert 'No matching messages' in str(status)
+            await pilot.press('escape')
+            await pilot.pause()
+            assert app.view._search_query == ''
 
     asyncio.run(scenario())
 

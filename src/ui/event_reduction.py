@@ -160,7 +160,8 @@ class EventReductionMixin:
             self._status['phase'] = payload.get('state')
             self._refresh_footer()
 
-    def _append_history_message(self, message: dict, *, prepend: bool = False) -> None:
+    def _append_history_message(self, message: dict, *, prepend: bool = False,
+                                history_index: int | None = None) -> None:
         role = message.get('role')
         content = message.get('content')
         if role == 'user':
@@ -173,10 +174,11 @@ class EventReductionMixin:
                 'output': str(content or ''), 'expanded': False}
         else:
             return
+        block_id = f'history:{history_index}' if history_index is not None else None
         if prepend:
-            self.model.prepend(kind, payload)
+            self.model.prepend(kind, payload, block_id=block_id)
         else:
-            self.model.append(kind, payload)
+            self.model.append(kind, payload, block_id=block_id)
 
     def _load_history(self, messages: list) -> None:
         self._stream_render_cache = None
@@ -186,8 +188,8 @@ class EventReductionMixin:
         self._history_auto_armed = False
         self._history_last_offset = 0
         self.model.clear()
-        for message in messages[self._history_start:]:
-            self._append_history_message(message)
+        for index in range(self._history_start, len(messages)):
+            self._append_history_message(messages[index], history_index=index)
         self._mark_dirty()
 
     def load_older_history(self) -> int:
@@ -197,11 +199,13 @@ class EventReductionMixin:
         self._history_loading = True
         try:
             start = max(0, self._history_start - HISTORY_PAGE_MESSAGES)
-            older = self._history_messages[start:self._history_start]
+            added_messages = self._history_start - start
             before = self.view.content_line_count
             offset = int(self.view.scroll_offset.y)
-            for message in reversed(older):
-                self._append_history_message(message, prepend=True)
+            for index in range(self._history_start - 1, start - 1, -1):
+                self._append_history_message(
+                    self._history_messages[index], prepend=True,
+                    history_index=index)
             self._history_start = start
             self._mark_dirty()
             self._flush_layout(force=True)
@@ -209,7 +213,7 @@ class EventReductionMixin:
             if added:
                 self.view.scroll_to(y=offset + added, animate=False)
             self.view.refresh()
-            return len(older)
+            return added_messages
         finally:
             self._history_loading = False
 

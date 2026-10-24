@@ -62,6 +62,14 @@
   校验候选后复用共享确认/清理流程，当前会话不可归档，永久删除仍要求输入“删除”。
   临时存储端到端测试覆盖取消/确认及归档、恢复/删除流程；全量 **1461 passed / 1 skipped**，
   Ruff、`py_compile` 与 diff 检查通过。
+- P5q：`Ctrl+F` 打开当前对话搜索，异步扫描完整会话历史和当前 transcript；`Enter` /
+  `Shift+Enter` 循环定位命中并高亮，命中较早历史时按页加载。历史块使用稳定索引 ID；
+  修复布局将前缀插入误判为尾部追加的问题。Textual 回归覆盖旧页定位、导航、高亮、无结果
+  与关闭清理；全量 **1462 passed / 1 skipped**，Ruff、`py_compile` 与 diff 检查通过。
+- P5r：`Ctrl+Shift+P` 打开命令面板，复用注册表和 fuzzy 匹配，按命令/技能分组。无参数
+  命令交给现有分发；有参数提示的命令只回填 Composer，不提前执行。Textual 验证覆盖 fuzzy
+  搜索、原分发、参数回填、无结果、取消及 80×24 布局；全量 **1463 passed / 1 skipped**，
+  Ruff、`py_compile` 与 diff 检查通过。真实终端验收仍待执行。
 - P6：`HARNESS_UI=textual` 路由到 `src/ui/harness_app.py`；旧实现保留为
   `textual-legacy`，`textual-next` 作为兼容别名。
 - P6a：迁移 `/checkpoint` `/rewind` `/undo`：回滚前显示 `plan_restore` 预览，
@@ -286,7 +294,10 @@ src/ui/
   加载；操作重新扫描所选条目并复用共享确认流程。当前会话不能归档，永久删除仍须输入
   “删除”；不开放直接删除活动会话。
 - 审批：命令或 diff 预览 + `y`（一次）/`a`（本会话同类）/`n`；展示风险等级。
-- 命令面板：复用现有 `COMMANDS`，fuzzy 评分（移植 Pi `fuzzy`），分组显示。
+- 当前对话搜索：`Ctrl+F` 输入关键词，`Enter` / `Shift+Enter` 循环定位，高亮当前命中；
+  搜索包含完整历史并按需补载较早页面。
+- 命令面板：`Ctrl+Shift+P` 打开；复用 `COMMANDS`、技能命令注册与 `fuzzy_filter`，按命令/
+  技能分组。无参数命令走现有分发；有参数提示的命令回填到 Composer，后续补全仍复用现有路径。
 - 模型选择器：列出 `MODEL_WINDOWS` 与价格，切换后写回会话状态。
 
 ## 5. 分阶段实施

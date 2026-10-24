@@ -3917,3 +3917,24 @@ failed、UI gate 与 busy 状态恢复；忙时再次提交 shell 命令不会�
 临时存储端到端测试覆盖重命名、拒绝归档当前会话、取消/确认归档、恢复，以及错误删除
 短语无副作用和正确短语删除。定向 UI/会话清理回归 101 passed；全量 1461 passed /
 1 skipped，Ruff、py_compile 与 diff 检查通过。真实终端验收仍按既定要求待执行。
+
+## 当前对话搜索
+
+新增 `Ctrl+F` 搜索浮层，输入时经短暂防抖在后台扫描当前会话完整历史与已生成的 transcript
+块。`Enter` / `Shift+Enter` 循环定位到下一/上一条命中；命中块高亮，摘要和命中计数显示在
+浮层中。跳转到尚未载入的历史消息时沿用分页加载，不要求启动时渲染完整历史。
+
+历史消息块使用 `history:<index>` 稳定 ID，以便跨页定位。该路径同时暴露布局的前缀插入缺陷：
+布局曾把 `prepend` 误当作尾部追加，导致块索引重复；现在根据首块 ID 识别分页前插并重建布局。
+Textual 回归覆盖全历史及新增 transcript 块搜索、旧页加载、前后循环、高亮、无结果和关闭后清理。
+HarnessApp 定向 71 passed；全量 **1462 passed / 1 skipped**，Ruff、`py_compile` 与 diff 检查通过，
+另有 5 条飞书 SDK 弃用警告。真实终端验收仍未执行。
+
+## 命令面板
+
+`Ctrl+Shift+P` 打开命令面板；数据直接来自共享命令注册表（包含动态技能命令），使用现有
+`fuzzy_filter` 按名称和描述匹配，并按命令/技能分组。选择无参数提示的命令交给既有
+`submit_text` / `_handle_command` 路由；带参数提示时只填入 `/{name} ` 并聚焦 Composer，
+不替用户执行带参数操作。命令面板快捷键加入 `/hotkeys`。HarnessApp 与命令路由定向回归
+84 passed；全量 **1463 passed / 1 skipped**，Ruff、`py_compile` 与 diff 检查通过，另有 5 条
+飞书 SDK 弃用警告。真实终端快捷键与 80×24 验收仍待执行。

@@ -27,6 +27,7 @@ from ui.event_reduction import EventReductionMixin
 from ui.queue_actions import QueueActionsMixin
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.rendering import _render_lines, _render_markdown, _streaming_markdown_source
+from ui.search_actions import SearchActionsMixin
 from ui.session_actions import SessionActionsMixin
 from ui.session_admin_actions import SessionAdminActionsMixin
 from ui.transcript import ConversationModel, TranscriptLayout
@@ -41,7 +42,8 @@ STREAM_MAX_INTERVAL = 0.30
 STREAM_DEFAULT_INTERVAL = 0.12
 
 class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
-                 CommandActionsMixin, EventReductionMixin, QueueActionsMixin,
+                 SearchActionsMixin, CommandActionsMixin, EventReductionMixin,
+                 QueueActionsMixin,
                  SuggestionsMixin, BackgroundActionsMixin, FooterMixin,
                  StatusMixin, App):
     """行模型驱动的 TUI：聊天区只有一个自绘视口。"""
@@ -53,6 +55,10 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         Binding('ctrl+q', 'quit_app', 'Quit', show=False, priority=True),
         Binding('ctrl+shift+c', 'copy_selection', 'Copy', show=False,
                 priority=True),
+        Binding('ctrl+f', 'open_transcript_search', 'Search conversation',
+                show=False, priority=True),
+        Binding('ctrl+shift+p', 'open_command_palette', 'Command palette',
+                show=False, priority=True),
     ]
 
     CSS = """
@@ -105,6 +111,17 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                  border: round $accent; background: $boost; }
     #queue-search { margin: 0 0 1 0; }
     #queue-list { height: auto; max-height: 18; }
+    #transcript-search-box { width: 82; max-width: 100%; max-height: 14;
+                            padding: 1 2; border: round $accent;
+                            background: $boost; }
+    #transcript-search-input { margin: 0 0 1 0; }
+    #transcript-search-preview { height: auto; max-height: 3;
+                                 overflow: hidden; color: $text-muted; }
+    #command-palette-box { width: 90; max-width: 100%; max-height: 100%;
+                           padding: 1 2; border: round $accent;
+                           background: $boost; }
+    #command-palette-search { margin: 0 0 1 0; }
+    #command-palette-list { height: auto; max-height: 18; }
     """
 
     def __init__(self, messages: list | None = None,

@@ -127,7 +127,12 @@ class TranscriptLayout:
         width = max(1, int(width))
         if model.revision == self._revision and width == self._width:
             return
-        full = width != self._width or len(model) < len(self._entries)
+        blocks = model.snapshot()
+        full = width != self._width or len(blocks) < len(self._entries)
+        if (not full and blocks and self._entries
+                and len(blocks) > len(self._entries)
+                and blocks[0].id != self._entries[0].block_id):
+            full = True
         if full:
             self._entries = []
             self._index = {}
@@ -136,7 +141,6 @@ class TranscriptLayout:
             self._trim_scan = 0
         self._model = model
         dirty = model.take_dirty()   # 无论是否全量都清空脏集合
-        blocks = model.snapshot()
 
         if not full and len(blocks) == len(self._entries):
             changed = [block_id for block_id in dirty if block_id in self._index]
@@ -257,6 +261,11 @@ class TranscriptLayout:
             else:
                 return entry.block_id
         return None
+
+    def block_start(self, block_id: str) -> int | None:
+        """Return the document row for a block, if it is in the layout."""
+        index = self._index.get(block_id)
+        return self._entries[index].start if index is not None else None
 
     def line_at(self, line_index: int) -> Line | None:
         """单行读取（视口按需渲染用）；越界返回 None。"""

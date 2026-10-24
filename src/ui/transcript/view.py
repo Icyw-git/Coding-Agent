@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from rich.text import Text
 from textual import events
 from textual.geometry import Size
@@ -27,6 +29,21 @@ class VirtualTranscript(ScrollView):
         self.follow_end = follow_end
         self._line_cache: dict[tuple[int, int, int], Strip] = {}
         self._cached_revision = -1
+        self._search_query = ''
+        self._search_pattern = None
+        self._search_active_block = None
+
+    def set_search(self, query: str, active_block_id: str | None) -> None:
+        query = str(query or '')
+        if (query == self._search_query
+                and active_block_id == self._search_active_block):
+            return
+        self._search_query = query
+        self._search_pattern = (re.compile(re.escape(query), re.IGNORECASE)
+                                if query else None)
+        self._search_active_block = active_block_id
+        self._line_cache.clear()
+        self.refresh()
 
     @property
     def content_line_count(self) -> int:
@@ -83,6 +100,13 @@ class VirtualTranscript(ScrollView):
             strip = Strip.blank(width, self.rich_style)
         else:
             text = line.copy() if isinstance(line, Text) else Text(str(line))
+            if self._search_pattern is not None:
+                block_id = self.transcript_layout.block_at(line_index)
+                style = ('bold white on #a84400'
+                         if block_id == self._search_active_block
+                         else 'black on #e5c84b')
+                for match in self._search_pattern.finditer(text.plain):
+                    text.stylize(style, match.start(), match.end())
             if span is not None:
                 start, end = span
                 text.stylize(self.selection_style, start, None if end == -1 else end)
