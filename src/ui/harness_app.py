@@ -344,50 +344,6 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         if self._composer is not None:
             self._composer.border_title = 'cancelling…'
 
-    def submit_shell(self, command: str) -> None:
-        """`!cmd`：直接执行 shell，输出按工具块展示，不进入模型上下文。"""
-        if self._busy:
-            self._notice('当前任务尚未结束，请结束后再执行 shell 命令。')
-            return
-        self._busy = True
-        self._operation = 'shell'
-        self._turn_started = time.monotonic()
-        block = self.model.append('tool', {
-            'name': 'bash', 'args': {'command': command},
-            'state': 'running', 'output': '', 'expanded': False})
-        self._mark_dirty()
-        threading.Thread(target=self._run_shell,
-                         args=(block.id, command), daemon=True).start()
-
-    def _run_shell(self, block_id: str, command: str) -> None:
-        import harness
-        import turn_control
-        started = time.monotonic()
-        output = ''
-        try:
-            harness.permission_gate.use_ui = True
-            turn_control.begin_turn()
-            output = harness.run_bash(command)
-        except Exception as exc:
-            output = f'Error: {exc}'
-        finally:
-            turn_control.end_turn()
-            harness.permission_gate.use_ui = False
-        duration = int((time.monotonic() - started) * 1000)
-        try:
-            self.call_from_thread(self._finish_shell, block_id, output, duration)
-        except Exception:
-            pass
-
-    def _finish_shell(self, block_id: str, output: str, duration_ms: int) -> None:
-        failed = str(output).lstrip().startswith(('Error', 'Permission denied'))
-        if self.model.get(block_id) is not None:
-            self.model.update(block_id,
-                              state='failed' if failed else 'complete',
-                              output=str(output), duration_ms=duration_ms)
-        self._mark_dirty()
-        self._finish_local_operation()
-
     def submit_composer(self, mode: str = 'followup') -> None:
         """Enter 的统一入口：候选优先采用，命令候选随后执行。
 

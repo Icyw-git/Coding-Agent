@@ -71,4 +71,9 @@ class FooterMixin:
             parts.append(f'{queued} queued')
         if self._busy:
             parts.append('working')
-        self._footer.update('  ·  '.join(part for part in parts if part))
+        footer = '  ·  '.join(part for part in parts if part)
+        cached = getattr(self, '_footer_render_cache', None)
+        if cached is not None and cached[0] is self._footer and cached[1] == footer:
+            return
+        self._footer.update(footer)
+        self._footer_render_cache = (self._footer, footer)

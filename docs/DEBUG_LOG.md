@@ -3876,3 +3876,21 @@ quotePath 转义，中文路径不再变成 `\346...` 坏键；-uall 让未跟�
 `tests/test_checkpoints.py` 新增 14 例：bash 新建/修改/删除/重命名的回滚、基线
 脏文件还原到节点开始、未跟踪文件内容还原、敏感文件不动、`_status_keys` 解析、
 -uall 枚举、中文路径、pre-image 丢失报告与 last/undo 不被污染。
+
+## TUI 本地后台动作收口
+
+沿 P7 mixin 拆分，把 `!command` 的提交、后台执行和结果回写从 `HarnessApp` 移入
+`src/ui/background_actions.py`，与 `/review`、`/watch` 放在同一职责模块。执行过程
+保持原有 permission gate、turn control、工具块状态和 `_finish_local_operation()` 队列
+调度语义；主 App 仍只负责把输入交给动作层和组装共享状态。
+
+新增 `test_bang_shell_failure_restores_ui_gate_and_busy_state`：命令失败后工具块标为
+failed、UI gate 与 busy 状态恢复；忙时再次提交 shell 命令不会启动第二个工具。定向 UI
+回归 99 passed；完整回归 1457 passed / 1 skipped，Ruff、py_compile 与 diff 检查通过。
+
+## Footer 无变化刷新跳过
+
+`FooterMixin` 缓存最后一次送入 footer 的 widget 身份与格式化文本。周期刷新内容相同
+时跳过 `Static.update()`；会话状态变化仍刷新，footer widget 被替换时也会重新渲染。
+`test_footer_skips_unchanged_updates_but_refreshes_changed_state` 覆盖三种路径。完整
+回归 1457 passed / 1 skipped，Ruff、py_compile 与 diff 检查通过。

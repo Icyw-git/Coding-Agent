@@ -107,6 +107,15 @@
   降到 558 行。全量 **1455 passed / 1 skipped**，相关 UI 定向 **97 passed**，
   Ruff 与 diff 检查通过；真实终端验收仍按 [UI_TERMINAL_ACCEPTANCE.md](UI_TERMINAL_ACCEPTANCE.md)
   待执行。
+- P7f：`!command` 的提交、后台执行与结果回写并入
+  `src/ui/background_actions.py`，与 `/review`、`/watch` 共用本地后台动作边界；
+  `HarnessApp` 仍负责输入路由和运行时组装，busy 拒绝、审批上下文、工具块状态与
+  队列调度保持不变。`harness_app.py` 从 558 行降到 514 行；新增失败清理与忙时拒绝
+  回归。真实终端验收仍待执行。
+- P7g：`FooterMixin` 缓存最后发送的 footer 文本和 widget 身份；周期刷新值不变时跳过
+  `Static.update()`，数据变化或 footer widget 替换时正常刷新。新增测试验证重复调用不
+  更新、ctx 状态变化仍更新。全量 **1457 passed / 1 skipped**，Ruff、`py_compile` 与 diff
+  检查通过。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于
@@ -251,7 +260,8 @@ src/ui/
 - 两行：工作状态（editor 边框）+ footer（dock 底部固定）：
   `~/repo (branch) • session  ↑12k ↓3k R8k CH72%  ctx 42% [███░░]  ~¥0.0123  model`
 - 数据来自 `ui_bridge` 指标（已有），加 `auto-compact` 标志与格式化函数（移植 Pi）。
-- 更新节流：只在值变化时刷新（100ms 合并），避免每帧重建 Text。
+- 更新节流：格式化值或 footer widget 变化时才调用 `Static.update()`，相同内容的周期
+  刷新直接跳过，避免反复重建 renderable。
 
 ### 4.5 事件与状态
 

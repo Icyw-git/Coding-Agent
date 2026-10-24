@@ -367,6 +367,42 @@ def test_bang_shell_runs_without_agent(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_bang_shell_failure_restores_ui_gate_and_busy_state(monkeypatch):
+    def fail_shell(command):
+        raise RuntimeError(f'failed: {command}')
+
+    def fail_loop(messages, **kwargs):
+        raise AssertionError('shell must not reach the model')
+
+    monkeypatch.setattr(harness, 'agent_loop', fail_loop)
+    monkeypatch.setattr(harness, 'run_bash', fail_shell)
+    monkeypatch.setattr(harness.permission_gate, 'use_ui', False)
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 20)) as pilot:
+            app.submit_text('!bad-command')
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.01)
+                block = next((b for b in app.model.snapshot()
+                              if b.kind == 'tool'), None)
+                if block and block.payload.get('state') != 'running':
+                    break
+            block = next(b for b in app.model.snapshot() if b.kind == 'tool')
+            assert block.payload['state'] == 'failed'
+            assert 'failed: bad-command' in block.payload['output']
+            assert not app._busy
+            assert not harness.permission_gate.use_ui
+
+            app._busy = True
+            app.submit_text('!must-not-run')
+            assert len([b for b in app.model.snapshot() if b.kind == 'tool']) == 1
+            assert '尚未结束' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+
+
 def test_escape_cancels_only_when_busy(monkeypatch):
     import turn_control
 
@@ -991,6 +1027,47 @@ def test_footer_shows_context_and_cache_hit_rate():
             footer = str(app._footer.render())
             assert 'ctx 25%' in footer
             assert 'cache 50%' in footer
+
+    asyncio.run(scenario())
+
+
+def test_footer_skips_unchanged_updates_but_refreshes_changed_state(monkeypatch):
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(100, 20)):
+            updates = []
+            original = app._footer.update
+
+            def record_update(value):
+                updates.append(str(value))
+                return original(value)
+
+            monkeypatch.setattr(app._footer, 'update', record_update)
+            app._refresh_footer()
+            app._refresh_footer()
+            assert updates == []
+
+            app._status['ctx_pct'] = 25.0
+            app._refresh_footer()
+            assert len(updates) == 1
+            assert 'ctx 25%' in updates[0]
+            app._refresh_footer()
+            assert len(updates) == 1
+
+            replacement = type(app._footer)()
+            replacement_updates = []
+            replacement_update = replacement.update
+
+            def record_replacement_update(value):
+                replacement_updates.append(str(value))
+                return replacement_update(value)
+
+            monkeypatch.setattr(replacement, 'update', record_replacement_update)
+            app._footer = replacement
+            app._refresh_footer()
+            app._refresh_footer()
+            assert len(replacement_updates) == 1
+            assert 'ctx 25%' in replacement_updates[0]
 
     asyncio.run(scenario())
 
