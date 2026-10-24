@@ -3894,3 +3894,14 @@ failed、UI gate 与 busy 状态恢复；忙时再次提交 shell 命令不会�
 时跳过 `Static.update()`；会话状态变化仍刷新，footer widget 被替换时也会重新渲染。
 `test_footer_skips_unchanged_updates_but_refreshes_changed_state` 覆盖三种路径。完整
 回归 1457 passed / 1 skipped，Ruff、py_compile 与 diff 检查通过。
+
+## 会话选择器排序、范围与预览
+
+`SessionPickerModal` 使用已有 session summary 支持最近更新/创建时间/名称排序、当前/全部
+工作区范围、摘要搜索和随高亮变化的预览；`Alt+S`/`Alt+W` 在搜索框焦点时仍可用。当前
+工作区按规范化路径比较，缺少 workspace 元数据的旧会话只出现在“全部工作区”。弹窗和
+列表高度限制已覆盖 80×24、15 条结果；管理操作仍由既有命令及其确认流程负责。
+
+`test_session_picker_sort_scope_search_and_preview` 验证排序、范围、搜索、预览和小屏边界。
+最终全量回归 1458 passed / 1 skipped；Ruff、py_compile 与 diff 检查通过。真实终端验收
+按既定要求仍未执行。

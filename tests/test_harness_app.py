@@ -240,6 +240,91 @@ def test_sessions_picker_resumes_real_session(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_session_picker_sort_scope_search_and_preview(tmp_path, monkeypatch):
+    workspace_a = tmp_path / 'workspace-a'
+    workspace_b = tmp_path / 'workspace-b'
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    rows = [
+        {'id': 'session-alpha', 'title': 'Alpha', 'workspace': str(workspace_a),
+         'created': 10, 'updated': 90, 'preview': 'alpha summary'},
+        {'id': 'session-beta', 'title': 'Beta', 'workspace': str(workspace_b),
+         'created': 30, 'updated': 20, 'preview': 'beta-only summary'},
+        {'id': 'session-gamma', 'title': 'Gamma', 'workspace': str(workspace_a),
+         'created': 40, 'updated': 60, 'preview': 'gamma details'},
+    ]
+    rows.extend(
+        {
+            'id': f'older-{index:02}',
+            'title': f'Zeta {index:02}',
+            'workspace': str(workspace_b),
+            'created': 1,
+            'updated': 1,
+            'preview': f'older summary {index}',
+        }
+        for index in range(12)
+    )
+    monkeypatch.setattr(harness, 'session_rows', lambda **kwargs: rows)
+    monkeypatch.setattr(harness, 'get_workdir', lambda: workspace_a)
+
+    def option_ids(options):
+        return [str(options.get_option_at_index(index).id)
+                for index in range(options.option_count)]
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.open_session_picker()
+            await pilot.pause()
+            modal = app.screen
+            box = modal.query_one('#session-box')
+            assert box.region.right <= app.size.width
+            assert box.region.bottom <= app.size.height
+            options = modal.query_one('#session-list')
+            assert options.option_count == 15
+            assert options.region.height <= 12
+            assert option_ids(options)[:3] == [
+                'session-alpha', 'session-gamma', 'session-beta']
+            assert 'alpha summary' in str(
+                modal.query_one('#session-preview').render())
+            # Shortcuts work while the search input owns focus.
+            await pilot.press('alt+s')
+            await pilot.pause()
+            assert option_ids(options)[:3] == [
+                'session-gamma', 'session-beta', 'session-alpha']
+            await pilot.press('alt+s')
+            await pilot.pause()
+            assert option_ids(options)[:3] == [
+                'session-alpha', 'session-beta', 'session-gamma']
+
+            await pilot.press('alt+w')
+            await pilot.pause()
+            assert option_ids(options) == ['session-alpha', 'session-gamma']
+
+            # Moving the list highlight updates the selected session preview.
+            await pilot.press('down')
+            await pilot.press('down')
+            await pilot.pause()
+            assert 'gamma details' in str(
+                modal.query_one('#session-preview').render())
+
+            search = modal.query_one('#session-search')
+            search.value = 'beta-only'
+            await pilot.pause()
+            assert options.option_count == 0
+            assert 'No matching sessions.' in str(
+                modal.query_one('#session-preview').render())
+
+            # All-workspace scope restores the matching remote session.
+            await pilot.press('alt+w')
+            await pilot.pause()
+            assert option_ids(options) == ['session-beta']
+            assert 'beta-only summary' in str(
+                modal.query_one('#session-preview').render())
+
+    asyncio.run(scenario())
+
+
 def test_permission_request_opens_modal_and_resolves():
     resolved = []
 

@@ -71,9 +71,11 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
     #perm-box { width: 76; max-height: 80%; padding: 2 3;
                 border: round $warning; background: $boost; }
     #perm-box.risk-danger { border: round $error; }
-    #session-box { width: 90; max-height: 28; padding: 1 2;
+    #session-box { width: 90; max-width: 100%; max-height: 28; padding: 1 2;
                    border: round $accent; background: $boost; }
-    #session-list { height: auto; max-height: 18; }
+    #session-list { height: auto; max-height: 12; }
+    #session-preview { height: 3; overflow: hidden; color: $text-muted; }
+    #session-controls { height: auto; max-height: 2; }
     #session-search { margin: 0 0 1 0; }
     #fork-box { width: 76; max-height: 24; padding: 1 2;
                 border: round $accent; background: $boost; }

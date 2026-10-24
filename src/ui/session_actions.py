@@ -388,7 +388,10 @@ class SessionActionsMixin:
         if not rows:
             self._notice('No saved sessions.')
             return
-        self.push_screen(SessionPickerModal(rows), self._on_session_picked)
+        current_workspace = harness.get_workdir()
+        self.push_screen(
+            SessionPickerModal(rows, current_workspace=current_workspace),
+            self._on_session_picked)
 
     def _on_session_picked(self, row) -> None:
         if row:
