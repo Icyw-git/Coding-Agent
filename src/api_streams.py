@@ -159,7 +159,9 @@ def build_router(client, runtime, logger):
                     status = progress.snapshot()
                     # 内容没有变化（阶段/工具/秒数都相同）时不重复推送
                     marker = (status.get('phase'), status.get('tool'),
-                              status.get('elapsed_text'))
+                              status.get('elapsed_text'),
+                              tuple(sorted((status.get('tool_counts') or {}).items())),
+                              len(status.get('tool_errors') or ()))
                     if marker != last_marker:
                         yield f"event: progress\ndata: {json.dumps(status)}\n\n"
                         last_marker = marker

@@ -36,6 +36,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import queue
@@ -54,6 +55,7 @@ import paths
 from exec_policy import approval_class
 from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
+from feishu_step_card import step_card
 from gateway_sim import GatewayClient
 from perf import record as perf_record
 from perf import reset as perf_reset
@@ -176,6 +178,14 @@ def markdown_to_card_md(md_text: str) -> str:
     return '\n'.join(out)
 
 
+def _accepts_kwarg(fn, name: str) -> bool:
+    """传输层是否支持某个可选参数（测试替身/旧实现可能没有 reply_to）。"""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _is_missing_session(exc: BaseException) -> bool:
     """把“会话不存在”从其它失败里分出来：404 / FileNotFoundError。"""
     if isinstance(exc, FileNotFoundError):
@@ -263,10 +273,40 @@ class LarkTransport:
         }
         return json.dumps(card, ensure_ascii=False)
 
-    def send_markdown(self, chat_id: str, md_text: str) -> str | None:
+    def send_step_card(self, chat_id: str, card: dict,
+                       reply_to: str | None = None) -> str | None:
+        """schema 2.0 过程卡；reply_to 时用「回复消息」以带上引用。"""
+        content = json.dumps(card, ensure_ascii=False)
+        if reply_to:
+            return self._reply_card(reply_to, content)
+        return self._send_card(chat_id, content)
+
+    def update_step_card(self, message_id: str, card: dict) -> None:
+        self.update_markdown(message_id, json.dumps(card, ensure_ascii=False),
+                             raw_content=True)
+
+    def _reply_card(self, message_id: str, content: str) -> str | None:
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+        request = ReplyMessageRequest.builder().message_id(message_id).request_body(
+            ReplyMessageRequestBody.builder()
+            .msg_type('interactive')
+            .content(content).build()
+        ).build()
+        response = self._client.im.v1.message.reply(request)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu reply failed: {response.code} {response.msg}')
+        data = getattr(response, 'data', None)
+        return getattr(data, 'message_id', None) if data else None
+
+    def send_markdown(self, chat_id: str, md_text: str,
+                      reply_to: str | None = None) -> str | None:
         """以交互卡片发送 markdown——飞书 text 消息不解析任何 markdown 语法，
         卡片的 markdown 元素才支持粗体/斜体/行内代码/链接。"""
-        return self._send_card(chat_id, self._markdown_card(md_text))
+        content = self._markdown_card(md_text)
+        if reply_to:
+            return self._reply_card(reply_to, content)
+        return self._send_card(chat_id, content)
 
     def send_session_card(self, chat_id: str, card: dict) -> str | None:
         return self._send_card(chat_id, json.dumps(card, ensure_ascii=False))
@@ -290,7 +330,8 @@ class LarkTransport:
         data = getattr(response, 'data', None)
         return getattr(data, 'message_id', None) if data else None
 
-    def update_markdown(self, message_id: str, md_text: str) -> None:
+    def update_markdown(self, message_id: str, md_text: str,
+                        *, raw_content: bool = False) -> None:
         """Update an existing interactive card in place.
 
         PATCH /im/v1/messages/:message_id 的 body 只收 content（卡片 JSON），
@@ -299,7 +340,7 @@ class LarkTransport:
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
         request = PatchMessageRequest.builder().message_id(message_id).request_body(
             PatchMessageRequestBody.builder()
-            .content(self._markdown_card(md_text)).build()
+            .content(md_text if raw_content else self._markdown_card(md_text)).build()
         ).build()
         response = self._client.im.v1.message.patch(request)
         if not response.success():
@@ -447,7 +488,8 @@ class FeishuGateway:
 
     def on_message(self, chat_id: str, text: str,
                    sender_id: str | None = None,
-                   chat_type: str | None = None) -> None:
+                   chat_type: str | None = None,
+                   message_id: str | None = None) -> None:
         """飞书文本消息入口。命令本地处理；普通文本转发给 agent 会话。
 
         chat_type=None 表示来自测试/模拟器（无来源信息）；真实飞书事件一定带
@@ -490,7 +532,8 @@ class FeishuGateway:
             self._send_panel(chat_id,
                              intro='已就绪，直接发消息即可；需要切换/停止时点按钮。')
         try:
-            self._send_agent_reply(chat_id, session_id, text)
+            kwargs = {'reply_to': message_id} if message_id else {}
+            self._send_agent_reply(chat_id, session_id, text, **kwargs)
         except Exception as exc:
             self._reply(chat_id, f'[error] {exc}')
 
@@ -503,56 +546,107 @@ class FeishuGateway:
         self._last_card_patch = now
         return True
 
-    def _send_agent_reply(self, chat_id: str, session_id: str, text: str) -> None:
-        """Stream into one editable Markdown card when supported."""
+    def _step_cards_enabled(self) -> bool:
+        raw = (os.getenv('FEISHU_STEP_CARD') or '').strip().lower()
+        return raw not in ('0', 'false', 'no', 'off')
+
+    def _send_agent_reply(self, chat_id: str, session_id: str, text: str,
+                          reply_to: str | None = None) -> None:
+        """每个回合一张可编辑卡片：默认 schema 2.0 过程卡，可退回 Markdown 卡。"""
         perf_reset()
         _t_entry = time.perf_counter()
-        updater = getattr(self.transport, 'update_markdown', None)
-        sender = getattr(self.transport, 'send_markdown', None)
+        step_sender = getattr(self.transport, 'send_step_card', None)
+        step_updater = getattr(self.transport, 'update_step_card', None)
+        step_mode = bool(step_sender and step_updater and self._step_cards_enabled())
         fallback_sender = getattr(self.transport, 'send_text', None)
-        if not updater or not sender:
-            updater = getattr(self.transport, 'update_text', None)
-            sender = getattr(self.transport, 'send_text', None) if updater else None
+        if step_mode:
+            sender, updater = step_sender, step_updater
+        else:
+            updater = getattr(self.transport, 'update_markdown', None)
+            sender = getattr(self.transport, 'send_markdown', None)
+            if not updater or not sender:
+                updater = getattr(self.transport, 'update_text', None)
+                sender = getattr(self.transport, 'send_text', None) if updater else None
+        reply_kwargs = ({'reply_to': reply_to}
+                        if reply_to and sender is not None
+                        and _accepts_kwarg(sender, 'reply_to') else {})
         message_id = None
         parts = []
         last_update = 0.0
         last_sent = None
         stream_failed = False
+        progress: dict = {'status': {}}
 
-        def update_partial(text: str) -> None:
+        def _note(status: dict | None = None) -> str:
+            status = status or progress['status'] or {}
+            elapsed = status.get('elapsed_text')                 or format_duration(status.get('elapsed', 0))
+            if status.get('phase') == 'tool':
+                return f"运行中 · 正在执行 {status.get('tool') or '工具'} · {elapsed}"
+            return f'运行中 · {elapsed}'
+
+        def _legacy(answer: str, status: dict | None = None) -> str:
+            label = ('正在执行 ' + (status or {}).get('tool') if (status or {}).get('phase') == 'tool'
+                     else '正在处理')
+            elapsed = (status or {}).get('elapsed_text') or format_duration(
+                (status or {}).get('elapsed', 0))
+            return f'{label} · 已用时 {elapsed}' + chr(10) + chr(10) + answer
+
+        def _payload(answer_text: str, *, running: bool, note: str = '') -> object:
+            state = progress['status'] or {}
+            return step_card(
+                answer=answer_text,
+                status='running' if running else 'completed',
+                tool_counts=state.get('tool_counts'),
+                tool_errors=state.get('tool_errors'),
+                total_ms=state.get('tool_total_ms') or 0,
+                note=note,
+            )
+
+        def update_partial(display_text: str, *, answer_text: str | None = None,
+                           running: bool = True, note: str = '') -> None:
             nonlocal message_id, last_update, stream_failed, last_sent
-            if stream_failed or not updater:
+            if stream_failed or updater is None or sender is None:
                 return
-            if text == last_sent:
+            answer = display_text if answer_text is None else answer_text
+            payload = _payload(answer, running=running, note=note) if step_mode else display_text
+            if payload == last_sent:
                 return   # 内容与计时都没变化，不重复更新卡片
             now = time.monotonic()
-            if updater and now - last_update >= 0.6:
-                try:
-                    if message_id is None:
-                        # 首建卡片用本次内容（进度路径下 parts 可能为空）
-                        message_id = sender(chat_id, text or '生成中…')
-                        # 首张卡片可见，可能仅包含处理进度。
-                        perf_record('gw.first_card', time.perf_counter() - _t_entry)
-                    elif self._card_patch_gate():
-                        updater(message_id, text)
-                        last_update = now
-                    last_sent = text
-                except Exception as exc:
-                    stream_failed = True
-                    print(f'[feishu] stream update failed, falling back: {exc}')
+            if now - last_update < 0.6:
+                return
+            try:
+                if message_id is None:
+                    # 首建卡片用本次内容（进度路径下 parts 可能为空）
+                    if step_mode:
+                        message_id = sender(chat_id, payload, **reply_kwargs)
+                    else:
+                        message_id = sender(chat_id, payload or '生成中…',
+                                            **reply_kwargs)
+                    perf_record('gw.first_card', time.perf_counter() - _t_entry)
+                elif self._card_patch_gate():
+                    updater(message_id, payload)
+                    last_update = now
+                last_sent = payload
+            except Exception as exc:
+                stream_failed = True
+                print(f'[feishu] stream update failed, falling back: {exc}')
 
         def on_delta(part: str) -> None:
             parts.append(part)
-            update_partial(''.join(parts))
+            answer = ''.join(parts)
+            if step_mode:
+                update_partial(answer, answer_text=answer, running=True, note=_note())
+            else:
+                update_partial(answer)
 
         def on_progress(status: dict) -> None:
-            elapsed = status.get('elapsed_text') \
-                or format_duration(status.get('elapsed', 0))
-            if status.get('phase') == 'tool':
-                label = f"正在执行 {status.get('tool') or '工具'}"
+            progress['status'] = status
+            answer = ''.join(parts)
+            if step_mode:
+                update_partial(answer, answer_text=answer, running=True,
+                               note=_note(status))
             else:
-                label = '正在处理'
-            update_partial(f'{label} · 已用时 {elapsed}\n\n' + ''.join(parts))
+                update_partial(_legacy(answer, status))
 
         def _invoke(target_session: str):
             streamer = getattr(self.api, 'send_stream', None)
@@ -573,30 +667,46 @@ class FeishuGateway:
                 reply = _invoke(session_id)
         except Exception as exc:
             print(f'[feishu] agent reply failed: {exc}')
-            failed = f'处理未完成：{exc}\n请先核实任务状态，再决定是否重试。\n\n' + ''.join(parts)
-            if message_id and updater:
+            failed = ('处理未完成：' + str(exc) + chr(10)
+                      + '请先核实任务状态，再决定是否重试。' + chr(10) + chr(10)
+                      + ''.join(parts))
+            if message_id and updater and not stream_failed:
                 try:
-                    updater(message_id, failed)
+                    if step_mode:
+                        state = progress['status'] or {}
+                        updater(message_id, step_card(
+                            answer=failed, status='failed',
+                            tool_counts=state.get('tool_counts'),
+                            tool_errors=state.get('tool_errors'),
+                            total_ms=state.get('tool_total_ms') or 0))
+                    else:
+                        updater(message_id, failed)
                     return
                 except Exception as update_exc:
                     print(f'[feishu] failure card update failed: {update_exc}')
             self._reply(chat_id, failed)
             return
+
         reply = reply or '本轮已结束，未生成文本回复。'
         duration = getattr(self.api, 'last_duration', None)
-        if duration:
-            reply = f'{reply}\n\n已完成 · 总用时 {duration}'
-        if message_id and updater and not stream_failed:
-            if reply == last_sent:
-                return   # 卡片已显示最终内容，无需重复 PATCH 或重发
+        if step_mode:
+            elapsed = duration or format_duration(time.monotonic() - _t_entry)
+            final_payload = _payload(reply, running=False, note=f'已完成 · 总用时 {elapsed}')
+        else:
+            if duration:
+                reply = reply + chr(10) + chr(10) + f'已完成 · 总用时 {duration}'
+            final_payload = reply
+        if message_id and updater and not stream_failed and final_payload != last_sent:
             try:
                 _t_final = time.perf_counter()
-                updater(message_id, reply)
+                updater(message_id, final_payload)
                 perf_record('gw.final_update', time.perf_counter() - _t_final)
                 return
             except Exception as exc:
                 print(f'[feishu] final card update failed, falling back: {exc}')
                 stream_failed = True
+        if message_id and updater and not stream_failed:
+            return   # 卡片已显示最终内容，无需重复 PATCH 或重发
         if stream_failed and fallback_sender:
             try:
                 fallback_sender(chat_id, reply)
@@ -1506,7 +1616,7 @@ class FeishuGateway:
             if type(index) is not int or not 0 <= index < len(view[1]):
                 return '无效的工作区按钮，请重新 /new', False
             try:
-                self._events.put_nowait((chat_id, value, open_id, None))
+                self._events.put_nowait((chat_id, value, open_id, None, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在创建会话…', True
@@ -1519,13 +1629,13 @@ class FeishuGateway:
             if action not in ('page', 'details', 'switch', 'fork') or type(index) is not int or not 0 <= index < limit:
                 return '无效的会话按钮，请重新 /sessions', False
             try:
-                self._events.put_nowait((chat_id, value, open_id, None))
+                self._events.put_nowait((chat_id, value, open_id, None, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理会话操作…', True
         if (value or {}).get('panel'):
             try:
-                self._events.put_nowait((chat_id, value, open_id, None))
+                self._events.put_nowait((chat_id, value, open_id, None, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在打开…', True
@@ -1662,7 +1772,8 @@ class FeishuGateway:
 
     def dispatch(self, chat_id: str, text: str,
                  sender_id: str | None = None,
-                 chat_type: str | None = None) -> None:
+                 chat_type: str | None = None,
+                 message_id: str | None = None) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
         norm = unicodedata.normalize('NFKC', text or '').strip().lower()
         is_approval = (norm.split()[:1] == ['/approve'] or
@@ -1670,7 +1781,7 @@ class FeishuGateway:
                         and bool(self._chat_pending.get(chat_id))))
         events = self._approval_events if is_approval else self._events
         try:
-            events.put_nowait((chat_id, text, sender_id, chat_type))
+            events.put_nowait((chat_id, text, sender_id, chat_type, message_id))
         except queue.Full:
             self._reply(chat_id, '当前消息较多，请稍后重试')
 
@@ -1684,7 +1795,7 @@ class FeishuGateway:
                     item = events.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                chat_id, text, sender_id, chat_type = item
+                chat_id, text, sender_id, chat_type, message_id = item
                 try:
                     if approval:
                         if self.allowed_users is not None and sender_id not in self.allowed_users:
@@ -1709,7 +1820,8 @@ class FeishuGateway:
                                     self._handle_session_action(chat_id, text, sender_id)
                             else:
                                 self.on_message(chat_id, text, sender_id=sender_id,
-                                                chat_type=chat_type)
+                                                chat_type=chat_type,
+                                                message_id=message_id)
                 except Exception as exc:
                     print(f'[feishu] dispatch error: {exc}')
                 finally:
@@ -1768,7 +1880,8 @@ class FeishuGateway:
                 print(f'[feishu] message from {sender_id!r} '
                       f'in chat {message.chat_id!r} ({chat_type})')
                 self.dispatch(message.chat_id, text,
-                              sender_id=sender_id, chat_type=chat_type)
+                              sender_id=sender_id, chat_type=chat_type,
+                              message_id=getattr(message, 'message_id', None))
             except Exception as exc:
                 print(f'[feishu] event error: {exc}')
 

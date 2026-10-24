@@ -4328,3 +4328,30 @@ Ruff、`py_compile`、`git diff --check` 通过。
 重启后第一次轮询会一次性清掉失效绑定（每个相关聊天只收到一条说明）。
 
 测试：新增 loopback 判定与 `trust_env` 取值断言；全量 **1552 passed / 1 skipped**。
+
+## 飞书回复改成 schema 2.0「任务过程」卡片
+
+用户拿 dsh-im 的截图问能不能做成那种效果。dsh-im 的源码就在本机
+`node_modules/@xmanrui/dsh-im/src/channels/feishu/feishu-cards.mjs`，里面明确用了
+卡片 **schema 2.0**：`body.elements`、`markdown`、`collapsible_panel`
+（`background_color: grey-50`、右侧 chevron 图标），以及“完成后把工具/思考面板塞进一个
+折叠的「过程详情」”。照这个结构实现了 `src/feishu_step_card.py`：
+
+- 运行时：答案 + 展开的工具摘要面板 + `_运行中 · 正在执行 bash · 00:03_`；
+- 完成后：工具摘要收进折叠的「📋 过程详情」，底部改成 `_已完成 · 总用时 00:12_`；
+- 工具摘要来自 `TurnProgress` 新增的计数（`tool_started` 名称计数、`tool_profile`
+  的耗时与 `status=error`），所以失败项会以 `⚠️ glob — SEARCH_FAILED` 出现在详情里；
+- SSE 的 progress 帧把 `tool_counts` / 错误数纳入去重 marker，避免“工具失败了但最后
+  一张卡没更新”。
+
+**引用回复**：截图顶部的引用是飞书“回复消息”的 UI，不是卡片元素。`LarkTransport` 现在
+支持 `reply_to`（`im.message.reply`），网关把入站 `message_id` 一路带进分发队列和
+`_send_agent_reply`，于是回复卡会挂在用户消息下面；没有 message_id（测试/模拟器）
+时行为不变。
+
+**兼容与回退**：旧 Markdown 卡片路径保留，`FEISHU_STEP_CARD=0` 可切回；传输层没有
+`send_step_card` 时自动走旧路径；2.0 卡片发送失败会退到纯文本回复（`stream_failed`），
+不会静默丢答案。
+
+测试：工具摘要行、折叠层级、运行中/完成态、`reply_to` 传递、环境变量回退、
+禁用后仍用 Markdown 卡、卡片 JSON 可序列化；全量 **1558 passed / 1 skipped**。

@@ -206,7 +206,7 @@ def test_approval_dispatch_bypasses_chat_lock(tmp_path):
 
     gw = FeishuGateway(API(), bindings_path=tmp_path / 'bindings.json')
     called = threading.Event()
-    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None: called.set()
+    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None,         message_id=None: called.set()
     lock = gw._chat_lock('c1')
     lock.acquire()
     try:
@@ -481,8 +481,8 @@ def test_dispatch_forwards_chat_type(tmp_path):
     """分发队列要把来源带过去；否则群消息在 worker 里丢掉 chat_type 就漏检。"""
     gw = FeishuGateway(object(), bindings_path=tmp_path / 'bindings.json')
     seen = []
-    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None: \
-        seen.append((chat_id, text, chat_type))
+    gw.on_message = lambda chat_id, text, sender_id=None, chat_type=None, \
+        message_id=None: seen.append((chat_id, text, chat_type))
     gw.start_dispatcher(workers=1)
     try:
         gw.dispatch('g1', 'hello', sender_id='ou_me', chat_type='group')

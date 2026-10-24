@@ -40,6 +40,10 @@ class TurnProgress:
         self.offset = 0
         self.tool = None
         self.tool_started = None
+        # 本回合工具汇总：名称计数、失败项、累计耗时（供飞书过程卡使用）
+        self.tool_counts: dict[str, int] = {}
+        self.tool_errors: list[dict] = []
+        self.tool_total_ms = 0.0
 
     def follow(self, store, offset):
         self.store, self.offset = store, offset
@@ -48,10 +52,25 @@ class TurnProgress:
         if self.store is not None:
             events, self.offset = self.store.tail_events(self.offset)
             for event in events:
-                if event.get('type') == 'tool_started':
+                kind = event.get('type')
+                if kind == 'tool_started':
                     self.tool = event.get('name')
                     self.tool_started = event.get('ts')
-                elif event.get('type') == 'message' and event.get('message', {}).get('role') == 'tool':
+                    if self.tool:
+                        self.tool_counts[self.tool] = self.tool_counts.get(self.tool, 0) + 1
+                elif kind == 'tool_profile':
+                    for item in event.get('tools') or []:
+                        try:
+                            self.tool_total_ms += float(item.get('duration_ms') or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    if event.get('status') == 'error':
+                        for item in event.get('tools') or []:
+                            self.tool_errors.append({
+                                'tool': item.get('name') or 'tool',
+                                'error': event.get('error_type') or 'error',
+                            })
+                elif kind == 'message' and event.get('message', {}).get('role') == 'tool':
                     self.tool = self.tool_started = None
         elapsed = max(0, time.monotonic() - self.started)
         # 工具内部耗时只留在诊断日志；客户端只看总时钟与阶段
@@ -60,6 +79,9 @@ class TurnProgress:
             'tool': self.tool,
             'elapsed': int(elapsed),
             'elapsed_text': format_duration(elapsed),
+            'tool_counts': dict(self.tool_counts),
+            'tool_errors': [dict(item) for item in self.tool_errors],
+            'tool_total_ms': round(self.tool_total_ms, 1),
         }
 
 
