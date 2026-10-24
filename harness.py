@@ -30,13 +30,13 @@ def enforce_trusted_policy_env() -> None:
 
 import hashlib
 import json
-import re
 import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -56,7 +56,6 @@ import status_report
 import tool_cache
 import turn_control
 import workspace_diff
-import workspaces
 from agent_core import (
     HOOKS,
     _bound_tool_output,
@@ -132,7 +131,30 @@ from prompt_cache_debug import enabled as cache_debug_enabled
 from prompt_cache_debug import fingerprints as cache_fingerprints
 from prompt_cache_debug import first_divergence as first_cache_divergence
 from repl_commands import handle_command
-from session_store import SessionEventStore, SessionReplayError
+from session_admin import (
+    _session_catalog,
+    _split_workspace_add,
+    _workspace_for_new_session,
+    add_workspace_from_argument,
+    apply_session_cleanup,
+    export_session,
+    format_session_list,
+    format_workspace_list,
+    handle_workspace_command,
+    list_session_paths,
+    list_transcripts,
+    load_transcript,
+    registered_workspaces,
+    remove_workspace_selector,
+    resolve_session_path,
+    session_cleanup_plan,
+    session_rows,
+    set_workspace,
+    start_new_session,
+    workspace_catalog,
+    workspace_registry_path,
+)
+from session_store import SessionEventStore
 from session_title import generate_session_title as _generate_session_title
 from skill_system import list_skills, load_skill, scan_skills
 from status_report import (
@@ -158,7 +180,6 @@ from tool_dispatch import (
     format_tool_output,
 )
 from tools import TOOLS, restore_todos, run_bash, tool_registry
-from workspace_choices import find_workspace, workspace_choices, workspace_key
 from workspace_context import current_workspace, use_workspace
 
 
@@ -170,11 +191,16 @@ def _tools_fingerprint() -> str:
 
 load_dotenv()
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
-WORKDIR = Path.cwd().resolve()
+WORKDIR = Path.cwd().resolve()   # CLI 当前工作区的进程级回退值，唯一写入方是 set_workspace
 APP_DIR = Path(__file__).resolve().parent
 
 
 def get_workdir() -> Path:
+    """当前工作区：执行上下文（ContextVar）优先，CLI 全局值为回退。
+
+    任何「当前工作区」的读取都应走这里；直接读 ``WORKDIR`` 会在
+    ``use_workspace`` 固定的回合里拿到别的目录。
+    """
     return current_workspace(WORKDIR)
 
 
@@ -308,294 +334,9 @@ def validate_runtime_config(environ=None) -> None:
         raise RuntimeError(str(exc)) from exc
 
 
-def list_session_paths(limit: int | None = 20) -> list[Path]:
-    """Return logs ordered by conversational activity, not filesystem mtime."""
-    return [SESSIONS_DIR / f"session_{row['id']}.jsonl"
-            for row in _session_catalog()][:limit]
-
-
+# 会话列表摘要缓存：session_admin 经 _h() 读写（测试也会整体替换这个字典）。
 _session_summary_cache = {}
 _SESSION_SUMMARY_CACHE_MAX = 512
-
-
-def _session_catalog():
-    """Reuse summaries until the log changes; timestamps only invalidate cache."""
-    paths = list(SESSIONS_DIR.glob('session_*.jsonl'))
-    live = {path.resolve() for path in paths}
-    for path in list(_session_summary_cache):
-        if path not in live:
-            del _session_summary_cache[path]
-    rows = []
-    for path in paths:
-        key = path.resolve()
-        try:
-            info = path.stat()
-            signature = (info.st_mtime_ns, info.st_size, info.st_ino)
-            cached = _session_summary_cache.get(key)
-            if cached is None or cached[0] != signature:
-                summary = SessionEventStore.open(path).session_summary()
-                _session_summary_cache[key] = (signature, summary)
-                while len(_session_summary_cache) > _SESSION_SUMMARY_CACHE_MAX:
-                    _session_summary_cache.pop(next(iter(_session_summary_cache)))
-            rows.append(dict(_session_summary_cache[key][1]))
-        except (OSError, SessionReplayError) as exc:
-            _session_summary_cache.pop(key, None)
-            print(f'  [session] 无法读取 {path.stem}: {exc}')
-    return sorted(rows, key=lambda row: (row['updated'], row['id']), reverse=True)
-
-
-def resolve_session_path(session_id: str) -> Path:
-    """Resolve a session ID without accepting arbitrary filesystem paths."""
-    if not session_id or not session_id.replace('-', '').replace('_', '').isalnum():
-        raise ValueError('Invalid session ID')
-    path = SESSIONS_DIR / f'session_{session_id}.jsonl'
-    if not path.is_file():
-        raise FileNotFoundError(f'Session {session_id} not found')
-    return path
-
-
-def set_workspace(path: str) -> Path:
-    """Switch the agent workspace without changing the process-wide cwd."""
-    global WORKDIR, SKILLS_DIR
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = WORKDIR / candidate
-    candidate = candidate.resolve()
-    if not candidate.is_dir():
-        raise ValueError(f'Workspace does not exist: {candidate}')
-    WORKDIR = candidate
-    SKILLS_DIR = WORKDIR / 'skills'
-    scan_skills()   # 项目技能随工作区切换；签名未变时是空操作
-    return WORKDIR
-
-
-def start_new_session(workspace=None, session_id=None):
-    """Create a session bound to ``workspace`` (default: the current one).
-
-    工作区先校验再落盘：目录不存在时不会留下一个半成品会话。选定目录会成为
-    本进程的当前工作区，并写进会话日志（/resume 恢复时据此切回）。
-    """
-    if session_id and (SESSIONS_DIR / f'session_{session_id}.jsonl').exists():
-        raise FileExistsError(f'already exists: {session_id}; use /r {session_id}')
-    previous = WORKDIR
-    if workspace is not None:
-        set_workspace(str(workspace))
-    try:
-        store = SessionEventStore(SESSIONS_DIR, session_id=session_id)
-        store.append('session_created')
-        store.record_workspace(WORKDIR)
-    except Exception:
-        set_workspace(str(previous))
-        raise
-    workspaces.remember_workspace(WORKDIR, file=workspace_registry_path())
-    return store
-
-
-def workspace_registry_path() -> Path:
-    return workspaces.default_path(SESSIONS_DIR)
-
-
-def registered_workspaces() -> list[dict]:
-    return workspaces.list_workspaces(file=workspace_registry_path())
-
-
-def workspace_catalog() -> list[dict]:
-    """当前目录 + 登记表 + 最近会话目录：与 API/飞书共用同一合并规则。"""
-    return workspace_choices(session_rows(limit=None, include_empty=True), WORKDIR,
-                             saved=registered_workspaces())
-
-
-def _workspace_for_new_session():
-    """选择新会话的工作区；非交互返回当前目录，用户取消返回 None。"""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return WORKDIR
-    from cli_input import browse_for_workspace, choose_workspace
-
-    choice = choose_workspace(workspace_catalog())
-    if choice is None:
-        return None
-    if choice.get('browse'):
-        return browse_for_workspace(WORKDIR)
-    return choice['path']
-
-
-def format_workspace_list() -> str:
-    entries = registered_workspaces()
-    if not entries:
-        return ('  尚未登记工作区。\n'
-                '  /workspace add <路径> [--name 名称] 可登记；/new 也能直接选最近目录。')
-    from turn_progress import relative_time
-    counts: dict[str, int] = {}
-    for row in session_rows(limit=None, include_empty=True):
-        value = str(row.get('workspace') or '').strip()
-        if value:
-            key = workspace_key(value)
-            counts[key] = counts.get(key, 0) + 1
-    current_key = workspace_key(WORKDIR)
-    lines = ['  已登记工作区：']
-    for index, entry in enumerate(entries, 1):
-        key = workspace_key(entry['path'])
-        mark = '（当前）' if key == current_key else ''
-        when = (f" · {relative_time(entry.get('last_used_at'))}"
-                if entry.get('last_used_at') else '')
-        lines.append(f"  {index}. {entry['name']}  {entry['path']}{mark}"
-                     f" · {counts.get(key, 0)} 个会话{when}")
-    lines.append('  /workspace remove <序号|名称|路径> 移除；/new --ws <序号|名称|路径> 直接使用。')
-    return '\n'.join(lines)
-
-
-def _split_workspace_add(argument: str):
-    text = argument.strip()
-    name = None
-    match = re.search(r'\s+--name\s+(.+)$', text)
-    if match:
-        name = match.group(1).strip().strip('"\'')
-        text = text[:match.start()].strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
-        text = text[1:-1]
-    return text, name
-
-
-def add_workspace_from_argument(argument: str) -> dict:
-    """`/workspace add` 的共享实现：解析路径与 `--name`，相对路径按当前工作区。"""
-    path, name = _split_workspace_add(argument)
-    if not path:
-        raise ValueError('用法：/workspace add <路径> [--name 名称]')
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = WORKDIR / candidate
-    return workspaces.add_workspace(candidate, name=name,
-                                    file=workspace_registry_path())
-
-
-def remove_workspace_selector(selector: str) -> dict:
-    """按序号/名称/id/路径移除登记项；只影响发现列表，不动任何文件。"""
-    selector = (selector or '').strip()
-    if not selector:
-        raise ValueError('用法：/workspace remove <序号|名称|路径>')
-    entry = find_workspace(registered_workspaces(), selector)
-    return workspaces.remove_workspace(entry['id'],
-                                       file=workspace_registry_path())
-
-
-def handle_workspace_command(command: str, argument: str) -> None:
-    parts = argument.split(maxsplit=1)
-    action = parts[0].lower() if parts else 'list'
-    if command == '/workspaces' or action in ('', 'list'):
-        print(format_workspace_list())
-        return
-    if action == 'add':
-        try:
-            entry = add_workspace_from_argument(parts[1] if len(parts) > 1 else '')
-        except (OSError, ValueError) as exc:
-            print(f'  [workspace] {exc}')
-            return
-        print(f"  已登记工作区：{entry['name']}  {entry['path']}")
-        return
-    if action == 'remove':
-        try:
-            removed = remove_workspace_selector(parts[1] if len(parts) > 1 else '')
-        except (KeyError, OSError, ValueError) as exc:
-            print(f'  [workspace] {exc}')
-            return
-        print(f"  已移除登记：{removed['name']}  {removed['path']}")
-        return
-    print('  用法：/workspaces；/workspace add <路径> [--name 名称]；'
-          '/workspace remove <序号|名称|路径>')
-
-
-def session_rows(limit: int | None = 100, *, include_empty: bool = False,
-                 workspace: Path | None = None, query: str = '') -> list[dict]:
-    rows = _session_catalog()
-    from cli_input import filter_session_rows
-    return filter_session_rows(rows, workspace=workspace, include_empty=include_empty,
-                               query=query)[:limit]
-
-
-def format_session_list(limit: int = 20) -> str:
-    from cli_input import session_label
-
-    rows = session_rows(max(100, limit), include_empty=False, workspace=WORKDIR)[:limit]
-    if not rows:
-        rows = session_rows(max(100, limit), include_empty=False)[:limit]
-    if not rows:
-        return '  (no saved sessions)'
-    return '\n\n'.join(session_label(row) for row in rows)
-
-
-def session_cleanup_plan(command: str, argument: str, current_id: str, *, emit=print):
-    """`/archive`、`/delete` 的候选集合：返回 (SessionArchive, rows)。
-
-    归档候选按天数/empty/all 过滤，删除与恢复只看已归档项；当前会话永远
-    排除。确认与执行由 UI 负责，这里只做只读扫描，便于 TUI 放到后台线程。
-    """
-    from session_cleanup import SessionArchive, cleanup_candidates
-
-    archive = SessionArchive(SESSIONS_DIR, CHECKPOINT_DIR)
-    deleting = command == 'delete'
-    restoring = argument == 'restore'
-    if restoring or deleting:
-        rows = archive.list(emit=emit)
-    else:
-        rows = cleanup_candidates(
-            session_rows(limit=None, include_empty=True), current_id,
-            days=int(argument) if argument.isdigit() else 30,
-            empty_only=argument == 'empty')
-        if argument == 'all':
-            rows = session_rows(limit=None, include_empty=True)
-    return archive, [row for row in rows if row['id'] != current_id]
-
-
-def apply_session_cleanup(archive, rows, action: str, current_id: str):
-    """执行已确认的归档/恢复/删除，返回 (completed, [(row, error), ...])。"""
-    completed = 0
-    failures = []
-    for row in rows:
-        try:
-            if action == 'delete':
-                archive.delete(row, current_id)
-            elif action == 'restore':
-                archive.restore(row['id'])
-            else:
-                archive.archive(row, current_id)
-            completed += 1
-        except (OSError, ValueError) as exc:
-            failures.append((row, str(exc)))
-    return completed, failures
-
-
-# ---------- 转录导出（Textual / 命令面板共用）----------
-
-def export_session(messages) -> Path:
-    """把当前会话写出一份 transcript，返回路径（复用 agent_core 的唯一写入实现）。"""
-    return write_transcript(messages)
-
-
-def list_transcripts() -> list[Path]:
-    """最近优先的 transcript 列表；目录不存在时返回空列表。"""
-    try:
-        return sorted(TRANSCRIPT_DIR.glob('transcript_*.jsonl'),
-                      key=lambda path: path.stat().st_mtime, reverse=True)
-    except OSError:
-        return []
-
-
-def load_transcript(path) -> list[dict]:
-    """读回一份 transcript；坏行跳过，不因一行损坏丢掉整场会话。"""
-    records = []
-    try:
-        with open(path, encoding='utf-8') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        return []
-    return records
 
 
 # ============================================================
@@ -1132,6 +873,396 @@ def _stream_completion(create_kwargs, on_delta, api=None):
     )
 
 
+@dataclass
+class _TurnState:
+    """一次 agent_loop 调用的显式状态。
+
+    之前这些值散落在 agent_loop 的局部变量里：压缩状态机、回合统计、快照基线与
+    工作区都必须同进同退。收进对象后，跨迭代的可变状态只有这一处，请求执行与
+    工具批处理可以按状态读写，不再靠闭包捕获。
+
+    字段全部是「本回合内」状态；跨进程真相仍在 session_store 的事件流里。
+    """
+
+    messages: list
+    session_store: SessionEventStore
+    on_delta: object
+    on_event: object
+    steer_provider: object
+    recovery_state: object
+    context: dict
+    system: str
+    checkpoint_manager: CheckpointManager
+    turn_workspace: Path
+    memories_content: str
+    memory_load_ms: float
+    turn_cp_start: object
+    turn_started: float = field(default_factory=time.monotonic)
+    reactive_retries: int = 0
+    skip_micro_rounds: int = 0
+    rounds_since_todo: int = 0
+    streamed_parts: list[str] = field(default_factory=list)
+    turn_tokens: int = 0
+    turn_usage: dict = field(default_factory=lambda: {
+        'prompt': 0, 'completion': 0, 'cached': 0, 'total': 0,
+        'reasoning': 0, 'cached_seen': False})
+    ctx_tokens: int | None = None
+    snip_state: dict = field(default_factory=dict)
+    turn_no: int = 0
+    memory_profile_pending: bool = True
+    turn_baseline: object = None
+    baseline_taken: bool = False
+
+
+def _drain_steering(state: _TurnState) -> bool:
+    """把 TUI 运行中的 steer 消息注入当前上下文（下一轮请求前）。"""
+    if state.steer_provider is None:
+        return False
+    try:
+        texts = state.steer_provider() or []
+    except Exception:
+        return False
+    injected = False
+    for text in texts:
+        if not text:
+            continue
+        message = {'role': 'user', 'content': str(text)}
+        state.messages.append(message)
+        state.session_store.append_message(message)
+        ui_emit('user_message', text=str(text))
+        injected = True
+    return injected
+
+
+def _system_fingerprint(system: str) -> str:
+    return hashlib.sha1((system or '').encode('utf-8', 'replace')).hexdigest()[:12]
+
+
+def _run_llm_request(state: _TurnState, request_messages: list, profile_timing: dict,
+                     stream_probe: dict, request_started: float):
+    """执行一次（含内部重试的）模型请求，流式增量直接写回状态与 UI。"""
+    def _create():
+        max_tokens = (recovery.ESCALATED_MAX_TOKENS
+                      if state.recovery_state.has_escalated
+                      else recovery.DEFAULT_MAX_TOKENS)
+        target = getattr(state.recovery_state, 'current_target', None)
+        if target is None:
+            try:
+                target = model_target('main')
+            except llm_config.ConfigError:
+                target = None
+        if target is not None:
+            selected_model = target.model
+            api = client_for('main', target)
+        else:
+            selected_model = state.recovery_state.current_model or os.getenv("LLM_MODEL_ID")
+            api = client
+        state.recovery_state.stream_started = False
+        kwargs = dict(
+            model=selected_model,
+            messages=request_messages,
+            tools=TOOLS,
+            temperature=0.7,
+            max_tokens=max_tokens,
+        )
+        if state.on_delta is None and (not streaming_enabled()
+                                       or (target is not None
+                                           and not target.supports('stream'))):
+            return api.chat.completions.create(**kwargs)
+
+        def _delta_hook(part):
+            if 'ttfb_ms' not in profile_timing:
+                profile_timing['ttfb_ms'] = round(
+                    (time.monotonic() - request_started) * 1000, 3)
+            if turn_control.cancel_requested():
+                raise KeyboardInterrupt
+            # 已经向用户交付过文本：重试会把同一段再放一遍，recovery 据此拒绝重放
+            state.recovery_state.stream_started = True
+            if not stream_probe['started']:
+                stream_probe['started'] = True
+                ui_emit('assistant_start', mid=stream_probe['mid'])
+            ui_emit('assistant_delta', mid=stream_probe['mid'], delta=part)
+            state.streamed_parts.append(part)
+            if state.on_delta is not None:
+                state.on_delta(part)
+
+        state.streamed_parts.clear()   # 标记只反映最近一次调用
+        stream_t0 = time.monotonic()
+        try:
+            if api is client:   # 保持测试对 _stream_completion(kwargs, hook) 的 patch 签名
+                response = _stream_completion(kwargs, _delta_hook)
+            else:
+                response = _stream_completion(kwargs, _delta_hook, api=api)
+        except Exception:
+            # 已经开过流就把 UI 的 streaming 状态收尾，否则气泡会一直转圈
+            if stream_probe['started']:
+                ui_emit('assistant_end', mid=stream_probe['mid'])
+            raise
+        profile_timing['stream_ms'] = round(
+            (time.monotonic() - stream_t0) * 1000, 3)
+        return response
+
+    with perf_segment('llm.main'):
+        return recovery.with_retry(_create, state.recovery_state)
+
+
+def _record_request_result(state: _TurnState, response, *, profile_timing: dict,
+                           request_started: float, request_ms: float,
+                           prompt_message_count: int) -> None:
+    """记录成功请求：usage 事件、回合累计与状态行。"""
+    detail = _parse_usage(getattr(response, 'usage', None))
+    if detail is None:
+        completed_profile = {
+            **profile_timing,
+            'request_ms': request_ms,
+            'ttfb_ms': profile_timing.get('ttfb_ms'),
+            'prompt_message_count': prompt_message_count,
+            'usage_available': False,
+            'model': active_model(state.recovery_state),
+            'system_fp': _system_fingerprint(state.system),
+            'tools_fp': _tools_fingerprint(),
+            'finish_reason': getattr(response.choices[0], 'finish_reason', None),
+        }
+        if state.memory_profile_pending:
+            completed_profile['memory_load_ms'] = state.memory_load_ms
+            state.memory_profile_pending = False
+        state.session_store.append('model_request_completed', **completed_profile)
+        return
+    # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
+    detail['model'] = active_model(state.recovery_state)
+    detail['system_fp'] = _system_fingerprint(state.system)
+    detail['tools_fp'] = _tools_fingerprint()
+    detail.update(profile_timing)
+    if state.memory_profile_pending:
+        detail['memory_load_ms'] = state.memory_load_ms
+        state.memory_profile_pending = False
+    detail['request_ms'] = request_ms
+    detail.setdefault('ttfb_ms', None)
+    detail['prompt_message_count'] = prompt_message_count
+    state.turn_tokens += detail['total']
+    for key in ('prompt', 'completion', 'cached', 'total', 'reasoning'):
+        state.turn_usage[key] += detail[key]
+    state.turn_usage['cached_seen'] = (
+        state.turn_usage['cached_seen'] or detail['cached_seen'])
+    # 埋点：逐调用 usage 事件（供应商权威值；命中率可逐调用分析，
+    # 聚合口径由 usage_totals() 求和保持不变）
+    state.session_store.append('usage', **detail)
+    state.ctx_tokens = detail['prompt']   # 压缩判据锚点：本请求真实大小
+    METRICS.record_usage(detail)
+    ui_emit('round_end', round=state.turn_no,
+            prompt_tokens=detail['prompt'],
+            completion_tokens=detail['completion'],
+            total_tokens=detail['total'],
+            cached_tokens=detail['cached'],
+            reasoning_tokens=detail.get('reasoning', 0),
+            cost=str(METRICS.cost),
+            cost_source=METRICS.cost_source,
+            duration_ms=round((time.monotonic() - request_started) * 1000),
+            compressed=False)
+    update_panel_status(state.messages, model=detail['model'],
+                        ctx_tokens=detail['prompt'],
+                        ctx_source='confirmed')
+
+
+def _record_request_failure(state: _TurnState, exc, *, profile_timing: dict,
+                            request_ms: float, prompt_message_count: int) -> None:
+    """记录失败请求画像；是否重试由调用方按异常类型决定。"""
+    response = getattr(exc, 'response', None)
+    status_code = (getattr(exc, 'status_code', None)
+                   or getattr(response, 'status_code', None))
+    failure_profile = {
+        **profile_timing,
+        'request_ms': request_ms,
+        'error_type': type(exc).__name__,
+        'provider_status': status_code,
+        'prompt_too_long': recovery.is_prompt_too_long_error(exc),
+        'prompt_message_count': prompt_message_count,
+    }
+    if state.memory_profile_pending:
+        failure_profile['memory_load_ms'] = state.memory_load_ms
+        state.memory_profile_pending = False
+    state.session_store.append('model_request_failed', **failure_profile)
+
+
+def _continue_after_length(state: _TurnState, response) -> bool:
+    """输出被截断时升级 max_tokens 并续写；返回 True 表示回到主循环。"""
+    if (response.choices[0].finish_reason != 'length'
+            or state.recovery_state.has_escalated):
+        return False
+    state.recovery_state.has_escalated = True
+    print('  [length] escalating max_tokens and requesting continuation')
+    completed = SessionEventStore.close_interrupted_tools(state.messages)
+    for tool_result in completed[len(state.messages):]:
+        state.session_store.append_message(tool_result)
+    state.messages[:] = completed
+    continuation = {'role': 'user', 'content': recovery.CONTINUATION_PROMPT}
+    state.messages.append(continuation)
+    state.session_store.append_message(continuation)
+    if state.ctx_tokens is not None:
+        state.ctx_tokens += estimate_size([continuation])
+    return True
+
+
+def _finish_response(state: _TurnState, message, *, pre_compress: list,
+                     housekeeping: bool) -> str | None:
+    """收尾一个非工具回复；返回 None 表示本轮还要继续（steer / Stop 注入）。"""
+    if _drain_steering(state):
+        return None
+    force = trigger_hooks('Stop', state.messages)
+    if force:
+        state.messages.append({'role': 'user', 'content': force})
+        if state.ctx_tokens is not None:
+            state.ctx_tokens += estimate_size([state.messages[-1]])
+        return None
+    if message.content:
+        if state.on_delta is not None or state.streamed_parts:
+            print()   # 调用方已逐段交付文本，只补换行，避免重复打印
+        else:
+            print(message.content)
+    if state.turn_tokens:
+        cum = state.session_store.usage_totals()   # 逐调用 usage 事件聚合
+        from turn_progress import format_duration
+        ctx_note = ''
+        if state.ctx_tokens is not None:
+            window = _context_window(active_model(state.recovery_state))
+            ctx_note = f' · ctx {min(100, 100 * state.ctx_tokens // window)}%'
+        print(f'  [tokens] 本轮 {_fmt_tokens(state.turn_tokens)} · '
+              f'会话累计 {_fmt_tokens(cum["total"])}'
+              f' · 用时 {format_duration(time.monotonic() - state.turn_started)}'
+              f'{ctx_note}'
+              f'{_cache_hit_rate_line(cum)}')
+    write_transcript(state.messages)   # 正常结束也落盘，便于复盘
+    _safe_checkpoint(state.checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
+    # 回合结束清单：Git 基线能看见 bash 造成的改动；非 Git 工作区回退到
+    # 本回合 checkpoint 记录的 write/edit/apply_patch 文件。
+    fallback = _safe_checkpoint(
+        state.checkpoint_manager.changed_files_since, state.turn_cp_start) or {}
+    try:
+        changes = [] if not state.baseline_taken else workspace_diff.turn_changes(
+            state.turn_workspace, state.turn_baseline, fallback, CHECKPOINT_IGNORE)
+    except Exception as exc:   # 汇总失败不影响本轮结果
+        print(f'  [diff] 无法汇总本轮改动：{exc}')
+        changes = []
+    if changes:
+        print(workspace_diff.format_changes(changes))
+        state.session_store.append('files_changed', files=[
+            {'code': entry['code'], 'path': entry['path'],
+             'old': entry.get('old')}
+            for entry in changes
+        ])
+    state.session_store.append('turn_completed')
+    # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
+    # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
+    # 无头一次性进程没有「下一次启动」可等，跑这些线程只会被退出截断，
+    # 所以由调用方显式关闭。
+    if housekeeping:
+        state.turn_no += 1
+        housekeeping_thread = threading.Thread(
+            target=_post_turn_housekeeping,
+            args=(pre_compress, list(state.messages), state.session_store, state.turn_no),
+            daemon=True,
+        )
+        with _housekeeping_lock:
+            # 只清理「已启动且已死」的旧线程——is_alive() 对未 start 的线程
+            # 也返回 False，必须先清理再注册，否则会把本线程误删
+            _housekeeping_threads[:] = [th for th in _housekeeping_threads
+                                        if th.is_alive()]
+            _housekeeping_threads.append(housekeeping_thread)
+        housekeeping_thread.start()
+    ui_emit('session_end', summary=METRICS.snapshot())
+    ui_emit('activity', state='complete', detail='Response complete')
+    return message.content or "No output"
+
+
+def _run_tool_calls(state: _TurnState, message) -> bool:
+    """执行一条 assistant 消息里的全部 tool_calls；返回 True 表示历史已被压缩。"""
+    tool_messages: list[dict] = []
+    compacted = False
+    used_todo = False
+    batch: list = []
+
+    def _flush_batch() -> None:
+        # 只在本轮内同步调用：batch/tool_messages 不跨轮存活
+        if batch:
+            if not state.baseline_taken:   # 首个工具执行前记录工作区基线
+                state.turn_baseline = workspace_diff.snapshot(
+                    state.turn_workspace, CHECKPOINT_IGNORE)
+                state.baseline_taken = True
+            # 批级合并审查：批内多条会 ASK 的 bash 打包成一次 LLM 审查，
+            # 放行结果进缓存（enforce 单条路径零开销命中）；升级的照旧问人
+            hooks.preflight_judge(batch)
+            _run_tool_batch(batch, state.session_store, tool_messages,
+                            on_event=state.on_event)
+            ui_emit('activity', state='thinking', detail='Reviewing tool result')
+            if state.ctx_tokens is not None:   # 只复用已知用量
+                update_panel_status(state.messages, ctx_tokens=state.ctx_tokens,
+                                    ctx_source='confirmed')
+        batch.clear()
+
+    for tool_call in message.tool_calls:
+        name = tool_call.function.name
+        if name == 'todo_write':
+            used_todo = True
+        if name == 'checkpoint':
+            # 当前节点在本轮请求前已创建，快照是完整 OpenAI 历史。只给它加标签，不能
+            # 在 assistant tool_calls 与对应 tool 结果之间新建快照，否则 rewind 后历史无法重放。
+            # 与 compact 一样不进 tool_registry —— 它是 loop 行为，不是普通工具。
+            _flush_batch()
+            try:
+                label = str(json.loads(tool_call.function.arguments or '{}').get('label', ''))
+            except json.JSONDecodeError:
+                label = ''
+            cp_id = _safe_checkpoint(state.checkpoint_manager.label_active, label,
+                                     state.session_store, trigger='manual')
+            tool_messages.append({
+                'role': 'tool', 'tool_call_id': tool_call.id,
+                'content': (f'Checkpoint created: {cp_id}' if cp_id
+                            else 'Checkpoint failed; continue without one.'),
+            })
+            state.session_store.append_message(tool_messages[-1])
+            continue
+        if name == 'compact':
+            # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
+            # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
+            # 改为文本附到新上下文里，避免执行结果丢失。
+            _flush_batch()
+            state.messages[:] = compact_history(state.messages)
+            _record_compaction(state.session_store, state.messages, 'tool')
+            state.skip_micro_rounds = 3
+            note = '[Compacted] Conversation history has been summarized.'
+            if tool_messages:
+                done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
+                note += '\n\nTool results executed before compaction:\n' + done
+            state.messages.append({'role': 'user', 'content': note})
+            state.session_store.append_message(state.messages[-1])
+            compacted = True
+            if state.ctx_tokens is not None:
+                state.ctx_tokens = estimate_size(state.messages)   # 整体替换历史后重估
+            break
+        batch.append(tool_call)
+    _flush_batch()
+
+    if compacted:   # 压缩后工具丢失，需要重新执行
+        return True
+
+    notifications = collect_background_results()
+    if notifications:
+        for notification in notifications:
+            # 后台任务完成通知：作为 user 消息注入（孤儿 role=tool 会触发 API 400）
+            tool_messages.append({'role': 'user', 'content': notification})
+            state.session_store.append_message(tool_messages[-1])
+        print(f"  \033[32m[inject] {len(notifications)} background "
+              f"notification(s)\033[0m")
+
+    state.messages.extend(tool_messages)
+    if state.ctx_tokens is not None and tool_messages:   # 增量：新增工具结果（已入口截断，单条有界）
+        state.ctx_tokens += estimate_size(tool_messages)
+    state.rounds_since_todo = 0 if used_todo else state.rounds_since_todo + 1
+    state.context = update_context(state.context, state.messages)
+    state.system = get_system_prompt(state.context)   # 工具面/工作区可能已变
+    return False
+
+
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None, *,
                on_event=None, housekeeping=True, steer_provider=None):
@@ -1151,97 +1282,77 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
     set_session(session_store.session_id)
     set_agent('lead')   # 子代理会临时覆盖，退出后恢复
-    context=update_context({},messages) #循环前更新上下文，包含所有对话记录
-    recovery_state=recovery.RecoveryState()
+    context = update_context({}, messages)   # 循环前更新上下文，包含所有对话记录
     if messages:
-        trigger_hooks('UserPromptSubmit',messages[-1]['content'])
-    system=get_system_prompt(context)
-    reactive_retries=0 #响应重试次数
-    skip_micro_rounds=0 #跳过 micro_compact 轮数
-    rounds_since_todo=0 #距离上次 todo 提醒的轮数
-    streamed_parts=[] #最近一次 API 调用已流式输出的文本（抑制最终重复打印）
-    turn_started=time.monotonic() #本回合起始（tokens 行显示总用时）
-    turn_tokens=0 #本回合累计 tokens（含工具轮次）
-    turn_usage={'prompt':0,'completion':0,'cached':0,'total':0,
-                'reasoning':0,'cached_seen':False} #本回合明细（回合末打印）
-    ctx_tokens=None #压缩判据：上次请求的 prompt_tokens（供应商权威值）+ 新增消息估算增量
-    snip_state={} #snip 触发迟滞：触发后基线+阈值/4 才允许再次触发（无迟滞则越线后每回合滑动断前缀）
-    turn_no=0 #已完成回合数（每 8 回合异步重生成一次会话标题）
+        trigger_hooks('UserPromptSubmit', messages[-1]['content'])
+    system = get_system_prompt(context)
+    turn_started = time.monotonic()   # 本回合起始（tokens 行显示总用时）
     # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
     # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
     #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
     memory_load_started = time.perf_counter()
     with perf_segment('mem.load'):
-        memories_content=load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
+        memories_content = load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
     memory_load_ms = round((time.perf_counter() - memory_load_started) * 1000, 3)
-    memory_profile_pending = True
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
     restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
-    turn_workspace = get_workdir()
-    # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
-    turn_baseline = None
-    baseline_taken = False
-    turn_cp_start = _safe_checkpoint(checkpoint_manager.head)
-
-    def _drain_steering() -> bool:
-        """把 TUI 运行中的 steer 消息注入当前上下文（下一轮请求前）。"""
-        if steer_provider is None:
-            return False
-        try:
-            texts = steer_provider() or []
-        except Exception:
-            return False
-        injected = False
-        for text in texts:
-            if not text:
-                continue
-            message = {'role': 'user', 'content': str(text)}
-            messages.append(message)
-            session_store.append_message(message)
-            ui_emit('user_message', text=str(text))
-            injected = True
-        return injected
+    state = _TurnState(
+        messages=messages,
+        session_store=session_store,
+        on_delta=on_delta,
+        on_event=on_event,
+        steer_provider=steer_provider,
+        recovery_state=recovery.RecoveryState(),
+        context=context,
+        system=system,
+        checkpoint_manager=checkpoint_manager,
+        turn_workspace=get_workdir(),
+        memories_content=memories_content,
+        memory_load_ms=memory_load_ms,
+        turn_started=turn_started,
+        # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
+        turn_cp_start=_safe_checkpoint(checkpoint_manager.head),
+    )
 
     while True:
         if turn_control.cancel_requested():   # TUI/REPL 的 Esc、Ctrl-C 取消
             raise KeyboardInterrupt
-        _drain_steering()
+        _drain_steering(state)
         # 每轮开头留一个可回溯节点：快照必须在 pre_compact 重新绑定 messages 之前取
-        _safe_checkpoint(checkpoint_manager.begin_turn,messages,session_store)
+        _safe_checkpoint(checkpoint_manager.begin_turn, state.messages, session_store)
 
         # 压缩前的快照：纯净对话（不含 cron/提醒），供会话结束提炼记忆
-        pre_compress=[m if isinstance(m,dict)
-                      else {'role':m.get('role',''),'content':str(m.get('content',''))}
-                      for m in messages]
-
+        pre_compress = [m if isinstance(m, dict)
+                        else {'role': m.get('role', ''), 'content': str(m.get('content', ''))}
+                        for m in state.messages]
 
         compact_started = time.perf_counter()
-        messages, skip_micro_rounds = pre_compact_messages(
-            messages, skip_micro_rounds,
+        state.messages, state.skip_micro_rounds = pre_compact_messages(
+            state.messages, state.skip_micro_rounds,
             on_compact=lambda compacted, strategy: _record_compaction(session_store, compacted, strategy),
             session_store=session_store,
-            size=ctx_tokens,
-            snip_state=snip_state,
+            size=state.ctx_tokens,
+            snip_state=state.snip_state,
         ) #压缩预处理流程（判据优先用真实用量，见 pre_compact_messages）
         compact_ms = round((time.perf_counter() - compact_started) * 1000, 3)
 
-        if rounds_since_todo >=8 and messages:
+        if state.rounds_since_todo >= 8 and state.messages:
             reminder = {
-                'role':'user',
-                'content':"<reminder>Update your todos.</reminder>",
+                'role': 'user',
+                'content': "<reminder>Update your todos.</reminder>",
             }
-            messages.append(reminder)
+            state.messages.append(reminder)
             session_store.append_message(reminder)
-            rounds_since_todo=0
+            state.rounds_since_todo = 0
 
-        fired=consume_cron_queue() #消费 cron 任务列
+        fired = consume_cron_queue()   # 消费 cron 任务列
         for job in fired:
             cron_message = {
-                'role':'user',
-                'content':f'[Scheduled] {job.prompt}'
+                'role': 'user',
+                'content': f'[Scheduled] {job.prompt}',
             }
-            messages.append(cron_message)
+            state.messages.append(cron_message)
             session_store.append_message(cron_message)
             print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
 
@@ -1250,16 +1361,16 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
         prompt_assembly_started = time.perf_counter()
         request_messages = expand_image_parts(
-            inject_memories(messages, memories_content, system))
+            inject_memories(state.messages, state.memories_content, state.system))
         prompt_assembly_ms = round(
             (time.perf_counter() - prompt_assembly_started) * 1000, 3)
         prompt_message_count = len(request_messages)
         prepare_ms = compact_ms + prompt_assembly_ms
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
         cache_prefix_profile = _report_cache_prefix(
-            session_store.session_id, messages,
-            active_model(recovery_state),
-            system=system) or {}
+            session_store.session_id, state.messages,
+            active_model(state.recovery_state),
+            system=state.system) or {}
 
         request_started = time.monotonic()
         profile_timing = {'prepare_ms': prepare_ms,
@@ -1269,156 +1380,34 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         stream_probe = {'started': False, 'mid': f'm{time.time_ns()}'}
         ui_emit('activity', state='thinking', detail='Requesting model response')
 
-        def _create(profile_timing=profile_timing): #创建模型回复函数
-            max_tokens=(recovery.ESCALATED_MAX_TOKENS
-                        if recovery_state.has_escalated
-                        else recovery.DEFAULT_MAX_TOKENS)
-            target = getattr(recovery_state, 'current_target', None)
-            if target is None:
-                try:
-                    target = model_target('main')
-                except llm_config.ConfigError:
-                    target = None
-            if target is not None:
-                selected_model = target.model
-                api = client_for('main', target)
-            else:
-                selected_model = recovery_state.current_model or os.getenv("LLM_MODEL_ID")
-                api = client
-            recovery_state.stream_started = False
-            kwargs = dict(
-                model=selected_model,
-                messages=request_messages,  # noqa: B023  本轮内同步交给 with_retry，无迟绑定
-                tools=TOOLS,
-                temperature=0.7,
-                max_tokens=max_tokens,
-            )
-            if on_delta is None and (not streaming_enabled()
-                                     or (target is not None
-                                         and not target.supports('stream'))):
-                return api.chat.completions.create(**kwargs)
-
-            _probe = stream_probe  # noqa: B023
-            def _delta_hook(part, probe=_probe, hook=on_delta, state=recovery_state,
-                            timing=profile_timing, started=request_started):  # noqa: B023
-                if 'ttfb_ms' not in timing:
-                    timing['ttfb_ms'] = round((time.monotonic() - started) * 1000, 3)
-                if turn_control.cancel_requested():
-                    raise KeyboardInterrupt
-                # 已经向用户交付过文本：重试会把同一段再放一遍，recovery 据此拒绝重放
-                state.stream_started = True
-                if not probe['started']:
-                    probe['started'] = True
-                    ui_emit('assistant_start', mid=probe['mid'])
-                ui_emit('assistant_delta', mid=probe['mid'], delta=part)
-                streamed_parts.append(part)
-                if hook is not None:
-                    hook(part)
-
-            streamed_parts.clear()   # 标记只反映最近一次调用
-            stream_t0 = time.monotonic()
-            try:
-                if api is client:   # 保持测试对 _stream_completion(kwargs, hook) 的 patch 签名
-                    response = _stream_completion(kwargs, _delta_hook)
-                else:
-                    response = _stream_completion(kwargs, _delta_hook, api=api)
-            except Exception:
-                # 已经开过流就把 UI 的 streaming 状态收尾，否则气泡会一直转圈
-                if _probe['started']:
-                    ui_emit('assistant_end', mid=_probe['mid'])
-                raise
-            profile_timing['stream_ms'] = round(
-                (time.monotonic() - stream_t0) * 1000, 3)
-            return response
-
-        try: #错误恢复逻辑
-            with perf_segment('llm.main'):
-                response=recovery.with_retry(_create,recovery_state)
-            reactive_retries=0
-            detail=_parse_usage(getattr(response, 'usage', None))
+        try:   # 错误恢复逻辑
+            response = _run_llm_request(state, request_messages, profile_timing,
+                                        stream_probe, request_started)
+            state.reactive_retries = 0
             request_ms = round((time.monotonic() - request_started) * 1000, 3)
-            if detail:
-                # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
-                detail['model'] = active_model(recovery_state)
-                detail['system_fp'] = hashlib.sha1(
-                    (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
-                detail['tools_fp'] = _tools_fingerprint()
-                detail.update(profile_timing)
-                if memory_profile_pending:
-                    detail['memory_load_ms'] = memory_load_ms
-                    memory_profile_pending = False
-                detail['request_ms'] = request_ms
-                detail.setdefault('ttfb_ms', None)
-                detail['prompt_message_count'] = prompt_message_count
-                turn_tokens += detail['total']
-                for _k in ('prompt','completion','cached','total','reasoning'):
-                    turn_usage[_k] += detail[_k]
-                turn_usage['cached_seen'] = turn_usage['cached_seen'] or detail['cached_seen']
-                # 埋点：逐调用 usage 事件（供应商权威值；命中率可逐调用分析，
-                # 聚合口径由 usage_totals() 求和保持不变）
-                session_store.append('usage', **detail)
-                ctx_tokens = detail['prompt']   # 压缩判据锚点：本请求真实大小
-                METRICS.record_usage(detail)
-                ui_emit('round_end', round=turn_no,
-                        prompt_tokens=detail['prompt'],
-                        completion_tokens=detail['completion'],
-                        total_tokens=detail['total'],
-                        cached_tokens=detail['cached'],
-                        reasoning_tokens=detail.get('reasoning', 0),
-                        cost=str(METRICS.cost),
-                        cost_source=METRICS.cost_source,
-                        duration_ms=round(
-                            (time.monotonic() - request_started) * 1000),
-                        compressed=False)
-                update_panel_status(messages, model=detail['model'],
-                                    ctx_tokens=detail['prompt'],
-                                    ctx_source='confirmed')
-            else:
-                completed_profile = {
-                    **profile_timing,
-                    'request_ms': request_ms,
-                    'ttfb_ms': profile_timing.get('ttfb_ms'),
-                    'prompt_message_count': prompt_message_count,
-                    'usage_available': False,
-                    'model': active_model(recovery_state),
-                    'system_fp': hashlib.sha1(
-                        (system or '').encode('utf-8', 'replace')).hexdigest()[:12],
-                    'tools_fp': _tools_fingerprint(),
-                    'finish_reason': getattr(response.choices[0], 'finish_reason', None),
-                }
-                if memory_profile_pending:
-                    completed_profile['memory_load_ms'] = memory_load_ms
-                    memory_profile_pending = False
-                session_store.append('model_request_completed', **completed_profile)
+            _record_request_result(
+                state, response, profile_timing=profile_timing,
+                request_started=request_started, request_ms=request_ms,
+                prompt_message_count=prompt_message_count)
         except Exception as e:
             request_ms = round((time.monotonic() - request_started) * 1000, 3)
-            response = getattr(e, 'response', None)
-            status_code = (getattr(e, 'status_code', None)
-                           or getattr(response, 'status_code', None))
-            failure_profile = {
-                **profile_timing,
-                'request_ms': request_ms,
-                'error_type': type(e).__name__,
-                'provider_status': status_code,
-                'prompt_too_long': recovery.is_prompt_too_long_error(e),
-                'prompt_message_count': prompt_message_count,
-            }
-            if memory_profile_pending:
-                failure_profile['memory_load_ms'] = memory_load_ms
-                memory_profile_pending = False
-            session_store.append('model_request_failed', **failure_profile)
-            if recovery.is_prompt_too_long_error(e) and reactive_retries<MAX_REACTIVE_RETRIES:
+            _record_request_failure(
+                state, e, profile_timing=profile_timing,
+                request_ms=request_ms, prompt_message_count=prompt_message_count)
+            if (recovery.is_prompt_too_long_error(e)
+                    and state.reactive_retries < MAX_REACTIVE_RETRIES):
                 # 逐次缩尾：keep/budget 收紧（500KB 尾部单靠条数压不住）
-                attempts=((6,None),(3,12_000),(1,4_000))
-                keep,budget=attempts[min(reactive_retries,len(attempts)-1)]
-                reactive_retries+=1
+                attempts = ((6, None), (3, 12_000), (1, 4_000))
+                keep, budget = attempts[min(state.reactive_retries, len(attempts) - 1)]
+                state.reactive_retries += 1
                 print(f'  [compact] 请求超限，已自动压缩历史并重试'
-                      f'（第 {reactive_retries}/{MAX_REACTIVE_RETRIES} 次，保留 {keep} 条）')
-                messages[:]=reactive_compact(messages, keep=keep, budget_tokens=budget)
-                _record_compaction(session_store, messages, 'reactive')
-                skip_micro_rounds=3
-                if ctx_tokens is not None:
-                    ctx_tokens = estimate_size(messages)   # 历史被整体替换，重估避免 auto 误触发
+                      f'（第 {state.reactive_retries}/{MAX_REACTIVE_RETRIES} 次，保留 {keep} 条）')
+                state.messages[:] = reactive_compact(
+                    state.messages, keep=keep, budget_tokens=budget)
+                _record_compaction(session_store, state.messages, 'reactive')
+                state.skip_micro_rounds = 3
+                if state.ctx_tokens is not None:
+                    state.ctx_tokens = estimate_size(state.messages)   # 整体替换历史后重估
                 continue
             raise
 
@@ -1437,197 +1426,31 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     for call in (message.tool_calls or [])
                 ] or None,
             }
-        messages.append(assistant_message) #添加模型回复到上下文
+        state.messages.append(assistant_message)   # 添加模型回复到上下文
         session_store.append_message(assistant_message)
         if stream_probe['started']:
             ui_emit('assistant_end', mid=stream_probe['mid'])
         elif assistant_message.get('content'):
             ui_emit('assistant_text', text=str(assistant_message['content']))
-        if ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
-            ctx_tokens += estimate_size([assistant_message])
+        if state.ctx_tokens is not None:   # 增量：只有新增部分走估算（assistant 回复较小）
+            state.ctx_tokens += estimate_size([assistant_message])
 
         # 输出被截断：升级到加大 max_tokens 并提示续写
-        if response.choices[0].finish_reason=='length' and not recovery_state.has_escalated:
-            recovery_state.has_escalated=True
-            print('  [length] escalating max_tokens and requesting continuation')
-            completed = SessionEventStore.close_interrupted_tools(messages)
-            for tool_result in completed[len(messages):]:
-                session_store.append_message(tool_result)
-            messages[:] = completed
-            continuation = {'role':'user','content':recovery.CONTINUATION_PROMPT}
-            messages.append(continuation)
-            session_store.append_message(continuation)
-            if ctx_tokens is not None:
-                ctx_tokens += estimate_size([continuation])
+        if _continue_after_length(state, response):
             continue
-
 
         if response.choices[0].finish_reason != "tool_calls":
-            # 若本轮已产生最终回答，但运行中又有 steer 消息，先继续同一 loop。
-            if _drain_steering():
+            result = _finish_response(state, message, pre_compress=pre_compress,
+                                      housekeeping=housekeeping)
+            if result is None:
                 continue
-            force=trigger_hooks('Stop',messages)
-            if force:
-                messages.append({'role':'user','content':force})
-                if ctx_tokens is not None:
-                    ctx_tokens += estimate_size([messages[-1]])
-                continue
-            if message.content:
-                if on_delta is not None or streamed_parts:
-                    print()   # 调用方已逐段交付文本，只补换行，避免重复打印
-                else:
-                    print(message.content)
-            if turn_tokens:
-                cum = session_store.usage_totals()   # 逐调用 usage 事件聚合
-                from turn_progress import format_duration
-                ctx_note = ''
-                if ctx_tokens is not None:
-                    window = _context_window(active_model(recovery_state))
-                    ctx_note = f' · ctx {min(100, 100 * ctx_tokens // window)}%'
-                print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
-                      f'会话累计 {_fmt_tokens(cum["total"])}'
-                      f' · 用时 {format_duration(time.monotonic() - turn_started)}'
-                      f'{ctx_note}'
-                      f'{_cache_hit_rate_line(cum)}')
-            write_transcript(messages)   # 正常结束也落盘，便于复盘
-            _safe_checkpoint(checkpoint_manager.seal)   # 固化本节点：记录改动文件写入后的 hash
-            # 回合结束清单：Git 基线能看见 bash 造成的改动；非 Git 工作区回退到
-            # 本回合 checkpoint 记录的 write/edit/apply_patch 文件。
-            fallback = _safe_checkpoint(
-                checkpoint_manager.changed_files_since, turn_cp_start) or {}
-            try:
-                changes = [] if not baseline_taken else workspace_diff.turn_changes(
-                    turn_workspace, turn_baseline, fallback, CHECKPOINT_IGNORE)
-            except Exception as exc:   # 汇总失败不影响本轮结果
-                print(f'  [diff] 无法汇总本轮改动：{exc}')
-                changes = []
-            if changes:
-                print(workspace_diff.format_changes(changes))
-                session_store.append('files_changed', files=[
-                    {'code': entry['code'], 'path': entry['path'],
-                     'old': entry.get('old')}
-                    for entry in changes
-                ])
-            session_store.append('turn_completed')
-            # 标题/记忆提炼移入后台线程（_post_turn_housekeeping）：回复立即返回，
-            # 副通道各自的 LLM 调用不再阻塞端到端延迟。快照防后续轮次改写。
-            # 无头一次性进程没有「下一次启动」可等，跑这些线程只会被退出截断，
-            # 所以由调用方显式关闭。
-            if housekeeping:
-                turn_no += 1
-                housekeeping_thread = threading.Thread(
-                    target=_post_turn_housekeeping,
-                    args=(pre_compress, list(messages), session_store, turn_no),
-                    daemon=True,
-                )
-                with _housekeeping_lock:
-                    # 只清理「已启动且已死」的旧线程——is_alive() 对未 start 的线程
-                    # 也返回 False，必须先清理再注册，否则会把本线程误删
-                    _housekeeping_threads[:] = [th for th in _housekeeping_threads
-                                                if th.is_alive()]
-                    _housekeeping_threads.append(housekeeping_thread)
-                housekeeping_thread.start()
-            ui_emit('session_end', summary=METRICS.snapshot())
-            ui_emit('activity', state='complete', detail='Response complete')
-            return message.content or "No output"
+            return result
 
 
-        # compact 工具：在 for 循环内按顺序处理——compact 之前的 tool_call 先正常执行，
-        # 遇到 compact 时压缩历史并重开一轮。
-        # 连续的普通 tool_call 攒成 batch（全只读并行 / 含可变串行，见 _run_tool_batch），
-        # 遇 checkpoint/compact 特殊工具先 flush 再处理。
-        tool_messages = []
-        compacted = False
-        used_todo = False
-        batch = []
-
-        def _flush_batch():
-            # 本函数每轮重新定义，且只在本轮内同步调用：batch/tool_messages 不跨轮存活
-            nonlocal baseline_taken, turn_baseline
-            if batch:  # noqa: B023
-                if not baseline_taken:   # 首个工具执行前记录工作区基线
-                    turn_baseline = workspace_diff.snapshot(
-                        turn_workspace, CHECKPOINT_IGNORE)
-                    baseline_taken = True
-                # 批级合并审查：批内多条会 ASK 的 bash 打包成一次 LLM 审查，
-                # 放行结果进缓存（enforce 单条路径零开销命中）；升级的照旧问人
-                hooks.preflight_judge(batch)  # noqa: B023
-                _run_tool_batch(batch, session_store, tool_messages,  # noqa: B023
-                                on_event=on_event)
-                ui_emit('activity', state='thinking',
-                        detail='Reviewing tool result')
-                if ctx_tokens is not None:   # noqa: B023  只复用已知用量
-                    update_panel_status(messages, ctx_tokens=ctx_tokens,  # noqa: B023
-                                        ctx_source='confirmed')
-            batch.clear()  # noqa: B023
-
-        for tool_call in message.tool_calls:
-            if tool_call.function.name == 'todo_write':
-                used_todo = True
-            if tool_call.function.name == 'checkpoint':
-                # 当前节点在本轮请求前已创建，快照是完整 OpenAI 历史。只给它加标签，不能
-                # 在 assistant tool_calls 与对应 tool 结果之间新建快照，否则 rewind 后历史无法重放。
-                # 与 compact 一样不进 tool_registry —— 它是 loop 行为，不是普通工具。
-                _flush_batch()
-                try:
-                    label=str(json.loads(tool_call.function.arguments or '{}').get('label',''))
-                except json.JSONDecodeError:
-                    label=''
-                cp_id=_safe_checkpoint(checkpoint_manager.label_active,label,session_store,
-                                       trigger='manual')
-                tool_messages.append({
-                    'role':'tool','tool_call_id':tool_call.id,
-                    'content':(f'Checkpoint created: {cp_id}' if cp_id
-                               else 'Checkpoint failed; continue without one.'),
-                })
-                session_store.append_message(tool_messages[-1])
-                continue
-            if tool_call.function.name == 'compact':
-                # compact_history 会替换整个上下文，原 assistant 的 tool_calls 被删除，
-                # 之前已执行的 tool 结果不能以 role=tool 保留（会变成 orphan），
-                # 改为文本附到新上下文里，避免执行结果丢失。
-                _flush_batch()
-                messages[:] = compact_history(messages)
-                _record_compaction(session_store, messages, 'tool')
-                skip_micro_rounds=3
-                note = '[Compacted] Conversation history has been summarized.'
-                if tool_messages:
-                    done = '\n'.join(f"- {str(tm['content'])[:1000]}" for tm in tool_messages)
-                    note += '\n\nTool results executed before compaction:\n' + done
-                messages.append({'role': 'user', 'content': note})
-                session_store.append_message(messages[-1])
-                compacted = True
-                if ctx_tokens is not None:
-                    ctx_tokens = estimate_size(messages)   # 历史被整体替换，重估避免 auto 误触发
-                break
-
-            batch.append(tool_call)
-        _flush_batch()
-
-        if compacted: #压缩后工具丢失，需要重新执行
+        # compact 工具、checkpoint 标签与普通工具批次的顺序处理都在 _run_tool_calls；
+        # 返回 True 表示历史已被 compact，需要重开一轮。
+        if _run_tool_calls(state, message):
             continue
-
-        notifications=collect_background_results() #收集后台任务结果
-        if notifications:
-            for notification in notifications:
-                # 后台任务完成通知：作为 user 消息注入（孤儿 role=tool 会触发 API 400）
-                tool_messages.append(
-                    {
-                        'role':'user',
-                        'content':notification,
-
-                    }
-                )
-                session_store.append_message(tool_messages[-1])
-            print(f"  \033[32m[inject] {len(notifications)} background "
-                  f"notification(s)\033[0m")
-
-        messages.extend(tool_messages)
-        if ctx_tokens is not None and tool_messages:   # 增量：新增工具结果（已入口截断，单条有界）
-            ctx_tokens += estimate_size(tool_messages)
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        context=update_context(context,messages) # 更新上下文，包含工具、工作目录、记忆、技能等
-        system=get_system_prompt(context) #更新系统提示，包含身份、工具、工作目录、记忆、技能、规则等
 
 
 def resume_agent_loop(session_path: Path):
@@ -1710,7 +1533,7 @@ def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
         resolve_session_path=resolve_session_path,
         checkpoints_dir=CHECKPOINT_DIR,
         before_session_change=before_session_change,
-        workspace=WORKDIR,
+        workspace=get_workdir(),
     )
 
 
@@ -1743,7 +1566,7 @@ def run_repl(initial_messages:list, session_store=None):
     messages=[dict(m) for m in initial_messages]
     if session_store is None:
         session_store=SessionEventStore(SESSIONS_DIR)
-        session_store.record_workspace(WORKDIR)
+        session_store.record_workspace(get_workdir())
         for message in messages:
             session_store.append_message(message)
     else:

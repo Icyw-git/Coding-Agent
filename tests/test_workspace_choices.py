@@ -133,3 +133,71 @@ def test_non_interactive_new_session_keeps_the_current_workspace(tmp_path, monke
     monkeypatch.setattr(harness.sys, 'stdin', SimpleNamespace(isatty=lambda: False))
     monkeypatch.setattr(harness.sys, 'stdout', SimpleNamespace(isatty=lambda: False))
     assert harness._workspace_for_new_session() == tmp_path
+
+
+def _pin_non_interactive(monkeypatch, sessions, workspace):
+    monkeypatch.setattr(harness, 'WORKDIR', workspace)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', sessions)
+    monkeypatch.setattr(harness.sys, 'stdin', SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(harness.sys, 'stdout', SimpleNamespace(isatty=lambda: False))
+
+
+def test_workspace_readers_follow_the_execution_context(tmp_path, monkeypatch):
+    """回合 ContextVar 优先于 CLI 全局 WORKDIR：读路径与新建会话默认值都跟随它。"""
+    from workspace_context import use_workspace
+
+    pinned = tmp_path / 'pinned'
+    pinned.mkdir()
+    fallback = tmp_path / 'fallback'
+    fallback.mkdir()
+    sessions = tmp_path / 'sessions'
+    sessions.mkdir()
+    _pin_non_interactive(monkeypatch, sessions, fallback)
+
+    with use_workspace(pinned):
+        assert Path(harness.workspace_catalog()[0]['path']) == pinned
+        assert harness._workspace_for_new_session() == pinned
+        store = harness.start_new_session(session_id='pinned1')
+        store.append_message({'role': 'user', 'content': 'pinned workspace task'})
+        assert Path(store.session_summary()['workspace']) == pinned
+        assert f'{pinned}（当前）' in harness.format_workspace_list()
+        assert 'pinned workspace task' in harness.format_session_list()
+
+    assert harness.WORKDIR == fallback
+    assert harness.get_workdir() == fallback
+
+
+def test_session_list_filters_by_the_execution_context(tmp_path, monkeypatch):
+    from workspace_context import use_workspace
+
+    pinned = tmp_path / 'pinned'
+    pinned.mkdir()
+    fallback = tmp_path / 'fallback'
+    fallback.mkdir()
+    sessions = tmp_path / 'sessions'
+    sessions.mkdir()
+    _pin_non_interactive(monkeypatch, sessions, fallback)
+
+    other = harness.SessionEventStore(sessions, session_id='other')
+    other.append_message({'role': 'user', 'content': 'other workspace task'})
+    other.record_workspace(fallback)
+
+    with use_workspace(pinned):
+        harness.start_new_session(session_id='mine').append_message(
+            {'role': 'user', 'content': 'pinned workspace task'})
+        listing = harness.format_session_list()
+        assert 'pinned workspace task' in listing
+        assert 'other workspace task' not in listing
+
+
+def test_set_workspace_resolves_relative_paths_in_the_execution_context(tmp_path, monkeypatch):
+    from workspace_context import use_workspace
+
+    pinned = tmp_path / 'pinned'
+    (pinned / 'child').mkdir(parents=True)
+    fallback = tmp_path / 'fallback'
+    (fallback / 'child').mkdir(parents=True)
+    monkeypatch.setattr(harness, 'WORKDIR', fallback)
+
+    with use_workspace(pinned):
+        assert harness.set_workspace('child') == (pinned / 'child').resolve()

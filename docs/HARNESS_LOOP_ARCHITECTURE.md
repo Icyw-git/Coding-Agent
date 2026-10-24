@@ -22,6 +22,7 @@
 | `tools.py`            | 工具接线、路径边界与 `tool_registry`                                                             |
 | `tool_schemas.py`     | OpenAI tool schema（顺序是契约）；分域实现见 `tool_*.py`                                         |
 | `session_store.py`    | 追加式 session JSONL、OpenAI 历史重放、pending tool 检测、checkpoint/rewind 事件                 |
+| `session_admin.py`    | 会话/工作区管理适配：列表、选择、清理与转录读取；当前工作区一律经 `get_workdir()` 读取             |
 | `tool_recovery.py`    | 中断工具调用的恢复分级（read-only / idempotent / destructive）与恢复提示文本                     |
 | `checkpoints.py`      | 可回溯节点：messages 快照、文件 pre-image、回溯计划与执行、节点回收、旧明文快照迁移（见 `CHECKPOINT_DESIGN.md`） |
 | `session_cleanup.py`  | 会话归档/恢复/永久删除，连同任务引用的子代理与 teammate 日志一起移动；孤儿子日志回收           |
@@ -41,6 +42,13 @@
 | `hooks.py`            | 工具权限、日志、大输出、用户提交和停止 hook                                                      |
 
 主循环中的 `messages` 是 OpenAI canonical history；system prompt 和相关记忆通过请求副本注入，不应混入 canonical history。
+
+`agent_loop` 的跨迭代可变状态收在 `_TurnState`（messages、压缩状态机、回合统计、快照基线、
+工作区、恢复状态）。三个执行单元各自只读写该状态：`_run_llm_request` 负责客户端选择、
+流式增量与内部重试；`_run_tool_calls` 负责工具批次、checkpoint/compact 特殊工具与后台通知；
+`_finish_response` 负责 Stop/steer、token 汇总、改动文件、transcript 与 housekeeping。
+三者仍定义在 `harness` 命名空间内，`client`、`_stream_completion`、`CONTEXT_LIMIT`、
+`exec_tool_call` 等测试 patch 点保持不变；跨进程真相仍只在 session_store 事件流。
 
 ## 2. 主 agent loop
 

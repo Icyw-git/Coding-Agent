@@ -12,6 +12,8 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from cli_commands import command_error, parse_command
+from session_store import SessionReplayError
+from workspace_choices import find_workspace
 
 
 def _h():
@@ -67,7 +69,7 @@ def _resume(argument: str, session_store):
             path = h.resolve_session_path(rows[0]['id'])
         elif not argument:
             identifier = choose_session(h.session_rows(limit=None, include_empty=True),
-                                        session_store.session_id, h.WORKDIR)
+                                        session_store.session_id, h.get_workdir())
             if identifier is None:
                 return None
             path = h.resolve_session_path(identifier)
@@ -90,9 +92,9 @@ def _resume(argument: str, session_store):
             h.set_workspace(summary['workspace'])
         else:
             print('  [session] 工作目录未记录，保留当前目录；请用 /cd 确认。')
-        print(f"  已恢复：{summary['title']}\n  工作区：{h.WORKDIR}")
+        print(f"  已恢复：{summary['title']}\n  工作区：{h.get_workdir()}")
         return history, candidate
-    except (FileNotFoundError, ValueError, h.SessionReplayError) as exc:
+    except (FileNotFoundError, ValueError, SessionReplayError) as exc:
         print(f'  [session] {exc}')
         return None
 
@@ -100,7 +102,7 @@ def _resume(argument: str, session_store):
 def _new(requested: str, session_store):
     """`/n`、`/new [--ws <序号|名称|路径>|会话ID]`：返回 ([], store) 或 None。"""
     h = _h()
-    target = h.WORKDIR
+    target = h.get_workdir()
     session_id = None
     lowered = requested.lower() if requested else ''
     if lowered.startswith('--'):
@@ -113,12 +115,12 @@ def _new(requested: str, session_store):
             print('  [workspace] 用法：/new --ws <序号|名称|路径>')
             return None
         try:
-            target = h.find_workspace(h.registered_workspaces(), selector)['path']
+            target = find_workspace(h.registered_workspaces(), selector)['path']
         except ValueError as exc:
             # 直接给路径也允许（未登记时不必先 /workspace add）
             candidate = Path(selector).expanduser()
             if not candidate.is_absolute():
-                candidate = h.WORKDIR / candidate
+                candidate = h.get_workdir() / candidate
             if candidate.is_dir():
                 target = str(candidate.resolve())
             else:
@@ -139,7 +141,7 @@ def _new(requested: str, session_store):
     except (ValueError, FileExistsError) as exc:
         print(f'  [session] {exc}')
         return None
-    print(f'  已开始新会话，工作区：{h.WORKDIR}')
+    print(f'  已开始新会话，工作区：{h.get_workdir()}')
     return [], store
 
 
@@ -154,7 +156,7 @@ def _fork(argument: str, session_store):
         upto = int(argument)
     try:
         forked = h.SessionEventStore.fork(session_store, upto_seq=upto)
-    except (FileExistsError, OSError, h.SessionReplayError) as exc:
+    except (FileExistsError, OSError, SessionReplayError) as exc:
         print(f'  [fork] 分叉失败：{exc}')
         return None
     print(f'  已分叉出新会话 {forked.session_id}（原会话保留），后续对话在新会话进行。')
@@ -210,7 +212,7 @@ def run_line_repl(messages: list, session_store) -> None:
     policy = h.load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "
           f"{session_store.session_summary()['title']}")
-    print(f"  模型 {h.format_main_target()} · 工作区 {h.WORKDIR}")
+    print(f"  模型 {h.format_main_target()} · 工作区 {h.get_workdir()}")
     print(f'  档位 {policy.sandbox_mode} / 审批 {policy.approval_policy} · '
           f'沙箱 {h.sandbox.configured_mode()}')
     print('  输入消息开始；/ 命令 · /resume 恢复 · Ctrl-C 中断 · Ctrl-D 退出')
@@ -223,7 +225,7 @@ def run_line_repl(messages: list, session_store) -> None:
             yield row['id'], (f"{row['title']} · {relative_time(row.get('updated'))}"
                               f" · {row['workspace'] or '工作目录未记录'} · {row['preview']}")
 
-    read_line = create_reader(lambda: h.WORKDIR, session_choices)
+    read_line = create_reader(lambda: h.get_workdir(), session_choices)
 
     from prompt_toolkit.patch_stdout import patch_stdout
 

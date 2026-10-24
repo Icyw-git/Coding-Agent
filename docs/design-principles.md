@@ -6,11 +6,12 @@
 
 | 层                        | 职责                                                                                                 |
 | ------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `harness.py` agent_loop   | 唯一 OpenAI 消息主循环：checkpoint、压缩预处理、注入、LLM 调用、工具批次、housekeeping 编排          |
+| `harness.py` agent_loop   | 唯一 OpenAI 消息主循环：`_TurnState` 持有回合状态，请求/工具批/收尾分单元；checkpoint 与压缩编排留在入口 |
 | `src/agent_core.py`       | 兼容门面：hooks 注册表；记忆、token 估算、压缩流水分别位于 `memory.py` / `tokens.py` / `compaction.py` |
 | `src/status_report.py`    | 只读状态与诊断汇总；路径、计数器与客户端经 `_h()` 调用期回读，不持有可变状态                           |
 | `src/repl_commands.py`    | 行式 REPL 的斜杠命令分发；目录、快照配置与执行函数经 `_h()` 回读，保留 `harness` patch 点                |
 | `src/line_repl.py`        | 行式 REPL 主循环：提示符、会话切换、流式回合；`agent_loop`/`run_bash` 等经 `_h()` 回读                    |
+| `src/session_admin.py`    | 会话/工作区管理适配：列表、选择、清理与转录读取；当前工作区一律经 `get_workdir()` 读取                  |
 | `src/tool_dispatch.py`    | 工具执行层：单次/批量调用、并行只读白名单、写入前后 diff 与终端活动行；registry/hooks/UI 经 `_h()` 回读      |
 | `src/prompt_assembly.py`  | system prompt 分段组装与上下文采集；按 context 指纹缓存，依赖由入口注入                              |
 | `src/session_title.py`    | 会话标题副通道：取材、LLM 调用与本地兜底，client 由入口注入，失败不阻塞回复                          |
@@ -65,6 +66,7 @@
 | 定时任务 / 后台任务              | `cron_scheduler` / `background_task` 各自注册表                |
 | 会话-飞书聊天绑定、per-chat 顺序 | feishu gateway（每 chat 一把锁）                               |
 | 标题来源                         | `session_title` 事件（`source='user'` 受保护，重生成永不覆盖） |
+| 当前工作区                       | `harness.get_workdir()`：回合 ContextVar 优先，`WORKDIR` 是 CLI 回退值；`set_workspace` 是唯一写入方 |
 
 其他组件通过 owner 方法更新；跨线程经 ContextVar（checkpoint）或显式参数传递，
 不共享可变全局。压缩判定参数（`CONTEXT_LIMIT`、阈值）集中在 harness.py，

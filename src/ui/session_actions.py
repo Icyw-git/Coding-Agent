@@ -17,6 +17,7 @@ from pathlib import Path
 from ui.modals.confirm import ConfirmModal
 from ui.modals.forks import ForkPickerModal
 from ui.modals.sessions import SessionPickerModal
+from workspace_choices import find_workspace
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
 
@@ -68,7 +69,7 @@ class SessionActionsMixin:
                 self._notice('用法：/new --ws <序号|名称|路径>', level='error')
                 return
             try:
-                target = harness.find_workspace(
+                target = find_workspace(
                     harness.registered_workspaces(), selector)['path']
             except ValueError as exc:
                 # 未登记的目录也允许直接使用，和旧 REPL 保持一致。

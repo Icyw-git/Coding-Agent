@@ -187,19 +187,20 @@ def handle_command(line: str, messages: list, session_store) -> None:
         h.handle_workspace_command(command, argument)
 
     elif command == '/pwd':
-        print(f'  工作区：{h.WORKDIR}')
+        print(f'  工作区：{h.get_workdir()}')
 
     elif command == '/cd':
         if len(parts) < 2:
-            print(f'  工作区：{h.WORKDIR}')
+            print(f'  工作区：{h.get_workdir()}')
             return
         try:
             path = argument
             if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
                 path = path[1:-1]
-            print(f'  工作区：{h.set_workspace(path)}')
+            target = h.set_workspace(path)
+            print(f'  工作区：{target}')
             if session_store is not None:
-                session_store.record_workspace(h.WORKDIR)
+                session_store.record_workspace(target)
         except ValueError as exc:
             print(f'  [workspace] {exc}')
 

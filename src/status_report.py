@@ -97,7 +97,7 @@ def format_status(session_store) -> str:
     return (
         f"  会话：{summary['title']}\n"
         f"  最近活跃：{relative_time(summary['updated'])}\n"
-        f'  工作区：{h.WORKDIR}\n'
+        f'  工作区：{h.get_workdir()}\n'
         f'  模型：{h.format_main_target()}\n'
         f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy} · '
         f'OS 沙箱：{sandbox.configured_mode()}'
@@ -134,12 +134,15 @@ def format_pending_approvals() -> str:
 
 
 def storage_profile_data(*, deep: bool = True) -> dict:
-    """扫描工作区 .cache；TUI、行式 REPL 与 --doctor 共用同一份口径。"""
+    """扫描启动期绑定的 .cache；TUI、行式 REPL 与 --doctor 共用同一份口径。
+
+    存储目录不随 ``/cd`` 迁移，所以根目录取自存储路径本身，而不是当前工作区。
+    """
     import storage_profile
 
     h = _h()
     return storage_profile.scan(
-        h.WORKDIR / '.cache', sessions_dir=h.SESSIONS_DIR,
+        h.SESSIONS_DIR.parent, sessions_dir=h.SESSIONS_DIR,
         checkpoint_keep=h.CHECKPOINT_MAX_NODES, deep=deep)
 
 
@@ -165,14 +168,20 @@ def run_doctor() -> int:
     except llm_config.ConfigError as exc:
         checks = [('model', False)]
         print(f'[model] {exc}')
+    workspace = h.get_workdir()
     checks.extend([
-        ('workspace', h.WORKDIR.is_dir()),
-        ('git repository', (h.WORKDIR / '.git').exists()),
+        ('workspace', workspace.is_dir()),
+        ('git repository', (workspace / '.git').exists()),
     ])
+    cache_root = h.SESSIONS_DIR.parent
     for directory in (h.SESSIONS_DIR, h.CHECKPOINT_DIR, h.MEMORY_DIR, h.TOOL_RESULTS_DIR):
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            checks.append((f'writable {directory.relative_to(h.WORKDIR)}', True))
+            try:
+                label = directory.relative_to(cache_root)
+            except ValueError:
+                label = directory
+            checks.append((f'writable {label}', True))
         except OSError:
             checks.append((f'writable {directory}', False))
     for label, passed in checks:
