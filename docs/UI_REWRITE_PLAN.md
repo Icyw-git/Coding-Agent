@@ -99,6 +99,14 @@
 - P7d：队列动作（取回/全部取回、Ctrl+G 选择器、单条删除确认、队列条刷新）
   下沉到 `src/ui/queue_actions.py` 的 `QueueActionsMixin`；队列对象仍由 App
   拥有，worker 取头部的语义不变。`harness_app.py` 从 925 行降到 797 行。
+- P7e：补全事件/候选接线下沉到 `src/ui/composer/suggestions.py` 的
+  `SuggestionsMixin`；footer 与 Working/历史分页状态分别下沉到
+  `src/ui/chrome/footer.py`、`status.py`；`/review` 与 `/watch` 后台动作下沉到
+  `src/ui/background_actions.py`。状态仍由 App 拥有，mixin 通过 `self` 复用现有
+  队列、widget、model 与事件生命周期，不改交互语义。`harness_app.py` 从 797 行
+  降到 558 行。全量 **1455 passed / 1 skipped**，相关 UI 定向 **97 passed**，
+  Ruff 与 diff 检查通过；真实终端验收仍按 [UI_TERMINAL_ACCEPTANCE.md](UI_TERMINAL_ACCEPTANCE.md)
+  待执行。
 - `/tree` 评估（不实现）：本项目以 append-only 事件流为真相源，
   checkpoint/rewind 负责文件回滚，`/fork <seq>` 与 fork 选择器负责从历史
   分叉；Pi 的消息树是另一套会话模型。强行引入会形成两套历史语义，收益低于

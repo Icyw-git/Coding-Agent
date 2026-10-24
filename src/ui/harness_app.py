@@ -16,19 +16,21 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import Static, TextArea
+from textual.widgets import Static
 
-from file_mentions import workspace_files
+from ui.background_actions import BackgroundActionsMixin
+from ui.chrome.footer import FooterMixin
+from ui.chrome.status import StatusMixin
 from ui.command_actions import CommandActionsMixin
-from ui.composer.completions import apply_suggestion, suggestions
+from ui.composer.suggestions import SuggestionsMixin
 from ui.event_reduction import EventReductionMixin
 from ui.queue_actions import QueueActionsMixin
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
-from ui.rendering import _render_lines, _render_markdown, _short_count, _streaming_markdown_source
+from ui.rendering import _render_lines, _render_markdown, _streaming_markdown_source
 from ui.session_actions import SessionActionsMixin
 from ui.session_admin_actions import SessionAdminActionsMixin
 from ui.transcript import ConversationModel, TranscriptLayout
-from ui.widgets import SUGGESTION_LIMIT, CompletionPopup, Composer, PendingQueue, Transcript
+from ui.widgets import CompletionPopup, Composer, PendingQueue, Transcript
 from ui_events import bus
 
 FOLLOW_END = True
@@ -37,11 +39,11 @@ FOLLOW_END = True
 STREAM_MIN_INTERVAL = 0.05
 STREAM_MAX_INTERVAL = 0.30
 STREAM_DEFAULT_INTERVAL = 0.12
-SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 
 class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                  CommandActionsMixin, EventReductionMixin, QueueActionsMixin,
-                 App):
+                 SuggestionsMixin, BackgroundActionsMixin, FooterMixin,
+                 StatusMixin, App):
     """行模型驱动的 TUI：聊天区只有一个自绘视口。"""
 
     # 子类 BINDINGS 会覆盖 App 默认绑定（默认里本来有 ctrl+c），必须显式写回。
@@ -231,169 +233,6 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             self._history_auto_armed = True
             self._history_last_offset = int(self.view.scroll_offset.y)
 
-    def _refresh_footer(self) -> None:
-        if self._footer is None:
-            return
-        parts = []
-        # 目录/分支常驻，不会被会话标题挤掉（标题只在有实际内容时显示）。
-        try:
-            import harness
-            workspace = harness.get_workdir()
-            branch = harness.current_branch(workspace)
-            label = f'{workspace.name} ({branch})' if branch else workspace.name
-            parts.append(str(label))
-        except Exception:
-            pass
-        if self._title and self._title not in ('新会话', '新对话', 'New session', 'Untitled'):
-            parts.append(self._title[:28])
-        try:
-            import harness
-            parts.append(harness.os.getenv('LLM_MODEL_ID', '') or '(model unset)')
-        except Exception:
-            pass
-        ctx_pct = self._status.get('ctx_pct')
-        ctx_tokens = self._status.get('ctx_tokens')
-        ctx_window = self._status.get('ctx_window')
-        if ctx_pct is not None:
-            detail = f'ctx {float(ctx_pct):.0f}%'
-            if ctx_tokens and ctx_window:
-                detail += f' {_short_count(ctx_tokens)}/{_short_count(ctx_window)}'
-            parts.append(detail)
-        input_tokens = self._status.get('input_tokens')
-        output_tokens = self._status.get('output_tokens')
-        prompt_tokens = self._status.get('prompt_tokens')
-        cached_tokens = self._status.get('cached_tokens')
-        cache_write = self._status.get('cache_write_tokens') or 0
-        if input_tokens is None and prompt_tokens is not None:
-            input_tokens = max(0, prompt_tokens - (cached_tokens or 0)
-                               - cache_write)
-        if input_tokens:
-            parts.append(f'↑{_short_count(input_tokens)}')
-        if output_tokens:
-            parts.append(f'↓{_short_count(output_tokens)}')
-        if cached_tokens:
-            parts.append(f'R{_short_count(cached_tokens)}')
-        if cache_write:
-            parts.append(f'W{_short_count(cache_write)}')
-        rate = self._status.get('latest_cache_hit_rate')
-        if rate is None and prompt_tokens:
-            rate = min(1.0, (cached_tokens or 0) / prompt_tokens)
-        if rate is not None and (cached_tokens or self._status.get('cache_seen')):
-            parts.append(f'cache {100 * float(rate):.0f}%')
-        total = self._status.get('tokens')
-        if total and not (input_tokens or output_tokens):
-            parts.append(f'tok {_short_count(total)}')
-        if self._status.get('cost') and self._status.get('cost_source') != 'unavailable':
-            symbol = '¥' if self._status.get('currency', 'CNY') == 'CNY' else ''
-            parts.append(f"~{symbol}{self._status['cost']}")
-        queued = len(self._pending) + len(self._steering)
-        if queued:
-            parts.append(f'{queued} queued')
-        if self._busy:
-            parts.append('working')
-        self._footer.update('  ·  '.join(part for part in parts if part))
-
-    # ---------- 补全 ----------
-
-    def _workspace_files(self) -> list[str]:
-        import harness
-        root = harness.get_workdir()
-        now = time.monotonic()
-        if root != self._mention_root or now - self._mention_at > 5.0:
-            self._mention_files = workspace_files(root)
-            self._mention_root = root
-            self._mention_at = now
-        return self._mention_files
-
-    def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        if getattr(event.text_area, 'id', '') != 'composer':
-            return
-        if self._programmatic_text is not None:
-            if event.text_area.text == self._programmatic_text:
-                return    # 程序化写入：保持补全关闭，直到用户再次编辑
-            self._programmatic_text = None
-        self._update_suggestions(event.text_area.text)
-
-    def _update_suggestions(self, value: str) -> None:
-        files = self._workspace_files() if '@' in (value or '') else []
-        self._suggestions = suggestions(value, files)
-        self._suggestion_index = 0
-        if self._suggestions:
-            self._popup.show(self._suggestions, self._suggestion_index)
-            self._place_popup()
-        else:
-            self._popup.hide_popup()
-
-    def _place_popup(self) -> None:
-        if self._popup is None or self._composer is None or not self._suggestions:
-            return
-        region = self._composer.region
-        if region.width <= 0:
-            return
-        rows = min(len(self._suggestions), SUGGESTION_LIMIT) + 2
-        width = min(max(24, region.width), 100)
-        x = region.x
-        y = max(0, region.y - rows)
-        self._popup.styles.offset = (x, y)
-        self._popup.styles.width = width
-        self._popup.styles.height = rows
-
-    def has_suggestions(self) -> bool:
-        return bool(self._suggestions)
-
-    def accept_suggestion(self) -> None:
-        if not self._suggestions or self._composer is None:
-            return
-        value, _label = self._suggestions[self._suggestion_index]
-        text = self._composer.text
-        new_text = apply_suggestion(text, value)
-        self._programmatic_text = new_text
-        self._composer.text = new_text
-        self.close_suggestions()
-        self._composer.cursor_location = (0, len(new_text))
-        self._composer.focus()
-
-    def choose_suggestion(self, index: int) -> None:
-        if 0 <= index < len(self._suggestions):
-            self._suggestion_index = index
-            self.accept_suggestion()
-
-    def cycle_suggestion(self, delta: int) -> None:
-        if not self._suggestions:
-            return
-        self._suggestion_index = ((self._suggestion_index + delta)
-                                  % len(self._suggestions))
-        self._popup.show(self._suggestions, self._suggestion_index)
-        self._place_popup()
-
-    def close_suggestions(self) -> None:
-        self._suggestions = []
-        if self._popup is not None:
-            self._popup.hide_popup()
-
-    # ---------- 状态 ----------
-
-    def _tick_border_status(self) -> None:
-        if self._composer is None:
-            return
-        offset = int(self.view.scroll_offset.y) if self.view.is_attached else 0
-        if (not self._busy and self._history_auto_armed
-                and self._history_start > 0 and offset <= 1
-                and self._history_last_offset > 1):
-            self.load_older_history()
-        self._history_last_offset = offset
-        if not self._busy:
-            if self._composer.border_title:
-                self._composer.border_title = ''
-            return
-        elapsed = max(0.0, time.monotonic() - self._turn_started)
-        spinner = SPINNERS[int(time.monotonic() * 8) % len(SPINNERS)]
-        queued = len(self._pending) + len(self._steering)
-        title = f'{spinner} Working {elapsed:4.1f}s'
-        if queued:
-            title += f' · {queued} queued'
-        self._composer.border_title = title
-
     # ---------- 渲染 ----------
 
     def _render_block(self, block, width: int) -> list[Text]:
@@ -494,84 +333,6 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
     def _notice(self, text: str, level: str = 'info') -> None:
         self.model.append('notice', {'text': text, 'level': level})
         self._mark_dirty()
-
-    def start_review(self) -> None:
-        """`/review`：后台只读审阅，进度/结果写进同一块（不占对话回合）。"""
-        if self._busy:
-            self._notice('Cannot review while a request is running.')
-            return
-        block = self.model.append('notice', {'text': 'review: running…'})
-        self._mark_dirty()
-        threading.Thread(target=self._run_review,
-                         args=(block.id,), daemon=True).start()
-
-    def _run_review(self, block_id: str) -> None:
-        from review import run_review
-
-        def progress(text: str) -> None:
-            try:
-                self.call_from_thread(self._review_progress, block_id, text)
-            except Exception:
-                pass
-
-        try:
-            result = run_review(progress=progress)
-        except Exception as exc:
-            result = f'Review failed: {type(exc).__name__}: {exc}'
-        try:
-            self.call_from_thread(self._review_done, block_id, result)
-        except Exception:
-            pass
-
-    def _review_progress(self, block_id: str, text: str) -> None:
-        if self.model.get(block_id) is not None:
-            self.model.update(block_id, text=str(text))
-            self._mark_dirty()
-
-    def _review_done(self, block_id: str, text: str) -> None:
-        if self.model.get(block_id) is not None:
-            self.model.update(block_id, text=str(text))
-            self._mark_dirty()
-
-    # ---------- 后台任务 ----------
-
-    def start_watch(self, argument: str) -> None:
-        """`/watch`：后台线程轮询，进度与最终输出写进同一块。"""
-        block = self.model.append('notice', {'text': 'watch: 等待后台任务…'})
-        self._mark_dirty()
-        threading.Thread(target=self._run_watch,
-                         args=(block.id, argument), daemon=True).start()
-
-    def _run_watch(self, block_id: str, argument: str) -> None:
-        from background_watch import watch_command
-        lines = []
-
-        def progress(text: str) -> None:
-            lines.append(str(text))
-            try:
-                self.call_from_thread(self._watch_progress, block_id, list(lines))
-            except Exception:
-                pass
-
-        try:
-            result = watch_command(argument, emit=progress)
-        except Exception as exc:
-            result = f'Watch failed: {type(exc).__name__}: {exc}'
-        try:
-            self.call_from_thread(self._watch_done, block_id, result)
-        except Exception:
-            pass
-
-    def _watch_progress(self, block_id: str, lines: list) -> None:
-        if self.model.get(block_id) is not None:
-            self.model.update(block_id,
-                              text='watch:' + chr(10) + chr(10).join(lines[-8:]))
-            self._mark_dirty()
-
-    def _watch_done(self, block_id: str, result: str) -> None:
-        if self.model.get(block_id) is not None:
-            self.model.update(block_id, text=str(result))
-            self._mark_dirty()
 
     def cancel_turn(self) -> None:
         """Esc：取消当前回合，并把 steering/follow-up 取回编辑器（同 Pi）。"""
