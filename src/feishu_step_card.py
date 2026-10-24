@@ -80,9 +80,22 @@ def tool_lines(tool_counts: dict[str, int] | None,
     return lines[:MAX_TOOL_LINES]
 
 
+def batch_lines(batch: dict) -> list[str]:
+    """一个工具批次的行：名称 × 次数；失败批次附带错误类型。"""
+    counts: dict[str, int] = {}
+    for name in batch.get('tools') or []:
+        counts[name] = counts.get(name, 0) + 1
+    lines = [f'`{name}` × {count}' if count > 1 else f'`{name}`'
+             for name, count in counts.items()]
+    if batch.get('status') == 'error':
+        lines.append('⚠️ ' + str(batch.get('error_type') or 'error'))
+    return lines
+
+
 def step_card(*, answer: str = '', status: str = 'completed',
               tool_counts: dict[str, int] | None = None,
               tool_errors: list[dict] | None = None, total_ms: float = 0,
+              tool_batches: list[dict] | None = None,
               note: str = '') -> dict:
     """生成回复卡：答案在上，工具摘要折叠进「过程详情」。"""
     elements: list[dict] = []
@@ -92,13 +105,25 @@ def step_card(*, answer: str = '', status: str = 'completed',
     elif status == 'running':
         elements.append(_markdown('_正在处理…_'))
 
-    lines = tool_lines(tool_counts, tool_errors, total_ms=total_ms or 0)
-    if lines:
-        count = sum(int(value or 0) for value in (tool_counts or {}).values())
-        title = f'🛠️ 工具摘要（{count or len(lines)}）'
-        panel = _panel(title, lines)
+    batches = [batch for batch in (tool_batches or []) if batch.get('tools')]
+    panels = []
+    if batches:
+        for index, batch in enumerate(batches[:6], 1):
+            count = len(batch.get('tools') or [])
+            if len(batches) == 1:
+                label = f'🛠️ 工具摘要（{count}）'
+            else:
+                label = f'🛠️ 工具摘要 {index}（{count}）'
+            panels.append(_panel(label, batch_lines(batch)))
+    else:
+        lines = tool_lines(tool_counts, tool_errors, total_ms=total_ms or 0)
+        if lines:
+            count = sum(int(value or 0) for value in (tool_counts or {}).values())
+            panels.append(_panel(f'🛠️ 工具摘要（{count or len(lines)}）', lines))
+
+    if panels:
         if status == 'running':
-            elements.append(panel)
+            elements.extend(panels)
         else:
             # 完成后整块折叠，手机上一眼只看答案与自己关心的细节
             elements.append({
@@ -115,7 +140,7 @@ def step_card(*, answer: str = '', status: str = 'completed',
                     'icon_position': 'right',
                     'icon_expanded_angle': -180,
                 },
-                'elements': [panel],
+                'elements': panels,
             })
 
     if note:

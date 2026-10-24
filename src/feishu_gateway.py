@@ -45,6 +45,7 @@ import secrets
 import threading
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 
 import httpx
@@ -178,6 +179,27 @@ def markdown_to_card_md(md_text: str) -> str:
     return '\n'.join(out)
 
 
+def _attachment_filename(kind: str, key: str, name: str | None,
+                         data: bytes) -> str:
+    raw = str(name or '').replace(chr(92), '/').split('/')[-1].strip()
+    safe = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in raw)
+    if safe and '.' in safe:
+        return safe[:80]
+    if kind == 'image':
+        if data[:4] == bytes([0x89]) + b'PNG':
+            ext = '.png'
+        elif data[:3] == bytes([0xFF, 0xD8, 0xFF]):
+            ext = '.jpg'
+        elif data[:6] in (b'GIF87a', b'GIF89a'):
+            ext = '.gif'
+        elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            ext = '.webp'
+        else:
+            ext = '.bin'
+        return f'image_{safe or key[-8:]}{ext}'
+    return (safe or f'file_{key[-8:]}')[:80]
+
+
 def _accepts_kwarg(fn, name: str) -> bool:
     """传输层是否支持某个可选参数（测试替身/旧实现可能没有 reply_to）。"""
     try:
@@ -272,6 +294,34 @@ class LarkTransport:
             }],
         }
         return json.dumps(card, ensure_ascii=False)
+
+    def download_image(self, image_key: str) -> bytes:
+        from lark_oapi.api.im.v1 import GetImageRequest
+        request = GetImageRequest.builder().image_key(image_key).build()
+        response = self._client.im.v1.image.get(request)
+        if not response.success():
+            raise RuntimeError(f'feishu image download failed: {response.code} {response.msg}')
+        return self._read_bytes(response)
+
+    def download_file(self, file_key: str) -> bytes:
+        from lark_oapi.api.im.v1 import GetFileRequest
+        request = GetFileRequest.builder().file_key(file_key).build()
+        response = self._client.im.v1.file.get(request)
+        if not response.success():
+            raise RuntimeError(f'feishu file download failed: {response.code} {response.msg}')
+        return self._read_bytes(response)
+
+    @staticmethod
+    def _read_bytes(response) -> bytes:
+        data = getattr(response, 'file', None)
+        if data is not None and hasattr(data, 'read'):
+            return data.read()
+        raw = getattr(response, 'raw', None)
+        if raw is not None and hasattr(raw, 'read'):
+            return raw.read()
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        raise RuntimeError('feishu download returned no content')
 
     def send_step_card(self, chat_id: str, card: dict,
                        reply_to: str | None = None) -> str | None:
@@ -599,6 +649,7 @@ class FeishuGateway:
                 tool_counts=state.get('tool_counts'),
                 tool_errors=state.get('tool_errors'),
                 total_ms=state.get('tool_total_ms') or 0,
+                tool_batches=state.get('tool_batches'),
                 note=note,
             )
 
@@ -678,7 +729,8 @@ class FeishuGateway:
                             answer=failed, status='failed',
                             tool_counts=state.get('tool_counts'),
                             tool_errors=state.get('tool_errors'),
-                            total_ms=state.get('tool_total_ms') or 0))
+                            total_ms=state.get('tool_total_ms') or 0,
+                            tool_batches=state.get('tool_batches')))
                     else:
                         updater(message_id, failed)
                     return
@@ -1700,6 +1752,73 @@ class FeishuGateway:
                     events.append(payload)
         return events, latest
 
+    def _attachment_limit(self) -> int:
+        try:
+            return max(1, int(os.getenv('FEISHU_MAX_ATTACHMENT_MB', '20'))) * 1024 * 1024
+        except ValueError:
+            return 20 * 1024 * 1024
+
+    def _unsupported_message(self, chat_id: str, kind: str) -> None:
+        self._reply(chat_id, f'暂不支持 {kind} 消息；目前可发送文字、图片、文件'
+                             '（PDF/Word/Excel/PPT 等，我会用文档工具读取）。')
+
+    def _handle_attachment(self, chat_id: str, payload: dict,
+                           sender_id: str | None, chat_type: str | None,
+                           message_id: str | None) -> None:
+        """把飞书图片/文件落到工作区，再让 agent 用现有工具读取。"""
+        if self.allowed_users is not None and sender_id not in self.allowed_users:
+            return
+        kind = payload.get('kind')
+        key = payload.get('key')
+        if not key:
+            self._reply(chat_id, '附件缺少 key，无法下载。')
+            return
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            session_id = self.api.create_session()
+            with self._bindings_lock:
+                self.bindings[chat_id] = session_id
+                self._save_bindings()
+        download = getattr(self.transport, 'download_image' if kind == 'image'
+                           else 'download_file', None)
+        if download is None:
+            self._reply(chat_id, '当前传输层不支持下载附件。')
+            return
+        try:
+            data = download(key)
+        except Exception as exc:
+            print(f'[feishu] attachment download failed: {exc}')
+            self._reply(chat_id, f'[附件] 下载失败：{exc}')
+            return
+        limit = self._attachment_limit()
+        if len(data) > limit:
+            self._reply(chat_id, f'[附件] 文件超过 {limit // (1024 * 1024)}MB，已拒绝。')
+            return
+        try:
+            workspace = Path(self.api.get_workspace(session_id))
+        except Exception as exc:
+            self._reply(chat_id, f'[附件] 无法定位会话工作区：{exc}')
+            return
+        inbox = workspace / '.cache' / 'feishu-inbox'
+        try:
+            inbox.mkdir(parents=True, exist_ok=True)
+            name = _attachment_filename(kind, key, payload.get('name'), data)
+            path = inbox / f'{uuid.uuid4().hex[:8]}_{name}'
+            path.write_bytes(data)
+        except OSError as exc:
+            self._reply(chat_id, f'[附件] 保存失败：{exc}')
+            return
+        if kind == 'image':
+            hint = ('[用户发来图片]' + chr(10) + f'path: {path}' + chr(10)
+                    + '请先用 view_image 查看图片内容，再回答用户的问题。')
+        else:
+            hint = (f'[用户发来文件] name: {payload.get("name") or path.name}'
+                    + chr(10) + f'path: {path}' + chr(10)
+                    + '请按需用 read_document 读取（PDF/Word/Excel/PPT/图片），'
+                      '或直接用 read 读取文本文件。')
+        self.on_message(chat_id, hint, sender_id=sender_id,
+                        chat_type=chat_type, message_id=message_id)
+
     def _rebind_new_session(self, chat_id: str) -> str:
         session_id = self.api.create_session()
         with self._bindings_lock:
@@ -1782,7 +1901,8 @@ class FeishuGateway:
                  chat_type: str | None = None,
                  message_id: str | None = None) -> None:
         """把飞书事件投递到分发队列（回调线程立即返回）。"""
-        norm = unicodedata.normalize('NFKC', text or '').strip().lower()
+        norm = (unicodedata.normalize('NFKC', text).strip().lower()
+                if isinstance(text, str) else '')
         is_approval = (norm.split()[:1] == ['/approve'] or
                        (re.fullmatch(r'(y|n)(\d{0,2})', norm) is not None
                         and bool(self._chat_pending.get(chat_id))))
@@ -1819,7 +1939,12 @@ class FeishuGateway:
                     else:
                         with self._chat_lock(chat_id):
                             if isinstance(text, dict):
-                                if text.get('panel'):
+                                if text.get('kind') in ('image', 'file'):
+                                    self._handle_attachment(chat_id, text, sender_id,
+                                                            chat_type, message_id)
+                                elif text.get('unsupported'):
+                                    self._unsupported_message(chat_id, text['unsupported'])
+                                elif text.get('panel'):
                                     self._handle_panel_action(chat_id, text['panel'], sender_id)
                                 elif text.get('workspace_view'):
                                     self._handle_workspace_action(chat_id, text, sender_id)
@@ -1872,9 +1997,27 @@ class FeishuGateway:
         def on_lark_message(data) -> None:
             try:
                 message = data.event.message
-                if message.message_type != 'text':
+                if message.message_type not in ('text', 'image', 'file'):
+                    self.dispatch(message.chat_id,
+                                  {'unsupported': message.message_type},
+                                  sender_id=None, chat_type=None,
+                                  message_id=getattr(message, 'message_id', None))
                     return
-                content = json.loads(message.content)
+                content = json.loads(message.content or '{}')
+                if message.message_type in ('image', 'file'):
+                    payload = {
+                        'kind': message.message_type,
+                        'key': content.get('image_key') if message.message_type == 'image'
+                        else content.get('file_key'),
+                        'name': content.get('file_name') or '',
+                    }
+                    self.dispatch(message.chat_id, payload,
+                                  sender_id=getattr(
+                                      getattr(getattr(data.event, 'sender', None),
+                                              'sender_id', None), 'open_id', None),
+                                  chat_type=getattr(message, 'chat_type', None),
+                                  message_id=getattr(message, 'message_id', None))
+                    return
                 # 群聊里 @机器人 会留下 <at user_id="...">名字</at> 标签，
                 # 必须剥掉，否则 "/run ..." 这类命令识别不到
                 text = re.sub(r'<at[^>]*>.*?</at>', '',

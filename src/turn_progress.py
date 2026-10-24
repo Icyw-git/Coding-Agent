@@ -44,6 +44,8 @@ class TurnProgress:
         self.tool_counts: dict[str, int] = {}
         self.tool_errors: list[dict] = []
         self.tool_total_ms = 0.0
+        # 每个工具批次一条（飞书过程卡按批次显示「工具摘要（N）」）
+        self.tool_batches: list[dict] = []
 
     def follow(self, store, offset):
         self.store, self.offset = store, offset
@@ -59,6 +61,14 @@ class TurnProgress:
                     if self.tool:
                         self.tool_counts[self.tool] = self.tool_counts.get(self.tool, 0) + 1
                 elif kind == 'tool_profile':
+                    tools = [item.get('name') or 'tool'
+                             for item in event.get('tools') or []]
+                    if tools:
+                        self.tool_batches.append({
+                            'tools': tools,
+                            'status': event.get('status') or 'ok',
+                            'error_type': event.get('error_type') or '',
+                        })
                     for item in event.get('tools') or []:
                         try:
                             self.tool_total_ms += float(item.get('duration_ms') or 0)
@@ -82,6 +92,7 @@ class TurnProgress:
             'tool_counts': dict(self.tool_counts),
             'tool_errors': [dict(item) for item in self.tool_errors],
             'tool_total_ms': round(self.tool_total_ms, 1),
+            'tool_batches': [dict(batch) for batch in self.tool_batches],
         }
 
 

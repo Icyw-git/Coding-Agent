@@ -4373,3 +4373,24 @@ Ruff、`py_compile`、`git diff --check` 通过。
 
 测试：启动面板发到每个绑定聊天、`panel=menu` 重新打开控制台、完成卡带控制台按钮、
 通知文案不再含 turn/来源。全量 **1560 passed / 1 skipped**。
+
+## 飞书：按批次显示工具摘要 + 图片/文件输入
+
+**工具摘要按批次**：截图里是多个「工具摘要（2）」「工具摘要（18）」，对应 agent 的多个
+工具批次。`TurnProgress` 现在记录 `tool_batches`（每批的工具名、状态、错误类型），
+`feishu_step_card` 每批渲染一个折叠面板；只有一个批次时标题仍是「工具摘要（N）」，
+多个批次加序号，全部收进「📋 过程详情」。聚合计数保留为兜底（旧事件没有批次时仍可用）。
+
+**多模态输入**：此前网关只处理 `text`，图片/文件会被直接丢弃。现在：
+- `LarkTransport.download_image/file` 走 `im.v1.image/file.get` 下载字节；
+- `_handle_attachment` 把附件落到**会话工作区**的 `.cache/feishu-inbox/`（uuid 前缀避免重名，
+  扩展名按 magic/原文件名判断），再合成一条提示消息进入正常回合：
+  图片提示用 `view_image`，文件提示用 `read_document`/`read`。这样不需要给 API/stream
+  增加附件传输面，也复用现有权限与工具；
+- 大小上限 `FEISHU_MAX_ATTACHMENT_MB`（默认 20MB）；超限、下载失败、无传输能力都会
+  明确回复，不静默丢；
+- 语音/表情等其余类型回一句“暂不支持”，而不是当没看见；
+- 分发队列支持 dict 载荷（panel/attachment/unsupported），文本路径行为不变。
+
+测试：图片落盘 + `view_image` 提示、PDF 落盘 + `read_document` 提示、超限拒绝、不支持
+类型提示、多批次工具摘要渲染。全量 **1564 passed / 1 skipped**。

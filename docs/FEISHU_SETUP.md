@@ -82,6 +82,16 @@ python src/feishu_gateway.py
 - 主动通知只显示结论（`✅ 回合完成` / `⚠️ 回合失败（原因）`），不带会话/turn ID。
 - 若你的飞书客户端不支持 2.0 卡片，设置 `FEISHU_STEP_CARD=0` 回到 Markdown 卡片。
 
+## 发图片 / 文件
+
+- 直接发**图片**：网关下载到会话工作区 `.cache/feishu-inbox/`，然后让 agent 用
+  `view_image` 查看（支持 PNG/JPG/GIF/WEBP）。
+- 直接发**文件**：同样落到 `.cache/feishu-inbox/`，agent 用 `read_document` 读取
+  PDF / Word / Excel / PPT（DOCX/PPTX 转换需要服务端装 LibreOffice），文本文件也可用
+  `read`。
+- 单文件默认上限 20MB，可用 `FEISHU_MAX_ATTACHMENT_MB` 调整；超限直接拒绝。
+- 语音、表情等暂不支持，会回一句提示。
+
 斜杠命令（`/sessions`、`/archive`、`/cron` 等）仍可用，适合批处理、排障和脚本；
 日常操作不需要记忆它们。
 

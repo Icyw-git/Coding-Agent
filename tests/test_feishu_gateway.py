@@ -1416,3 +1416,96 @@ def test_missing_session_error_detection():
     assert _is_missing_session(FileNotFoundError('x'))
     assert _is_missing_session(HTTPError())
     assert not _is_missing_session(RuntimeError('boom'))
+
+
+class AttachmentTransport(FakeTransport):
+    """带附件下载能力的传输层替身。"""
+
+    def __init__(self, image=b'', file=b''):
+        super().__init__()
+        self.image = image
+        self.file = file
+        self.downloaded = []
+
+    def download_image(self, image_key):
+        self.downloaded.append(('image', image_key))
+        return self.image
+
+    def download_file(self, file_key):
+        self.downloaded.append(('file', file_key))
+        return self.file
+
+
+class AttachmentAPI:
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.sent = []
+
+    def create_session(self):
+        return 'att-session'
+
+    def get_workspace(self, session_id):
+        return str(self.workspace)
+
+    def send(self, text, session_id=None):
+        self.sent.append((session_id, text))
+        return 'ok'
+
+    def send_stream(self, text, session_id=None, on_delta=None, on_progress=None):
+        self.sent.append((session_id, text))
+        if on_delta:
+            on_delta('ok')
+        return 'ok'
+
+
+def test_image_attachment_saved_to_workspace_with_view_image_hint(tmp_path):
+    png = bytes([0x89]) + b'PNG' + b'\x00' * 20
+    transport = AttachmentTransport(image=png)
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+    gw._handle_attachment('chat-img', {'kind': 'image', 'key': 'img_1'},
+                          sender_id='ou_me', chat_type='p2p', message_id='om_1')
+
+    inbox = tmp_path / '.cache' / 'feishu-inbox'
+    files = list(inbox.glob('*.png'))
+    assert len(files) == 1
+    assert files[0].read_bytes() == png
+    hint = api.sent[-1][1]
+    assert 'view_image' in hint and str(files[0]) in hint
+    assert gw.bindings['chat-img'] == 'att-session'
+
+
+def test_document_attachment_hint_points_at_read_document(tmp_path):
+    transport = AttachmentTransport(file=b'%PDF-1.4 fake')
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+    gw._handle_attachment('chat-doc', {'kind': 'file', 'key': 'file_1',
+                                       'name': '季度报告.pdf'},
+                          sender_id='ou_me', chat_type='p2p', message_id='om_2')
+    saved = list((tmp_path / '.cache' / 'feishu-inbox').glob('*.pdf'))
+    assert saved and saved[0].name.endswith('季度报告.pdf')
+    hint = api.sent[-1][1]
+    assert 'read_document' in hint and '季度报告.pdf' in hint
+    assert str(saved[0]) in hint
+
+
+def test_oversized_attachment_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('FEISHU_MAX_ATTACHMENT_MB', '1')
+    transport = AttachmentTransport(file=b'x' * (2 * 1024 * 1024))
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+    gw._handle_attachment('chat-big', {'kind': 'file', 'key': 'f', 'name': 'big.bin'},
+                          sender_id='ou_me', chat_type='p2p', message_id='om_3')
+    assert '超过' in transport.last()
+    assert not list((tmp_path / '.cache' / 'feishu-inbox').glob('*'))
+
+
+def test_unsupported_message_type_gets_hint(tmp_path):
+    fake = FakeTransport()
+    gw = FeishuGateway(AttachmentAPI(tmp_path), transport=fake,
+                       bindings_path=tmp_path / 'bindings.json')
+    gw._unsupported_message('chat-audio', 'audio')
+    assert '暂不支持 audio' in fake.last() and '图片、文件' in fake.last()
