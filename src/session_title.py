@@ -11,7 +11,7 @@ import os
 from session_store import is_injected_user_content
 
 
-def generate_session_title(messages: list[dict], client) -> str:
+def generate_session_title(messages: list[dict], client, model: str | None = None) -> str:
     """Ask the configured model for a compact session topic, with a local fallback.
 
     取材是「会话在做什么」而非「最后说了什么」：首条有效 user（原始目标）+
@@ -62,7 +62,7 @@ def generate_session_title(messages: list[dict], client) -> str:
         return '(untitled session)'
     try:
         response = client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
+            model=model or os.getenv('LLM_MODEL_ID'),
             messages=[
                 {'role': 'system', 'content': (
                     '为这段 coding agent 会话概括一个主题标题。只输出标题本体（名词短语，'

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import llm_config
 from autonomous_agent import idle_poll
 from file_lock import exclusive_file_lock
 from subagent_events import TeammateRecorder
@@ -24,27 +25,16 @@ MAILBOX_DIR = WORKDIR / '.mailbox'
 MAILBOX_DIR.mkdir(exist_ok=True)
 
 
-class _LazyLLMClient:
-    """延迟构造 OpenAI 客户端（同 harness._LazyLLMClient）：openai SDK 的
-    import 约 1.5s，只在真正发起团队协作调用时才加载。"""
-
-    def __init__(self):
-        self._real = None
-
-    def _instance(self):
-        if self._real is None:
-            import openai
-            self._real = openai.OpenAI(
-                api_key=os.getenv("LLM_API_KEY"),
-                base_url=os.getenv("LLM_BASE_URL"),
-            )
-        return self._real
-
-    def __getattr__(self, name):
-        return getattr(self._instance(), name)
+def _main_model() -> str | None:
+    """teammate 与主循环同角色；配置缺失时退回旧 LLM_MODEL_ID。"""
+    try:
+        return llm_config.get_settings().model_for('main')
+    except llm_config.ConfigError:
+        return os.getenv('LLM_MODEL_ID')
 
 
-client = _LazyLLMClient()
+# 与 harness 共用角色解析与客户端缓存；openai SDK 仍然延迟到首次调用才加载。
+client = llm_config.LazyClient('main')
 
 active_teammates = {}
 AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -454,7 +444,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str: #创建团�
                 recorder.turns += 1
                 try:
                     response = client.chat.completions.create(
-                        model=os.getenv('LLM_MODEL_ID'),
+                        model=_main_model(),
                         messages=request_messages,
                         temperature=0.7,
                         tools=sub_tools,

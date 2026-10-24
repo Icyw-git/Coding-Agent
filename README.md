@@ -382,6 +382,14 @@ LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL_ID=your-model-id
 
+# 可选：多供应商与角色模型（详见 docs/LLM_PROVIDERS.md）
+# 指向 YAML/JSON 文件，或直接写内联 YAML；未设置时完全沿用上面的旧变量。
+# HARNESS_LLM_CONFIG=./llm.yaml
+# 角色覆盖（优先级高于配置文件）：main/summary/memory/title/approval
+# HARNESS_MODEL_TITLE=cheap-model
+# 显式允许跨供应商回退（默认关闭，同供应商回退不受影响）
+# HARNESS_ALLOW_CROSS_PROVIDER_FALLBACK=1
+
 # 可选：MCP 配置文件
 MCP_SERVERS_FILE=.cache/mcp_servers.json
 

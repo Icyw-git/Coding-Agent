@@ -27,6 +27,18 @@ def _h():
     return harness
 
 
+def _main_route():
+    """子代理继承 main 角色；配置缺失时退回旧 LLM_MODEL_ID + 模块级 client。"""
+    h = _h()
+    try:
+        target = h.model_target('main') if hasattr(h, 'model_target') else None
+    except Exception:
+        target = None
+    api = h.client_for('main', target) if hasattr(h, 'client_for') else h.client
+    model = target.model if target is not None else os.getenv('LLM_MODEL_ID')
+    return api, model
+
+
 def _subagent_surface():
     """按当前实时注册表构造子代理工具面。
 
@@ -61,8 +73,9 @@ def spawn_subagent(description:str)->str:
     try:
         for _ in range(30):
             recorder.turns += 1
-            response=_h().client.chat.completions.create(
-                model=os.getenv("LLM_MODEL_ID"),
+            api, model = _main_route()
+            response=api.chat.completions.create(
+                model=model,
                 # 图片附件在副本里展开，messages 本身只保留 harness_image 引用
                 messages=expand_image_parts(messages),
                 tools=sub_tools,

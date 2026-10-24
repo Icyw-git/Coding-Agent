@@ -49,6 +49,7 @@ from pathlib import Path
 import httpx
 
 import approval_view
+import llm_config
 from exec_policy import approval_class
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
 from gateway_sim import GatewayClient
@@ -1157,8 +1158,14 @@ class FeishuGateway:
                     return
                 self._reply(chat_id, f'已撤销 {count} 条当前会话预授权。')
             elif command == '/model':
-                self._reply(chat_id, f"当前模型: {os.getenv('LLM_MODEL_ID', '未配置')}\n"
-                              f"服务地址: {os.getenv('LLM_BASE_URL', '默认地址')}")
+                try:
+                    main = llm_config.get_settings().resolve_for('main')
+                    model_text = main.ref
+                    base_text = main.base_url or '默认地址'
+                except llm_config.ConfigError:
+                    model_text = os.getenv('LLM_MODEL_ID', '未配置')
+                    base_text = os.getenv('LLM_BASE_URL', '默认地址')
+                self._reply(chat_id, f'当前模型: {model_text}\n服务地址: {base_text}')
             elif command == '/sandbox':
                 self._change_policy(chat_id, argument)
             elif command == '/fork':

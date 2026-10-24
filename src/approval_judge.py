@@ -16,6 +16,7 @@ import os
 import sys
 
 import approval_view
+import llm_config
 from exec_policy import (
     ASK,
     READ_ONLY_FILE_TOOLS,
@@ -113,8 +114,22 @@ def _judge_facts(tool: str, args: dict) -> str:
 
 
 def _judge_model() -> str:
-    """审查官模型：HARNESS_JUDGE_MODEL 可单独指定，未设置时跟随主模型。"""
-    return os.getenv(JUDGE_MODEL_ENV) or os.getenv('LLM_MODEL_ID')
+    """审查官模型：approval 角色可单独指定，未设置时跟随主模型。
+
+    优先级：HARNESS_MODEL_APPROVAL > 配置 roles.approval >
+    HARNESS_JUDGE_MODEL（既有变量）> main。
+    """
+    try:
+        return llm_config.get_settings().model_for('approval')
+    except llm_config.ConfigError:
+        return os.getenv(JUDGE_MODEL_ENV) or os.getenv('LLM_MODEL_ID')
+
+
+def _judge_client():
+    """与 main 同 provider 时复用 harness.client（测试也在这里注入假客户端）。"""
+    from hooks import _h
+    h = _h()
+    return h.client_for('approval') if hasattr(h, 'client_for') else h.client
 
 
 def _judge_payload(tool: str, args: dict, decision) -> str | None:
@@ -144,14 +159,13 @@ def _llm_judge_review(tool: str, args: dict, decision) -> tuple[bool | None, str
     不能把 fail-safe 的 300s 语义拖到审查官这一环。
     截断盲批防御：detail 超预算直接升级——opaque_command 最危险的部分通常在
     尾部，只喂头部等于盲批（与「截断的命令不提供同类预授权」同一原则）。"""
-    from hooks import _h
 
     payload = _judge_payload(tool, dict(args), decision)
     if payload is None:
         return False, f'命令摘要超过 {JUDGE_DETAIL_BUDGET} 字符，需人工确认'
     payload = f'{JUDGE_DATA_MARKER}\n{payload}'
     try:
-        response = _h().client.chat.completions.create(
+        response = _judge_client().chat.completions.create(
             model=_judge_model(),
             messages=[{'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
                       {'role': 'user', 'content': payload}],
@@ -221,7 +235,7 @@ def preflight_judge(tool_calls) -> int:
     payload 与单条同源（_judge_payload）：事实段、控制字符转义、长度预算和
     HARNESS_JUDGE_MODEL 两条路径一致；超预算的命令不进批量，留给单条路径
     升级人工，避免只喂半条命令的盲批。"""
-    from hooks import GATE, _h, current_session_id, evaluate_call
+    from hooks import GATE, current_session_id, evaluate_call
 
     if not llm_approval_enabled() or GATE.judge_broken:
         return 0
@@ -264,7 +278,7 @@ def preflight_judge(tool_calls) -> int:
         return 0
     listing = f'{JUDGE_DATA_MARKER}\n\n' + '\n\n'.join(blocks)
     try:
-        response = _h().client.chat.completions.create(
+        response = _judge_client().chat.completions.create(
             model=_judge_model(),
             messages=[{'role': 'system', 'content': JUDGE_BATCH_PROMPT},
                       {'role': 'user', 'content': listing}],

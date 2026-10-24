@@ -159,15 +159,18 @@ system prompt 的分段组装（身份 / 工具 / 工作区 / 技能 / 规则 / 
 
 API 调用在 [`harness.py:386-409`](harness.py:386) 中执行。
 
-### 6.1 429/overload
+### 6.1 错误分类与重试
 
-[`recovery.py:32`](recovery.py:32) 的 `with_retry()` 对 overload、429、rate limit 使用指数退避：
+[`recovery.py`](recovery.py) 的 `classify_error()` 先把供应商各异的异常归一为
+`context_length / rate_limit / overloaded / server / timeout / network /
+auth / invalid_request / unknown`，`with_retry()` 只对可重试类别做指数退避：
 
 - 最多 10 次；
-- 初始约 0.5 秒；
-- 最大约 32 秒；
-- 加随机 jitter；
-- 连续 overload 达阈值时切换 `FALLBACK_MODEL_ID`。
+- 初始约 0.5 秒，最大约 32 秒，加随机 jitter；
+- 优先使用响应的 `Retry-After`（上限 60 秒）；
+- 连续 3 次 overload 或重试耗尽时，按 `fallbacks.main` 切换模型；旧
+  `FALLBACK_MODEL_ID` 等价于同 provider 回退，跨 provider 需显式开启；
+- 流式响应已输出文本后不再重试，避免重复输出。
 
 ### 6.2 上下文超限
 

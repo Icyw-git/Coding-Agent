@@ -52,6 +52,7 @@ import approval_view  # 审批面的参数渲染（/approvals 列表要显示完
 import checkpoint_commands
 import checkpoints
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
+import llm_config
 import recovery
 import sandbox
 import tool_cache
@@ -187,36 +188,69 @@ def build_sub_system() -> str:
 
 
 def generate_session_title(messages: list[dict]) -> str:
-    return _generate_session_title(messages, client)
+    try:
+        target = model_target('title')
+        model = target.model
+    except llm_config.ConfigError:
+        target = model = None
+    return _generate_session_title(
+        messages, client_for('title', target), model=model)
 
 
-class _LazyLLMClient:
-    """延迟构造 OpenAI 客户端：openai SDK 的 import 约 1.5s，CLI/测试进程
-    启动时不该为它买单。属性访问透明委托，首次真正调用 LLM 时才加载。"""
-
-    def __init__(self):
-        self._real = None
-
-    def _instance(self):
-        if self._real is None:
-            import openai  # 首次使用时加载（import 即 ~1.5s）
-            self._real = openai.OpenAI(
-                api_key=os.getenv("LLM_API_KEY"),
-                base_url=os.getenv("LLM_BASE_URL"),
-                timeout=120,   # API 挂起时最多等 120s 抛错，避免静默阻塞 600s（SDK 默认）
-            )
-        return self._real
-
-    def __getattr__(self, name):
-        return getattr(self._instance(), name)
-
-    def warmup(self):
-        """后台预热：提前完成 openai SDK import 与客户端构造（~1.5s），
-        用户敲第一条消息时不再等待。"""
-        self._instance()
+# 兼容旧名字：入口与测试把 `client` 当普通 OpenAI 客户端用，角色解析放在
+# llm_config 里；默认角色 main，首次请求时才 import openai 并构造客户端。
+_LazyLLMClient = llm_config.LazyClient
+client = _LazyLLMClient('main')
 
 
-client = _LazyLLMClient()
+def model_target(role: str = 'main') -> llm_config.ModelTarget:
+    """当前角色最终使用的 provider/model/key。配置错误直接抛出，便于启动校验。"""
+    return llm_config.get_settings().resolve_for(role)
+
+
+def model_for(role: str = 'main') -> str:
+    """状态行/诊断用的模型名；配置缺失时退回旧变量，避免 import 期崩溃。"""
+    try:
+        return model_target(role).model
+    except llm_config.ConfigError:
+        return os.getenv('LLM_MODEL_ID') or ''
+
+
+def client_for(role: str = 'main', target=None):
+    """按角色取客户端。
+
+    与 main 同端点同凭据时复用模块级 ``client``——测试一直用
+    ``monkeypatch.setattr(harness, 'client', fake)`` 注入，副通道必须继续命中
+    这个 patch 点；只有配置了不同 provider 时才另建并缓存客户端。
+    """
+    target = target if target is not None else model_target(role)
+    try:
+        main = model_target('main')
+    except llm_config.ConfigError:
+        main = None
+    if main is not None and (
+            target.provider, target.base_url, target.api_key_env, target.api_key
+    ) == (main.provider, main.base_url, main.api_key_env, main.api_key):
+        return client
+    return llm_config.get_client(target)
+
+
+def active_model(state=None) -> str:
+    """当前生效模型：回退后显示新模型，未回退时按配置解析。"""
+    target = getattr(state, 'current_target', None)
+    if target is not None:
+        return target.model
+    return (getattr(state, 'current_model', None)
+            or model_for('main')
+            or os.getenv('LLM_MODEL_ID') or '')
+
+
+def format_main_target() -> str:
+    """状态页显示 provider/model；旧配置只显示模型名。"""
+    try:
+        return model_target('main').ref
+    except llm_config.ConfigError:
+        return os.getenv('LLM_MODEL_ID') or '未配置'
 
 # UI 事件总线与权限门：Textual / ANSI 渲染层订阅 bus，并在弹窗里应答审批。
 # 非 UI 模式下 PermissionGate 仍走 stdin，行为与原 console 审批一致。
@@ -243,14 +277,24 @@ def __getattr__(name):
 
 
 def validate_runtime_config(environ=None) -> None:
-    """Fail early with an actionable error when required model settings are absent."""
+    """Fail early with an actionable error when required model settings are absent.
+
+    旧变量路径保持原有报错文案（LLM_API_KEY, LLM_MODEL_ID）；新配置路径按
+    main 角色实际引用的 provider 检查密钥，避免要求一个根本用不到的变量。
+    """
     environ = os.environ if environ is None else environ
-    missing = [name for name in ('LLM_API_KEY', 'LLM_MODEL_ID') if not environ.get(name)]
-    if missing:
-        raise RuntimeError(
-            'Missing required configuration: ' + ', '.join(missing)
-            + '. Set them in .env before starting Harness Agent.'
-        )
+    settings = llm_config.load_settings(environ)
+    try:
+        settings.validate_main()
+    except llm_config.ConfigError as exc:
+        if not environ.get('HARNESS_LLM_CONFIG') and not environ.get('LLM_MODEL_ID'):
+            missing = [name for name in ('LLM_API_KEY', 'LLM_MODEL_ID')
+                       if not environ.get(name)]
+            raise RuntimeError(
+                'Missing required configuration: ' + ', '.join(missing)
+                + '. Set them in .env before starting Harness Agent.'
+            ) from exc
+        raise RuntimeError(str(exc)) from exc
 
 
 def list_session_paths(limit: int | None = 20) -> list[Path]:
@@ -621,7 +665,7 @@ def format_status(session_store) -> str:
         f"  会话：{summary['title']}\n"
         f"  最近活跃：{relative_time(summary['updated'])}\n"
         f'  工作区：{WORKDIR}\n'
-        f'  模型：{os.getenv("LLM_MODEL_ID", "未配置")}\n'
+        f'  模型：{format_main_target()}\n'
         f'  执行档位：{policy.sandbox_mode} · 审批：{policy.approval_policy} · '
         f'OS 沙箱：{sandbox.configured_mode()}'
         f'{hooks.GATE.judge_summary() if hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
@@ -670,12 +714,21 @@ def format_storage_profile(*, deep: bool = True) -> str:
 
 def run_doctor() -> int:
     """Report startup prerequisites without contacting the model provider."""
-    checks = [
-        ('LLM_API_KEY', bool(os.getenv('LLM_API_KEY'))),
-        ('LLM_MODEL_ID', bool(os.getenv('LLM_MODEL_ID'))),
+    try:
+        main = model_target('main')
+        checks = [
+            ('model', True),
+            (f'model target {main.ref}', True),
+            (main.api_key_env or 'api key (not required)',
+             bool(main.api_key) or not main.api_key_env),
+        ]
+    except llm_config.ConfigError as exc:
+        checks = [('model', False)]
+        print(f'[model] {exc}')
+    checks.extend([
         ('workspace', WORKDIR.is_dir()),
         ('git repository', (WORKDIR / '.git').exists()),
-    ]
+    ])
     for directory in (SESSIONS_DIR, CHECKPOINT_DIR, MEMORY_DIR, TOOL_RESULTS_DIR):
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -747,9 +800,18 @@ MODEL_WINDOWS={
 OUTPUT_RESERVE=8192        # 给 max_tokens=8000 输出预留
 CTX_SAFETY=0.8             # 留余量，防 prompt_too_long
 
+def _configured_window(model: str) -> int | None:
+    """新配置里声明的窗口；旧环境变量/内置表仍可按既有优先级覆盖。"""
+    try:
+        return llm_config.get_settings().context_window_for(model)
+    except llm_config.ConfigError:
+        return None
+
+
 def _default_context_limit()->int:
-    model=os.getenv('LLM_MODEL_ID','')
-    window=os.getenv('LLM_CONTEXT_WINDOW') or MODEL_WINDOWS.get(model)
+    model=model_for('main')
+    window=(os.getenv('LLM_CONTEXT_WINDOW')
+            or _configured_window(model) or MODEL_WINDOWS.get(model))
     if window is None:
         # Codex 行为：模型信息表 + 告警，绝不静默降级（此前 deepseek-flash 缺注册
         # 曾静默回落 64K，压缩阈值被低估 16 倍）
@@ -763,14 +825,15 @@ CONTEXT_LIMIT=_default_context_limit()
 
 def _context_window(model: str) -> int:
     """状态行显示用的真实窗口（不是压缩阈值 CONTEXT_LIMIT）。"""
-    window = os.getenv('LLM_CONTEXT_WINDOW') or MODEL_WINDOWS.get(model)
+    window = (os.getenv('LLM_CONTEXT_WINDOW')
+              or _configured_window(model) or MODEL_WINDOWS.get(model))
     return int(window) if window else CONTEXT_LIMIT
 
 
 def update_panel_status(messages=None, *, model=None, ctx_tokens=None,
                         ctx_source=None) -> None:
     """把当前用量/上下文占用发给 UI 状态行；无订阅者时是空操作。"""
-    model = model or os.getenv('LLM_MODEL_ID', '')
+    model = model or model_for('main')
     if ctx_tokens is None:
         ctx_tokens = estimate_size(messages) if messages else 0
         ctx_source = ctx_source or 'estimated'
@@ -1456,8 +1519,20 @@ def handle_command(line:str,messages:list,session_store)->None:
             print(f'  [review] 审阅失败：{exc}')
 
     elif command == '/model':
-        print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
-        print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
+        try:
+            main = model_target('main')
+            print(f'  当前模型：{main.ref}')
+            print(f'  服务地址：{main.base_url or "默认地址"}')
+            for _role in ('summary', 'memory', 'title', 'approval'):
+                try:
+                    role_target = model_target(_role)
+                except llm_config.ConfigError:
+                    continue
+                if (role_target.provider, role_target.model) != (main.provider, main.model):
+                    print(f'  {_role}：{role_target.ref}')
+        except llm_config.ConfigError:
+            print(f'  当前模型：{os.getenv("LLM_MODEL_ID", "未配置")}')
+            print(f'  服务地址：{os.getenv("LLM_BASE_URL", "默认地址")}')
 
     elif command == '/sandbox':
         print(apply_sandbox_tier(argument) if argument else format_sandbox_tier())
@@ -1721,13 +1796,14 @@ def _cache_hit_rate_line(bucket: dict) -> str:
     return f' · 缓存命中 {rate:.0%}'
 
 
-def _stream_completion(create_kwargs, on_delta):
+def _stream_completion(create_kwargs, on_delta, api=None):
     """Collect a streamed completion while preserving the existing response shape."""
     _t0 = time.perf_counter()
     _ttfb_done = False
+    api = api if api is not None else client
     # include_usage：流式默认不带 usage，显式索取后随收尾块返回（Deepseek/OpenAI 兼容）
-    stream = client.chat.completions.create(**create_kwargs, stream=True,
-                                            stream_options={'include_usage': True})
+    stream = api.chat.completions.create(**create_kwargs, stream=True,
+                                         stream_options={'include_usage': True})
     if not hasattr(stream, '__iter__'):
         # 客户端不支持流式（测试假件/兼容层返回非迭代对象）：整段作为单次
         # 增量交付并按非流式形状返回，调用方无需区分。
@@ -1905,7 +1981,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         # 诊断只看 system + 历史：记忆块在请求尾部，每轮位置都变，不参与比较。
         cache_prefix_profile = _report_cache_prefix(
             session_store.session_id, messages,
-            recovery_state.current_model or os.getenv('LLM_MODEL_ID') or '',
+            active_model(recovery_state),
             system=system) or {}
 
         request_started = time.monotonic()
@@ -1920,23 +1996,40 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             max_tokens=(recovery.ESCALATED_MAX_TOKENS
                         if recovery_state.has_escalated
                         else recovery.DEFAULT_MAX_TOKENS)
+            target = getattr(recovery_state, 'current_target', None)
+            if target is None:
+                try:
+                    target = model_target('main')
+                except llm_config.ConfigError:
+                    target = None
+            if target is not None:
+                selected_model = target.model
+                api = client_for('main', target)
+            else:
+                selected_model = recovery_state.current_model or os.getenv("LLM_MODEL_ID")
+                api = client
+            recovery_state.stream_started = False
             kwargs = dict(
-                model=recovery_state.current_model or os.getenv("LLM_MODEL_ID"),
+                model=selected_model,
                 messages=request_messages,  # noqa: B023  本轮内同步交给 with_retry，无迟绑定
                 tools=TOOLS,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
-            if on_delta is None and not streaming_enabled():
-                return client.chat.completions.create(**kwargs)
+            if on_delta is None and (not streaming_enabled()
+                                     or (target is not None
+                                         and not target.supports('stream'))):
+                return api.chat.completions.create(**kwargs)
 
             _probe = stream_probe  # noqa: B023
-            def _delta_hook(part, probe=_probe, hook=on_delta,
+            def _delta_hook(part, probe=_probe, hook=on_delta, state=recovery_state,
                             timing=profile_timing, started=request_started):  # noqa: B023
                 if 'ttfb_ms' not in timing:
                     timing['ttfb_ms'] = round((time.monotonic() - started) * 1000, 3)
                 if turn_control.cancel_requested():
                     raise KeyboardInterrupt
+                # 已经向用户交付过文本：重试会把同一段再放一遍，recovery 据此拒绝重放
+                state.stream_started = True
                 if not probe['started']:
                     probe['started'] = True
                     ui_emit('assistant_start', mid=probe['mid'])
@@ -1946,10 +2039,19 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     hook(part)
 
             streamed_parts.clear()   # 标记只反映最近一次调用
-            stream_started = time.monotonic()
-            response = _stream_completion(kwargs, _delta_hook)
+            stream_t0 = time.monotonic()
+            try:
+                if api is client:   # 保持测试对 _stream_completion(kwargs, hook) 的 patch 签名
+                    response = _stream_completion(kwargs, _delta_hook)
+                else:
+                    response = _stream_completion(kwargs, _delta_hook, api=api)
+            except Exception:
+                # 已经开过流就把 UI 的 streaming 状态收尾，否则气泡会一直转圈
+                if _probe['started']:
+                    ui_emit('assistant_end', mid=_probe['mid'])
+                raise
             profile_timing['stream_ms'] = round(
-                (time.monotonic() - stream_started) * 1000, 3)
+                (time.monotonic() - stream_t0) * 1000, 3)
             return response
 
         try: #错误恢复逻辑
@@ -1960,8 +2062,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             request_ms = round((time.monotonic() - request_started) * 1000, 3)
             if detail:
                 # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
-                detail['model'] = (recovery_state.current_model
-                                   or os.getenv('LLM_MODEL_ID') or '')
+                detail['model'] = active_model(recovery_state)
                 detail['system_fp'] = hashlib.sha1(
                     (system or '').encode('utf-8', 'replace')).hexdigest()[:12]
                 detail['tools_fp'] = _tools_fingerprint()
@@ -2002,8 +2103,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                     'ttfb_ms': profile_timing.get('ttfb_ms'),
                     'prompt_message_count': prompt_message_count,
                     'usage_available': False,
-                    'model': (recovery_state.current_model
-                              or os.getenv('LLM_MODEL_ID') or ''),
+                    'model': active_model(recovery_state),
                     'system_fp': hashlib.sha1(
                         (system or '').encode('utf-8', 'replace')).hexdigest()[:12],
                     'tools_fp': _tools_fingerprint(),
@@ -2105,9 +2205,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 from turn_progress import format_duration
                 ctx_note = ''
                 if ctx_tokens is not None:
-                    window = _context_window(
-                        recovery_state.current_model
-                        or os.getenv('LLM_MODEL_ID') or '')
+                    window = _context_window(active_model(recovery_state))
                     ctx_note = f' · ctx {min(100, 100 * ctx_tokens // window)}%'
                 print(f'  [tokens] 本轮 {_fmt_tokens(turn_tokens)} · '
                       f'会话累计 {_fmt_tokens(cum["total"])}'
@@ -2427,7 +2525,7 @@ def _run_line_repl(messages, session_store):
     policy = load_policy()
     print(f"  会话 {session_store.session_id[:8]} · "
           f"{session_store.session_summary()['title']}")
-    print(f"  模型 {os.getenv('LLM_MODEL_ID', '未配置')} · 工作区 {WORKDIR}")
+    print(f"  模型 {format_main_target()} · 工作区 {WORKDIR}")
     print(f'  档位 {policy.sandbox_mode} / 审批 {policy.approval_policy} · '
           f'沙箱 {sandbox.configured_mode()}')
     print('  输入消息开始；/ 命令 · /resume 恢复 · Ctrl-C 中断 · Ctrl-D 退出')

@@ -24,6 +24,37 @@ def _h():
     return harness
 
 
+def _role_target(role: str):
+    """按角色解析模型；配置缺失时返回 None，退回旧 LLM_MODEL_ID 行为。"""
+    import llm_config
+    try:
+        return llm_config.get_settings().resolve_for(role)
+    except llm_config.ConfigError:
+        return None
+
+
+def _role_model(role: str) -> str | None:
+    target = _role_target(role)
+    return target.model if target is not None else None
+
+
+def _role_completion(role: str = 'main', **kwargs):
+    """副通道调用：memory/summary 等角色可独立配置供应商与模型。
+
+    ``harness.client_for`` 在同 provider 时返回模块级 client，测试对
+    ``harness.client`` 的 patch 继续生效。
+    """
+    h = _h()
+    target = _role_target(role)
+    if target is not None:
+        kwargs['model'] = target.model
+        api = h.client_for(role, target) if hasattr(h, 'client_for') else h.client
+    else:
+        kwargs.setdefault('model', os.getenv('LLM_MODEL_ID'))
+        api = h.client
+    return api.chat.completions.create(**kwargs)
+
+
 # ============================================================
 # Hook 注册表
 # ============================================================
@@ -204,8 +235,8 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
     )
 
     try:
-        response = _h().client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
+        response = _role_completion(
+            'memory',
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.7,
             max_tokens=8000,   # 思考模式 reasoning 先于正文，小预算=空 content
@@ -300,8 +331,8 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
     )
 
     try:
-        response = _h().client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
+        response = _role_completion(
+            'memory',
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.7,
             max_tokens=8000,   # 思考模式 reasoning 先于正文（实测简单任务也 4000+）
@@ -377,8 +408,8 @@ def consolidate_memories():
     )
 
     def _call(reminder=''):
-        response = h.client.chat.completions.create(
-            model=os.getenv('LLM_MODEL_ID'),
+        response = _role_completion(
+            'memory',
             messages=[{'role': 'user', 'content': prompt + reminder}],
             max_tokens=8000, temperature=0.2,   # 结构化输出：低温提高 JSON 合规率；思考模式需大预算防 JSON 截断
         )
@@ -567,7 +598,7 @@ def estimate_image_tokens(data: bytes, model: str | None = None) -> int:
     width, height = dimensions
     if width <= 0 or height <= 0:
         return fallback
-    model_name = (model or os.getenv('LLM_MODEL_ID') or '').lower()
+    model_name = (model or _role_model('main') or os.getenv('LLM_MODEL_ID') or '').lower()
     if 'claude' in model_name or 'anthropic' in model_name:
         estimate = _claude_image_tokens(width, height)
     elif 'gemini' in model_name:
@@ -932,8 +963,8 @@ def summarize_history(messages):  # 总结对话记录，返回总结内容
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
               "4. remaining work, 5. user constraints.\nBe compact but concrete, and MUST complete "
               "all five sections - if tight on space, drop details rather than truncating.\n\n" + conversation)
-    response = _h().client.chat.completions.create(
-        model=os.getenv("LLM_MODEL_ID"),
+    response = _role_completion(
+        'summary',
         messages=[{'role': 'user', 'content': prompt}],
         temperature=0.7,
         max_tokens=8000,   # 思考模式 reasoning 先于正文
