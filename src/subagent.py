@@ -18,6 +18,7 @@ _SUBAGENT_EXCLUDED = frozenset({
     'spawn_teammate', 'send_message', 'check_inbox',
     'request_shutdown', 'request_plan', 'review_plan',
     'schedule_cron', 'list_crons', 'cancel_cron',
+    'rename_session', 'revoke_permissions',
     'create_worktree', 'remove_worktree', 'keep_worktree',
     'background_output', 'kill_background',
 })

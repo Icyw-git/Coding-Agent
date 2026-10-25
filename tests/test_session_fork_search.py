@@ -305,6 +305,17 @@ def test_inject_memories_appends_tail_system_message():
     assert messages[0]['content'] == '问题'                # 不污染原列表
 
 
+def test_inject_memories_places_environment_before_memory_block():
+    """环境时间在记忆块之前：两者都在稳定前缀之后，但记忆块保持在请求末尾。"""
+    from agent_core import inject_memories
+    messages = [{'role': 'user', 'content': '问题'}]
+    out = inject_memories(messages, '<relevant_memories>记忆</relevant_memories>',
+                          '系统提示', environment='<environment>now</environment>')
+    assert [m['role'] for m in out] == ['system', 'user', 'system', 'system']
+    assert '<environment>' in out[-2]['content']
+    assert '<relevant_memories>' in out[-1]['content']
+
+
 def test_last_user_skips_noise_input(tmp_path):
     store = SessionEventStore(tmp_path, session_id='noise')
     store.append_message({'role': 'user', 'content': 'x'})

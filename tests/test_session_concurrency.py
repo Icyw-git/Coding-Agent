@@ -23,7 +23,8 @@ def test_concurrent_turns_capture_files_in_their_own_sessions(tmp_path, monkeypa
 
     def create(**kwargs):
         messages = kwargs['messages']
-        if messages[-1]['role'] == 'tool':
+        # 请求尾部还追加了 system（环境时间/记忆），不能假设最后一条是 tool 结果
+        if any(m.get('role') == 'tool' for m in messages):
             return make_text_response('done')
         name = next(m['content'] for m in messages if m['role'] == 'user')
         if name == 'a':

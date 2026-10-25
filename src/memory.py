@@ -598,14 +598,19 @@ def _parse_frontmatter(text: str):
     return meta, parts[2].strip()
 
 
-def inject_memories(messages, memories_content, system=None):
+def inject_memories(messages, memories_content, system=None, environment=None):
     """记忆注入（返回副本，不污染 messages）：记忆块作为独立的 system 消息
     追加在请求末尾。主前缀（system + 全部历史）保持逐字稳定，供应商前缀
     缓存（KV 复用）可跨轮命中——若改写第一条 user 消息（旧行为），每轮
-    召回结果变化都会作废整个前缀，多轮对话越长越亏。"""
+    召回结果变化都会作废整个前缀，多轮对话越长越亏。
+
+    environment（当前本地时间等）放在记忆块之前：两者都在稳定前缀之后，
+    但记忆块保持在最后，读请求尾部的人/测试仍先看到召回结果。"""
     request_messages = messages.copy()
     if system:
         request_messages = [{'role': 'system', 'content': system}] + request_messages
+    if environment:
+        request_messages.append({'role': 'system', 'content': environment})
     if memories_content:
         request_messages.append({'role': 'system', 'content': memories_content})
     return request_messages

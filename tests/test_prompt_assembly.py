@@ -39,6 +39,28 @@ def test_collect_context_uses_injected_dependencies(tmp_path):
     assert 'Injected rule.' in prompt and 'demo' in prompt
 
 
+def test_environment_message_renders_local_time():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 10, 25, 9, 30, tzinfo=timezone(timedelta(hours=8)))
+
+    message = prompt_assembly.environment_message(now)
+
+    assert '2026-10-25 09:30:00' in message
+    assert 'weekday 日' in message
+    assert 'relative dates' in message
+
+
+def test_rules_tell_model_to_use_tools_in_chat_clients():
+    prompt = prompt_assembly.assemble_system_prompt({
+        'workspace': 'D:/work', 'enabled_tools': [], 'skills': '',
+        'project_instructions': '',
+    })
+
+    assert 'schedule_cron' in prompt and 'find_sessions' in prompt
+    assert 'instead of telling them to type a command' in prompt
+
+
 def test_build_sub_system_accepts_explicit_workspace(tmp_path):
     (tmp_path / 'CLAUDE.md').write_text('Sub rule.', encoding='utf-8')
 

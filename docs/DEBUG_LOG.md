@@ -4482,3 +4482,37 @@ cron 回合跑在新建的、未绑定会话的 `SessionEventStore` 里，结果
 测试：`tests/test_cron_delivery.py`（去重/确认/上限/截断、成功与失败投递、无目标静默、
 带目标任务不被交互回合消费、worker 存活、origin chat 继承与重置、runtime 透传）、
 飞书只向已绑定聊天推送、API 往返。定向 **164 passed**；全量 **1615 passed / 1 skipped**。
+
+## 飞书自然语言入口：命令之外还缺什么
+
+按 `/help` 逐条对照卡片按钮与模型工具后，结论不是“所有命令都要搬家”，而是
+三类情况：会话新建/切换/fork、停止/状态、审批、模型信息已有卡片或工具入口；
+`/find`、`/rename`、`/revoke` 只能打字；`/cron` 已有工具，但模型不知道聊天场景
+不该让用户敲命令，也不知道今天的日期。
+
+- `rules_main` 增加第 4 条：聊天客户端里用 `schedule_cron` / `find_sessions` /
+  `rename_session` / `revoke_permissions` 等工具完成请求，不要让用户输入斜杠命令。
+- `schedule_cron` / `list_crons` / `cancel_cron` 描述改成提醒语义，并写明结果自动
+  推回当前聊天、任务默认只读。
+- 每轮请求尾部追加一条本地时间 system 消息（`prompt_assembly.environment_message`）。
+  不放进 system 前缀：时间每分钟变化会让供应商前缀缓存整段失效；尾部消息排在记忆
+  块之前（`inject_memories(..., environment=)`），两者都在稳定前缀之后，记忆块仍是
+  请求最后一条。模型据此把“明天/下周一”换算成 cron。
+- 环境消息会出现在工具结果之后，原先靠 `messages[-1]['role'] == 'tool'` 判断“第二轮”
+  的两个并发用例改成扫描请求里是否已有 tool 结果（假模型的入参假设，不是产品契约）。
+- 新增 `src/tool_sessions.py`：`find_sessions` 直接扫会话目录；`rename_session`
+  写当前回合已打开的 SessionEventStore（source='user'，自动标题不覆盖）；
+  `revoke_permissions` 复用 `hooks.GATE.revoke_session`。改名/撤销不对子代理暴露，
+  只读定时回合也禁止，避免后台任务改会话元数据或撤掉交互审批。
+- 飞书 `/help` 首行改成“日常不用记命令”，命令清单保留给排障。
+
+有意保留为命令/API 专属：`/workspace add|remove`（安装期配置）、`/archive` /
+`/delete`（破坏性，需二次确认）、`/cd`（会话中途换工作区，现有卡片可用“新会话 +
+选目录”代替）、`/sandbox`（安全档位）、`/quit`（解绑）。cron 的可写授权仍需
+`/cron add --writes` 或 API；卡片审批留作后续，模型不能给自己授权。
+
+测试：`tests/test_tool_sessions.py`（空查询、limit 夹取、改名截断/来源、撤销计数
+与异常）、`tests/test_prompt_assembly.py` 的环境消息与规则、飞书帮助文案、工具
+schema 顺序与指纹；`test_cron_side_effects.py` / `test_subagent_surface.py` 补上
+“只读定时回合拒绝改名/撤销、子代理不暴露这两个工具”的归属断言。定向回归
+**142 passed**；全量 **1626 passed / 1 skipped**，Ruff 全通过。

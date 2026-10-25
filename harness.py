@@ -126,6 +126,7 @@ from perf import segment as perf_segment
 from prompt_assembly import (
     assemble_system_prompt,
     collect_context,
+    environment_message,
     get_system_prompt,
 )
 from prompt_assembly import build_sub_system as _build_sub_system
@@ -1487,8 +1488,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
             # 图片引用在同一副本里展开成 data URI：历史/事件流仍只存小引用，
             # 每轮请求现读缓存文件（见 agent_core.expand_image_parts）。
             prompt_assembly_started = time.perf_counter()
-            request_messages = expand_image_parts(
-                inject_memories(state.messages, state.memories_content, state.system))
+            request_messages = expand_image_parts(inject_memories(
+                state.messages, state.memories_content, state.system,
+                environment=environment_message()))
             prompt_assembly_ms = round(
                 (time.perf_counter() - prompt_assembly_started) * 1000, 3)
             prompt_message_count = len(request_messages)

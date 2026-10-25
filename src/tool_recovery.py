@@ -23,12 +23,14 @@ READ_ONLY_TOOLS = frozenset({
     'read', 'view_image', 'read_document', 'render_document',
     'glob', 'grep', 'ls', 'web_fetch', 'load_skill',
     'todo_read', 'list_tasks', 'get_task', 'list_crons', 'background_output',
+    'find_sessions',
 })
 
 # Repeating converges to the same state or is refused by a status guard.
 IDEMPOTENT_TOOLS = frozenset({
     'write', 'todo_write', 'claim_task', 'complete_task',
     'cancel_cron', 'kill_background', 'keep_worktree',
+    'rename_session', 'revoke_permissions',
 })
 
 # Repeating may duplicate, consume, or apply twice; inspect state first.

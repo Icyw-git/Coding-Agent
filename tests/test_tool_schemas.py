@@ -13,14 +13,16 @@ ORDER = [
     'bash', 'read', 'view_image', 'read_document', 'render_document',
     'write', 'edit', 'glob', 'grep', 'ls', 'todo_write', 'todo_read',
     'create_task', 'list_tasks', 'get_task', 'claim_task', 'complete_task',
-    'schedule_cron', 'list_crons', 'cancel_cron', 'spawn_teammate',
-    'send_message', 'check_inbox', 'background_output', 'kill_background',
+    'schedule_cron', 'list_crons', 'cancel_cron',
+    'find_sessions', 'rename_session', 'revoke_permissions',
+    'spawn_teammate', 'send_message', 'check_inbox', 'background_output',
+    'kill_background',
     'web_fetch', 'apply_patch', 'checkpoint', 'task', 'load_skill', 'compact',
     'request_shutdown', 'request_plan', 'review_plan', 'create_worktree',
     'remove_worktree', 'keep_worktree',
 ]
 
-SCHEMA_SHA1 = 'f4bb585ae3bb098fe8fdad0fca49d90d455ca311'
+SCHEMA_SHA1 = 'a47680c42cd81c146dbc73eecbf3a882f3d716b3'
 
 
 def test_tool_order_is_stable():

@@ -293,8 +293,12 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'required': ['task_id']}}},
  {'type': 'function',
   'function': {'name': 'schedule_cron',
-               'description': 'Schedule a cron job: at matching times the prompt is injected into '
-                              'the conversation as a scheduled task.',
+               'description': 'Create a reminder or recurring job for the current chat. Use this '
+                              'whenever the user asks to be reminded or to do something '
+                              'periodically; do not tell them to type a slash command. The prompt '
+                              'runs unattended at matching local times and its result is delivered '
+                              'back to the current chat automatically. Jobs are read-only unless '
+                              'the user explicitly authorized side effects.',
                'parameters': {'type': 'object',
                               'properties': {'cron': {'type': 'string',
                                                       'description': '5-field cron expression, '
@@ -315,16 +319,48 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'required': ['cron', 'prompt']}}},
  {'type': 'function',
   'function': {'name': 'list_crons',
-               'description': 'List all scheduled cron jobs.',
+               'description': 'List scheduled jobs with their schedule, delivery target and '
+                              'read-only/writable mode. Use when the user asks what reminders '
+                              'exist.',
                'parameters': {'type': 'object', 'properties': {}}}},
  {'type': 'function',
   'function': {'name': 'cancel_cron',
-               'description': 'Cancel a scheduled cron job by id.',
+               'description': 'Cancel a scheduled job by id. Use when the user asks to stop or '
+                              'remove a reminder.',
                'parameters': {'type': 'object',
                               'properties': {'job_id': {'type': 'string',
                                                         'description': 'Cron job id, e.g. '
                                                                        'cron_123456'}},
                               'required': ['job_id']}}},
+ {'type': 'function',
+  'function': {'name': 'find_sessions',
+               'description': 'Search past conversations by keyword and return matching sessions '
+                              'with a short snippet. Use when the user refers to something '
+                              'discussed earlier or asks to find an old conversation.',
+               'parameters': {'type': 'object',
+                              'properties': {'query': {'type': 'string',
+                                                       'description': 'Keyword or phrase to '
+                                                                      'search for'},
+                                             'limit': {'type': 'integer',
+                                                       'description': 'Maximum sessions to '
+                                                                      'return (default 5, max 20)'}},
+                              'required': ['query']}}},
+ {'type': 'function',
+  'function': {'name': 'rename_session',
+               'description': 'Rename the current session. Use when the user asks to change the '
+                              'title of this conversation; user-set titles are not overwritten by '
+                              'automatic titling.',
+               'parameters': {'type': 'object',
+                              'properties': {'title': {'type': 'string',
+                                                       'description': 'New session title '
+                                                                      '(max 80 chars)'}},
+                              'required': ['title']}}},
+ {'type': 'function',
+  'function': {'name': 'revoke_permissions',
+               'description': 'Revoke all permission grants remembered for the current session. '
+                              'Use when the user asks to undo earlier approvals. This removes '
+                              'approvals only; changes already made are not undone.',
+               'parameters': {'type': 'object', 'properties': {}}}},
  {'type': 'function',
   'function': {'name': 'spawn_teammate',
                'description': 'Spawn a teammate agent in a background thread to work on a '

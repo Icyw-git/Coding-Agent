@@ -59,6 +59,11 @@ def test_read_only_turn_denies_writes_network_and_coordination(workspace):
             'web_fetch', {'url': 'https://example.com'}, interactive=False)
         assert 'scheduled task is read-only' in hooks.enforce(
             'task', {'description': 'write it'}, interactive=False)
+        # 会话元数据与授权也不许后台回合改：不经过文件/命令策略，必须显式列入。
+        assert 'scheduled task is read-only' in hooks.enforce(
+            'rename_session', {'title': 'x'}, interactive=False)
+        assert 'scheduled task is read-only' in hooks.enforce(
+            'revoke_permissions', {}, interactive=False)
         # 只读操作照常放行：读文件、只读命令、只读工具。
         assert hooks.enforce('read', {'path': 'notes.md'}, interactive=False) is None
         assert hooks.enforce('bash', {'command': 'ls'}, interactive=False) is None

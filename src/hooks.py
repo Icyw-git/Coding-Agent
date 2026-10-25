@@ -341,7 +341,7 @@ SCHEDULED_FORBIDDEN_TOOLS = frozenset({
     'request_plan', 'review_plan', 'schedule_cron', 'cancel_cron',
     'create_task', 'claim_task', 'complete_task', 'todo_write',
     'create_worktree', 'remove_worktree', 'keep_worktree',
-    'kill_background',
+    'kill_background', 'rename_session', 'revoke_permissions',
 })
 # 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
 # 整批就按该分区判定，避免被同批的工作区内文件稀释。

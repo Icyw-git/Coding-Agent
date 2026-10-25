@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from contextvars import ContextVar
+from datetime import datetime
 
 import project_context
 
@@ -51,6 +52,13 @@ PROMPT_SECTIONS = {
         'git status / git log / ls), issue ALL of them as multiple tool calls in the SAME turn instead of '
         'one per turn — they will run in parallel. Calls whose input depends on an earlier result '
         'must stay sequential. '
+        '(4) In chat clients the user usually does not type slash commands. When they ask to be '
+        'reminded, to repeat something periodically, to recall an earlier conversation, to rename '
+        'this session, or to revoke approvals, use the corresponding tool (schedule_cron / '
+        'list_crons / cancel_cron / find_sessions / rename_session / revoke_permissions) instead of '
+        'telling them to type a command. Scheduled results are delivered back to the chat '
+        'automatically; scheduled jobs are read-only unless the user explicitly authorized side '
+        'effects. '
     ),
     'rules_sub': (
         'Rules: '
@@ -69,6 +77,25 @@ PROMPT_SECTIONS = {
         'Skills available:\n{catalog}\nUse load_skill to load a skill. E.g. load_skill("file-summarizer")'
     ),
 }
+
+
+def environment_message(now: datetime | None = None) -> str:
+    """当前本地时间（尾部 system 消息）。
+
+    不能放进 system prompt 前缀：时间每分钟变化，会让供应商的前缀缓存整段失效。
+    作为每轮请求末尾的独立 system 消息注入，主前缀仍逐字稳定。
+    """
+    local = now or datetime.now().astimezone()
+    if local.tzinfo is None:
+        local = local.astimezone()
+    weekday = '一二三四五六日'[local.weekday()]
+    zone = local.tzname() or local.strftime('UTC%z')
+    return ('<environment>'
+            f'Current local time: {local.strftime("%Y-%m-%d %H:%M:%S")} '
+            f'({zone}, weekday {weekday}). '
+            'Resolve relative dates such as "tomorrow" or "next Monday" against this '
+            'time when scheduling cron jobs.'
+            '</environment>')
 
 
 def assemble_system_prompt(context: dict) -> str:

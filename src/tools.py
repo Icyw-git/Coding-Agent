@@ -23,6 +23,11 @@ from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
 from tool_patch import apply_patch as _apply_patch
 from tool_schemas import TOOL_SCHEMAS
 from tool_search import _grep_with_ripgrep, _rg_binary, glob_files, grep_files, ls_dir
+from tool_sessions import (
+    run_find_sessions,
+    run_rename_session,
+    run_revoke_permissions,
+)
 from tool_tasks import (  # noqa: F401  注册表与 Teammate 从这里取 handler
     run_cancel_cron,
     run_claim_task,
@@ -240,6 +245,9 @@ tool_registry = {
     'schedule_cron': run_schedule_cron,
     'list_crons': run_list_crons,
     'cancel_cron': run_cancel_cron,
+    'find_sessions': run_find_sessions,
+    'rename_session': run_rename_session,
+    'revoke_permissions': run_revoke_permissions,
     'spawn_teammate': run_spawn_teammate,
     'send_message': run_send_message,
     'check_inbox': run_check_inbox,

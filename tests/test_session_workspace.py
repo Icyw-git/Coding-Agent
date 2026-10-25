@@ -89,7 +89,8 @@ def test_single_turn_gate_keeps_each_session_prompt_and_checkpoints(tmp_path, mo
         messages = kwargs['messages']
         name = next(m['content'] for m in messages if m['role'] == 'user')
         assert str(roots[name]) in messages[0]['content']
-        if messages[-1]['role'] == 'tool':
+        # 请求尾部还追加了 system（环境时间/记忆），不能假设最后一条是 tool 结果
+        if any(m.get('role') == 'tool' for m in messages):
             results = {m['tool_call_id']: m['content'] for m in messages if m['role'] == 'tool'}
             assert results['read'] == name
             assert 'shared.txt' in results['glob']
