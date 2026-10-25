@@ -56,6 +56,7 @@ import paths
 from exec_policy import approval_class
 from feishu_approval_card import approval_card, approval_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
+from feishu_help_card import help_card
 from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
 from feishu_step_card import step_card, truncated_note
@@ -592,6 +593,8 @@ class FeishuGateway:
         self._notified: set[str] = set()
         # req_id → 登记时的请求体：合并审批卡片要还原每条的工具/原因/参数
         self._pending_requests: dict[str, dict] = {}
+        # chat_id → 最近一次用户输入：失败卡片的「重试」用它，30 分钟内有效
+        self._last_user: dict[str, dict] = {}
         # chat_id → 审批卡片 message_id：新请求/决议后 PATCH 同一张卡，不刷屏
         self._approval_cards: dict[str, str] = {}
         self._poll_stop = threading.Event()
@@ -733,6 +736,8 @@ class FeishuGateway:
     def _send_agent_reply(self, chat_id: str, session_id: str, text: str,
                           reply_to: str | None = None) -> None:
         """每个回合一张可编辑卡片：默认 schema 2.0 过程卡，可退回 Markdown 卡。"""
+        self._last_user[chat_id] = {'text': text, 'session_id': session_id,
+                                    'at': time.monotonic()}
         perf_reset()
         _t_entry = time.perf_counter()
         step_sender = getattr(self.transport, 'send_step_card', None)
@@ -869,12 +874,28 @@ class FeishuGateway:
                             tool_counts=state.get('tool_counts'),
                             tool_errors=state.get('tool_errors'),
                             total_ms=state.get('tool_total_ms') or 0,
-                            tool_batches=state.get('tool_batches')))
+                            tool_batches=state.get('tool_batches'),
+                            actions='retry'))
                     else:
                         updater(message_id, failed)
                     return
                 except Exception as update_exc:
                     print(f'[feishu] failure card update failed: {update_exc}')
+            # 首请求就失败（402/401/超时）时还没有卡片：补发一张带「重试」的失败卡，
+            # 手机上不用重新打字。
+            if step_mode and sender is not None and not stream_failed:
+                try:
+                    state = progress['status'] or {}
+                    sender(chat_id, step_card(
+                        answer=failed, status='failed',
+                        tool_counts=state.get('tool_counts'),
+                        tool_errors=state.get('tool_errors'),
+                        total_ms=state.get('tool_total_ms') or 0,
+                        tool_batches=state.get('tool_batches'),
+                        actions='retry'), **reply_kwargs)
+                    return
+                except Exception as send_exc:
+                    print(f'[feishu] failure card send failed: {send_exc}')
             self._reply(chat_id, failed)
             return
 
@@ -902,6 +923,14 @@ class FeishuGateway:
                 stream_failed = True
         if message_id and updater and not stream_failed:
             return   # 卡片已显示最终内容，无需重复 PATCH 或重发
+        if step_mode and sender is not None and not stream_failed:
+            # 没有流式增量（非流式回退、一键重试）时还没有卡片：补发最终卡，
+            # 否则同一个回合会因为“有没有 delta”而在卡片/纯文本之间摇摆。
+            try:
+                sender(chat_id, final_payload, **reply_kwargs)
+                return
+            except Exception as exc:
+                print(f'[feishu] final card send failed, falling back: {exc}')
         if stream_failed and fallback_sender:
             try:
                 fallback_sender(chat_id, reply)
@@ -1222,6 +1251,14 @@ class FeishuGateway:
             self._panel_status(chat_id)
         elif action in ('crons', 'cron'):
             self._show_crons(chat_id)
+        elif action in ('perms', 'approvals'):
+            pending = [req for req in self.api.pending_permissions()
+                       if self._request_belongs_to(chat_id, req)]
+            if not pending:
+                self._reply(chat_id, '(无待审批请求)')
+                return
+            self._chat_pending[chat_id] = [req['req_id'] for req in pending]
+            self._render_approvals(chat_id)
         elif action in ('menu', 'panel'):
             self._send_panel(chat_id, intro='常用操作：')
         else:
@@ -1301,6 +1338,22 @@ class FeishuGateway:
             return
         self._send_task_view(chat_id, logs_card(task, logs, lines=lines),
                              logs or '(no output)', message_id=message_id)
+
+    RETRY_TTL = 1800.0
+
+    def _retry_last(self, chat_id: str) -> None:
+        """重发上一条用户输入；没有可重试内容时明确说明。"""
+        item = self._last_user.get(chat_id)
+        if not item or time.monotonic() - item['at'] > self.RETRY_TTL:
+            self._reply(chat_id, '没有可重试的消息（超过 30 分钟或还没发过）；直接再发一次即可。')
+            return
+        session_id = item['session_id']
+        if not self.bindings.get(chat_id):
+            # 绑定被解除了：仍用当时的会话，避免悄悄换会话重跑
+            with self._bindings_lock:
+                self.bindings[chat_id] = session_id
+                self._save_bindings()
+        self._send_agent_reply(chat_id, session_id, item['text'])
 
     def _handle_task_action(self, chat_id: str, value: dict,
                             sender_id: str | None = None,
@@ -1495,6 +1548,17 @@ class FeishuGateway:
             self._show_crons(chat_id, message_id=message_id)
             return
         self._reply(chat_id, '未知的定时任务操作，请重新发送 /cron。')
+
+    def _send_help(self, chat_id: str) -> None:
+        """帮助卡：常用入口按钮 + 折叠命令清单；无 2.0 卡片能力时回退纯文本。"""
+        sender = getattr(self.transport, 'send_step_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, help_card(self._help_text()))
+                return
+            except Exception as exc:
+                print(f'[feishu] help card failed, fallback to text: {exc}')
+        self._reply(chat_id, self._help_text())
 
     def _help_text(self) -> str:
         return '\n'.join([
@@ -1756,7 +1820,7 @@ class FeishuGateway:
             if command in ('/archive', '/delete', '/confirm', '/cancel'):
                 self._manage_sessions(chat_id, command, argument)
             elif command in ('/help', '/?', '/'):
-                self._reply(chat_id, self._help_text())
+                self._send_help(chat_id)
             elif command == '/new':
                 self._handle_new(chat_id, argument)
             elif command in ('/workspaces', '/workspace'):
@@ -2074,7 +2138,7 @@ class FeishuGateway:
         还必须属于本聊天已收到的请求。
         """
         view_keys = ('session_view', 'workspace_view', 'cron_action', 'task_action',
-                     'panel')
+                     'retry', 'panel')
         if self.allowed_users is not None and open_id not in self.allowed_users:
             return ('⛔ 你没有会话操作权限'
                     if any((value or {}).get(key) for key in view_keys)
@@ -2106,6 +2170,13 @@ class FeishuGateway:
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理会话操作…', True
+        if (value or {}).get('retry'):
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在重试…', True
         if (value or {}).get('task_action'):
             try:
                 self._events.put_nowait((chat_id, value, open_id, None,
@@ -2560,6 +2631,8 @@ class FeishuGateway:
                                 elif text.get('task_action'):
                                     self._handle_task_action(chat_id, text, sender_id,
                                                              message_id)
+                                elif text.get('retry'):
+                                    self._retry_last(chat_id)
                                 elif text.get('workspace_view'):
                                     self._handle_workspace_action(chat_id, text, sender_id)
                                 else:

@@ -73,3 +73,24 @@ def test_cards_stay_under_feishu_size_limit():
     for name, card in acc.build_cards().items():
         size = len(json.dumps(card, ensure_ascii=False).encode('utf-8'))
         assert size < acc.MAX_CARD_BYTES, name
+
+
+def test_schema_2_cards_never_use_action_tag():
+    """飞书实测：schema 2.0 的 action/note 会报 200861，按钮必须放 column_set。"""
+    cards = acc.build_cards()
+    for name, card in cards.items():
+        if card.get('schema') != '2.0':
+            continue
+        tags = {element['tag'] for element in acc._walk(acc._elements_of(card))}
+        assert 'action' not in tags, name
+        assert 'note' not in tags, name
+
+
+def test_validator_rejects_action_tag_in_schema_2():
+    card = {'schema': '2.0',
+            'body': {'elements': [
+                {'tag': 'action', 'actions': []},
+                {'tag': 'markdown', 'content': 'x'},
+            ]}}
+    problems = acc.validate_card('x', card, require_buttons=False)
+    assert any('200861' in item or 'schema 2.0 不支持' in item for item in problems)

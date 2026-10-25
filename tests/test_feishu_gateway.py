@@ -2224,3 +2224,129 @@ def test_task_action_buttons_are_queued_and_whitelisted(gateway, monkeypatch):
     text, ok = blocked.handle_card_action('ou_me', {'task_action': 'refresh'},
                                           'om_task', chat_id='chat-task2')
     assert not ok and '没有会话操作权限' in text
+
+
+def test_failure_card_offers_retry_and_replays_last_message(gateway):
+    gw, fake = gateway
+
+    class StepTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.step_cards = {}
+            self.counter = 0
+
+        def send_step_card(self, chat_id, card, reply_to=None):
+            self.counter += 1
+            message_id = f'om_step_{self.counter}'
+            self.step_cards[message_id] = card
+            return message_id
+
+        def update_step_card(self, message_id, card):
+            self.step_cards[message_id] = card
+
+    transport = StepTransport()
+    gw.transport = transport
+    calls = []
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('agent send failed (402): Insufficient Balance')
+
+    original_stream = gw.api.send_stream
+    gw.api.send_stream = boom
+    try:
+        gw.on_message('chat-retry', '帮我整理一下')
+    finally:
+        gw.api.send_stream = original_stream
+
+    failure = list(transport.step_cards.values())[-1]
+    buttons = [button
+               for element in failure['body']['elements']
+               if element.get('tag') == 'column_set'
+               for column in element['columns']
+               for button in column['elements']]
+    assert buttons and buttons[-1]['behaviors'][0]['value'] == {'retry': True}
+    assert '余额/额度不足' in json.dumps(failure, ensure_ascii=False)
+
+    # 点重试：重跑上一条消息（这一次成功）
+    def ok(text, session_id=None, on_delta=None, on_progress=None, **kwargs):
+        calls.append(text)
+        return '重试成功'
+
+    gw.api.send_stream = ok
+    try:
+        text, accepted = gw.handle_card_action('ou_me', {'retry': True},
+                                               'om_fail', chat_id='chat-retry')
+        assert accepted and '正在重试' in text
+        gw._retry_last('chat-retry')
+    finally:
+        gw.api.send_stream = original_stream
+    assert calls == ['帮我整理一下']
+    latest = list(transport.step_cards.values())[-1]
+    assert '重试成功' in json.dumps(latest, ensure_ascii=False)
+
+
+def test_retry_without_recent_message_explains(gateway):
+    gw, fake = gateway
+    gw._retry_last('chat-nothing')
+    assert '没有可重试的消息' in fake.last()
+
+    gw._last_user['chat-old'] = {'text': 'x', 'session_id': 's1',
+                                 'at': time.monotonic() - gw.RETRY_TTL - 1}
+    gw._retry_last('chat-old')
+    assert '没有可重试的消息' in fake.last()
+
+
+def test_help_is_a_card_with_entry_buttons(gateway):
+    gw, fake = gateway
+    cards_before = len(fake.cards)
+
+    class HelpTransport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.help_cards = []
+
+        def send_step_card(self, chat_id, card, reply_to=None):
+            self.help_cards.append((chat_id, card))
+            return 'om_help'
+
+    help_transport = HelpTransport()
+    gw.transport = help_transport
+    gw.on_message('chat-help', '/help')
+    assert help_transport.help_cards, '应发送帮助卡片'
+    card = help_transport.help_cards[-1][1]
+    assert card['schema'] == '2.0'
+    text = json.dumps(card, ensure_ascii=False)
+    assert '日常不用记命令' in text and '每天早上 9 点提醒我喝水' in text
+
+    values = []
+    for element in card['body']['elements']:
+        if element.get('tag') == 'column_set':
+            for column in element['columns']:
+                for button in column['elements']:
+                    values.append(button['behaviors'][0]['value'])
+        if element.get('tag') == 'action':
+            for button in element['actions']:
+                values.append(button['behaviors'][0]['value'])
+    assert {'panel': 'menu'} in values and {'panel': 'crons'} in values
+    assert {'panel': 'perms'} in values
+    assert {'task_action': 'refresh'} in values
+
+    # 命令清单在折叠面板里，不占首屏
+    panel = next(element for element in card['body']['elements']
+                 if element.get('tag') == 'collapsible_panel')
+    assert panel['expanded'] is False
+    assert '/sessions' in json.dumps(panel, ensure_ascii=False)
+    assert len(fake.cards) == cards_before   # 没有额外发 1.0 卡片
+
+
+def test_help_falls_back_to_text_without_step_cards(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-help-text', '/help')
+    assert '可用命令' in fake.last()
+
+
+def test_help_panel_button_opens_pending_approvals(gateway):
+    gw, fake = gateway
+    gw._chat_pending['chat-help-perms'] = []
+    gw._handle_panel_action('chat-help-perms', 'perms')
+    assert '(无待审批请求)' in fake.last()

@@ -4656,3 +4656,47 @@ msg-frontier.feishu.cn` 追加进 `NO_PROXY`，其他域名（如 OpenAI）仍�
 
 测试：`tests/test_feishu_approval_batch.py`（合并、折叠、批量、越权、无变化不重渲染）、
 会话语义过滤与序号一致性、任务卡片渲染与按钮/白名单。全量 1678 passed / 1 skipped。
+
+## 失败卡「重试」与帮助卡片
+
+**失败卡重试**：402/401/超时这些常见失败以前只能看着文案重新打字。现在失败卡底部有
+「🔄 重试这一次」（`retry_row()`，value `{"retry": true}`），网关记住该聊天最近一次
+用户输入（`_last_user`，30 分钟 TTL），点一下就用**原来的会话**重跑。
+
+顺手修了两个真问题：
+1. **首请求就失败时根本没有卡片**：以前只有“已经有卡片”才更新成失败卡，402 一上来
+   失败就回退成纯文本，重试按钮无处可放。现在补发一张失败卡。
+2. **非流式回退时答案是纯文本**：没有 delta 的回合（非流式路径、一键重试）以前走
+   `_reply`，同一功能在卡片/文本之间摇摆。现在补发最终卡片（带「控制台」）。
+
+`_last_user` 只在内存里、按聊天覆盖、半小时过期；重试只是“再发一次同样的话”，
+不缓存授权、不绕过回合槽，所以并发/忙碌行为与正常消息一致。
+
+**帮助卡片**（`src/feishu_help_card.py`）：`/help` 从一大段文本变成 schema 2.0 卡片——
+三句可照抄例句 + 「控制台 / 会话列表 / 定时任务 / 待审批 / 后台任务 / 停止回合」按钮，
+命令清单收进折叠面板。没有 2.0 能力的传输层仍回退成原来的文本。
+
+另：控制台「待审批」按钮（`panel=perms`）之前没有处理分支，点了会落到帮助；现已实现。
+
+测试：重试会重跑原消息、TTL 过期提示、帮助卡按钮集合与折叠、无卡片能力回退、
+`panel=perms` 空态。全量 1683 passed / 1 skipped。
+
+## schema 2.0 不支持 action 标签（真机发卡当场暴露）
+
+帮助卡第一次真机发送被飞书拒绝：
+
+```
+230099 Failed to create card content, ext=ErrCode: 200861;
+ErrPath: ROOT -> body -> elements -> [3](tag: action);
+ErrMsg: cards of schema V2 no longer support this capability
+```
+
+schema 2.0 的按钮必须放进 `column_set`/`column`，不能再用 1.0 的 `tag: "action"`。
+修复：帮助卡底部两按钮改成 `column_set`。同时把这条规则写进验收校验器
+（`schema 2.0` 出现 `action`/`note` 直接报错），并加回归
+`test_schema_2_cards_never_use_action_tag` / `test_validator_rejects_action_tag_in_schema_2`
+——本地校验器之前只查“tag 认不认识”，认不出“这个 tag 在这个 schema 里非法”，
+所以没能提前拦住。
+
+这正是 `--send-cards` 的价值：结构校验通过 ≠ 飞书接受。改完重新发送成功
+（`om_x100b62d56faa...`）。

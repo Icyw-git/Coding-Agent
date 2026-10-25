@@ -85,6 +85,26 @@ def stop_row() -> dict:
     }
 
 
+def retry_row() -> dict:
+    """失败卡片的「重试」按钮：手机上不用重新打字。"""
+    return {
+        'tag': 'column_set',
+        'flex_mode': 'none',
+        'columns': [{
+            'tag': 'column',
+            'width': 'weighted',
+            'weight': 1,
+            'elements': [{
+                'tag': 'button',
+                'text': _plain('🔄 重试这一次'),
+                'type': 'primary',
+                'width': 'fill',
+                'behaviors': [{'type': 'callback', 'value': {'retry': True}}],
+            }],
+        }],
+    }
+
+
 def truncated_note(text: str) -> str:
     """答案超长时给一句可执行的说明，而不是静默截断。"""
     text = str(text or '')
@@ -181,6 +201,8 @@ def step_card(*, answer: str = '', status: str = 'completed',
         elements.append(stop_row())
     elif actions == 'menu':
         elements.append(menu_row())
+    elif actions == 'retry':
+        elements.append(retry_row())
     if not elements:
         elements.append(_markdown(' '))
     return {

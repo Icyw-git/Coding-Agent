@@ -64,10 +64,14 @@ def validate_card(name: str, card: dict, *, max_bytes: int = MAX_CARD_BYTES,
     if not _elements_of(card):
         problems.append(f'{name}: 没有 elements（schema 2.0 里是 body.elements）')
     buttons = 0
+    schema = str(card.get('schema') or '')
     for element in _walk(_elements_of(card)):
         tag = element['tag']
         if tag not in KNOWN_TAGS:
             problems.append(f'{name}: 未知元素 tag {tag!r}')
+        if schema == '2.0' and tag in ('action', 'note'):
+            # 飞书实测报 200861 “cards of schema V2 no longer support this capability”
+            problems.append(f'{name}: schema 2.0 不支持 tag {tag!r}（改用 column_set）')
         if tag == 'button':
             buttons += 1
             label = (element.get('text') or {}).get('content')
@@ -105,6 +109,7 @@ def build_cards(*, jobs: list[dict] | None = None,
     """构造全部卡片样本；覆盖完成/失败/进行中与授权/删除确认。"""
     import feishu_approval_card
     import feishu_cron_card
+    import feishu_help_card
     import feishu_panel
     import feishu_sessions
     import feishu_step_card
@@ -155,6 +160,8 @@ def build_cards(*, jobs: list[dict] | None = None,
         '定时任务·删除确认': feishu_cron_card.cron_delete_card(jobs[0], token=token),
         '会话列表': feishu_sessions.list_card(rows, token, current_id=session_id),
         '工作区选择': feishu_sessions.workspace_card(readable, token),
+        '帮助': feishu_help_card.help_card(
+            ['/new 新建会话', '/sessions 会话列表', '/cron 定时任务']),
         '审批·合并卡': feishu_approval_card.approval_card([
             {'req_id': 'req_demo_1', 'tool': 'bash', 'reason': '需要执行命令',
              'args': {'command': 'git status --short'}},
