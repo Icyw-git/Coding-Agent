@@ -675,6 +675,41 @@ def test_api_cron_crud(api_client, tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_cron_update_toggles_side_effects_and_persists(api_client, tmp_path,
+                                                          monkeypatch):
+    import json
+
+    import cron_scheduler
+
+    path = tmp_path / 'crons.json'
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', path)
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks'))
+    headers = {'Authorization': 'Bearer t'}
+    assert client.post('/v1/crons', json={
+        'cron': '0 9 * * *', 'prompt': 'report', 'id': 'ro'},
+        headers=headers).status_code == 201
+
+    allowed = client.patch('/v1/crons/ro', json={'allow_side_effects': True},
+                           headers=headers)
+    assert allowed.status_code == 200 and allowed.json()['allow_side_effects'] is True
+    # 落盘的是新授权，重启后仍生效
+    assert json.loads(path.read_text(encoding='utf-8'))[0]['allow_side_effects'] is True
+
+    revoked = client.patch('/v1/crons/ro', json={'allow_side_effects': False},
+                           headers=headers)
+    assert revoked.status_code == 200 and revoked.json()['allow_side_effects'] is False
+
+    # 只改投递目标时不动授权；未知任务 404
+    target = client.patch('/v1/crons/ro', json={'deliver_to': 'oc_x'},
+                          headers=headers)
+    assert target.json()['deliver_to'] == 'oc_x'
+    assert target.json()['allow_side_effects'] is False
+    assert client.patch('/v1/crons/missing', json={'allow_side_effects': True},
+                        headers=headers).status_code == 404
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
 def test_api_cron_defaults_to_read_only(api_client, tmp_path, monkeypatch):
     import cron_scheduler
 

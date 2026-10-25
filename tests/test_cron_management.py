@@ -1,4 +1,5 @@
 """阶段 2：cron 触发语义、管理 API 与飞书 /cron。"""
+import json
 from datetime import datetime
 
 import pytest
@@ -67,3 +68,63 @@ def test_invalid_cron_is_rejected_before_touching_state():
         raise ValueError(cron_scheduler.validate_cron('* * *'))
     assert cron_scheduler.validate_cron('* * *') is not None
     assert cron_scheduler.validate_cron('* * * * *') is None
+
+
+def test_update_job_toggles_authorization_and_persists(tmp_path, monkeypatch):
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    job = cron_scheduler.schedule_job('0 9 * * *', 'report', job_id='ro')
+
+    updated = cron_scheduler.update_job('ro', allow_side_effects=True)
+    assert updated is job and job.allow_side_effects is True
+    assert json.loads((tmp_path / 'crons.json').read_text(encoding='utf-8'))[
+        0]['allow_side_effects'] is True
+
+    cron_scheduler.update_job('ro', allow_side_effects=False, deliver_to=' oc_1 ')
+    assert job.allow_side_effects is False and job.deliver_to == 'oc_1'
+
+    # 未知任务只返回错误字符串，不新增条目
+    assert cron_scheduler.update_job('missing', allow_side_effects=True) ==         'Job missing not found'
+    with cron_scheduler.cron_lock:
+        assert list(cron_scheduler.scheduled_jobs) == ['ro']
+
+
+def test_durable_jobs_with_chinese_survive_reload(tmp_path, monkeypatch):
+    """持久化文件是 UTF-8；读取必须固定编码，不能跟随 Windows GBK locale。"""
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    cron_scheduler.schedule_job('0 9 * * *', '每日汇报：检查待办并提醒喝水',
+                                job_id='cn', deliver_to='oc_cn',
+                                allow_side_effects=True)
+    with cron_scheduler.cron_lock:
+        cron_scheduler.scheduled_jobs.clear()
+
+    cron_scheduler.load_durable_jobs()
+    job = cron_scheduler.scheduled_jobs['cn']
+    assert job.prompt == '每日汇报：检查待办并提醒喝水'
+    assert job.deliver_to == 'oc_cn' and job.allow_side_effects is True
+
+
+def test_one_malformed_durable_record_does_not_drop_the_rest(tmp_path, monkeypatch):
+    path = tmp_path / 'crons.json'
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', path)
+    path.write_text(json.dumps([
+        {'id': 'good', 'cron': '0 9 * * *', 'prompt': 'ok', 'recurring': True,
+         'durable': True},
+        {'id': 'bad', 'cron': '* * *'},
+    ], ensure_ascii=False), encoding='utf-8')
+    with cron_scheduler.cron_lock:
+        cron_scheduler.scheduled_jobs.clear()
+
+    cron_scheduler.load_durable_jobs()
+    assert list(cron_scheduler.scheduled_jobs) == ['good']
+
+
+def test_undecodable_durable_file_leaves_existing_jobs_intact(tmp_path, monkeypatch):
+    path = tmp_path / 'crons.json'
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', path)
+    path.write_bytes(b'\xff\xfe\x00not json at all')
+    with cron_scheduler.cron_lock:
+        cron_scheduler.scheduled_jobs.clear()
+
+    cron_scheduler.load_durable_jobs()
+    with cron_scheduler.cron_lock:
+        assert cron_scheduler.scheduled_jobs == {}

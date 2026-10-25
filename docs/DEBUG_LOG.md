@@ -4516,3 +4516,143 @@ cron 回合跑在新建的、未绑定会话的 `SessionEventStore` 里，结果
 schema 顺序与指纹；`test_cron_side_effects.py` / `test_subagent_surface.py` 补上
 “只读定时回合拒绝改名/撤销、子代理不暴露这两个工具”的归属断言。定向回归
 **142 passed**；全量 **1626 passed / 1 skipped**，Ruff 全通过。
+
+## 定时任务授权卡片
+
+计划里最后一块安全边界：可写定时任务此前只能靠 `/cron add --writes` 或 API 开启。
+现在 `PATCH /v1/crons/{job_id}` + `cron_scheduler.update_job` 提供「改授权/改投递
+目标」的单一入口（改完按 durable 落盘），飞书 `/cron` 列表改成卡片，每个任务带
+「允许写操作 / 收回写权限 / 删除」，控制台加「定时任务」按钮。
+
+安全取舍：
+- 模型侧的 `schedule_cron` 仍然不暴露 `allow_side_effects`——授权只能由人在卡片上
+  点、或用命令/API 显式给出，模型不能给自己提权。
+- 按钮 value 带一次性 `cron_view` token（10 分钟 TTL，按 chat 存）：别的聊天拿到
+  value、旧卡片、以及重新渲染后的旧 token 都会被拒绝，避免过期卡片改到新状态。
+- 删除走两次点击（确认卡 → 确认删除 / 取消），删除不可恢复，不把误触变成数据丢失。
+
+测试：`update_job` 落盘与未知任务、API PATCH 200/404 与重启后授权仍在、飞书卡片
+的授权/收回/二次删除/取消/过期 token/跨聊天重放。全量 **1632 tests collected、
+全部通过**（1 个 symlink 跳过）。
+
+## 飞书网关单实例锁
+
+`feishu_gateway.main()` 启动前先拿 `<cache>/locks/feishu-gateway.lock`（复用
+`file_lock.exclusive_file_lock`，非阻塞）。拿不到就退出（返回码 2）并提示：
+两个网关会对同一条消息回复两次、把同一批 cron/心跳推送发两遍。这是个人单机部署
+的实用兜底，而不是多实例会话分配——后者需要网关间协商 chat 归属和推送去重，
+在没有真实需求前不做。`FEISHU_ALLOW_MULTI=1` 显式跳过检查（不同应用凭证并行）。
+
+测试：`test_gateway_refuses_a_second_instance` 用同一把 OS 锁模拟第二个进程，
+断言不会创建 transport、返回码 2，并覆盖 `FEISHU_ALLOW_MULTI=1` 的放行路径。
+
+## 飞书验收预检发现的两个真问题
+
+**1. durable cron 任务在 Windows 上重启后整表丢失。**
+`load_durable_jobs()` 用 `DURABLE_PATH.read_text()`（无 encoding），Windows 上按 GBK
+解码 UTF-8 JSON，中文提示词直接抛 `UnicodeDecodeError`；异常被外层 `except` 吞掉，
+结果是“静默地一个任务都没加载”。心跳任务因为 `ensure_registered()` 会重新注册而
+掩盖了问题，用户自己创建的提醒会消失。修复：固定 `utf-8-sig` 读取，失败再回退一次
+locale（兼容旧文件），仍失败则明确报错；单条坏记录只跳过自己，不清空整表。
+
+**2. 旧进程不会加载新代码。**
+8000 端口上的 API 是改动前启动的，`/v1/heartbeat` 直接 404；旧网关也没有单实例锁，
+日志里看不到任何异常。验收前重启 API 与网关后全部 200。这类“代码对但进程旧”的问题
+只能靠重启解决，所以 `scripts/feishu_acceptance.py` 的预检里带上 API 版本探测
+（heartbeat 路由）和网关锁状态。
+
+预检同时把 8 类卡片真机发了一遍（`--send-cards bound`），8/8 返回 message_id，
+说明 schema 1.0 控制台/列表/工作区卡与 schema 2.0 过程卡都被飞书接受。
+
+## 飞书体验打磨（用完之后的第二轮）
+
+功能验收通过后只改“看得见的地方”，每条都能被真实使用感知到：
+
+1. **运行中卡片带「⏹ 停止这个回合」**：以前长回合想停下要回控制台找按钮，现在
+   卡片底部直接有（`stop_row()`，schema 2.0 按钮的 `behaviors[].value`）。完成时
+   同一位置换成「⚙️ 控制台」，不再依赖网关手动 append。
+2. **失败文案先说人话**：`friendly_error()` 把 402 余额不足、401 鉴权失败、
+   403、429、超时、`turn_busy/409` 映射成一句可执行的建议，原始异常降为第二行
+   “技术细节”。识别不到就保持原文，不猜。
+3. **长答案截断有提示**：`truncated_note()` 在超过 18000 字时补一句“可以让它写入
+   文件再发给你”，而不是静默截断。
+4. **首次绑定给例句**：自动建会话时控制台卡提示三句可照抄的话（看看项目改了什么 /
+   每天 9 点提醒 / 上次聊到哪），降低“第一句该说什么”的门槛。
+5. **状态卡信息更全**：模型、工作区、待审批条数、定时任务数量；待审批只报条数，
+   不贴命令正文。
+6. **新建定时任务后指路**：回复里补“改授权或删除，点「定时任务」卡片即可”。
+
+验收脚本同时补了 `--only`（只发指定卡片）和 schema 2.0 按钮的 `behaviors[].value`
+校验——之前校验器只认 `value`，会误报真实卡片。
+
+## 定时任务卡片分页 + 控制台角标
+
+任务多了以后 `/cron` 卡片会很长，手机上要滚半天；控制台也看不出“有没有事要做”。
+
+- `cron_card(..., page=)`：按 `last_fired` 倒序（最近触发的在前、从未触发的最后），
+  每页 `PAGE_SIZE=3`，底部「← 上一页 / 下一页 →」。分页按钮带同一个 `cron_view`
+  与目标页码，网关 `_handle_cron_action` 先处理 `page` 再查 job。
+- **就地翻页**：卡片回调自带 `message_id`，`_show_crons(..., message_id=)` 优先用
+  `update_step_card` PATCH 同一张卡。以前每翻一页就新发一张，聊天记录会被“下一页”
+  塞满；现在不新增消息（测试断言 `len(fake.cards)` 不变）。
+- **旧卡片不再“连坐”**：点过期卡片只提示“这张已过期”，不再把聊天里的最新视图
+  一起清掉（否则新卡片的按钮也跟着失效）。
+- **控制台角标**：`control_card(pending=, crons=)` 在信息区显示
+  「待审批 N 条 · 定时任务 N 个」；待审批>0 时追加“（回 y / n 或点卡片按钮）”。
+  只报数量，不贴命令正文。`api.list_crons()` 失败时按 0 显示，面板不能因为
+  cron 接口抖动就打不开。
+
+测试：排序（最近触发在前、未触发在后）、分页（页码、页脚、边界按钮、越界收敛）、
+`page` 按钮翻页与旧 token 失效、PATCH 就地翻页不新增消息、角标计数与接口失败降级。
+全量 1660 passed / 1 skipped。
+
+## 系统代理把飞书域名也劫持了（真机验收中途踩到）
+
+验收中途本机 Clash 一类代理（`127.0.0.1:10090`）关了，随后所有飞书 REST 调用变成
+
+```
+ProxyError('Unable to connect to proxy', ... open.feishu.cn ...)
+```
+
+网关的长连接（WebSocket）不受影响，所以表现为“日志里连着，但发不出消息/下载不了附件”
+——这种半死状态最难查。根因：`requests` 在 Windows 上从注册表读系统代理，飞书是境内
+域名却被一起代理走。
+
+修复：`bypass_proxy_for_feishu()` 把 `.feishu.cn / feishu.cn / open.feishu.cn /
+msg-frontier.feishu.cn` 追加进 `NO_PROXY`，其他域名（如 OpenAI）仍按原代理走；
+`FEISHU_USE_PROXY=1` 可关闭该行为。网关启动与验收脚本发卡前都会调用。
+
+**踩到的坑**：第一版写成“先设 `NO_PROXY` 再 `pop('no_proxy')`”，Windows 上
+`os.environ` 键不区分大小写，pop 直接把刚设的值删了，看起来“设了没用”。现在只在
+非 Windows 上写小写别名。
+
+回归：`test_bypass_proxy_for_feishu_keeps_other_traffic_proxied`（保留既有例外、
+幂等）与 `..._can_be_disabled`。
+
+## 审批合并卡 / 会话语义过滤 / 任务卡片
+
+按用户要求依次做三个体验项。
+
+**1. 审批合并（`src/feishu_approval_card.py`）**
+一次批量操作可能同时产生十几条审批请求，旧实现一条一张卡。现在每个聊天只有一张
+审批卡：逐条展示工具/原因/命令 + 自己的「允许 / 拒绝 / 同类」，超过 4 条折叠成
+“另有 N 条未展开”，底部「全部允许 / 全部拒绝」。首次发送后记住 `message_id`，
+决议一条就 PATCH 同一张，全部处理完显示“✅ 待审批已全部处理完”，按钮消失。
+`poll_permissions` 只在**有变化**（新增请求 / 超时或别处已决议）时重渲染，
+不会每 3 秒 PATCH 一次；无卡片能力的传输层回退成一条纯文本摘要。
+安全边界不变：按钮只带 `req_id`，归属仍按“本聊天推送过的请求”校验；同类键仍由
+服务端按登记内容重算；别人的聊天按不动（`test_bulk_button_from_another_chat_is_rejected`）。
+
+**2. 会话列表（`feishu_sessions.list_card` + `_render_sessions`）**
+工作区分组头带上会话数量与「当前工作区」标记，长路径只留尾部；底部新增
+「只看当前工作区 / 显示全部工作区」切换（`action=scope`）。过滤只影响展示：
+展示用的行写回 `_session_views`，因此按钮序号始终对应用户看到的顺序；完整列表留在
+`_session_all`，来回切换不会丢条目。
+
+**3. 后台任务卡片（`src/feishu_task_card.py`）**
+`/status`、`/logs <id>` 从纯文本改成卡片：任务列表带「看日志 / 停止」，日志卡带
+「刷新 / 任务列表 / 停止」，刷新与看日志都 PATCH 同一张卡（回调带 `message_id`），
+日志只保留末尾 120 行 / 12k 字符。按钮走 `task_action` 分支，受用户白名单约束。
+
+测试：`tests/test_feishu_approval_batch.py`（合并、折叠、批量、越权、无变化不重渲染）、
+会话语义过滤与序号一致性、任务卡片渲染与按钮/白名单。全量 1678 passed / 1 skipped。

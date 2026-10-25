@@ -140,14 +140,17 @@ def test_turn_slot_released_after_turn(monkeypatch):
     async def scenario():
         app = HarnessApp([])
         async with app.run_test(size=(80, 20)) as pilot:
-            for text in ('one', 'two'):
+            for index, text in enumerate(('one', 'two'), 1):
                 app.submit_text(text)
-                for _ in range(80):
+                # 这里用的是真实回合锁（.cache/locks/agent-turn.lock），机器上同时跑着
+                # 网关/TUI 时可能被短暂占用；给足 10s，不用固定次数的短等待，
+                # 否则并行验收期间会偶发失败（本机 2026-10-25 实际遇到）。
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and len(calls) < index:
                     await pilot.pause()
                     await asyncio.sleep(0.02)
-                    if len(calls) >= (1 if text == 'one' else 2):
-                        break
                 assert not app._busy, text
+                assert len(calls) == index, f'{text} 未被接受（可能被别的进程占用回合槽）'
             assert len(calls) == 2
 
     asyncio.run(scenario())

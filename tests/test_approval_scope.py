@@ -6,6 +6,7 @@ clear() 清空、飞书卡片 scope=session 全链路（HTTP resolve 透传）�
 
 运行: python test_approval_scope.py
 """
+import json
 import sys
 import threading
 import time
@@ -236,8 +237,8 @@ def test_feishu_session_scope_button_end_to_end(api_app, tmp_path):
             self.cards = []
             self.sent = []
 
-        def send_approval_card(self, chat_id, prompt_md, req):
-            self.cards.append((chat_id, prompt_md, req))
+        def send_session_card(self, chat_id, card):
+            self.cards.append((chat_id, card))
             return 'om-1'
 
         def send_text(self, chat_id, text):
@@ -254,11 +255,15 @@ def test_feishu_session_scope_button_end_to_end(api_app, tmp_path):
         results = {}
         thread = _decide_async('rm -rf build', results)
         gw.poll_permissions()
-        assert fake.cards, '应推送审批卡片'
-        req = fake.cards[0][2]
+        assert fake.cards, '应推送合并审批卡片'
+        req_id = gw._chat_pending['c1'][0]
+        approval_cards = [card for _, card in fake.cards
+                          if '需要审批' in json.dumps(card, ensure_ascii=False)]
+        assert len(approval_cards) == 1
+        assert req_id in json.dumps(approval_cards[0], ensure_ascii=False)
 
         text, ok = gw.handle_card_action(
-            None, {'approval': req['req_id'], 'allow': True,
+            None, {'approval': req_id, 'allow': True,
                    'scope': 'session'}, 'om_1', chat_id='c1')
         assert ok and '已允许' in text
         thread.join(timeout=2)

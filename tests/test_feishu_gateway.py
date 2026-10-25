@@ -3,6 +3,8 @@
 不依赖 lark-oapi 与网络——只测 on_message 编排 / 命令分发 / 审批联动。
 """
 
+import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -26,11 +28,16 @@ class FakeTransport:
     def send_text(self, chat_id: str, text: str) -> None:
         self.sent.append((chat_id, text))
 
-    def send_session_card(self, chat_id: str, card: dict) -> None:
+    def send_session_card(self, chat_id: str, card: dict) -> str:
         self.cards.append((chat_id, card))
+        return f'om-card-{len(self.cards)}'
 
     def last(self) -> str:
         return self.sent[-1][1] if self.sent else ''
+
+    def last_card(self) -> str:
+        return (json.dumps(self.cards[-1][1], ensure_ascii=False)
+                if self.cards else '')
 
     def all_text(self) -> str:
         return '\n'.join(text for _, text in self.sent)
@@ -139,10 +146,11 @@ def test_commands_run_status_logs_stop(gateway):
             break
         time.sleep(0.05)
 
+    # /status <id> 与 /logs 现在都是卡片（就地可刷新/停止），不再回纯文本
     gw.on_message('c1', f'/status {task_id}')
-    assert 'succeeded' in fake.last()
+    assert 'succeeded' in fake.last_card()
     gw.on_message('c1', f'/logs {task_id}')
-    assert 'feishu-task' in fake.last()
+    assert 'feishu-task' in fake.last_card()
 
 
 def test_unknown_command_reports_error(gateway):
@@ -258,9 +266,9 @@ def test_permission_approval_via_chat(gateway):
         time.sleep(0.02)
     req_id = permission_gate.pending()[0].req_id
 
-    # 轮询器推送提醒（直接调用核心方法验证格式）
+    # 轮询器推送合并审批卡（卡片正文里能看清工具与命令）
     gw.poll_permissions()
-    assert 'bash' in fake.all_text()
+    assert 'bash' in fake.last_card()
     assert format_permission_prompt(
         {'req_id': req_id, 'tool': 'bash', 'reason': 'destructive',
          'args': {'command': 'del x'}}).startswith('⚠ 需要审批')
@@ -345,24 +353,13 @@ def test_indexed_y_n_resolves_by_position(gateway):
     assert permission_gate.pending() == []
 
 
-def test_approval_push_prefers_button_card(gateway):
-    """有 send_approval_card 的 transport 推送按钮卡片而非纯文本。"""
+def test_approval_push_uses_one_merged_card(gateway):
+    """审批推送走合并卡片，不是一条请求一张卡，也不回退成文本。"""
     gw, fake = gateway
     _drain_stale_permissions()
     gw.on_message('c1', 'hi')
-
-    class ApprovalTransport(FakeTransport):
-        def __init__(self):
-            super().__init__()
-            self.cards = []
-
-        def send_approval_card(self, chat_id, prompt_md, req):
-            self.cards.append((chat_id, prompt_md, req))
-            return 'om-1'
-
-    approval = ApprovalTransport()
-    gw.transport = approval
-    baseline = len(fake.sent)   # on_message('hi') 已产生的文本回复
+    baseline_sent = len(fake.sent)      # on_message('hi') 已产生的文本回复
+    baseline_cards = len(fake.cards)
 
     results = {}
 
@@ -379,10 +376,12 @@ def test_approval_push_prefers_button_card(gateway):
     req_id = permission_gate.pending()[0].req_id
 
     gw.poll_permissions()
-    assert approval.cards == [('c1', approval.cards[0][1], approval.cards[0][2])]
-    assert approval.cards[0][2]['req_id'] == req_id
-    assert '回复 y（允许）或 n（拒绝）' in approval.cards[0][1]
-    assert len(fake.sent) == baseline   # 推送未走文本回退
+    approval_cards = [card for chat, card in fake.cards[baseline_cards:]
+                      if '需要审批' in json.dumps(card, ensure_ascii=False)]
+    assert len(approval_cards) == 1
+    text = json.dumps(approval_cards[0], ensure_ascii=False)
+    assert req_id in text and '允许' in text and '拒绝' in text
+    assert len(fake.sent) == baseline_sent   # 没有走文本回退
 
     gw.on_message('c1', 'y')        # 文本快捷键仍然生效
     thread.join(timeout=2)
@@ -506,8 +505,9 @@ def test_approvals_route_only_to_the_bound_session_chat(gateway):
                                   session_id=sid_a)
     try:
         gw.poll_permissions()
-        assert any(chat_id == 'c1' for chat_id, _ in fake.sent)
-        assert all(chat_id != 'c2' for chat_id, _ in fake.sent)
+        approval_chats = [chat for chat, card in fake.cards
+                          if '需要审批' in json.dumps(card, ensure_ascii=False)]
+        assert approval_chats == ['c1']
         assert req.req_id in gw._chat_pending['c1']
         assert req.req_id not in gw._chat_pending.get('c2', [])
 
@@ -563,8 +563,11 @@ def test_main_refuses_to_start_without_allowlist(monkeypatch, capsys):
     assert 'FEISHU_ALLOWED_USERS is required' in capsys.readouterr().out
 
 
-def test_main_allows_explicit_any_user_escape_hatch(monkeypatch):
+def test_main_allows_explicit_any_user_escape_hatch(monkeypatch, tmp_path):
     """本地测试可显式放开；启动后仍照常构造网关。"""
+    # 单实例锁改用临时路径：否则本机真有一个网关在跑时，这条用例会被拒绝。
+    monkeypatch.setattr(feishu_gateway, 'INSTANCE_LOCK_PATH',
+                        tmp_path / 'gateway.lock')
     monkeypatch.setenv('FEISHU_APP_ID', 'cli_x')
     monkeypatch.setenv('FEISHU_APP_SECRET', 'secret')
     monkeypatch.setenv('HARNESS_API_TOKEN', 't')
@@ -1228,7 +1231,7 @@ def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
     gw, fake = gateway
 
     gw.on_message('chat-cron', '/cron')
-    assert '没有定时任务' in fake.last()
+    assert '没有定时任务' in fake.last_card()
 
     gw.on_message('chat-cron', '/cron add "0 9 * * *" 每日汇报')
     created = fake.last()
@@ -1236,7 +1239,7 @@ def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
     job_id = created.split('已创建 ', 1)[1].split(':', 1)[0]
 
     gw.on_message('chat-cron', '/cron list')
-    assert job_id in fake.last() and '每日汇报' in fake.last()
+    assert job_id in fake.last_card() and '每日汇报' in fake.last_card()
 
     gw.on_message('chat-cron', '/cron add "* * *" 缺少字段')
     assert 'Expected 5 fields' in fake.last()
@@ -1244,7 +1247,7 @@ def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
     gw.on_message('chat-cron', f'/cron delete {job_id}')
     assert '已删除' in fake.last()
     gw.on_message('chat-cron', '/cron list')
-    assert '没有定时任务' in fake.last()
+    assert '没有定时任务' in fake.last_card()
 
 
 def test_cron_command_usage_and_unknown_job(gateway):
@@ -1268,8 +1271,10 @@ def test_cron_add_is_read_only_unless_writes_flag(gateway, tmp_path, monkeypatch
     assert '可写' in fake.last() and '修改文件' in fake.last()
 
     gw.on_message('chat-cron-w', '/cron list')
-    assert '[recurring · 只读 · 推送]' in fake.last()
-    assert '[recurring · 可写 · 推送]' in fake.last()
+    listing = fake.last_card()
+    assert 'recurring · 只读 · 推送本聊天' in listing
+    assert 'recurring · 可写（副作用仍审批） · 推送本聊天' in listing
+    assert '允许写操作' in listing and '收回写权限' in listing
 
     # 只有开关没有表达式：退回用法，不创建任务
     gw.on_message('chat-cron-w', '/cron add --writes')
@@ -1699,3 +1704,523 @@ def test_file_extension_is_not_restricted_by_gateway(tmp_path):
             'name': name}, 'ou_me', 'p2p', 'om-' + name)
     files = list((tmp_path / '.cache' / 'feishu-inbox').iterdir())
     assert {path.suffix for path in files} >= {'.csv', '.zip', '.pptx', '.xlsx'}
+
+
+def test_cron_card_buttons_authorize_and_revoke_side_effects(gateway, tmp_path,
+                                                             monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    gw.on_message('chat-cards', '/cron add "0 9 * * *" 每日汇报')
+    job_id = fake.last().split('已创建 ', 1)[1].split(':', 1)[0]
+
+    gw.on_message('chat-cards', '/cron list')
+    card = fake.cards[-1][1]
+    token = _card_token(card, 'writes', job_id)
+    assert token
+    assert _card_label(card, 'writes', job_id) == '允许写操作'
+
+    ok, allowed = gw.handle_card_action('ou_me', {
+        'cron_action': 'writes', 'job_id': job_id, 'cron_view': token},
+        None, chat_id='chat-cards')
+    assert ok and allowed
+    gw._handle_cron_action('chat-cards', {
+        'cron_action': 'writes', 'job_id': job_id, 'cron_view': token})
+    assert cron_scheduler.scheduled_jobs[job_id].allow_side_effects is True
+    assert '已允许写操作' in fake.last()
+
+    gw.on_message('chat-cards', '/cron list')
+    card = fake.cards[-1][1]
+    token = _card_token(card, 'readonly', job_id)
+    gw._handle_cron_action('chat-cards', {
+        'cron_action': 'readonly', 'job_id': job_id, 'cron_view': token})
+    assert cron_scheduler.scheduled_jobs[job_id].allow_side_effects is False
+    assert '已收回写权限' in fake.last()
+
+
+def _card_buttons(card):
+    return [button
+            for element in card.get('elements', [])
+            if element.get('tag') == 'action'
+            for button in element.get('actions', [])]
+
+
+def _card_token(card, action, job_id):
+    for button in _card_buttons(card):
+        value = button.get('value') or {}
+        if value.get('cron_action') == action and (
+                job_id is None or value.get('job_id') == job_id):
+            return value.get('cron_view')
+    raise AssertionError(f'no {action} button for {job_id}')
+
+
+def _card_label(card, action, job_id):
+    for button in _card_buttons(card):
+        value = button.get('value') or {}
+        if value.get('cron_action') == action and value.get('job_id') == job_id:
+            return button['text']['content']
+    raise AssertionError(f'no {action} button for {job_id}')
+
+
+def test_cron_card_delete_requires_confirmation(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    gw.on_message('chat-del', '/cron add "0 9 * * *" 每日汇报')
+    job_id = fake.last().split('已创建 ', 1)[1].split(':', 1)[0]
+    gw.on_message('chat-del', '/cron list')
+    token = _card_token(fake.cards[-1][1], 'delete', job_id)
+
+    # 第一次只发确认卡，任务仍在
+    gw._handle_cron_action('chat-del', {
+        'cron_action': 'delete', 'job_id': job_id, 'cron_view': token})
+    assert job_id in cron_scheduler.scheduled_jobs
+    assert '确认删除' in fake.last_card()
+
+    confirm_token = _card_token(fake.cards[-1][1], 'delete_confirm', job_id)
+    gw._handle_cron_action('chat-del', {
+        'cron_action': 'delete_confirm', 'job_id': job_id,
+        'cron_view': confirm_token})
+    assert job_id not in cron_scheduler.scheduled_jobs
+    assert '已删除' in fake.last()
+
+    # 取消按钮不改状态
+    gw.on_message('chat-del', '/cron add "0 8 * * *" 早报')
+    other = fake.last().split('已创建 ', 1)[1].split(':', 1)[0]
+    gw.on_message('chat-del', '/cron list')
+    token = _card_token(fake.cards[-1][1], 'delete', other)
+    gw._handle_cron_action('chat-del', {
+        'cron_action': 'cancel', 'job_id': other, 'cron_view': token})
+    assert other in cron_scheduler.scheduled_jobs
+
+
+def test_cron_card_rejects_stale_token_and_foreign_chat(gateway, tmp_path,
+                                                        monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    gw.on_message('chat-a', '/cron add "0 9 * * *" 每日汇报')
+    job_id = fake.last().split('已创建 ', 1)[1].split(':', 1)[0]
+    gw.on_message('chat-a', '/cron list')
+    token = _card_token(fake.cards[-1][1], 'writes', job_id)
+
+    # 别的聊天拿到同样的 value 也不能授权
+    text, ok = gw.handle_card_action('ou_me', {
+        'cron_action': 'writes', 'job_id': job_id, 'cron_view': token},
+        None, chat_id='chat-b')
+    assert not ok and '过期' in text
+    gw._handle_cron_action('chat-b', {
+        'cron_action': 'writes', 'job_id': job_id, 'cron_view': token})
+    assert cron_scheduler.scheduled_jobs[job_id].allow_side_effects is False
+
+    # 重新渲染后旧 token 失效
+    gw.on_message('chat-a', '/cron list')
+    gw._handle_cron_action('chat-a', {
+        'cron_action': 'writes', 'job_id': job_id, 'cron_view': token})
+    assert cron_scheduler.scheduled_jobs[job_id].allow_side_effects is False
+
+
+def test_gateway_refuses_a_second_instance(tmp_path, monkeypatch):
+    lock = tmp_path / 'locks' / 'feishu-gateway.lock'
+    monkeypatch.setattr(feishu_gateway, 'INSTANCE_LOCK_PATH', lock)
+    monkeypatch.setenv('FEISHU_APP_ID', 'app')
+    monkeypatch.setenv('FEISHU_APP_SECRET', 'secret')
+    monkeypatch.setenv('HARNESS_API_TOKEN', 't')
+    monkeypatch.setenv('FEISHU_ALLOWED_USERS', 'ou_me')
+    monkeypatch.delenv('FEISHU_ALLOW_MULTI', raising=False)
+    started = []
+    monkeypatch.setattr(feishu_gateway, '_run_gateway',
+                        lambda **kwargs: started.append(kwargs) or 0)
+
+    # 单实例：第一次启动成功，锁在 main() 结束（进程级 run 返回）后才释放
+    assert feishu_gateway.main([]) == 0
+    assert len(started) == 1
+
+    # 另一个「进程」持有同一把锁 → 第二个实例拒绝启动，且不建 transport
+    with feishu_gateway.exclusive_file_lock(lock, timeout=0):
+        assert feishu_gateway.main([]) == 2
+        assert len(started) == 1
+        # 显式并行（不同应用凭证）时跳过检查
+        monkeypatch.setenv('FEISHU_ALLOW_MULTI', '1')
+        assert feishu_gateway.main([]) == 0
+        assert len(started) == 2
+
+
+@pytest.mark.parametrize(('raw', 'expected'), [
+    ('agent send failed (402): Insufficient Balance', '余额/额度不足'),
+    ('HTTP 401 Unauthorized: invalid api key', '鉴权失败'),
+    ('403 forbidden', '拒绝访问'),
+    ('429 Too Many Requests', '请求过于频繁'),
+    ('ReadTimeout: request timed out', '请求超时'),
+    ('turn_busy: another turn is running', '上一轮还在执行'),
+    ('something odd happened', ''),
+])
+def test_friendly_error_maps_common_failures(raw, expected):
+    hint = feishu_gateway.friendly_error(RuntimeError(raw))
+    if expected:
+        assert expected in hint
+    else:
+        assert hint == ''
+
+
+def test_step_card_running_shows_stop_and_completed_shows_console():
+    import feishu_step_card
+
+    running = feishu_step_card.step_card(status='running', note='运行中 · 00:03',
+                                         actions='stop')
+    labels = [button['text']['content']
+              for element in running['body']['elements']
+              if element.get('tag') == 'column_set'
+              for column in element['columns']
+              for button in column['elements']]
+    assert any('停止' in label for label in labels)
+    value = [column['elements'][0]['behaviors'][0]['value']
+             for element in running['body']['elements']
+             if element.get('tag') == 'column_set'
+             for column in element['columns']][0]
+    assert value == {'panel': 'stop'}
+
+    done = feishu_step_card.step_card(answer='ok', status='completed',
+                                      actions='menu')
+    assert any(element.get('tag') == 'column_set'
+               for element in done['body']['elements'])
+
+
+def test_truncated_note_only_for_long_answers():
+    import feishu_step_card
+
+    assert feishu_step_card.truncated_note('short') == ''
+    note = feishu_step_card.truncated_note(
+        'x' * (feishu_step_card.MAX_ANSWER_CHARS + 1))
+    assert '前' in note and '写入文件' in note
+
+
+def test_failure_card_uses_friendly_hint_and_raw_detail(gateway):
+    gw, fake = gateway
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('agent send failed (402): Insufficient Balance')
+
+    original = gw.api.send_stream
+    gw.api.send_stream = boom
+    try:
+        gw.on_message('chat-402', 'hi')
+    finally:
+        gw.api.send_stream = original
+    text = fake.all_text()
+    assert '余额/额度不足' in text and 'Insufficient Balance' in text
+
+
+def test_panel_status_shows_pending_and_cron_counts(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    gw.on_message('chat-status', 'hi')
+    gw.on_message('chat-status', '/cron add "0 9 * * *" 每日汇报')
+    gw._handle_panel_action('chat-status', 'status')
+    text = fake.all_text()
+    assert '待审批 0 条' in text
+    assert '定时任务 1 个' in text
+    assert '直接发消息即可' in text
+
+
+def test_first_message_welcome_suggests_what_to_say(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-welcome', 'hi')
+    cards = [card for chat, card in fake.cards if chat == 'chat-welcome']
+    intro = json.dumps(cards[0], ensure_ascii=False)
+    assert '直接说话就行' in intro
+    assert '每天早上 9 点提醒我喝水' in intro
+
+
+def _cron_job(job_id, *, fired='', writes=False):
+    return {'id': job_id, 'cron': '0 9 * * *', 'prompt': f'任务{job_id}',
+            'recurring': True, 'allow_side_effects': writes,
+            'deliver_to': 'oc_x', 'last_fired': fired}
+
+
+def test_cron_card_sorts_by_last_fired_and_paginates():
+    from feishu_cron_card import cron_card, sort_jobs
+
+    jobs = [_cron_job('old', fired='2026-10-01 09:00'),
+            _cron_job('never'),
+            _cron_job('new', fired='2026-10-25 09:00'),
+            _cron_job('mid', fired='2026-10-20 09:00')]
+    assert [job['id'] for job in sort_jobs(jobs)] == ['new', 'mid', 'old', 'never']
+
+    first = cron_card(jobs, chat_id='oc_x', token='t')
+    text = json.dumps(first, ensure_ascii=False)
+    assert '第 1/2 页' in text and '共 4 个任务' in text
+    assert '任务new' in text and '“任务never”' not in text
+    assert '下一页' in text and '上一页' not in text
+
+    second = cron_card(jobs, chat_id='oc_x', token='t', page=1)
+    text = json.dumps(second, ensure_ascii=False)
+    assert '第 2/2 页' in text and '任务never' in text
+    assert '上一页' in text and '下一页' not in text
+
+    # 页码越界收敛到最后一页，不会出现空白页
+    assert '第 2/2 页' in json.dumps(
+        cron_card(jobs, chat_id='oc_x', token='t', page=9), ensure_ascii=False)
+
+
+def test_cron_page_button_navigates(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    for hour in range(4):
+        cron_scheduler.schedule_job(f'0 {hour} * * *', f'任务{hour}',
+                                    deliver_to='chat-pages')
+    gw.on_message('chat-pages', '/cron')
+    token = _card_token(fake.cards[-1][1], 'page', None)
+    assert token
+
+    gw._handle_cron_action('chat-pages', {'cron_action': 'page', 'page': 1,
+                                          'cron_view': token})
+    assert '第 2/2 页' in fake.last_card()
+    # 翻页会重渲染，token 随之更新；旧 token 不能再动
+    fresh = _card_token(fake.cards[-1][1], 'page', None)
+    assert fresh and fresh != token
+    gw._handle_cron_action('chat-pages', {'cron_action': 'page', 'page': 0,
+                                          'cron_view': token})
+    assert '已过期' in fake.last()
+    # 非法页码只提示，不改卡片
+    gw._handle_cron_action('chat-pages', {'cron_action': 'page', 'page': 'x',
+                                          'cron_view': fresh})
+    assert '无效的页码' in fake.last()
+    # 旧卡片被点不会连带作废新卡片：fresh token 仍然可用
+    gw._handle_cron_action('chat-pages', {'cron_action': 'page', 'page': 0,
+                                          'cron_view': fresh})
+    assert '第 1/2 页' in fake.last_card()
+
+
+def test_cron_page_patches_existing_card_instead_of_posting(gateway, tmp_path,
+                                                            monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    for hour in range(4):
+        cron_scheduler.schedule_job(f'0 {hour} * * *', f'任务{hour}',
+                                    deliver_to='chat-patch')
+    patches = []
+
+    def patch(message_id, card):
+        patches.append((message_id, card))
+
+    fake.update_step_card = patch
+    gw.on_message('chat-patch', '/cron')
+    sent_before = len(fake.cards)
+    token = _card_token(fake.cards[-1][1], 'page', None)
+
+    gw._handle_cron_action('chat-patch', {'cron_action': 'page', 'page': 1,
+                                          'cron_view': token},
+                           message_id='om_card_1')
+    assert patches and patches[-1][0] == 'om_card_1'
+    assert len(fake.cards) == sent_before   # 没有新消息，聊天不刷屏
+    assert '第 2/2 页' in json.dumps(patches[-1][1], ensure_ascii=False)
+
+    # 没有 message_id 时退回发送新卡
+    token = _card_token(patches[-1][1], 'page', None)
+    gw._handle_cron_action('chat-patch', {'cron_action': 'page', 'page': 0,
+                                          'cron_view': token})
+    assert len(fake.cards) == sent_before + 1
+
+
+def test_control_card_shows_pending_and_cron_counts(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+    gw.on_message('chat-badge', 'hi')
+    gw.on_message('chat-badge', '/cron add "0 9 * * *" 每日汇报')
+    gw._chat_pending['chat-badge'] = ['req-1', 'req-2']
+    gw._send_panel('chat-badge')
+    card = json.dumps(fake.cards[-1][1], ensure_ascii=False)
+    assert '待审批 2 条' in card and '定时任务 1 个' in card
+    assert '回 y / n' in card
+
+
+def test_control_card_survives_cron_api_failure(gateway):
+    gw, fake = gateway
+
+    def boom():
+        raise RuntimeError('cron api down')
+
+    original = gw.api.list_crons
+    gw.api.list_crons = boom
+    try:
+        gw.on_message('chat-badge2', 'hi')
+    finally:
+        gw.api.list_crons = original
+    card = json.dumps([c for chat, c in fake.cards if chat == 'chat-badge2'][0],
+                      ensure_ascii=False)
+    assert '待审批 0 条' in card and '定时任务 0 个' in card
+
+
+def test_bypass_proxy_for_feishu_keeps_other_traffic_proxied(monkeypatch):
+    monkeypatch.delenv('NO_PROXY', raising=False)
+    monkeypatch.delenv('no_proxy', raising=False)
+    monkeypatch.delenv('FEISHU_USE_PROXY', raising=False)
+    monkeypatch.setenv('NO_PROXY', 'internal.corp')
+
+    feishu_gateway.bypass_proxy_for_feishu()
+
+    hosts = os.environ['NO_PROXY'].split(',')
+    assert 'internal.corp' in hosts          # 既有例外保留
+    assert '.feishu.cn' in hosts and 'open.feishu.cn' in hosts
+    # 幂等：重复调用不重复追加
+    feishu_gateway.bypass_proxy_for_feishu()
+    assert os.environ['NO_PROXY'].split(',').count('.feishu.cn') == 1
+
+
+def test_bypass_proxy_for_feishu_can_be_disabled(monkeypatch):
+    monkeypatch.delenv('NO_PROXY', raising=False)
+    monkeypatch.delenv('no_proxy', raising=False)
+    monkeypatch.setenv('FEISHU_USE_PROXY', '1')
+
+    feishu_gateway.bypass_proxy_for_feishu()
+
+    assert 'feishu.cn' not in (os.environ.get('NO_PROXY') or '')
+
+
+def test_session_card_shows_workspace_counts_and_short_paths():
+    from feishu_sessions import list_card
+
+    rows = [{'id': 's1', 'title': '会话一', 'workspace': 'D:/harness-agent',
+             'updated': time.time() - 60, 'preview': '预览'},
+            {'id': 's2', 'title': '会话二', 'workspace': 'D:/harness-agent',
+             'updated': time.time() - 120, 'preview': '预览'},
+            {'id': 's3', 'title': '会话三',
+             'workspace': 'D:/very/long/path/' + 'x' * 80,
+             'updated': time.time() - 180, 'preview': '预览'}]
+    card = list_card(rows, 'tok', current_id='s1')
+    text = json.dumps(card, ensure_ascii=False)
+    assert '当前工作区 · D:/harness-agent（2 个会话）' in text
+    assert '只看当前工作区' in text
+    assert 'x' * 80 not in text          # 长路径被收窄
+    assert '…' in text
+
+    filtered = list_card(rows[:2], 'tok', current_id='s1', filtered=True)
+    assert '显示全部工作区' in json.dumps(filtered, ensure_ascii=False)
+    assert '（已过滤当前工作区）' in json.dumps(filtered, ensure_ascii=False)
+
+
+def test_session_filter_toggle_keeps_indexes_consistent(gateway, monkeypatch):
+    gw, fake = gateway
+    current = gw.api.create_session()
+    other = gw.api.create_session()
+    gw.bindings['chat-filter'] = current
+    rows = [{'id': current, 'title': '当前工作区会话', 'workspace': 'D:/harness-agent',
+             'updated': time.time(), 'preview': '预览'},
+            {'id': other, 'title': '别的工作区会话', 'workspace': 'D:/tmp/other',
+             'updated': time.time() - 60, 'preview': '预览'}]
+    monkeypatch.setattr(gw.api, 'list_sessions', lambda limit=1000: list(rows))
+    monkeypatch.setattr(gw.api, 'list_workspaces',
+                        lambda current=None: {'workspaces': []})
+    monkeypatch.setattr(gw.api, 'get_workspace', lambda sid: 'D:/harness-agent')
+
+    gw._show_sessions('chat-filter', list(rows))
+    assert '共 2 个会话' in fake.last_card()
+    token = gw._session_views['chat-filter'][0]
+
+    # 只看当前工作区：只剩 1 条，且序号 0 指向当前会话
+    gw._handle_session_action('chat-filter', {'session_view': token,
+                                              'action': 'scope', 'index': 0},
+                              'ou_me')
+    card = fake.last_card()
+    assert '共 1 个会话' in card and '已过滤当前工作区' in card
+    assert len(gw._session_views['chat-filter'][1]) == 1
+
+    # 再点一次回到全部
+    gw._handle_session_action('chat-filter', {'session_view': token,
+                                              'action': 'scope', 'index': 0},
+                              'ou_me')
+    assert '共 2 个会话' in fake.last_card()
+    assert len(gw._session_views['chat-filter'][1]) == 2
+
+
+def test_session_scope_button_is_accepted_by_card_action(gateway, monkeypatch):
+    gw, fake = gateway
+    current = gw.api.create_session()
+    gw.bindings['chat-scope'] = current
+    rows = [{'id': current, 'title': '会话', 'workspace': 'D:/harness-agent',
+             'updated': time.time(), 'preview': '预览'}]
+    monkeypatch.setattr(gw.api, 'get_workspace', lambda sid: 'D:/harness-agent')
+    gw._show_sessions('chat-scope', list(rows))
+    token = gw._session_views['chat-scope'][0]
+
+    text, ok = gw.handle_card_action('ou_me', {'session_view': token,
+                                               'action': 'scope', 'index': 0},
+                                     'om_card', chat_id='chat-scope')
+    assert ok and '正在处理会话操作' in text
+
+
+def test_status_and_logs_render_as_cards_with_buttons(gateway, monkeypatch):
+    gw, fake = gateway
+
+    def list_tasks():
+        return [{'id': 'bg_1', 'status': 'running', 'command': 'npm test',
+                 'duration_ms': 12_000}]
+
+    monkeypatch.setattr(gw.api, 'list_tasks', list_tasks)
+    monkeypatch.setattr(gw.api, 'get_task',
+                        lambda task_id: {'id': task_id, 'status': 'running',
+                                         'command': 'npm test',
+                                         'duration_ms': 12_000})
+    monkeypatch.setattr(gw.api, 'task_logs',
+                        lambda task_id, lines=60: 'line1\nline2\nline3')
+    lines = []
+    monkeypatch.setattr(gw.api, 'stop_task',
+                        lambda task_id: lines.append(task_id) or
+                        {'id': task_id, 'status': 'stopped'})
+
+    gw.on_message('chat-task', '/status')
+    card = json.dumps(fake.cards[-1][1], ensure_ascii=False)
+    assert '后台任务（1）' in card and 'bg_1' in card
+    assert '看日志' in card and '停止' in card and 'npm test' in card
+
+    gw.on_message('chat-task', '/logs bg_1 5')
+    card = json.dumps(fake.cards[-1][1], ensure_ascii=False)
+    assert '任务日志 · bg_1' in card and 'line1' in card
+
+    # 卡片按钮：看日志就地更新同一张卡
+    patches = []
+    fake.update_step_card = lambda message_id, payload: patches.append(payload)
+    gw._handle_task_action('chat-task', {'task_action': 'logs', 'task_id': 'bg_1'},
+                           message_id='om_task')
+    assert patches and 'line1' in json.dumps(patches[-1], ensure_ascii=False)
+
+    gw._handle_task_action('chat-task', {'task_action': 'stop', 'task_id': 'bg_1'},
+                           message_id='om_task')
+    assert lines == ['bg_1']
+    assert '→ stopped' in fake.last()
+
+
+def test_status_card_without_tasks_explains_how_to_start(gateway, monkeypatch):
+    gw, fake = gateway
+    monkeypatch.setattr(gw.api, 'list_tasks', lambda: [])
+    gw.on_message('chat-task-empty', '/status')
+    card = json.dumps(fake.cards[-1][1], ensure_ascii=False)
+    assert '没有后台任务' in card and '刷新' in card
+
+
+def test_task_action_buttons_are_queued_and_whitelisted(gateway, monkeypatch):
+    gw, fake = gateway
+    monkeypatch.setattr(gw.api, 'list_tasks', lambda: [])
+    text, ok = gw.handle_card_action('ou_me', {'task_action': 'refresh'},
+                                     'om_task', chat_id='chat-task2')
+    assert ok and '正在处理' in text
+
+    # 白名单外的用户点任务卡片：拒绝
+    blocked = FeishuGateway(gw.api, transport=fake,
+                            bindings_path=gw.bindings_path,
+                            allowed_users={'ou_other'})
+    text, ok = blocked.handle_card_action('ou_me', {'task_action': 'refresh'},
+                                          'om_task', chat_id='chat-task2')
+    assert not ok and '没有会话操作权限' in text

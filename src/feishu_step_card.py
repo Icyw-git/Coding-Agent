@@ -65,6 +65,35 @@ def menu_row() -> dict:
     }
 
 
+def stop_row() -> dict:
+    """运行中卡片的「停止」按钮：等长回合时不用回控制台找入口。"""
+    return {
+        'tag': 'column_set',
+        'flex_mode': 'none',
+        'columns': [{
+            'tag': 'column',
+            'width': 'weighted',
+            'weight': 1,
+            'elements': [{
+                'tag': 'button',
+                'text': _plain('⏹ 停止这个回合'),
+                'type': 'danger',
+                'width': 'fill',
+                'behaviors': [{'type': 'callback', 'value': {'panel': 'stop'}}],
+            }],
+        }],
+    }
+
+
+def truncated_note(text: str) -> str:
+    """答案超长时给一句可执行的说明，而不是静默截断。"""
+    text = str(text or '')
+    if len(text) <= MAX_ANSWER_CHARS:
+        return ''
+    return (f'内容较长，卡片只显示前 {MAX_ANSWER_CHARS} 字；'
+            '需要全文可以让它写入文件再发给你。')
+
+
 def tool_lines(tool_counts: dict[str, int] | None,
                tool_errors: list[dict] | None,
                *, total_ms: float = 0) -> list[str]:
@@ -96,8 +125,11 @@ def step_card(*, answer: str = '', status: str = 'completed',
               tool_counts: dict[str, int] | None = None,
               tool_errors: list[dict] | None = None, total_ms: float = 0,
               tool_batches: list[dict] | None = None,
-              note: str = '') -> dict:
-    """生成回复卡：答案在上，工具摘要折叠进「过程详情」。"""
+              note: str = '', actions: str = 'none') -> dict:
+    """生成回复卡：答案在上，工具摘要折叠进「过程详情」。
+
+    actions：'none' 不加按钮，'stop' 运行中给停止按钮，'menu' 完成后给控制台入口。
+    """
     elements: list[dict] = []
     text = str(answer or '').strip()
     if text:
@@ -145,6 +177,10 @@ def step_card(*, answer: str = '', status: str = 'completed',
 
     if note:
         elements.append(_markdown(f'_{note}_'))
+    if actions == 'stop':
+        elements.append(stop_row())
+    elif actions == 'menu':
+        elements.append(menu_row())
     if not elements:
         elements.append(_markdown(' '))
     return {

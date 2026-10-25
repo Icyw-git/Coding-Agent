@@ -128,24 +128,48 @@ def save_durable_jobs(): #保存持久化任务
         tmp.write_text(json.dumps(durable,ensure_ascii=False,indent=2),encoding='utf-8')
         tmp.replace(DURABLE_PATH)
 
+def _read_durable_text(path) -> str: #读取持久化文件；编码固定 UTF-8
+    """持久化文件一律按 UTF-8 读。
+
+    直接用 ``Path.read_text()`` 会跟着系统 locale 走（Windows 上是 GBK），中文提示词
+    的 UTF-8 字节会解码失败，结果是**整批 durable 任务在重启后消失**。旧版本可能
+    按本地编码写过，所以回退一次 locale 解码，再不行才放弃并明确报错。
+    """
+    raw=path.read_bytes()
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        pass
+    import locale
+    fallback=locale.getpreferredencoding(False) or 'utf-8'
+    try:
+        return raw.decode(fallback)
+    except UnicodeDecodeError as exc:
+        raise ValueError(f'cannot decode {path} as UTF-8 or {fallback}') from exc
+
 def load_durable_jobs(): #加载持久化任务，将有效任务添加到scheduled_jobs中
     if not DURABLE_PATH.exists():
 
         return
     try:
-        jobs=json.loads(DURABLE_PATH.read_text())
-        for j in jobs:
-            job=CronJob(**j)
-            err=validate_cron(job.cron)
-            if err:
-                print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
-                continue
-            scheduled_jobs[job.id]=job
-        valid=[j for j in jobs if j['id'] in scheduled_jobs]
-        if valid:
-            print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
+        jobs=json.loads(_read_durable_text(DURABLE_PATH))
     except Exception as exc:
         print(f"  \033[31m[cron] failed to load durable jobs: {exc}\033[0m")
+        return
+    # 单条记录坏了只跳过它，不能让一个坏任务清空整张表。
+    for j in jobs:
+        try:
+            job=CronJob(**j)
+        except (TypeError, ValueError) as exc:
+            print(f"  \033[31m[cron] skipping malformed job record: {exc}\033[0m")
+            continue
+        err=validate_cron(job.cron)
+        if err:
+            print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
+            continue
+        scheduled_jobs[job.id]=job
+    if scheduled_jobs:
+        print(f"  \033[35m[cron] loaded {len(scheduled_jobs)} durable job(s)\033[0m")
 
 def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
                  job_id:str|None=None,allow_side_effects:bool=False,
@@ -193,6 +217,29 @@ def cancel_job(job_id:str)->str: #取消一个cron任务
         save_durable_jobs()
     print(f"  \033[31m[cron cancel] {job_id}\033[0m")
     return f'Cancelled {job_id}'
+
+def update_job(job_id:str,*,allow_side_effects:bool|None=None,
+               deliver_to:str|None=None): #调整已有任务的授权/投递目标
+    """
+    修改任务的副作用授权或投递目标；返回更新后的任务，未知任务返回错误字符串。
+
+    授权只能由人通过按钮/命令/API 显式给出：模型侧的 schedule_cron 工具不暴露
+    这个开关，避免模型给自己授权。
+    """
+    with cron_lock:
+        job=scheduled_jobs.get(job_id)
+        if job is None:
+            return f'Job {job_id} not found'
+        if allow_side_effects is not None:
+            job.allow_side_effects=bool(allow_side_effects)
+        if deliver_to is not None:
+            job.deliver_to=(deliver_to or '').strip()
+        durable=job.durable
+    if durable:
+        save_durable_jobs()
+    mode='可写' if job.allow_side_effects else '只读'
+    print(f"  [35m[cron update] {job.id} → {mode}[0m")
+    return job
 
 def tick(now: datetime | None = None) -> list[CronJob]: #扫描一次；返回本次新入队的任务
     """按当前时间扫描所有任务：到点且本分钟未触发 → 入队。

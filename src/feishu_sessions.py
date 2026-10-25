@@ -15,7 +15,15 @@ def _button(label, token, action, index, primary=False):
             'value': {'session_view': token, 'action': action, 'index': index}}
 
 
-def list_card(rows, token, current_id=None, page=0):
+def _short_path(path, limit=48):
+    """长工作区路径留尾部：手机上一行放不下，尾部（目录名）才是有信息量的部分。"""
+    text = display_text(path)
+    if len(text) <= limit:
+        return text
+    return '…' + text[-(limit - 1):]
+
+
+def list_card(rows, token, current_id=None, page=0, *, filtered=False):
     pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(max(0, page), pages - 1)
     elements = []
@@ -24,7 +32,13 @@ def list_card(rows, token, current_id=None, page=0):
         row = rows[index]
         workspace = row.get('workspace') or '工作目录未记录'
         if workspace != previous_group:
-            elements.append(_text(f'工作区 · {workspace[:200]}'))
+            count = sum(1 for item in rows
+                        if (item.get('workspace') or '工作目录未记录') == workspace)
+            label = '当前工作区' if (current_id and any(
+                item['id'] == current_id and
+                (item.get('workspace') or '工作目录未记录') == workspace
+                for item in rows)) else '工作区'
+            elements.append(_text(f'{label} · {_short_path(workspace)}（{count} 个会话）'))
             previous_group = workspace
         elements.append(_text(f'{index + 1}. {row["title"][:80]}\n'
                               f'{session_status(row, current_id)} · 最近活跃 {relative_time(row.get("updated"))}'))
@@ -37,10 +51,14 @@ def list_card(rows, token, current_id=None, page=0):
         navigation.append(_button('上一页', token, 'page', page - 1))
     if page + 1 < pages:
         navigation.append(_button('下一页', token, 'page', page + 1))
-    if navigation:
-        elements.append({'tag': 'action', 'actions': navigation})
-    elements.append(_text(f'第 {page + 1}/{pages} 页 · 共 {len(rows)} 个会话\n'
-                          '/resume 关键词 搜索 · /resume 序号 切换\n旧卡片失效后请重新 /sessions。'))
+    navigation.append(
+        _button('显示全部工作区' if filtered else '只看当前工作区',
+                token, 'scope', 0))
+    elements.append({'tag': 'action', 'actions': navigation})
+    elements.append(_text(f'第 {page + 1}/{pages} 页 · 共 {len(rows)} 个会话'
+                          + ('（已过滤当前工作区）' if filtered else '') + '\n'
+                          '/resume 关键词 搜索 · /resume 序号 切换\n'
+                          '旧卡片失效后请重新 /sessions。'))
     return {'config': {'wide_screen_mode': True},
             'header': {'title': {'tag': 'plain_text', 'content': '会话管理 · 按工作区分组'}},
             'elements': elements}

@@ -54,9 +54,13 @@ import approval_view
 import llm_route
 import paths
 from exec_policy import approval_class
+from feishu_approval_card import approval_card, approval_text
+from feishu_cron_card import cron_card, cron_delete_card, cron_text
 from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
-from feishu_step_card import menu_row, step_card
+from feishu_step_card import step_card, truncated_note
+from feishu_task_card import logs_card, tasks_card, tasks_text
+from file_lock import FileLockTimeout, exclusive_file_lock
 from gateway_sim import GatewayClient
 from perf import record as perf_record
 from perf import reset as perf_reset
@@ -66,6 +70,9 @@ from turn_watcher import TurnWatcher, WatchState
 from workspace_choices import find_workspace
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS') or paths.cache_path('feishu_bindings.json'))
+# 单实例锁：两个网关同时跑会对同一条消息各回一次、把同一批推送发两遍。
+# 个人部署只需要一个进程；确需并行（不同应用凭证）时用 FEISHU_ALLOW_MULTI=1 跳过。
+INSTANCE_LOCK_PATH = Path(paths.cache_path('locks/feishu-gateway.lock'))
 PERMISSION_POLL_INTERVAL = 3.0
 HEARTBEAT_POLL_INTERVAL = 60.0   # 心跳是每日摘要，轮询间隔远大于审批
 CRON_RESULT_POLL_INTERVAL = 15.0  # 定时任务结果：晚十几秒可接受，别每秒打 API
@@ -252,6 +259,52 @@ def _accepts_kwarg(fn, name: str) -> bool:
         return name in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+
+
+# 常见失败 → 一句能照着做的话。未知错误保留原文，不做猜测性改写。
+_ERROR_HINTS = (
+    (r'402|insufficient balance|insufficient_quota|quota exceeded',
+     '模型 provider 余额/额度不足（402）。充值或换个模型后再试。'),
+    (r'401|unauthorized|invalid api key|invalid_api_key',
+     '模型鉴权失败（401）：API key 可能失效或被禁用。'),
+    (r'403|forbidden|permission denied', '模型拒绝访问（403）：检查 key 的权限与地区限制。'),
+    (r'429|rate limit|too many requests', '请求过于频繁（429）：等几秒再发一次。'),
+    (r'timeout|timed out', '请求超时：网络或 provider 响应太慢，可直接重试。'),
+    (r'turn_busy|another turn|409', '上一轮还在执行：等它结束，或点「停止这个回合」再发。'),
+)
+
+
+# 飞书是境内域名：走本机系统代理（Clash/VPN 等）既慢又易失败——代理没开时
+# requests 会直接抛 ProxyError，连 open.feishu.cn 都到不了。这里把飞书域名加进
+# NO_PROXY，其余流量（如 OpenAI）仍按原来的代理设置走。
+_FEISHU_NO_PROXY = ('.feishu.cn', 'feishu.cn', 'open.feishu.cn',
+                    'msg-frontier.feishu.cn')
+
+
+def bypass_proxy_for_feishu() -> None:
+    """让飞书域名绕过系统代理；FEISHU_USE_PROXY=1 时保持原样。"""
+    if (os.getenv('FEISHU_USE_PROXY') or '').strip().lower() in ('1', 'true', 'yes'):
+        return
+    current = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
+    hosts = [item.strip() for item in current.split(',') if item.strip()]
+    for host in _FEISHU_NO_PROXY:
+        if host not in hosts:
+            hosts.append(host)
+    value = ','.join(hosts)
+    os.environ['NO_PROXY'] = value
+    # Windows 上 os.environ 的键不区分大小写，NO_PROXY 与 no_proxy 是同一个变量：
+    # 这里绝不能 pop('no_proxy')，否则会把刚设置的值删掉（实测踩过）。
+    if os.name != 'nt':
+        os.environ['no_proxy'] = value
+
+
+def friendly_error(exc: BaseException) -> str:
+    """把 provider/HTTP 失败翻成一句可执行的提示；无法识别时返回空串。"""
+    raw = str(exc or '').casefold()
+    for pattern, hint in _ERROR_HINTS:
+        if re.search(pattern, raw):
+            return hint
+    return ''
 
 
 def _is_missing_session(exc: BaseException) -> bool:
@@ -537,6 +590,10 @@ class FeishuGateway:
         self.allowed_users = set(allowed_users) if allowed_users else None
         self._load_bindings()
         self._notified: set[str] = set()
+        # req_id → 登记时的请求体：合并审批卡片要还原每条的工具/原因/参数
+        self._pending_requests: dict[str, dict] = {}
+        # chat_id → 审批卡片 message_id：新请求/决议后 PATCH 同一张卡，不刷屏
+        self._approval_cards: dict[str, str] = {}
         self._poll_stop = threading.Event()
         # 每聊天的待审批 FIFO：收到审批提醒后直接回复 y/n 即可，免输 req_id
         self._chat_pending: dict[str, list[str]] = {}
@@ -544,6 +601,11 @@ class FeishuGateway:
         # chat_id → (token, rows, created_at)：卡片按钮与「/new 序号」共用同一快照
         self._workspace_views: dict[str, tuple[str, list[dict], float]] = {}
         self._session_views: dict[str, tuple] = {}
+        # chat_id → 完整会话列表 / 是否只看当前工作区：过滤只影响展示，不改快照
+        self._session_all: dict[str, list[dict]] = {}
+        self._session_filters: dict[str, bool] = {}
+        # chat_id → (token, created_at)：定时任务卡片的按钮有效期（10 分钟）
+        self._cron_views: dict[str, tuple[str, float]] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
@@ -643,13 +705,17 @@ class FeishuGateway:
             with self._bindings_lock:
                 self.bindings[chat_id] = session_id
                 self._save_bindings()
-            self._send_panel(chat_id,
-                             intro='已就绪，直接发消息即可；需要切换/停止时点按钮。')
+            self._send_panel(
+                chat_id,
+                intro=('已就绪，直接说话就行。试试：' + chr(10)
+                       + '· 帮我看看这个项目最近改了什么' + chr(10)
+                       + '· 每天早上 9 点提醒我喝水' + chr(10)
+                       + '· 我们上次聊到哪了'))
         try:
             kwargs = {'reply_to': message_id} if message_id else {}
             self._send_agent_reply(chat_id, session_id, text, **kwargs)
         except Exception as exc:
-            self._reply(chat_id, f'[error] {exc}')
+            self._reply(chat_id, friendly_error(exc) or f'[error] {exc}')
 
     def _card_patch_gate(self) -> bool:
         """多会话并发时合并卡片更新：实例内最小间隔 0.45s，未到点跳过本拍
@@ -715,6 +781,7 @@ class FeishuGateway:
                 total_ms=state.get('tool_total_ms') or 0,
                 tool_batches=state.get('tool_batches'),
                 note=note,
+                actions='stop' if running else 'menu',
             )
 
         def update_partial(display_text: str, *, answer_text: str | None = None,
@@ -788,7 +855,9 @@ class FeishuGateway:
                 reply = _invoke(session_id)
         except Exception as exc:
             print(f'[feishu] agent reply failed: {exc}')
-            failed = ('处理未完成：' + str(exc) + chr(10)
+            hint = friendly_error(exc)
+            failed = ('处理未完成：' + (hint or str(exc)) + chr(10)
+                      + ('技术细节：' + str(exc) + chr(10) if hint else '')
                       + '请先核实任务状态，再决定是否重试。' + chr(10) + chr(10)
                       + ''.join(parts))
             if message_id and updater and not stream_failed:
@@ -813,9 +882,11 @@ class FeishuGateway:
         duration = getattr(self.api, 'last_duration', None)
         if step_mode:
             elapsed = duration or format_duration(time.monotonic() - _t_entry)
-            final_payload = _payload(reply, running=False,
-                                     note=f'已完成 · 总用时 {elapsed}')
-            final_payload['body']['elements'].append(menu_row())
+            note = f'已完成 · 总用时 {elapsed}'
+            clipped = truncated_note(reply)
+            if clipped:
+                note += chr(10) + clipped
+            final_payload = _payload(reply, running=False, note=note)
         else:
             if duration:
                 reply = reply + chr(10) + chr(10) + f'已完成 · 总用时 {duration}'
@@ -880,11 +951,36 @@ class FeishuGateway:
         if not rows:
             self._reply(chat_id, '暂无有任务内容的会话。')
             return
-        token = secrets.token_urlsafe(12)
+        self._session_all[chat_id] = rows
+        self._session_filters[chat_id] = False
+        self._render_sessions(chat_id, page=0)
+
+    def _render_sessions(self, chat_id, page=0):
+        """渲染会话列表：可只看当前工作区；按钮序号始终对应本次展示的行。"""
+        rows_all = self._session_all.get(chat_id) or []
+        current = self.bindings.get(chat_id)
+        filtered = bool(self._session_filters.get(chat_id))
+        rows = rows_all
+        if filtered:
+            workspace = next((row.get('workspace') or ''
+                              for row in rows_all if row['id'] == current), '')
+            rows = [row for row in rows_all
+                    if (row.get('workspace') or '') == workspace]
+        if not rows:
+            self._reply(chat_id, '当前工作区下没有会话；点「显示全部工作区」查看其它工作区。')
+            return
+        view = self._session_views.get(chat_id)
+        token = view[0] if view else secrets.token_urlsafe(12)
+        pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(max(0, int(page or 0)), pages - 1)
+        # 展示用的行写回视图：按钮序号必须与用户看到的顺序一致
         self._session_views[chat_id] = (token, rows, time.monotonic())
-        self._send_session_view(chat_id, list_card(rows, token, current),
-                                self._session_rows_text(rows[:PAGE_SIZE])
-                                + '\n\n/resume <序号或关键词> 切换；/sessions 2 查看下一页。')
+        self._session_choices[chat_id] = rows
+        start = page * PAGE_SIZE
+        self._send_session_view(
+            chat_id, list_card(rows, token, current, page, filtered=filtered),
+            self._session_rows_text(rows[start:start + PAGE_SIZE], start=start)
+            + '\n\n/resume <序号或关键词> 切换；/sessions 2 查看下一页。')
 
     def _send_session_view(self, chat_id, card, fallback):
         sender = getattr(self.transport, 'send_session_card', None)
@@ -921,11 +1017,11 @@ class FeishuGateway:
         if type(index) is not int or index < 0:
             return
         current = self.bindings.get(chat_id)
-        if action == 'page' and index < (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE:
-            start = index * PAGE_SIZE
-            self._send_session_view(chat_id, list_card(rows, token, current, index),
-                                    self._session_rows_text(rows[start:start + PAGE_SIZE], start=start)
-                                    + '\n\n/resume <序号> 切换；/sessions <页码> 翻页。')
+        if action == 'scope':
+            self._session_filters[chat_id] = not self._session_filters.get(chat_id, False)
+            self._render_sessions(chat_id, page=0)
+        elif action == 'page' and index < (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE:
+            self._render_sessions(chat_id, page=index)
         elif action in ('switch', 'details') and index < len(rows):
             try:
                 # Re-read the session: archiving/deleting after listing must not
@@ -1093,13 +1189,19 @@ class FeishuGateway:
                 workspace = self.api.get_workspace(session_id)
             except Exception:
                 workspace = ''
+        pending = len(self._chat_pending.get(chat_id) or [])
+        try:
+            crons = len(self.api.list_crons())
+        except Exception:
+            crons = 0   # 面板不能因为 cron 接口抖动就打不开
         sender = getattr(self.transport, 'send_session_card', None)
         if sender is not None:
             try:
                 sender(chat_id, control_card(session_id=session_id,
                                              workspace=workspace,
                                              model=self._model_summary(),
-                                             intro=intro))
+                                             intro=intro, pending=pending,
+                                             crons=crons))
                 return
             except Exception as exc:
                 print(f'[feishu] panel card failed, fallback to text: {exc}')
@@ -1118,6 +1220,8 @@ class FeishuGateway:
             self._panel_stop(chat_id)
         elif action == 'status':
             self._panel_status(chat_id)
+        elif action in ('crons', 'cron'):
+            self._show_crons(chat_id)
         elif action in ('menu', 'panel'):
             self._send_panel(chat_id, intro='常用操作：')
         else:
@@ -1144,12 +1248,86 @@ class FeishuGateway:
         if not session_id:
             self._reply(chat_id, '还没有会话；直接发一条消息就会自动创建。')
             return
-        lines = [f'会话 {session_id[:8]}', f'模型 {self._model_summary()}']
+        lines = [f'模型 {self._model_summary()}']
         try:
             lines.append(f'工作区 {self.api.get_workspace(session_id)}')
         except Exception as exc:
             lines.append(f'工作区不可用: {exc}')
+        lines.append(f'会话 {session_id[:8]}')
+        pending = len(self._chat_pending.get(chat_id) or [])
+        # 只报“有几条”，不贴命令正文/参数，避免在聊天里泄露执行细节。
+        lines.append(f'待审批 {pending} 条' + ('（回 y / n 或点卡片按钮）' if pending else ''))
+        try:
+            lines.append(f"定时任务 {len(self.api.list_crons())} 个（点「定时任务」管理）")
+        except Exception as exc:
+            lines.append(f'定时任务不可用: {exc}')
+        lines.append('直接发消息即可；停止与详情都在控制台卡片上。')
         self._reply(chat_id, chr(10).join(lines))
+
+    def _send_task_view(self, chat_id: str, card: dict, fallback: str,
+                        message_id: str | None = None) -> None:
+        """任务卡片：优先就地更新（刷新/看日志都复用同一张卡）。"""
+        patcher = getattr(self.transport, 'update_step_card', None)
+        if message_id and patcher is not None:
+            try:
+                patcher(message_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] task card patch failed: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] task card failed, fallback to text: {exc}')
+        self._reply(chat_id, fallback)
+
+    def _show_tasks(self, chat_id: str, *, message_id: str | None = None) -> None:
+        try:
+            tasks = self.api.list_tasks()
+        except Exception as exc:
+            self._reply(chat_id, f'[status] {exc}')
+            return
+        self._send_task_view(chat_id, tasks_card(tasks), tasks_text(tasks),
+                             message_id=message_id)
+
+    def _show_logs(self, chat_id: str, task: dict, *, lines: int = 60,
+                   message_id: str | None = None) -> None:
+        try:
+            logs = self.api.task_logs(task['id'], lines)
+        except Exception as exc:
+            self._reply(chat_id, f'[logs] {exc}')
+            return
+        self._send_task_view(chat_id, logs_card(task, logs, lines=lines),
+                             logs or '(no output)', message_id=message_id)
+
+    def _handle_task_action(self, chat_id: str, value: dict,
+                            sender_id: str | None = None,
+                            message_id: str | None = None) -> None:
+        """任务卡片按钮：刷新列表 / 看日志 / 停止。"""
+        action = str(value.get('task_action') or '')
+        task_id = str(value.get('task_id') or '')
+        if action == 'refresh':
+            self._show_tasks(chat_id, message_id=message_id)
+            return
+        try:
+            if action == 'logs':
+                lines = value.get('lines')
+                task = self.api.get_task(task_id)
+                self._show_logs(chat_id, task,
+                                lines=lines if type(lines) is int else 60,
+                                message_id=message_id)
+                return
+            if action == 'stop':
+                task = self.api.stop_task(task_id)
+                self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
+                self._show_tasks(chat_id, message_id=message_id)
+                return
+        except Exception as exc:
+            self._reply(chat_id, f'[{action}] {exc}')
+            return
+        self._reply(chat_id, '未知的任务操作，请重新 /status。')
 
     def _handle_cron(self, chat_id: str, argument: str) -> None:
         """/cron：查看/创建/删除定时任务；cron 表达式由服务端校验。"""
@@ -1159,29 +1337,12 @@ class FeishuGateway:
             '/cron add "<分 时 日 月 周>" <提示词>',
             '/cron add --writes "<分 时 日 月 周>" <提示词>  允许副作用',
             '/cron delete <job_id>',
+            '/cron writes|readonly <job_id>   授权/收回副作用（也可点卡片按钮）',
         ])
         text = argument.strip()
 
         if not text or text.casefold() in ('list', 'ls'):
-            try:
-                jobs = self.api.list_crons()
-            except Exception as exc:
-                self._reply(chat_id, f'[cron] {exc}')
-                return
-            if not jobs:
-                self._reply(chat_id, '（没有定时任务）')
-                return
-            lines = ['定时任务:']
-            for job in jobs:
-                kind = 'recurring' if job.get('recurring') else 'one-shot'
-                mode = '可写' if job.get('allow_side_effects') else '只读'
-                target = job.get('deliver_to') or ''
-                push = '推送' if target == chat_id else (
-                    f'推送→{target[:8]}' if target else '不推送')
-                lines.append(f"  {job['id']}: '{job['cron']}' → "
-                             f"{job.get('prompt', '')[:40]} "
-                             f"[{kind} · {mode} · {push}]")
-            self._reply(chat_id, chr(10).join(lines))
+            self._show_crons(chat_id)
             return
 
         action, _, rest = text.partition(' ')
@@ -1203,8 +1364,10 @@ class FeishuGateway:
                 return
             mode = '可写（副作用仍需审批）' if allow_side_effects else '只读'
             tail = ' · 结果推送回本聊天' if push else ''
-            self._reply(chat_id, f"已创建 {job['id']}: '{job['cron']}' → "
-                                 f"{job['prompt']}（{mode}{tail}）")
+            self._reply(chat_id,
+                        f"已创建 {job['id']}: '{job['cron']}' → "
+                        f"{job['prompt']}（{mode}{tail}）" + chr(10)
+                        + '需要改授权或删除，点「定时任务」卡片即可。')
             return
         if action in ('delete', 'del', 'rm'):
             if not rest:
@@ -1217,7 +1380,121 @@ class FeishuGateway:
                 return
             self._reply(chat_id, f'已删除 {rest}')
             return
+        if action in ('writes', 'readonly'):
+            if not rest:
+                self._reply(chat_id, usage)
+                return
+            try:
+                job = self.api.update_cron(
+                    rest, allow_side_effects=action == 'writes')
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            mode = '可写（副作用仍需审批）' if job.get('allow_side_effects') else '只读'
+            self._reply(chat_id, f"已更新 {rest}：{mode}")
+            return
         self._reply(chat_id, usage)
+
+    def _show_crons(self, chat_id: str, *, page: int = 0,
+                    intro: str = '', message_id: str | None = None) -> None:
+        """定时任务卡片：按最近触发排序并分页；有原消息时就地更新，不刷屏。
+
+        翻页时如果每次都新发一张卡，聊天记录会被“下一页”塞满，所以按钮回调
+        带来的 `message_id` 优先用 PATCH 复用同一张卡。
+        """
+        try:
+            jobs = self.api.list_crons()
+        except Exception as exc:
+            self._reply(chat_id, f'[cron] {exc}')
+            return
+        token = secrets.token_hex(4)
+        self._cron_views[chat_id] = (token, time.monotonic())
+        card = cron_card(jobs, chat_id=chat_id, token=token, intro=intro,
+                         page=page)
+        patcher = getattr(self.transport, 'update_step_card', None)
+        if message_id and patcher is not None:
+            try:
+                patcher(message_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] cron card patch failed, sending new: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] cron card failed, fallback to text: {exc}')
+        self._reply(chat_id, (intro + chr(10) if intro else '')
+                    + cron_text(jobs, chat_id=chat_id))
+
+    def _cron_view_ok(self, chat_id: str, value: dict) -> bool:
+        view = self._cron_views.get(chat_id)
+        return bool(view and value.get('cron_view') == view[0]
+                    and time.monotonic() - view[1] <= 600)
+
+    def _handle_cron_action(self, chat_id: str, value: dict,
+                            sender_id: str | None = None,
+                            message_id: str | None = None) -> None:
+        """卡片按钮：允许写 / 收回写 / 删除（二次确认）。"""
+        action = str(value.get('cron_action') or '')
+        job_id = str(value.get('job_id') or '')
+        if not self._cron_view_ok(chat_id, value):
+            # 只提示，不清掉最新视图：旧卡片被点不该让新卡片一起失效。
+            self._reply(chat_id, '这张定时任务卡片已过期，请重新发送 /cron 打开。')
+            return
+        if action == 'page':
+            target = value.get('page')
+            if type(target) is not int or target < 0:
+                self._reply(chat_id, '无效的页码，请重新打开 /cron。')
+                return
+            self._show_crons(chat_id, page=target, message_id=message_id)
+            return
+        try:
+            jobs = self.api.list_crons()
+        except Exception as exc:
+            self._reply(chat_id, f'[cron] {exc}')
+            return
+        job = next((item for item in jobs if item.get('id') == job_id), None)
+        if job is None:
+            self._reply(chat_id, f'任务 {job_id} 已不存在，请重新打开 /cron。')
+            return
+        if action == 'cancel':
+            self._reply(chat_id, f'已取消，{job_id} 保持不变。')
+            return
+        if action == 'delete':
+            sender = getattr(self.transport, 'send_session_card', None)
+            if sender is not None:
+                try:
+                    sender(chat_id, cron_delete_card(
+                        job, token=self._cron_views[chat_id][0]))
+                    return
+                except Exception as exc:
+                    print(f'[feishu] cron delete card failed: {exc}')
+            self._reply(chat_id, f'删除 {job_id} 不可恢复；确认请发送 /cron delete {job_id}')
+            return
+        if action == 'delete_confirm':
+            try:
+                self.api.delete_cron(job_id)
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            self._reply(chat_id, f'已删除 {job_id}')
+            self._show_crons(chat_id, message_id=message_id)
+            return
+        if action in ('writes', 'readonly'):
+            allow = action == 'writes'
+            try:
+                self.api.update_cron(job_id, allow_side_effects=allow)
+            except Exception as exc:
+                self._reply(chat_id, f'[cron] {exc}')
+                return
+            note = ('已允许写操作。定时回合的每次写操作仍会单独请求审批。'
+                    if allow else '已收回写权限，该任务恢复只读。')
+            self._reply(chat_id, f'{job_id}：{note}')
+            self._show_crons(chat_id, message_id=message_id)
+            return
+        self._reply(chat_id, '未知的定时任务操作，请重新发送 /cron。')
 
     def _help_text(self) -> str:
         return '\n'.join([
@@ -1557,20 +1834,26 @@ class FeishuGateway:
                               f"({task['status']}){where}")
             elif command == '/status':
                 if argument:
-                    task = self.api.get_task(argument)
-                    duration = _format_task_duration(task)
-                    self._reply(chat_id, f"{task['id']} {task['status']} "
-                                          f"exit={task.get('exit_code')} 总用时={duration}")
+                    try:
+                        task = self.api.get_task(argument)
+                    except Exception as exc:
+                        self._reply(chat_id, f'[status] {exc}')
+                        return
+                    self._show_logs(chat_id, task, lines=60)
                 else:
-                    lines = [f"{t['id']} {t['status']} exit={t.get('exit_code')} "
-                             f"总用时={_format_task_duration(t)}"
-                             for t in self.api.list_tasks()[:10]]
-                    self._reply(chat_id, '\n'.join(lines) or '(no tasks)')
+                    self._show_tasks(chat_id)
             elif command == '/logs':
                 tokens = argument.split()
-                logs = self.api.task_logs(
-                    tokens[0], int(tokens[1]) if len(tokens) > 1 else 60)
-                self._reply(chat_id, logs or '(no output)')
+                if not tokens:
+                    self._reply(chat_id, '用法: /logs <任务id> [行数]')
+                    return
+                try:
+                    task = self.api.get_task(tokens[0])
+                except Exception as exc:
+                    self._reply(chat_id, f'[logs] {exc}')
+                    return
+                lines = int(tokens[1]) if len(tokens) > 1 else 60
+                self._show_logs(chat_id, task, lines=lines)
             elif command == '/stop':
                 task = self.api.stop_task(argument)
                 self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
@@ -1694,8 +1977,11 @@ class FeishuGateway:
             return
         with self._bindings_lock:
             bindings = dict(self.bindings)
+        pending_by_id = {req['req_id']: req for req in pending}
+        changed: set[str] = set()   # 只有变化过的聊天才重渲染，避免每轮轮询都 PATCH
         for req in pending:
             req_id = req['req_id']
+            self._pending_requests[req_id] = req
             if req_id in self._notified:
                 continue
             session_id = req.get('session_id') or ''
@@ -1710,26 +1996,68 @@ class FeishuGateway:
                 fifo = self._chat_pending.setdefault(chat_id, [])
                 if req_id not in fifo:
                     fifo.append(req_id)
-                try:
-                    self._push_approval(chat_id, req, fifo.index(req_id) + 1)
-                except Exception as exc:
-                    print(f'[feishu] approval notification failed for chat {chat_id!r}: {exc}')
+                    changed.add(chat_id)
         # 决议完成（或超时）的请求退出通知集合与各聊天 FIFO，避免无界增长
-        pending_ids = {req['req_id'] for req in pending}
+        pending_ids = set(pending_by_id)
         self._notified &= pending_ids
-        for fifo in self._chat_pending.values():
+        self._pending_requests = {req_id: req for req_id, req in
+                                  self._pending_requests.items()
+                                  if req_id in pending_ids}
+        for chat_id, fifo in self._chat_pending.items():
+            before = len(fifo)
             fifo[:] = [req_id for req_id in fifo if req_id in pending_ids]
+            if len(fifo) != before:
+                changed.add(chat_id)   # 超时/别处已决议：卡片也要跟着更新
+        # 每个聊天只渲染一次合并卡：一次批量操作产生多条请求时不再一条一张卡
+        for chat_id in sorted(changed):
+            try:
+                self._render_approvals(chat_id)
+            except Exception as exc:
+                print(f'[feishu] approval notification failed for chat {chat_id!r}: {exc}')
 
     def _push_approval(self, chat_id: str, req: dict, index: int) -> None:
-        """推送审批请求：优先带按钮的卡片，发送失败回退纯文本提示。"""
-        sender = getattr(self.transport, 'send_approval_card', None)
-        if sender:
+        """兼容入口：旧调用方按“单条请求”推送，现在统一走合并卡片。"""
+        self._render_approvals(chat_id)
+
+    def _render_approvals(self, chat_id: str) -> None:
+        """渲染该聊天的合并审批卡：首次发送，之后 PATCH 同一张卡。
+
+        一次批量操作可能同时产生十几条审批请求；每条一张卡会把聊天刷满，也看不出
+        “还剩几条”。这里始终渲染当前待审批的**全部**请求，并复用同一个 message_id。
+        """
+        ids = list(self._chat_pending.get(chat_id) or [])
+        requests = [self._pending_requests[req_id] for req_id in ids
+                    if req_id in self._pending_requests]
+        card = approval_card(requests)
+        message_id = self._approval_cards.get(chat_id)
+        if message_id:
+            patcher = getattr(self.transport, 'update_step_card', None)
+            if patcher is not None:
+                try:
+                    patcher(message_id, card)
+                    return
+                except Exception as exc:
+                    print(f'[feishu] approval card patch failed: {exc}')
+            else:
+                updater = getattr(self.transport, 'update_markdown', None)
+                if updater is not None:
+                    try:
+                        updater(message_id, json.dumps(card, ensure_ascii=False),
+                                raw_content=True)
+                        return
+                    except Exception as exc:
+                        print(f'[feishu] approval card update failed: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
             try:
-                sender(chat_id, format_permission_prompt(req, index), req)
-                return
+                sent = sender(chat_id, card)
             except Exception as exc:
                 print(f'[feishu] approval card failed, fallback to text: {exc}')
-        self._reply(chat_id, format_permission_prompt(req, index))
+            else:
+                if sent:
+                    self._approval_cards[chat_id] = sent
+                return
+        self._reply(chat_id, approval_text(requests))
 
     def _forget_pending(self, req_id: str) -> None:
         """决议完成后清理通知集合与各聊天的 FIFO。"""
@@ -1745,9 +2073,11 @@ class FeishuGateway:
         返回 (toast 文案, 是否成功)。open_id 受用户白名单约束；审批按钮
         还必须属于本聊天已收到的请求。
         """
+        view_keys = ('session_view', 'workspace_view', 'cron_action', 'task_action',
+                     'panel')
         if self.allowed_users is not None and open_id not in self.allowed_users:
             return ('⛔ 你没有会话操作权限'
-                    if (value or {}).get('session_view') or (value or {}).get('workspace_view')
+                    if any((value or {}).get(key) for key in view_keys)
                     else '⛔ 你没有审批权限'), False
         if (value or {}).get('workspace_view'):
             view = self._workspace_view(chat_id)
@@ -1767,19 +2097,61 @@ class FeishuGateway:
                 return '会话列表已失效，请重新 /sessions', False
             index, action = value.get('index'), value.get('action')
             limit = ((len(view[1]) + PAGE_SIZE - 1) // PAGE_SIZE if action == 'page' else len(view[1]))
-            if action not in ('page', 'details', 'switch', 'fork') or type(index) is not int or not 0 <= index < limit:
+            allowed = ('page', 'details', 'switch', 'fork', 'scope')
+            if (action not in allowed or type(index) is not int
+                    or not 0 <= index < limit):
                 return '无效的会话按钮，请重新 /sessions', False
             try:
                 self._events.put_nowait((chat_id, value, open_id, None, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理会话操作…', True
+        if (value or {}).get('task_action'):
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理…', True
+        if (value or {}).get('cron_action'):
+            if not self._cron_view_ok(chat_id, value):
+                return '定时任务卡片已过期，请重新打开', False
+            try:
+                # 带上原消息 id：翻页/刷新时 PATCH 同一张卡，不在聊天里堆新卡。
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理…', True
         if (value or {}).get('panel'):
             try:
                 self._events.put_nowait((chat_id, value, open_id, None, None))
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在打开…', True
+        bulk = (value or {}).get('approval_bulk')
+        if bulk in ('allow', 'deny'):
+            if not chat_id:
+                return '⚠ 无效的审批按钮', False
+            ids = list(self._chat_pending.get(chat_id) or [])
+            if not ids:
+                return '没有待审批请求，可能已处理或已过期', False
+            allow_all = bulk == 'allow'
+            done = failed = 0
+            for req_id in ids:
+                try:
+                    self.api.resolve_permission(req_id, allow_all)
+                    done += 1
+                except Exception as exc:
+                    print(f'[feishu] bulk approval failed for {req_id}: {exc}')
+                    failed += 1
+                self._forget_pending(req_id)
+            self._render_approvals(chat_id)
+            verb = '允许' if allow_all else '拒绝'
+            note = f'已{verb} {done} 条'
+            if failed:
+                note += f'，{failed} 条失败（用 /perms 查看）'
+            return note, failed == 0
         req_id = (value or {}).get('approval')
         if not req_id:
             return '⚠ 无效的审批按钮', False
@@ -1790,19 +2162,14 @@ class FeishuGateway:
         allow = bool((value or {}).get('allow'))
         scope = (value or {}).get('scope')
         try:
-            record = self.api.resolve_permission(req_id, allow, scope=scope)
+            self.api.resolve_permission(req_id, allow, scope=scope)
         except Exception as exc:
             print(f'[feishu] approval failed: {exc}')
             return '⚠ 操作未能完成，请用 /perms 查看最新审批状态', False
         self._forget_pending(req_id)
         verb = '允许' if allow else '拒绝'
         session_note = '，本会话同类自动通过' if (allow and scope == 'session') else ''
-        updater = getattr(self.transport, 'update_markdown', None)
-        if updater and message_id:
-            try:
-                updater(message_id, permission_result(record) + session_note)
-            except Exception as exc:
-                print(f'[feishu] approval card update failed: {exc}')
+        self._render_approvals(chat_id)
         return f'已{verb}{session_note}', True
 
     # ---------- 回合终态主动通知（TUI/API/cron 发起的回合） ----------
@@ -2187,6 +2554,12 @@ class FeishuGateway:
                                     self._unsupported_message(chat_id, text['unsupported'])
                                 elif text.get('panel'):
                                     self._handle_panel_action(chat_id, text['panel'], sender_id)
+                                elif text.get('cron_action'):
+                                    self._handle_cron_action(chat_id, text, sender_id,
+                                                             message_id)
+                                elif text.get('task_action'):
+                                    self._handle_task_action(chat_id, text, sender_id,
+                                                             message_id)
                                 elif text.get('workspace_view'):
                                     self._handle_workspace_action(chat_id, text, sender_id)
                                 else:
@@ -2398,7 +2771,26 @@ def main(argv=()) -> int:
         print('FEISHU_ALLOWED_USERS is required (comma-separated open_id). '
               'Set FEISHU_ALLOW_ANY_USER=1 only for local testing.')
         return 1
-    api = GatewayClient(base_url, token)
+    options = dict(api_base=base_url, token=token, app_id=app_id,
+                   app_secret=app_secret, allowed_users=allowed_users)
+    if os.getenv('FEISHU_ALLOW_MULTI', '').strip().lower() in ('1', 'true', 'yes'):
+        print('[feishu] FEISHU_ALLOW_MULTI=1：已跳过单实例检查，'
+              '并行实例可能重复回复/重复推送。')
+        return _run_gateway(**options)
+    try:
+        with exclusive_file_lock(INSTANCE_LOCK_PATH, timeout=0):
+            return _run_gateway(**options)
+    except FileLockTimeout:
+        print(f'[feishu] 已经有一个网关实例在运行（{INSTANCE_LOCK_PATH}）。')
+        print('  两个网关会把同一条消息回两次、把同一批推送发两遍。请先关掉旧进程。')
+        print('  确实要并行（例如不同应用凭证）时设置 FEISHU_ALLOW_MULTI=1。')
+        return 2
+
+
+def _run_gateway(*, api_base: str, token: str, app_id: str, app_secret: str,
+                 allowed_users) -> int:
+    bypass_proxy_for_feishu()
+    api = GatewayClient(api_base, token)
     transport = LarkTransport(app_id, app_secret)
     gateway = FeishuGateway(api, transport=transport,
                             allowed_users=allowed_users)

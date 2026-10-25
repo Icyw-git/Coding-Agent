@@ -132,6 +132,16 @@ class GatewayClient:
             payload['deliver_to'] = deliver_to
         return self._json(self.http.post('/v1/crons', json=payload), 'create cron')
 
+    def update_cron(self, job_id: str, *, allow_side_effects: bool | None = None,
+                    deliver_to: str | None = None) -> dict:
+        payload = {}
+        if allow_side_effects is not None:
+            payload['allow_side_effects'] = allow_side_effects
+        if deliver_to is not None:
+            payload['deliver_to'] = deliver_to
+        return self._json(self.http.patch(f'/v1/crons/{job_id}', json=payload),
+                          'update cron')
+
     def pending_cron_results(self) -> list[dict]:
         return self._json(self.http.get('/v1/cron-results'),
                           'list cron results')['pending']

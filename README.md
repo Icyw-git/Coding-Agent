@@ -665,7 +665,18 @@ python src/feishu_gateway.py                     # 终端 B
 ```
 
 配置自检：`python src/feishu_gateway.py --check`。完整步骤、日常用法和排障见
-[飞书接入](docs/FEISHU_SETUP.md)。
+[飞书接入](docs/FEISHU_SETUP.md)；端到端验收清单与记录见
+[飞书验收](docs/FEISHU_ACCEPTANCE.md)。
+
+验收辅助（本地预检 + 卡片结构校验 + 可选真机发卡）：
+
+```bash
+python scripts/feishu_acceptance.py --api            # 只读检查配置/API/卡片
+python scripts/feishu_acceptance.py --send-cards bound   # 给已绑定聊天发一遍所有卡片
+```
+
+网关有单实例锁：第二个进程会打印“已经有一个网关实例在运行”并退出，
+避免两个进程重复回复/重复推送。
 
 ## 启动可视化界面
 

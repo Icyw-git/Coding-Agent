@@ -35,6 +35,11 @@ if BaseModel is not None:
         # 结果推送到哪个聊天（飞书 chat_id）；空 = 只写会话日志，不推送。
         deliver_to: str | None = Field(default=None, max_length=200)
 
+    class UpdateCronRequest(BaseModel):
+        # None = 不改。授权只由人显式给出（按钮/命令/API），模型工具不暴露。
+        allow_side_effects: bool | None = None
+        deliver_to: str | None = Field(default=None, max_length=200)
+
     class SteerRequest(BaseModel):
         content: str = Field(min_length=1)
         # 客户端重试去重：同一 request_id 只入队/发送一次（见 AgentRuntime.steer）。

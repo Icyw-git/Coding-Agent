@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from api_models import CreateCronRequest
+from api_models import CreateCronRequest, UpdateCronRequest
 
 
 def _as_dict(job) -> dict:
@@ -39,6 +39,16 @@ def build_router():
         if isinstance(job, str):
             status = 409 if 'already exists' in job else 400
             raise HTTPException(status_code=status, detail=job)
+        return _as_dict(job)
+
+    @router.patch('/v1/crons/{job_id}')
+    def update_cron(job_id: str, request: UpdateCronRequest):
+        job = cron_scheduler.update_job(
+            job_id,
+            allow_side_effects=request.allow_side_effects,
+            deliver_to=request.deliver_to)
+        if isinstance(job, str):
+            raise HTTPException(status_code=404, detail=job)
         return _as_dict(job)
 
     @router.delete('/v1/crons/{job_id}')
