@@ -7,7 +7,10 @@ import sys
 import threading
 from pathlib import Path
 
+import console
 import harness
+
+console.harden_stdio()
 
 
 def build_parser() -> argparse.ArgumentParser:

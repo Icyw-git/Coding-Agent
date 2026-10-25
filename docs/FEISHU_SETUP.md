@@ -142,6 +142,9 @@ python src/feishu_gateway.py
 
 ## 常见问题
 
+- **回复里出现 `处理未完成：'gbk' codec can't encode character ...`**：这是旧版本的
+  Windows 控制台编码问题（回合里的日志打印了 emoji）。已修复：stdout 遇到无法编码
+  的字符会写成 `😊` 而不是抛异常；重启 API 即可生效。
 - **机器人连着但发不出消息 / 附件下载失败**：多半是本机系统代理（Clash/VPN）关了，
   而飞书请求被一起代理走。网关默认让 `*.feishu.cn` 绕过代理（`NO_PROXY`），
   若你的网络必须经代理访问飞书，设 `FEISHU_USE_PROXY=1` 恢复原行为。

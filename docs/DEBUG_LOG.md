@@ -4700,3 +4700,62 @@ schema 2.0 的按钮必须放进 `column_set`/`column`，不能再用 1.0 的 `t
 
 这正是 `--send-cards` 的价值：结构校验通过 ≠ 飞书接受。改完重新发送成功
 （`om_x100b62d56faa...`）。
+
+## emoji 把整个回合打死：GBK 控制台的 print
+
+真机上一张失败卡写着：
+
+```
+处理未完成：{'detail': "'gbk' codec can't encode character '😊' in position 475: ...",
+             'duration_ms': 39375, 'duration': '00:39'}
+```
+
+**不是模型、不是 provider、也不是飞书**：回合真的跑完了（39 秒），但回合路径里有人
+`print()` 了含 emoji 的文本，而 API 进程的 stdout 重定向到日志文件、编码跟随系统
+locale（中文 Windows = GBK），于是 `UnicodeEncodeError` 从 print 抛进 turn worker，
+被 `api_streams` 的兜底 `except Exception` 记成 `detail`，最后变成“处理未完成”。
+
+真实的 print 来源不止一个：`hooks.log_hook` 会打印工具输出前 100 字符
+（`[HOOK] read(...) -> ...`）、非流式回复会打印 `message.content`、cron 会打印提示词。
+任何一个里出现 😊 就能复现。
+
+最小复现（不加固时返回 400，`detail` 与线上一致）：
+
+```python
+out = io.TextIOWrapper(io.BytesIO(), encoding='gbk'); sys.stdout = out
+def run_turn(messages, **kw):
+    print('[HOOK] read -> content 😊')
+    return 'ok'
+```
+
+修复：新增 `src/console.py`，把 stdout/stderr 的 **errors** 改成 `backslashreplace`
+（不重设 encoding，GBK 终端不会变乱码；编不了的字符写成 `😊`，日志里仍可辨认）。
+在 `api.py`、`entrypoint.py`、`feishu_gateway.main()`、`gateway_sim.main()` 和
+`harness_api.create_app()` 里调用，所以无论从哪个入口起进程都被兜住。
+
+回归：`tests/test_console_encoding.py`（GBK 流写 emoji 不抛、转义可读、
+无 reconfigure 的流保持原样、`[HOOK]` 打印路径、以及端到端的“回合返回 200 且答案是
+含 emoji 的文本”）。全量 1690 passed / 1 skipped。
+
+## 能力缺口盘点与下一阶段方案
+
+按“personal agent 还缺哪些本机权限/操作”做了一次对照代码的盘点，并调研了 Codex / dots /
+computer-use 各家做法，结论写进 `docs/PERSONAL_AGENT_ROADMAP.md`。
+
+要点：
+- 现状是「写有闸、读和网络近乎放开、桌面与系统层没碰」：`exec_policy` 三档三策略、
+  `sandbox`（Windows Low IL）默认关；无截屏/OCR/剪贴板/键鼠/自启/本地通知；
+  凭据在 `.env` 明文；无目录级持久授权与域名策略。
+- Codex 的可复用设计：App Server（server 可主动发 approval 并暂停 turn）、
+  sandbox 与 approval 双控制、`writable_roots`、网络 allow/deny + 未知域名审批、
+  Starlark prefix rules、keyring 凭据、OTel 审计。
+- dots 的可复用设计：**后台主动性只给只读工具**、Custom Rules 三态、auto-review、
+  “改密码永远留给人”、随时可看它的电脑与 Activity View。
+- 桌面控制三类形态（自己的桌面 / 云电脑 / 只控浏览器）差异很大；各家共识是
+  prompt injection 是首要威胁、无人值守优先隔离、不可逆动作必须审批、全程留痕。
+- 技术可行性本机已验证：`Windows.Media.Ocr` 可用且带 `zh-Hans-CN`；截屏/剪贴板/Toast/
+  自启都能用 PowerShell/.NET/WinRT 零依赖实现（PyWinRT 4.x 要 Python≥3.11，我们是 3.10）。
+
+方案分 P1–P6：P1 截屏+本地 OCR（地基，零依赖）、P2 自启+toast+空闲、P3a 剪贴板、
+P3b 键鼠（默认关、需显式开启）、P4 权限模型 v2（目录级授权/域名策略/规则文件/auto-review）、
+P5 浏览器（优先走 MCP）、P6 审计。含每阶段工具接口、权限与审批、测试与验收、风险缓解。

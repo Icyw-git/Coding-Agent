@@ -2812,6 +2812,10 @@ def _print_setup_help() -> None:
 def main(argv=()) -> int:
     import argparse
 
+    import console
+
+    console.harden_stdio()
+
     parser = argparse.ArgumentParser(description='Feishu gateway')
     parser.add_argument('--check', action='store_true',
                         help='只检查配置，不连接飞书')

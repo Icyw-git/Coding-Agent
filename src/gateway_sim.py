@@ -562,6 +562,10 @@ def repl(client: GatewayClient) -> int:
 
 def main(argv=None) -> int:
     from dotenv import load_dotenv
+
+    import console
+
+    console.harden_stdio()   # 模拟器也会 print 回复正文（可能含 emoji）
     load_dotenv()   # 与 harness 共用项目根的 .env
     parser = argparse.ArgumentParser(description='Harness message-gateway simulator')
     parser.add_argument('--url', default=os.getenv('HARNESS_API_URL', 'http://127.0.0.1:8000'))

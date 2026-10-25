@@ -37,6 +37,11 @@ def _scheduler_enabled() -> bool:
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
                access_log_path: str | None = None, task_root=None, workspace=None):
     """Create the HTTP application without starting background services."""
+    import console
+
+    # 无论从 api.py、uvicorn 直接导入还是测试创建 app，都先兜住 GBK 输出：
+    # 回合里的 print（hooks/日志/非流式回复）不能因为一个 emoji 把回合打死。
+    console.harden_stdio()
     try:
         from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse

@@ -666,7 +666,8 @@ python src/feishu_gateway.py                     # 终端 B
 
 配置自检：`python src/feishu_gateway.py --check`。完整步骤、日常用法和排障见
 [飞书接入](docs/FEISHU_SETUP.md)；端到端验收清单与记录见
-[飞书验收](docs/FEISHU_ACCEPTANCE.md)。
+[飞书验收](docs/FEISHU_ACCEPTANCE.md)；下一阶段能力规划（桌面/系统/账号）见
+[Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)。
 
 验收辅助（本地预检 + 卡片结构校验 + 可选真机发卡）：
 

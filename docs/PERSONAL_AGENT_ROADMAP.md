@@ -1,0 +1,358 @@
+# Personal Agent 下一阶段改进方案（桌面 / 系统 / 账号）
+
+状态：规划文档（2026-10-25）。前一份 [PERSONAL_AGENT_PLAN.md](PERSONAL_AGENT_PLAN.md) 覆盖的阶段 0–2
+（跨进程回合协调、远程控制、主动性）已落地并在真机验收；本文只讨论**能力边界**的下一步：
+从「文件 + 命令 + 文档」型 agent 扩到「桌面 + 系统 + 账号」型 personal agent。
+
+本文顺序：① 现状与缺口 → ② 竞品怎么做的 → ③ 我们的设计原则 → ④ 分阶段方案（可直接开工）
+→ ⑤ 与现有代码的映射 → ⑥ 验收口径 → ⑦ 明确不做。
+
+---
+
+## 1. 现状总结（对照代码，不是印象）
+
+### 1.1 已有的权限底座
+
+| 层 | 实现 | 现状 |
+|---|---|---|
+| 策略闸 | `src/exec_policy.py` | 三档 sandbox（`read-only` / `workspace-write` 默认 / `danger-full-access`）× 三种审批策略（`untrusted` / `on-request` 默认 / `never`）；路径四区：workspace / outside / secret（直接拒）/ system（默认拒写）；联网一律审批 |
+| 内核层 | `src/sandbox.py` | Windows Low IL，子进程只能写工作区；**默认 `off`**，文档明确“读和网络不受限制” |
+| 回合层 | `turn_coordinator` + `session_locks` | 全局单回合、同会话写锁；跨进程 steer/interrupt |
+| 授权账本 | 会话级白名单 + `revoke_permissions` | 只覆盖工具审批，不覆盖“给过哪个目录/账号” |
+| 审计 | `session_store` 事件全量落盘 | 无统一检索/导出，无“我批准过什么”的汇总 |
+
+### 1.2 缺口清单（按个人助理日常价值排序）
+
+| # | 能力 | 现状 | 缺口性质 |
+|---|---|---|---|
+| A1 | 截屏 / 看屏幕 | 只能 `render_document` 渲染文档页 | 缺能力 |
+| A2 | 本地 OCR | 无，扫描件走视觉模型 | 缺能力（且当前系统已具备 `Windows.Media.Ocr`，见 §4.1） |
+| A3 | 剪贴板读写 | 无 | 缺能力 |
+| A4 | 鼠标键盘控制 | 无 | 缺能力（高风险，最后做） |
+| A5 | 窗口/进程管理 | 只能 `bash` 间接 tasklist/taskkill | 缺封装 |
+| B1 | 开机自启 / 守护 | 无，重启后要手动拉 API + 网关 | 缺能力（决定“常驻”是否成立） |
+| B2 | 本地通知 | 只有飞书；飞书断/未配则无提醒 | 缺能力 |
+| B3 | 空闲/锁屏感知 | 无 | 缺能力 |
+| C1 | 凭据存储 | `.env` 明文 | 缺安全边界 |
+| C2 | 浏览器登录态 | `web_fetch` 无 cookie | 缺能力 |
+| D1 | 目录级持久授权 | 只能改 `HARNESS_WORKSPACE_ROOTS` 重启 | 缺策略能力 |
+| D2 | 删除可撤销 | `bash del` 不进回收站 | 缺安全网 |
+| E1 | 语音输入/输出 | 只保存不转写；无 TTS | 缺能力 |
+| F1 | 浏览器自动化 | 无（可外接 MCP） | 缺能力 |
+| G1 | 多机协同 | 单机单实例 | 缺能力（个人不需要） |
+| H1 | 资源限额 | bash 有 timeout，无内存/CPU/配额 | 缺护栏 |
+| H2 | 自动复核 | 有 LLM 审查官（`HARNESS_LLM_APPROVAL`），默认关闭 | 缺默认策略 |
+
+一句话：**写有闸、读和网络近乎放开、桌面与系统层完全没碰。**
+
+---
+
+## 2. 竞品怎么做的（2026-10 调研）
+
+### 2.1 Codex（OpenAI）— 与我们最接近的架构
+
+来源：[Unlocking the Codex harness](https://openai.com/index/unlocking-the-codex-harness/)、
+[Sandbox](https://learn.chatgpt.com/docs/sandboxing)、[Running Codex safely](https://openai.com/index/running-codex-safely/)。
+
+| 设计 | 具体做法 | 对我们的启示 |
+|---|---|---|
+| App Server | JSON-RPC over stdio，双向；**server 可以主动发起 approval 请求并暂停 turn**；原语 = item（`started`/`delta`/`completed`）、turn、thread | 我们已有 `turn_id`/`turn_started`/`turn_terminal`/steer/interrupt，等价物齐了；差的是“稳定协议 + 客户端可生成类型” |
+| 双控制 | **sandbox = 技术边界**（macOS Seatbelt / Linux bwrap / Windows 原生沙箱），**approval = 何时问人**；两者独立 | 我们两层都有，但内核层默认关。应把“默认开”做成产品决策，而不是可选实验 |
+| 权限档位 | `sandbox_mode` × `approval_policy` × `approvals_reviewer`（`user` / `auto_review`）；`untrusted` 已退役 | 我们的三档三策略已对齐；缺 `auto_review`（自动复核低风险） |
+| 可写根 | `sandbox_workspace_write.writable_roots = ["~/development"]` | 对应我们缺的“目录级持久授权” |
+| 网络 | Proxy + `allowed_domains` / `denied_domains` / `allow_local_binding` + 未知域名需审批 | 我们现在只有“联网一律审批”，缺域名级策略 |
+| 规则 | Starlark `prefix_rule(pattern=["gh","pr",["view","list"]], decision="allow", justification=...)` | 我们 `policy_bash` 是内置启发式，缺**用户可写的规则文件** |
+| 凭据 | `cli_auth_credentials_store="keyring"`、`mcp_oauth_credentials_store="keyring"` | 对应我们的 `.env` 明文缺口 |
+| 审计 | OpenTelemetry 导出：user prompts、approval decisions、tool results、MCP 使用、网络 allow/deny | 我们事件都在本地 jsonl，缺统一导出与“审批账本” |
+
+### 2.2 dots（OpenAI，2026-09 发布）— 最接近“personal agent”的形态
+
+来源：[Introducing dots](https://openai.com/index/introducing-dots/)。
+
+- **每个 dot 有自己的云电脑和浏览器**；你的电脑默认隔离，“除非你选择连接它”。
+- **后台主动性 = 只读工具**：“当你没有在和它工作时，它用已连接的、被限制为只读的工具做主动研究，
+  这些工具不能发消息、改内容、控制浏览器或电脑。”
+- 权限：选择它能访问哪些 app；**Custom Rules** 三态（allow / 需审批 / block）；
+  影响账户或外发信息的动作走 **auto-review**；**改密码这类永远留给人**。
+- 可观察：随时打开它的电脑看工作过程；Activity View 看进度（含后台）。
+- 密码可由系统代填，**不暴露给模型**。
+
+对我们最有价值的三条：
+1. **“主动/后台”与“前台交互”用不同权限档**——后台只读，前台才可写；
+2. **敏感操作白名单是硬编码的**（改密码永远不代做），不是靠模型自律；
+3. **用户随时能“看它现在在干什么”**，这是信任的前提。
+
+### 2.3 桌面控制（computer use）全景
+
+来源：[AI Agents That Control Your Mouse and Keyboard (2026-10)](https://www.simular.ai/alternatives/ai-agents-that-control-your-mouse-and-keyboard)。
+
+三类形态，别混为一谈：
+
+| 形态 | 代表 | 特点 | 对我们的意义 |
+|---|---|---|---|
+| 控制**你自己的**桌面 | Claude computer use、ChatGPT Work Computer Use、Perplexity Personal Computer、UI-TARS Desktop | 用真实账号/文件；**无沙箱**；电脑要醒着；一次一个会话 | 最贴合“个人助理”，也最危险 |
+| 控制**云电脑** | dots、Sai、Copilot Actions（独立会话） | 隔离好、可无人值守；拿不到本地上下文 | 长期方向，个人单机成本高 |
+| 只控制浏览器 | Browser Use、Chrome Auto Browse | 覆盖网页不覆盖桌面 app | 可作为 P5 的第一步 |
+
+安全共识（各厂商一致）：
+- **prompt injection 是首要威胁**：“能读屏幕的 agent 会被屏幕指挥”；
+- 无人值守优先隔离（云电脑 / 独立会话）；
+- 不可逆动作必须审批（付款、发消息、删文件、改设置）；
+- **全程留痕**（截图/轨迹既是审计也是调试）。
+
+Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent 账号**，文件默认只能碰
+`Documents/Downloads/Desktop/Music/Pictures/Videos`。
+
+### 2.4 OpenClaw（开源，MIT）
+
+- 消息优先（WhatsApp/Telegram/Slack…）+ gateway；桌面控制是**可选 node**。
+- macOS 需要 Allow Computer Control + Accessibility + Screen Recording；Windows/Linux 实验性、仅主屏。
+- **没有逐动作确认、默认没有沙箱**，官方文档自己要求“把收到的消息当作不可信输入”。
+
+反面教材价值：我们已有的审批 + 沙箱 + 白名单，比它更严；不要为了“顺手”把这些拆掉。
+
+### 2.5 落地技术可行性（本机已验证）
+
+- **本地 OCR 可用**：`[Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages` 返回 `zh-Hans-CN`，
+  说明 Windows 内置 OCR 引擎与中文模型都已就绪。PyWinRT 新版要求 Python ≥3.11，我们跑 3.10，
+  所以**优先用 PowerShell 调 WinRT**（零 pip 依赖），未来再切 `winrt-*` 包。
+  另有 NPU 版 `Microsoft.Windows.AI.Imaging.TextRecognizer`，仅 NPU 机器可用。
+- **截屏**：PowerShell + `System.Windows.Forms`/`System.Drawing`（零依赖）。
+- **剪贴板**：`Get-Clipboard` / `Set-Clipboard`（零依赖）。
+- **Toast**：WinRT `ToastNotificationManager`（`win11toast` 展示了完整可行路径），
+  可选 `BurntToast` 模块；零依赖方案是用 PowerShell 直接构造 toast XML。
+- **自启**：计划任务 `schtasks /Create /SC ONLOGON /RL LIMITED`，或启动目录快捷方式。
+
+---
+
+## 3. 我们的设计原则（在竞品之上做取舍）
+
+1. **双控制不合并**：`exec_policy`（该不该）与 `sandbox`（内核允不允许）继续独立；
+   新增能力必须同时回答这两个问题，缺一不发布。
+2. **后台比前台严**：定时/心跳/主动性回合只读（已有 `use_scheduled_turn` + read-only 复核），
+   这条要继续覆盖新工具——截屏、剪贴板、通知在后台回合里默认拒绝。
+3. **看屏幕 ≠ 摸键盘**：A1/A2（观察）与 A4（输入控制）分开发布，中间隔至少一个版本，
+   且 A4 默认关闭、需要显式配置 + 每次会话审批。
+4. **没有本地留痕就不做**：每个新工具都要落审计事件（谁、何时、参数摘要、结果摘要、截图哈希），
+   并能在飞书上一键查看最近 N 条。
+5. **敏感清单硬编码**：改密码、支付、2FA、输入凭据**永不代做**，写在代码里，不受配置影响
+   （对标 dots 的“永远留给人”）。
+6. **零依赖优先**：优先 PowerShell/.NET/WinRT；需要 pip 的能力（keyring、playwright）单独
+   `requirements-*.txt`，缺依赖时工具返回明确安装提示，而不是让整个 agent 起不来（沿用现有 `read_document` 模式）。
+7. **默认值偏保守**：新能力默认 `off` 或只读；开启需要用户显式动作（配置文件/按钮），并写进
+   启动日志与 `/status`。
+
+---
+
+## 4. 分阶段方案
+
+### P1：桌面观察（截屏 + 本地 OCR）— 1 个迭代
+
+**目标**：飞书发“看看我屏幕上的报错”“把截图里的表格读出来”，agent 能自己取到画面。
+
+**工具接口**（新增 `src/tool_screen.py`，注册进 `tools.TOOLS`）
+
+| 工具 | 参数 | 行为 |
+|---|---|---|
+| `screen_capture` | `screen`（`primary`/`all`，默认 primary）、`region`（可选 `x,y,w,h`）、`delay_ms` | 截屏存到 `workspace/.cache/screenshots/<sha1>.png`，返回路径 + 尺寸；`ImageResult` 自动附带图片给视觉模型 |
+| `screen_ocr` | `path`（默认最新截图）、`lang`（默认 `zh-Hans-CN`）、`region`（可选） | 走 PowerShell + `Windows.Media.Ocr`，返回纯文本 + 每行 bbox；无 OCR 语言包时给安装提示 |
+
+**权限与审批**
+
+- 策略：`screen_capture` / `screen_ocr` 属“读本机屏幕”，按 `READ_ONLY_SCREEN_TOOLS` 处理：
+  `read-only` 档放行、`never` 策略仍需审批一次（截图可能含密码/私信，视同数据外发风险）；
+  **后台/定时回合直接拒绝**（`use_scheduled_turn` 分支）。
+- 落盘路径固定在工作区 `.cache/`，受 `safe_path` 与 secret 通配约束。
+- 审计事件：`screen_captured{path,sha1,bytes,screen,region,duration_ms}`、
+  `screen_ocr{path,chars,lang,duration_ms}`。
+
+**实现要点**
+
+1. `src/screen_capture.py`：PowerShell 脚本（`System.Windows.Forms.Screen` + `Graphics.CopyFromScreen`），
+   单屏/多屏/区域，DIP→像素用 `GetDpiForWindow` 或 `Screen.Bounds` 直接给像素。
+2. `src/ocr_windows.py`：`pwsh -NoProfile -Command` 调 `Windows.Media.Ocr`，
+   输入 PNG 路径，输出 JSON（`lines[].text` + `words[].bounding_rect`）。
+   中文模型已验证存在；缺语言包时返回 `Get-WindowsCapability -Online -Name "Language.OCR*"` 提示。
+3. 复用 `tool_documents.cache_image` + `ImageResult`，让截图走现有多模态链路，不新造传输路径。
+4. 飞书：“看看屏幕”触发时，附件提示里带上截图路径，模型自然调用 `screen_capture`。
+
+**测试**：fake PowerShell 后端（注入返回固定 PNG/JSON）；区域裁剪尺寸断言；
+后台回合拒绝；secret 目录不可写；审计事件字段。
+
+**验收**：真机截一张含中英文的窗口 → `screen_ocr` 文本与肉眼一致；
+飞书说“看看我现在屏幕上的报错”能拿到截图并回答。
+
+**风险与缓解**：截图含敏感信息 → 默认只存 `.cache/`、7 天自动清理、`/status` 显示截图数量；
+多屏 DPI 错位 → 记录每屏 rect 并在返回里说明。
+
+### P2：常驻（自启 + 本地通知 + 空闲感知）— 1 个迭代
+
+**目标**：重启机器后无需人工，agent 起来并能在飞书断线时用系统通知兜底。
+
+**能力**
+
+| 项 | 方案 | 备注 |
+|---|---|---|
+| 自启 | `scripts/install_autostart.py`：写计划任务（`schtasks /SC ONLOGON /RL LIMITED /TN HarnessAgent`），启动 `entrypoint.py --daemon`（API + 网关），日志到 `.cache/logs/` | 卸载命令 `--remove`；计划任务用当前用户权限，不提权 |
+| 守护 | 进程内 watchdog：`api` 起不来/端口占用 → 通知；可选 `--restart-on-crash`（父进程守护子进程） | 先做“起不来要吼一声”，不做自愈重启 |
+| 本地通知 | `src/notify.py`：Windows toast（WinRT），`notify(title, body, url?)`；飞书发送失败时降级 | 触发点：回合失败、审批超时、心跳、cron 结果 |
+| 空闲/锁屏 | `src/idle.py`：`GetLastInputInfo` 读空闲秒数 + `SessionSwitch` 事件；暴露 `/v1/system/state` | 用途：空闲才跑主动性任务；锁屏时暂停截屏类工具 |
+
+**权限**：`notify` 属“输出”，无需审批但限频（每 10 秒最多 1 条）；自启安装属**安装期操作**，
+必须命令行显式执行，不给模型工具入口。
+
+**测试**：计划任务命令构造（不真装）；notify 限频与降级；idle 解析；`/v1/system/state` 契约。
+
+**验收**：重启机器 → 飞书自动收到“服务已就绪”；关掉飞书网关 → 失败通知出现在 Windows 通知中心。
+
+### P3：剪贴板与输入控制 — 2 个迭代（分两次发布）
+
+**P3a 剪贴板（低风险，先做）**
+
+| 工具 | 行为 |
+|---|---|
+| `clipboard_read` | `Get-Clipboard -Raw`；超过 200KB 截断并提示；返回文本长度与前 N 字符 |
+| `clipboard_write` | `Set-Clipboard`；**需要审批**（会覆盖用户剪贴板），内容摘要进审计 |
+
+**P3b 键鼠控制（高风险，默认关）**
+
+- 工具：`ui_action`（`click/move/type/key/scroll`，坐标或无障碍名称）、`ui_snapshot`（截图 + 可选
+  UI Automation 树，给模型更稳的定位）。
+- 开关：`HARNESS_DESKTOP_CONTROL=1` **且** 每会话首次动作审批；`/status` 显示“桌面控制：开/关”。
+- 硬约束：`TYPE` 只允许前台窗口；**禁止**在密码框/支付页面动作（按窗口标题 + UIA 控件类型拦截）；
+  后台回合完全禁止。
+- 定位优先 UIA（`UIAutomationClient`）再回退像素坐标；坐标动作前强制截图存证。
+
+**验收**：P3a 手机“把我刚复制的发我”；P3b 打开记事本输入一段文字（需显式开启），
+并验证密码框拦截生效。
+
+### P4：权限模型 v2（把“能干什么”变成可配置、可撤销）
+
+四个子项，建议按顺序：
+
+1. **目录级持久授权**（`src/grants.py`）
+   ```json
+   {"version": 1,
+    "paths": [{"path": "D:/work", "scope": "write", "expires": "2026-12-31",
+               "created_by": "feishu:oc_xxx", "note": "项目目录"}],
+    "domains": [{"host": "*.corp.example.com", "scope": "read"}],
+    "tools": [{"name": "clipboard_read", "scope": "session"}]}
+   ```
+   读 `grants` 后 `exec_policy` 在 `PATH_OUTSIDE` 判定时先查表；飞书卡片可增删（复用「定时任务」卡片的
+   按钮 + token 模式）；`revoke_permissions` 扩展到撤销 grants。
+2. **网络域名策略**（`src/net_policy.py`）：`allow` / `deny` / 需审批 三态，接在 `web_access.check_url` 前；
+   默认仍是“未知域名需审批”。对标 Codex 的 `allowed_domains/denied_domains`。
+3. **用户规则文件**（`src/rules.py`，YAML/TOML）：`prefix_rule([...], decision, justification)` 的简化版，
+   只支持 `allow`/`ask`/`deny` 三态与命令前缀匹配；加载失败**不影响启动**，只打印并忽略。
+4. **自动复核**（`auto_review`）：把现有 `HARNESS_LLM_APPROVAL` 审查官升级成默认 reviewer：
+   低风险（只读、工作区内写）自动放行并记账；高风险仍问人；所有 auto 决策写审计事件
+   `approval_auto{request,tool,decision,model,reason}`。**必须可一键关闭**。
+
+### P5：浏览器与登录态（依赖外部能力，单独评估）
+
+- 方案 A（推荐）：接 MCP（Playwright/Puppeteer MCP），把浏览器当作**可替换的外部工具**，
+  避免把浏览器代码塞进内核；登录态用独立 profile 目录，不进 agent 上下文。
+- 方案 B：内置 Playwright + persistent context；成本是被浏览器版本/依赖绑定。
+- 硬约束：登录、支付、2FA 一律转人工（对标 dots 的“密码不暴露给模型”）；浏览器 profile 目录纳入
+  secret 通配，模型不可读 cookie 文件。
+
+### P6：审计与可观测（贯穿，P1 就开始）
+
+| 事件 | 字段 |
+|---|---|
+| `screen_captured` / `screen_ocr` | path、sha1、bytes、duration_ms |
+| `approval_auto` | request_id、tool、decision、reason、model |
+| `grant_added` / `grant_removed` | path/domain、scope、by |
+| `notify_sent` / `notify_failed` | channel、level、title_sha1 |
+| `policy_denied` | tool、code、zone |
+
+- 新增 `GET /v1/audit?since=` 与飞书「审计」卡片（最近 20 条，按类型过滤）；
+- 可选 OTel 导出（`HARNESS_OTEL_ENDPOINT`），字段对齐 Codex 的 otel 事件命名习惯。
+
+### P7：其他（明确排在后面）
+
+语音 ASR（要 ffmpeg + key）、TTS、浏览器外设（摄像头/麦克风）、多机协同、回收站删除。
+
+---
+
+## 5. 与现有代码的映射
+
+| 新增 | 复用/改动 |
+|---|---|
+| `src/tool_screen.py`、`src/screen_capture.py`、`src/ocr_windows.py` | `tools.tool_registry`、`tool_documents.cache_image`、`ImageResult`、`tool_schemas.TOOLS` |
+| `src/notify.py`、`src/idle.py`、`scripts/install_autostart.py` | `paths.cache_path`、`api_*` 路由模式（`build_router`） |
+| `src/tool_clipboard.py` | 同上 + `exec_policy.READ_ONLY_*` 常量 |
+| `src/tool_ui.py`（P3b） | `sandbox`、`approval`（新 `approval_class` 分类） |
+| `src/grants.py`、`src/net_policy.py`、`src/rules.py` | `exec_policy.evaluate` 前置查表、`web_access.check_url` |
+| `src/audit.py` + `api_audit.py` | `session_store` 事件、`feishu_*_card.py` 卡片风格 |
+
+改动点（要小心，都有测试）：
+- `exec_policy.SANDBOX_MODES` / policy 分支：新增 zone（如 `PATH_SCREEN`）时要保持旧行为不变；
+- `tools.TOOLS` 顺序进入 system prompt 与指纹（`tests/test_tool_schemas.py::SCHEMA_SHA1`），
+  新工具**追加在末尾**并更新指纹；
+- 后台回合只读复核（`hooks.use_scheduled_turn`）的拒绝矩阵要加新工具，避免定时任务偷偷截屏。
+
+---
+
+## 6. 验收口径
+
+每阶段都必须同时满足：
+
+1. **自动化**：新增工具的边界测试（路径、审批、后台拒绝、审计字段）+ 全量回归通过；
+2. **真机**：按 [FEISHU_ACCEPTANCE.md](FEISHU_ACCEPTANCE.md) 的模式补一份逐项表，
+   记录版本、操作、预期、实际；
+3. **安全复核**：`docs/DEBUG_LOG.md` 写清“这个能力最坏能做什么、谁拦住它”；
+4. **可回退**：新能力都有一个环境变量或配置开关能一键关闭，关闭后行为与上线前一致。
+
+P1 完成的最小验收（举例）：
+
+- [ ] 飞书“看看我现在屏幕上的报错” → 收到截图 + 能描述报错内容
+- [ ] 截一张中英文混排窗口 → `screen_ocr` 文本与肉眼一致（中文不乱码）
+- [ ] 后台/定时回合请求截图 → 被明确拒绝
+- [ ] 截图落盘在 `.cache/screenshots/`，7 天后自动清理
+- [ ] `/status` 显示截图数量与占用空间
+
+---
+
+## 7. 明确不做
+
+| 不做 | 原因 |
+|---|---|
+| 代做登录 / 支付 / 2FA / 改密码 | 收益 < 风险；对标 dots 的硬边界 |
+| 默认开启键鼠控制 | prompt injection 下等于把整台机器交出去 |
+| 常开摄像头/麦克风 | 隐私与合规成本过高 |
+| 注册表/服务任意改 | 误操作代价不可逆，现有 `bash` + 审批已够 |
+| 多机会话分配 | 个人单机不需要；单实例锁已覆盖误开双进程 |
+| 自研手机端 | 飞书卡片已覆盖入口 |
+
+---
+
+## 8. 建议的推进顺序与工作量
+
+| 阶段 | 内容 | 预估 | 依赖 |
+|---|---|---|---|
+| P1 | 截屏 + 本地 OCR + 审计事件 | 2–3 天 | 无（PowerShell 零依赖） |
+| P2 | 自启 + toast + 空闲感知 | 2 天 | P1 的 notify 需求 |
+| P3a | 剪贴板读写 | 1 天 | P1 的审批模式 |
+| P4.1 | 目录级持久授权 + 撤销 UI | 3 天 | 飞书卡片模式（已有） |
+| P3b | 键鼠控制（默认关） | 5 天 | P1 截图存证 + P4 规则 |
+| P4.2 | 域名策略 + 规则文件 | 3 天 | 无 |
+| P4.3 | auto_review 默认化 | 3 天 | `HARNESS_LLM_APPROVAL` 现有实现 |
+| P5 | 浏览器（MCP 接入） | 3–5 天 | P4.2 |
+| P6 | 审计查询 + 卡片 | 2 天 | P1 起持续 |
+
+先做 P1，因为它是后续所有“桌面类”能力的地基（截图是证据、OCR 是低成本理解），
+而且零依赖、可完全用现有 `view_image` + 审批链复用。
+
+---
+
+## 9. 参考
+
+- Codex App Server 架构与协议：<https://openai.com/index/unlocking-the-codex-harness/>
+- Codex 沙箱与审批模型：<https://learn.chatgpt.com/docs/sandboxing>
+- Codex 在 OpenAI 内部的安全实践（网络策略、keyring、rules、OTel）：<https://openai.com/index/running-codex-safely/>
+- dots 产品与权限模型：<https://openai.com/index/introducing-dots/>
+- 桌面控制产品对比与安全共识（2026-10）：<https://www.simular.ai/alternatives/ai-agents-that-control-your-mouse-and-keyboard>
+- Windows 内置 OCR（WinRT）：<https://pypi.org/project/winrt-Windows.Media.Ocr/>、
+  <https://learn.microsoft.com/en-us/windows/ai/apis/text-recognition>
+- Windows toast via Python/WinRT 参考实现：<https://github.com/GitHub30/win11toast>
