@@ -21,6 +21,8 @@ if BaseModel is not None:
 
     class SendMessageRequest(BaseModel):
         content: str = Field(min_length=1)
+        # 来源聊天：模型在本回合创建的定时任务继承它作为结果推送目标。
+        origin_chat: str | None = Field(default=None, max_length=200)
 
     class CreateCronRequest(BaseModel):
         cron: str = Field(min_length=1, max_length=120)
@@ -30,6 +32,8 @@ if BaseModel is not None:
         id: str | None = Field(default=None, max_length=80)
         # 默认只读；显式开启后定时回合才允许写操作/联网/第三方工具（仍走审批）。
         allow_side_effects: bool = False
+        # 结果推送到哪个聊天（飞书 chat_id）；空 = 只写会话日志，不推送。
+        deliver_to: str | None = Field(default=None, max_length=200)
 
     class SteerRequest(BaseModel):
         content: str = Field(min_length=1)

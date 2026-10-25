@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+import hooks
 from cron_scheduler import cancel_job, cron_lock, schedule_job, scheduled_jobs
 from task_system import claim_task, complete_task, create_task, get_task, list_tasks
 
@@ -52,11 +53,15 @@ def run_complete_task(task_id: str) -> str:
 def run_schedule_cron(cron: str, prompt: str,
                       recurring: bool = True, durable: bool = True) -> str:
     # 模型不能给自己授权副作用：schedule_job 的默认值就是只读；需要写操作
-    # 由用户在 /cron add --writes 里显式开启。
-    result = schedule_job(cron, prompt, recurring, durable)
+    # 由用户在 /cron add --writes 里显式开启。来源聊天只在飞书回合里有值：
+    # 任务结束后结果推回同一处，而不是留在一个没人看的后台会话里。
+    deliver_to = hooks.current_origin_chat()
+    result = schedule_job(cron, prompt, recurring, durable,
+                          deliver_to=deliver_to)
     if isinstance(result, str):
         return f"Error: {result}"
-    return f"Scheduled {result.id}: '{cron}' → {prompt} (read-only)"
+    push = ' → 结果推送到当前聊天' if deliver_to else ''
+    return f"Scheduled {result.id}: '{cron}' → {prompt} (read-only){push}"
 
 
 def run_list_crons() -> str:
@@ -69,8 +74,9 @@ def run_list_crons() -> str:
         tag = "recurring" if j.recurring else "one-shot"
         dur = "durable" if j.durable else "session"
         mode = "" if getattr(j, 'allow_side_effects', False) else " (read-only)"
+        push = ' → 推送' if getattr(j, 'deliver_to', '') else ''
         lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
-                     f"[{tag}, {dur}]{mode}")
+                     f"[{tag}, {dur}]{mode}{push}")
     return "\n".join(lines)
 
 

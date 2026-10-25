@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Type
 
+import hooks
 import turn_control
 import turn_files
 import workspaces
@@ -229,12 +230,14 @@ class AgentRuntime:
         on_event=None,
         housekeeping: bool = True,
         source: str = 'api',
+        origin_chat: str | None = None,
     ) -> AgentResult:
         """追加一条用户消息，执行一个回合，返回 assistant 内容。
 
         ``attachments`` 是 ``harness_image`` 引用（调用方已缓存），作为紧跟提示词
         的独立用户消息存放，与 view_image 结果的回放方式一致。``on_event`` 接收
         ``(event_type, payload)``，供 JSONL 等一次性传输使用。
+        ``origin_chat`` 是消息来源聊天：回合内创建的定时任务继承它作为投递目标。
         """
         if not isinstance(content, str) or not content.strip():
             raise ValueError('message content must be a non-empty string')
@@ -284,7 +287,8 @@ class AgentRuntime:
                     token = turn_control.begin_turn(session_id=session_id,
                                                     source=source)
                     try:
-                        with use_workspace(workspace):
+                        with use_workspace(workspace), \
+                                hooks.use_origin_chat(origin_chat):
                             result = self._run_turn(messages, session_store=store,
                                                     **turn_kwargs)
                     except KeyboardInterrupt as exc:

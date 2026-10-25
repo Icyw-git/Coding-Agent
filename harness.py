@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import checkpoint_commands
 import checkpoints
+import cron_delivery
 import heartbeat
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import llm_config
@@ -1700,11 +1701,38 @@ def _consume_cron_for_running_turn():
         _run_heartbeat_jobs(
             consume_cron_queue(lambda job: job.id == heartbeat.JOB_ID))
         return []
+    # 带投递目标的任务必须走自己的 cron 回合：答案要单独推回来源聊天，
+    # 不能混进当前交互回合（比如用户在 TUI 打字时顺手跑掉飞书的任务）。
     fired = consume_cron_queue(
         lambda job: job.id == heartbeat.JOB_ID
-        or bool(getattr(job, 'allow_side_effects', False)))
+        or (bool(getattr(job, 'allow_side_effects', False))
+            and not getattr(job, 'deliver_to', '')))
     _run_heartbeat_jobs(job for job in fired if job.id == heartbeat.JOB_ID)
     return [job for job in fired if job.id != heartbeat.JOB_ID]
+
+
+def _deliver_cron_outcome(jobs, answer=None, error=None) -> None:
+    """把定时回合的最终答复/失败原因放进投递 outbox（同一聊天合并一条）。"""
+    targets: dict[str, list[str]] = {}
+    for job in jobs:
+        chat_id = str(getattr(job, 'deliver_to', '') or '').strip()
+        if chat_id:
+            targets.setdefault(chat_id, []).append(job.id)
+    if not targets:
+        return
+    occurrence = ','.join(sorted({str(getattr(job, 'last_fired', '') or '')
+                                  for job in jobs}))
+    for chat_id, job_ids in targets.items():
+        ids = sorted(set(job_ids))
+        text = (cron_delivery.failure_text(ids, error)
+                if error is not None
+                else cron_delivery.result_text(ids, answer or ''))
+        try:
+            cron_delivery.queue(chat_id, text, job_id=','.join(ids),
+                                occurrence=occurrence)
+        except Exception as exc:   # 投递失败不能反过来弄丢回合结果
+            print(f'  \033[31m[cron] delivery queue failed: '
+                  f'{type(exc).__name__}: {exc}\033[0m')
 
 
 def run_agent_turn_locked():
@@ -1738,12 +1766,26 @@ def run_agent_turn_locked():
             mode = 'read-only' if read_only else 'side-effects'
             print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s) "
                   f"[{mode}]\033[0m")
+            answer = None
+            error = None
+            interrupted = False
             try:
                 with hooks.use_scheduled_turn(read_only=read_only):
-                    agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}],
-                               turn_source='cron')
+                    answer = agent_loop(
+                        [{'role': 'user', 'content': '\n'.join(prompts)}],
+                        turn_source='cron')
             except KeyboardInterrupt:
+                interrupted = True
                 print('\n[会话已中断]')
+            except Exception as exc:
+                # 后台回合失败只影响这一批任务：worker 线程必须活下来，否则
+                # 一次模型/网络错误之后所有定时任务都静默停摆。
+                error = exc
+                print(f'  \033[31m[cron] turn failed: '
+                      f'{type(exc).__name__}: {exc}\033[0m')
+            finally:
+                if not interrupted:
+                    _deliver_cron_outcome(fired, answer, error)
     except TurnBusy:
         return   # 别的入口在跑：本轮跳过，任务仍在 cron_queue
 

@@ -4458,3 +4458,27 @@ cron 任务原先继承创建时的会话档位，谁建的任务就以谁的权
 测试：`tests/test_cron_side_effects.py`（默认只读持久化、只读拒绝矩阵、可写任务走队列、
 混批严格档、长回合过滤）、`tests/test_housekeeping_shutdown.py`、API 与飞书入口用例。
 全量 **1601 passed / 1 skipped**（`test_turn_slot_released_after_turn` 偶发红，单跑通过）。
+
+## 定时任务结果投递与失败隔离
+
+cron 回合跑在新建的、未绑定会话的 `SessionEventStore` 里，结果只写进那份临时日志，
+飞书 watcher 从来读不到——用户设了“每天提醒我”，到点只在服务器上自言自语。
+现在新增 `cron_delivery` 发件箱：回合结束后按任务分组的 `deliver_to` 写入
+`.cache/cron_results/outbox.json`（按 `chat_id|job_id|occurrence` 生成稳定 item id，
+上限 20 条，正文截断 12k 字符），网关每 15 秒轮询 `GET /v1/cron-results`，
+发送成功才 `POST .../ack`，失败或该聊天未绑定就留在箱里下次再试——至少一次，不丢。
+
+投递目标不是广播：`CronJob.deliver_to` 为空的任务继续只进会话日志；模型通过
+`schedule_cron` 建的任务自动继承当前聊天（`hooks._ORIGIN_CHAT` ContextVar 从
+`AgentRuntime.send(origin_chat=...)` 一路带到工具层），用户从飞书说“提醒我”才会真的
+推回飞书，避免凭空往陌生 chat 发消息。带投递目标的任务也不再被无关的交互回合
+“顺手消费”掉，只在自己那次 cron 回合结束后投递一次。
+
+顺带修了一个会静默瘫痪调度器的问题：cron 回合抛出的异常原先会穿出
+`run_agent_turn_locked` 和 `queue_processor_loop`，`cron-worker` 线程直接死掉，
+之后所有定时任务都不再触发。现在两层都兜住并打印 `[cron] turn failed`，
+失败也会以 `⚠️ 定时任务失败` 的形式投递（有目标时），线程继续跑。
+
+测试：`tests/test_cron_delivery.py`（去重/确认/上限/截断、成功与失败投递、无目标静默、
+带目标任务不被交互回合消费、worker 存活、origin chat 继承与重置、runtime 透传）、
+飞书只向已绑定聊天推送、API 往返。定向 **164 passed**；全量 **1615 passed / 1 skipped**。

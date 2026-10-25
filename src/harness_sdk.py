@@ -82,11 +82,14 @@ class Messages:
     def __init__(self, runtime: RuntimeClient) -> None:
         self._runtime = runtime
 
-    def create(self, session_id: str, content: str, on_delta=None) -> MessageResponse:
-        if on_delta is None:
-            result = self._runtime.send(session_id, content)
-        else:
-            result = self._runtime.send(session_id, content, on_delta=on_delta)
+    def create(self, session_id: str, content: str, on_delta=None,
+               origin_chat: str | None = None) -> MessageResponse:
+        kwargs = {}
+        if on_delta is not None:
+            kwargs['on_delta'] = on_delta
+        if origin_chat:
+            kwargs['origin_chat'] = origin_chat
+        result = self._runtime.send(session_id, content, **kwargs)
         return MessageResponse(session_id=result.session_id, content=result.content)
 
 

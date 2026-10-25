@@ -121,13 +121,24 @@ class GatewayClient:
     def create_cron(self, cron: str, prompt: str, *,
                     recurring: bool = True, durable: bool = True,
                     job_id: str | None = None,
-                    allow_side_effects: bool = False) -> dict:
+                    allow_side_effects: bool = False,
+                    deliver_to: str = '') -> dict:
         payload = {'cron': cron, 'prompt': prompt,
                    'recurring': recurring, 'durable': durable,
                    'allow_side_effects': allow_side_effects}
         if job_id:
             payload['id'] = job_id
+        if deliver_to:
+            payload['deliver_to'] = deliver_to
         return self._json(self.http.post('/v1/crons', json=payload), 'create cron')
+
+    def pending_cron_results(self) -> list[dict]:
+        return self._json(self.http.get('/v1/cron-results'),
+                          'list cron results')['pending']
+
+    def ack_cron_result(self, item_id: str) -> dict:
+        return self._json(self.http.post(f'/v1/cron-results/{item_id}/ack'),
+                          'ack cron result')
 
     def delete_cron(self, job_id: str) -> dict:
         return self._json(self.http.delete(f'/v1/crons/{job_id}'), 'delete cron')
@@ -176,29 +187,37 @@ class GatewayClient:
         response = self.http.post('/v1/session-actions', json={'action': action, 'session': row})
         response.raise_for_status()
 
-    def send(self, content: str, session_id: str | None = None) -> str:
+    def send(self, content: str, session_id: str | None = None,
+             origin_chat: str | None = None) -> str:
         session_id = session_id or self.session_id
         if not session_id:
             raise RuntimeError('no active session; use /new first')
+        payload = {'content': content}
+        if origin_chat:
+            payload['origin_chat'] = origin_chat
         response = self.http.post(
             f'/v1/sessions/{session_id}/messages',
-            json={'content': content},
+            json=payload,
         )
         response.raise_for_status()
         return response.json()['content']
 
     def send_stream(self, content: str, session_id: str | None = None,
-                    on_delta=None, on_progress=None) -> str:
+                    on_delta=None, on_progress=None,
+                    origin_chat: str | None = None) -> str:
         """Run a turn over the message SSE endpoint and return final text."""
         session_id = session_id or self.session_id
         if not session_id:
             raise RuntimeError('no active session; use /new first')
+        payload = {'content': content}
+        if origin_chat:
+            payload['origin_chat'] = origin_chat
         final = ''
         self.last_duration_ms = None
         self.last_duration = None
         completed = False
         with self.http.stream('POST', f'/v1/sessions/{session_id}/messages/stream',
-                              json={'content': content}) as response:
+                              json=payload) as response:
             response.raise_for_status()
             event = None
             for line in response.iter_lines():

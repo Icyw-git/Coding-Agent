@@ -1267,12 +1267,33 @@ def test_cron_add_is_read_only_unless_writes_flag(gateway, tmp_path, monkeypatch
     assert '可写' in fake.last() and '修改文件' in fake.last()
 
     gw.on_message('chat-cron-w', '/cron list')
-    assert '[recurring · 只读]' in fake.last()
-    assert '[recurring · 可写]' in fake.last()
+    assert '[recurring · 只读 · 推送]' in fake.last()
+    assert '[recurring · 可写 · 推送]' in fake.last()
 
     # 只有开关没有表达式：退回用法，不创建任务
     gw.on_message('chat-cron-w', '/cron add --writes')
     assert '用法' in fake.last()
+
+
+def test_gateway_pushes_cron_results_only_to_bound_chats(gateway, tmp_path,
+                                                        monkeypatch):
+    import cron_delivery
+
+    monkeypatch.setattr(cron_delivery, 'OUTBOX_PATH', tmp_path / 'outbox.json')
+    gw, fake = gateway
+
+    gw.on_message('chat-result', 'hi')   # 绑定会话
+    fake.sent.clear()
+    cron_delivery.queue('chat-result', '⏰ 定时结果', job_id='j1',
+                        occurrence='o1')
+    cron_delivery.queue('chat-unknown', '不该发出', job_id='j2',
+                        occurrence='o2')
+
+    assert gw.poll_cron_results() == 1
+    assert ('chat-result', '⏰ 定时结果') in fake.sent
+    assert all('不该发出' not in text for _, text in fake.sent)
+    # 未绑定的目标保留 pending，等绑定恢复再补发
+    assert [item['chat_id'] for item in cron_delivery.pending()] == ['chat-unknown']
 
 
 def _last_card_text(fake) -> str:

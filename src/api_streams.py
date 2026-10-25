@@ -103,6 +103,7 @@ def build_router(client, runtime, logger):
                 response = client.messages.create(
                     session_id, request.content,
                     on_delta=lambda text: deltas.put(("delta", text)),
+                    origin_chat=request.origin_chat,
                 )
                 duration_ms = round((time.monotonic() - started) * 1000)
                 deltas.put(("done", {"session_id": response.session_id,

@@ -697,3 +697,51 @@ def test_api_cron_defaults_to_read_only(api_client, tmp_path, monkeypatch):
     modes = {job['id']: job['allow_side_effects']
              for job in client.get('/v1/crons', headers=headers).json()['jobs']}
     assert modes == {'ro': False, 'rw': True}
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_cron_delivery_target_defaults_and_round_trips(api_client, tmp_path,
+                                                           monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks'))
+    headers = {'Authorization': 'Bearer t'}
+
+    silent = client.post('/v1/crons', json={
+        'cron': '0 9 * * *', 'prompt': 'report', 'id': 'silent'},
+        headers=headers)
+    assert silent.status_code == 201 and silent.json()['deliver_to'] == ''
+
+    pushed = client.post('/v1/crons', json={
+        'cron': '0 10 * * *', 'prompt': 'report', 'id': 'pushed',
+        'deliver_to': 'oc_chat_1'}, headers=headers)
+    assert pushed.status_code == 201
+    assert pushed.json()['deliver_to'] == 'oc_chat_1'
+
+    targets = {job['id']: job['deliver_to']
+               for job in client.get('/v1/crons', headers=headers).json()['jobs']}
+    assert targets == {'silent': '', 'pushed': 'oc_chat_1'}
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_cron_results_outbox_and_ack(api_client, tmp_path, monkeypatch):
+    import cron_delivery
+
+    monkeypatch.setattr(cron_delivery, 'OUTBOX_PATH', tmp_path / 'outbox.json')
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks'))
+    headers = {'Authorization': 'Bearer t'}
+
+    entry = cron_delivery.queue('oc_chat_1', '定时结果', job_id='j1',
+                                occurrence='o1')
+    listed = client.get('/v1/cron-results', headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()['pending'][0]['id'] == entry['id']
+
+    acked = client.post(f"/v1/cron-results/{entry['id']}/ack", headers=headers)
+    assert acked.status_code == 200 and acked.json()['status'] == 'acked'
+    assert client.post(f"/v1/cron-results/{entry['id']}/ack",
+                       headers=headers).status_code == 404
+    assert client.get('/v1/cron-results', headers=headers).json()['pending'] == []

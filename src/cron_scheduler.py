@@ -21,6 +21,8 @@ class CronJob:
     # 默认 False = 定时回合只读：写文件、联网、第三方工具、子代理一律拒绝。
     # 创建时显式开启才允许副作用，届时仍走正常审批（远程队列，不读 stdin）。
     allow_side_effects:bool=False
+    # 结果推送到哪个聊天（飞书 chat_id）；空 = 只在会话日志里，不推送。
+    deliver_to:str=''
 
 scheduled_jobs:dict[str,CronJob]={} # id -> job
 cron_queue:list[CronJob]=[] #任务队列
@@ -146,13 +148,15 @@ def load_durable_jobs(): #加载持久化任务，将有效任务添加到schedu
         print(f"  \033[31m[cron] failed to load durable jobs: {exc}\033[0m")
 
 def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
-                 job_id:str|None=None,allow_side_effects:bool=False): #注册一个cron任务
+                 job_id:str|None=None,allow_side_effects:bool=False,
+                 deliver_to:str=''): #注册一个cron任务
     """
     Register a cron job with the scheduler.
 
     job_id 可指定稳定 ID（如 heartbeat）：已存在时返回错误字符串，由调用方转成 409。
     allow_side_effects 默认 False：定时回合按只读策略执行，写操作/联网/第三方工具
     会被拒绝；只有在创建时显式开启的任务里才走正常审批。
+    空 deliver_to = 不推送结果；飞书创建的默认目标是当前聊天。
     """
 
     err=validate_cron(cron)
@@ -169,6 +173,7 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
             recurring=recurring, # 是否重复执行
             durable=durable, # 是否持久化存储
             allow_side_effects=bool(allow_side_effects),
+            deliver_to=(deliver_to or '').strip(),
         )
         scheduled_jobs[job.id]=job
     if durable: # 如果任务持久化存储，保存持久化存储
@@ -263,7 +268,14 @@ def queue_processor_loop(run_turn, poll_interval: float = 0.2, stop_event=None) 
         try:
             if not _has_cron_queue():                # 双重检查：拿锁后队列可能已被取走，例如上一轮 cron 任务已执行
                 continue
-            run_turn()
+            try:
+                run_turn()
+            except Exception as exc:
+                # 兜底：run_turn 的实现（agent_loop）可能抛出模型/网络错误。
+                # 这里吞掉并继续下一轮，不能让 cron-worker 线程死掉——线程一死，
+                # 之后所有定时任务都会静默失效。
+                print(f"  \033[31m[cron] turn failed: "
+                      f"{type(exc).__name__}: {exc}\033[0m")
         finally:
             agent_lock.release() # 释放锁，允许其他任务执行
 

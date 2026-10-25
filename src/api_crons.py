@@ -12,7 +12,8 @@ def _as_dict(job) -> dict:
     return {'id': job.id, 'cron': job.cron, 'prompt': job.prompt,
             'recurring': job.recurring, 'durable': job.durable,
             'last_fired': job.last_fired,
-            'allow_side_effects': bool(getattr(job, 'allow_side_effects', False))}
+            'allow_side_effects': bool(getattr(job, 'allow_side_effects', False)),
+            'deliver_to': str(getattr(job, 'deliver_to', '') or '')}
 
 
 def build_router():
@@ -33,7 +34,8 @@ def build_router():
         job = cron_scheduler.schedule_job(
             request.cron, request.prompt, request.recurring,
             request.durable, job_id=request.id,
-            allow_side_effects=request.allow_side_effects)
+            allow_side_effects=request.allow_side_effects,
+            deliver_to=request.deliver_to or '')
         if isinstance(job, str):
             status = 409 if 'already exists' in job else 400
             raise HTTPException(status_code=status, detail=job)

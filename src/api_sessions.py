@@ -169,7 +169,8 @@ def build_router(client, runtime):
         from turn_coordinator import TurnBusy
 
         try:
-            response = client.messages.create(session_id, request.content)
+            response = client.messages.create(session_id, request.content,
+                                              origin_chat=request.origin_chat)
         except TurnCancelled as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except TurnBusy as exc:

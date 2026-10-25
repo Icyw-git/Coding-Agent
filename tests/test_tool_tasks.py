@@ -30,14 +30,15 @@ def test_get_task_missing_returns_error(monkeypatch):
 
 
 def test_schedule_cron_reports_backend_error(monkeypatch):
-    monkeypatch.setattr(tool_tasks, 'schedule_job', lambda *args: 'bad cron')
+    monkeypatch.setattr(tool_tasks, 'schedule_job',
+                        lambda *args, **kwargs: 'bad cron')
 
     assert tool_tasks.run_schedule_cron('nope', 'p') == 'Error: bad cron'
 
 
 def test_schedule_cron_lists_and_cancels(monkeypatch):
     monkeypatch.setattr(tool_tasks, 'schedule_job',
-                        lambda *args: SimpleNamespace(id='c1'))
+                        lambda *args, **kwargs: SimpleNamespace(id='c1'))
     assert "Scheduled c1" in tool_tasks.run_schedule_cron('* * * * *', 'p')
 
     job = SimpleNamespace(id='c1', cron='* * * * *', prompt='p',

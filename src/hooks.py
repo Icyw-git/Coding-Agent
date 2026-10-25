@@ -82,6 +82,7 @@ __all__ = [
     'approval_timeout',
     'context_injection_hook',
     'current_grants',
+    'current_origin_chat',
     'current_session_id',
     'deny_message',
     'enforce',
@@ -101,6 +102,7 @@ __all__ = [
     'take_grant',
     'take_grants',
     'use_grants',
+    'use_origin_chat',
     'use_scheduled_turn',
     'use_session',
     'scheduled_read_only',
@@ -144,6 +146,25 @@ def scheduled_turn() -> bool:
 
 def scheduled_read_only() -> bool:
     return _SCHEDULED_READ_ONLY.get() is True
+
+
+# 来源聊天：模型在一个飞书回合里调用 schedule_cron 时，任务要记住「从哪个
+# 聊天来的」，回合结束后才能把结果推回同一处。API/CLI 回合没有这个上下文。
+_ORIGIN_CHAT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'harness_origin_chat', default='')
+
+
+@contextlib.contextmanager
+def use_origin_chat(chat_id: str | None):
+    token = _ORIGIN_CHAT.set(str(chat_id or ''))
+    try:
+        yield
+    finally:
+        _ORIGIN_CHAT.reset(token)
+
+
+def current_origin_chat() -> str:
+    return _ORIGIN_CHAT.get()
 
 
 @contextlib.contextmanager

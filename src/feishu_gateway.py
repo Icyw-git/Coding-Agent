@@ -68,6 +68,7 @@ from workspace_choices import find_workspace
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS') or paths.cache_path('feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
 HEARTBEAT_POLL_INTERVAL = 60.0   # 心跳是每日摘要，轮询间隔远大于审批
+CRON_RESULT_POLL_INTERVAL = 15.0  # 定时任务结果：晚十几秒可接受，别每秒打 API
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须重新 /new
 
@@ -763,11 +764,17 @@ class FeishuGateway:
                 update_partial(_legacy(answer, status))
 
         def _invoke(target_session: str):
+            # 来源聊天随消息带走：模型在回合内建的定时任务结果要能推回这里。
             streamer = getattr(self.api, 'send_stream', None)
             if streamer is not None:
+                extra = ({'origin_chat': chat_id}
+                         if _accepts_kwarg(streamer, 'origin_chat') else {})
                 return streamer(text, session_id=target_session,
-                                on_delta=on_delta, on_progress=on_progress)
-            return self.api.send(text, session_id=target_session)
+                                on_delta=on_delta, on_progress=on_progress,
+                                **extra)
+            extra = ({'origin_chat': chat_id}
+                     if _accepts_kwarg(self.api.send, 'origin_chat') else {})
+            return self.api.send(text, session_id=target_session, **extra)
 
         try:
             try:
@@ -1168,8 +1175,12 @@ class FeishuGateway:
             for job in jobs:
                 kind = 'recurring' if job.get('recurring') else 'one-shot'
                 mode = '可写' if job.get('allow_side_effects') else '只读'
+                target = job.get('deliver_to') or ''
+                push = '推送' if target == chat_id else (
+                    f'推送→{target[:8]}' if target else '不推送')
                 lines.append(f"  {job['id']}: '{job['cron']}' → "
-                             f"{job.get('prompt', '')[:40]} [{kind} · {mode}]")
+                             f"{job.get('prompt', '')[:40]} "
+                             f"[{kind} · {mode} · {push}]")
             self._reply(chat_id, chr(10).join(lines))
             return
 
@@ -1181,15 +1192,19 @@ class FeishuGateway:
             if not expr or not prompt:
                 self._reply(chat_id, usage)
                 return
+            push = _accepts_kwarg(self.api.create_cron, 'deliver_to')
             try:
+                extra = {'deliver_to': chat_id} if push else {}
                 job = self.api.create_cron(
-                    expr, prompt, allow_side_effects=allow_side_effects)
+                    expr, prompt, allow_side_effects=allow_side_effects,
+                    **extra)
             except Exception as exc:
                 self._reply(chat_id, f'[cron] {exc}')
                 return
             mode = '可写（副作用仍需审批）' if allow_side_effects else '只读'
+            tail = ' · 结果推送回本聊天' if push else ''
             self._reply(chat_id, f"已创建 {job['id']}: '{job['cron']}' → "
-                                 f"{job['prompt']}（{mode}）")
+                                 f"{job['prompt']}（{mode}{tail}）")
             return
         if action in ('delete', 'del', 'rm'):
             if not rest:
@@ -1999,18 +2014,25 @@ class FeishuGateway:
         return self.watcher.stop(timeout=timeout)
 
     def start_permission_poller(self) -> threading.Thread:
-        """审批轮询（3s）+ 心跳摘要补发（60s），共用一个后台线程。
+        """审批轮询（3s）+ 心跳摘要（60s）+ 定时结果（15s），共用一个后台线程。
 
-        心跳不需要卡点：它一天只生成一份，网关离线时摘要留在 API 的 outbox 里，
-        重启后按当前绑定补发；发送与 ack 之间的重复窗口见 heartbeat 模块说明。
+        心跳/结果都不需要卡点：网关离线时摘要留在 API 的 outbox 里，重启后
+        按当前绑定补发；发送与 ack 之间的重复窗口见 heartbeat / cron_delivery。
         """
         next_heartbeat = 0.0   # 启动后第一轮就检查一次（补发离线期间的摘要）
+        next_results = 0.0
 
         def loop() -> None:
-            nonlocal next_heartbeat
+            nonlocal next_heartbeat, next_results
             while not self._poll_stop.wait(PERMISSION_POLL_INTERVAL):
                 self.poll_permissions()
                 now = time.monotonic()
+                if now >= next_results:
+                    next_results = now + CRON_RESULT_POLL_INTERVAL
+                    try:
+                        self.poll_cron_results()
+                    except Exception as exc:
+                        print(f'[feishu] cron result delivery failed: {exc}')
                 if now >= next_heartbeat:
                     next_heartbeat = now + HEARTBEAT_POLL_INTERVAL
                     try:
@@ -2057,6 +2079,44 @@ class FeishuGateway:
             except Exception as exc:
                 # 已发出但没记上：下一轮会重复推送一次（接受这个窗口）
                 print(f'[feishu] heartbeat ack failed: {exc}')
+                continue
+            delivered += 1
+        return delivered
+
+    def poll_cron_results(self) -> int:
+        """把定时任务结果推到各自的来源聊天，发送成功才 ack。
+
+        只发当前仍绑定的聊天：不能凭 outbox 里一个任意的 chat_id 就发消息
+        （任务创建入口不校验绑定关系）。目标暂时未绑定时保留 pending，等
+        绑定恢复后再补发；outbox 自身有上限，不会无限堆积。
+        """
+        if self.transport is None:
+            return 0
+        try:
+            pending = self.api.pending_cron_results()
+        except Exception:
+            return 0
+        if not pending:
+            return 0
+        with self._bindings_lock:
+            chats = set(self.bindings)
+        delivered = 0
+        for item in pending:
+            item_id = str(item.get('id') or '')
+            chat_id = str(item.get('chat_id') or '')
+            text = str(item.get('text') or '').strip()
+            if not item_id or not text or chat_id not in chats:
+                continue
+            try:
+                self.transport.send_text(chat_id, text)
+            except Exception as exc:
+                print(f'[feishu] cron result send failed: {exc}')
+                continue
+            try:
+                self.api.ack_cron_result(item_id)
+            except Exception as exc:
+                # 已发出但没记上：下一轮会重复推送一次（接受这个窗口）
+                print(f'[feishu] cron result ack failed: {exc}')
                 continue
             delivered += 1
         return delivered
