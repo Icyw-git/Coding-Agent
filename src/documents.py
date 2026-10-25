@@ -122,7 +122,8 @@ def _pdf_text(data: bytes, filename: str, pages) -> str:
     if selected and empty == len(selected):
         notes.append(
             'no text layer found; this may be a scanned PDF. '
-            'pypdf cannot OCR - convert/render pages to images and use view_image.'
+            'pypdf cannot OCR; use render_document on the affected pages so the '
+            'vision model can read the rendered images.'
         )
     summary = f'{total} pages · extracted {len(selected)} page(s)'
     return _header('PDF', filename, summary, body, notes)

@@ -1533,3 +1533,79 @@ def test_lark_transport_downloads_via_message_resource_endpoint():
     assert request.message_id == 'om_1'
     assert request.file_key == 'img_1'
     assert request.type == 'image'
+
+
+def test_parse_post_content_text_links_and_images():
+    import json
+
+    from feishu_gateway import parse_post_content
+
+    raw = json.dumps({'title': '标题', 'content': [
+        [{'tag': 'text', 'text': '看这张图 '},
+         {'tag': 'img', 'image_key': 'img_1'},
+         {'tag': 'a', 'text': '文档', 'href': 'https://example.com'}],
+    ]})
+    text, images = parse_post_content(raw)
+    assert '标题' in text and '看这张图' in text
+    assert '文档 (https://example.com)' in text
+    assert images == ['img_1']
+
+    wrapped = json.dumps({'zh_cn': {'title': '', 'content': [
+        [{'tag': 'text', 'text': '你好'}]]}})
+    assert parse_post_content(wrapped) == ('你好', [])
+    assert parse_post_content('not json') == ('', [])
+
+
+def test_post_message_with_images_saves_all_and_hints_view_image(tmp_path):
+    png = bytes([0x89]) + b'PNG' + b'\x00' * 10
+    transport = AttachmentTransport(image=png)
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+
+    gw._handle_attachment('chat-post', {
+        'kind': 'post', 'text': '这两张图对比一下',
+        'images': ['img_1', 'img_2'],
+    }, sender_id='ou_me', chat_type='p2p', message_id='om_post')
+
+    files = sorted((tmp_path / '.cache' / 'feishu-inbox').glob('*.png'))
+    assert len(files) == 2
+    hint = api.sent[-1][1]
+    assert '这两张图对比一下' in hint
+    assert all(str(path) in hint for path in files)
+    assert 'view_image' in hint
+    assert [item[1] for item in transport.downloaded] == ['img_1', 'img_2']
+
+
+def test_audio_and_media_messages_are_saved_with_explicit_capability_hint(tmp_path):
+    transport = AttachmentTransport(file=b'fake-audio-or-video')
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+
+    gw._handle_attachment('chat-audio', {
+        'kind': 'audio', 'resource_kind': 'file', 'key': 'audio-1',
+        'name': 'voice.opus'}, 'ou_me', 'p2p', 'om-audio')
+    assert '音频已保存' in api.sent[-1][1]
+    assert '不自动转写' in api.sent[-1][1]
+    assert list((tmp_path / '.cache' / 'feishu-inbox').glob('*.opus'))
+
+    gw._handle_attachment('chat-video', {
+        'kind': 'media', 'resource_kind': 'file', 'key': 'video-1',
+        'name': 'clip.mp4'}, 'ou_me', 'p2p', 'om-video')
+    assert '视频/媒体文件' in api.sent[-1][1]
+    assert '不自动做视频理解' in api.sent[-1][1]
+    assert list((tmp_path / '.cache' / 'feishu-inbox').glob('*.mp4'))
+
+
+def test_file_extension_is_not_restricted_by_gateway(tmp_path):
+    transport = AttachmentTransport(file=b'PK\x03\x04not-really-a-doc')
+    api = AttachmentAPI(tmp_path)
+    gw = FeishuGateway(api, transport=transport,
+                       bindings_path=tmp_path / 'bindings.json')
+    for name in ('data.csv', 'archive.zip', 'slides.pptx', 'sheet.xlsx'):
+        gw._handle_attachment('chat-files', {
+            'kind': 'file', 'resource_kind': 'file', 'key': name,
+            'name': name}, 'ou_me', 'p2p', 'om-' + name)
+    files = list((tmp_path / '.cache' / 'feishu-inbox').iterdir())
+    assert {path.suffix for path in files} >= {'.csv', '.zip', '.pptx', '.xlsx'}

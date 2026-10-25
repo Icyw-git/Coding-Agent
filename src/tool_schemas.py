@@ -80,7 +80,8 @@ TOOL_SCHEMAS = [{'type': 'function',
                'description': 'Extract text from a local PDF, DOCX, PPTX, or XLSX file. PDF/PPTX '
                               "accept a 1-based pages range such as '1-10,15'; XLSX accepts sheet "
                               'names or 1-based indexes. Scanned PDFs without a text layer are '
-                              'reported and need view_image on rendered pages (no OCR).',
+                              'reported; call render_document for the affected pages so a vision-capable '
+                              'model can read the rendered images.',
                'parameters': {'type': 'object',
                               'properties': {'path': {'type': 'string',
                                                       'description': 'Document path: relative to '

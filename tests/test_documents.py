@@ -293,3 +293,25 @@ def test_tool_is_registered_and_read_only():
     assert 'read_document' in exec_policy.READ_ONLY_FILE_TOOLS
     assert 'read_document' in harness.PARALLEL_SAFE_TOOLS
     assert Path(__file__).is_file()
+
+
+def test_scanned_pdf_guides_to_render_document(monkeypatch):
+    import documents
+
+    class Page:
+        def extract_text(self):
+            return ''
+
+    class Reader:
+        pages = [Page()]
+        is_encrypted = False
+
+    class Pypdf:
+        def PdfReader(self, stream):
+            return Reader()
+
+    monkeypatch.setitem(__import__('sys').modules, 'pypdf', Pypdf())
+    result = documents.extract_document(b'%PDF-fake', 'scan.pdf')
+    assert 'no text layer' in result
+    assert 'render_document' in result
+    assert 'vision model' in result

@@ -179,6 +179,50 @@ def markdown_to_card_md(md_text: str) -> str:
     return '\n'.join(out)
 
 
+def parse_post_content(raw) -> tuple[str, list[str]]:
+    """飞书富文本（post）→ (文本, 图片 key 列表)。
+
+    兼容两种外形：直接的 `{title, content}`，以及按语言包装的
+    `{zh_cn: {title, content}}`。链接保留为 `文字 (href)`，图片取 `image_key`。
+    """
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    except (TypeError, ValueError):
+        return '', []
+    if not isinstance(data, dict):
+        return '', []
+    if not ('content' in data or 'title' in data):
+        for value in data.values():
+            if isinstance(value, dict) and ('content' in value or 'title' in value):
+                data = value
+                break
+    title = str(data.get('title') or '').strip()
+    images: list[str] = []
+    lines: list[str] = []
+    for paragraph in data.get('content') or []:
+        parts = []
+        for element in paragraph if isinstance(paragraph, list) else []:
+            if not isinstance(element, dict):
+                continue
+            tag = element.get('tag')
+            if tag == 'img':
+                key = element.get('image_key')
+                if key:
+                    images.append(str(key))
+                parts.append('[图片]')
+            elif tag == 'a':
+                text = str(element.get('text') or '').strip()
+                href = str(element.get('href') or '').strip()
+                parts.append(f'{text} ({href})' if href else text)
+            else:
+                parts.append(str(element.get('text') or ''))
+        line = ''.join(parts).strip()
+        if line:
+            lines.append(line)
+    text = chr(10).join(([title] if title else []) + lines).strip()
+    return text, images
+
+
 def _attachment_filename(kind: str, key: str, name: str | None,
                          data: bytes) -> str:
     raw = str(name or '').replace(chr(92), '/').split('/')[-1].strip()
@@ -1762,8 +1806,8 @@ class FeishuGateway:
             return 20 * 1024 * 1024
 
     def _unsupported_message(self, chat_id: str, kind: str) -> None:
-        self._reply(chat_id, f'暂不支持 {kind} 消息；目前可发送文字、图片、文件'
-                             '（PDF/Word/Excel/PPT 等，我会用文档工具读取）。')
+        self._reply(chat_id, f'暂不支持 {kind} 消息；目前可发送文字、图片、文件、音频、视频。'
+                             '音频/视频会保存但暂不自动转写或理解。')
 
     def _handle_attachment(self, chat_id: str, payload: dict,
                            sender_id: str | None, chat_type: str | None,
@@ -1772,52 +1816,101 @@ class FeishuGateway:
         if self.allowed_users is not None and sender_id not in self.allowed_users:
             return
         kind = payload.get('kind')
+        if kind == 'post':
+            self._handle_post(chat_id, payload, sender_id, chat_type, message_id)
+            return
         key = payload.get('key')
         if not key:
             self._reply(chat_id, '附件缺少 key，无法下载。')
             return
+        inbox = self._inbox_dir(chat_id)
+        if inbox is None:
+            return
+        try:
+            path = self._save_attachment(
+                inbox, kind, key, message_id or '', payload.get('name'),
+                resource_kind=payload.get('resource_kind'))
+        except Exception as exc:
+            print(f'[feishu] attachment failed: {exc}')
+            self._reply(chat_id, f'[附件] {exc}')
+            return
+        if kind == 'image':
+            hint = ('[用户发来图片]' + chr(10) + f'path: {path}' + chr(10)
+                    + '请先用 view_image 查看图片内容，再回答用户的问题。')
+        elif kind == 'audio':
+            hint = (f'[用户发来音频] path: {path}' + chr(10)
+                    + '音频已保存；当前网关不自动转写，请告知用户需要语音识别时再配置 ASR。')
+        elif kind == 'media':
+            hint = (f'[用户发来视频/媒体文件] path: {path}' + chr(10)
+                    + '文件已保存；当前网关不自动做视频理解，可先说明已收到文件。')
+        else:
+            hint = (f'[用户发来文件] name: {payload.get("name") or path.name}'
+                    + chr(10) + f'path: {path}' + chr(10)
+                    + '请按需用 read_document 读取（PDF/Word/Excel/PPT/图片），'
+                      '若提示扫描 PDF 没有文本层，再调用 render_document 让视觉模型读取页面；'
+                      '或直接用 read 读取文本文件。')
+        self.on_message(chat_id, hint, sender_id=sender_id,
+                        chat_type=chat_type, message_id=message_id)
+
+    def _inbox_dir(self, chat_id: str) -> Path | None:
         session_id = self.bindings.get(chat_id)
         if not session_id:
             session_id = self.api.create_session()
             with self._bindings_lock:
                 self.bindings[chat_id] = session_id
                 self._save_bindings()
-        download = getattr(self.transport, 'download_message_resource', None)
-        if download is None or not message_id:
-            self._reply(chat_id, '当前传输层不支持下载附件。')
-            return
-        try:
-            data = download(message_id, key, kind)
-        except Exception as exc:
-            print(f'[feishu] attachment download failed: {exc}')
-            self._reply(chat_id, f'[附件] 下载失败：{exc}')
-            return
-        limit = self._attachment_limit()
-        if len(data) > limit:
-            self._reply(chat_id, f'[附件] 文件超过 {limit // (1024 * 1024)}MB，已拒绝。')
-            return
         try:
             workspace = Path(self.api.get_workspace(session_id))
         except Exception as exc:
             self._reply(chat_id, f'[附件] 无法定位会话工作区：{exc}')
-            return
+            return None
         inbox = workspace / '.cache' / 'feishu-inbox'
         try:
             inbox.mkdir(parents=True, exist_ok=True)
-            name = _attachment_filename(kind, key, payload.get('name'), data)
-            path = inbox / f'{uuid.uuid4().hex[:8]}_{name}'
-            path.write_bytes(data)
         except OSError as exc:
             self._reply(chat_id, f'[附件] 保存失败：{exc}')
+            return None
+        return inbox
+
+    def _save_attachment(self, inbox: Path, kind: str, key: str,
+                         message_id: str, name: str | None = None,
+                         resource_kind: str | None = None) -> Path:
+        download = getattr(self.transport, 'download_message_resource', None)
+        if download is None or not message_id:
+            raise RuntimeError('当前传输层不支持下载附件')
+        data = download(message_id, key, resource_kind or
+                         ('image' if kind == 'image' else 'file'))
+        limit = self._attachment_limit()
+        if len(data) > limit:
+            raise ValueError(f'文件超过 {limit // (1024 * 1024)}MB，已拒绝')
+        filename = _attachment_filename(kind, key, name, data)
+        path = inbox / f'{uuid.uuid4().hex[:8]}_{filename}'
+        path.write_bytes(data)
+        return path
+
+    def _handle_post(self, chat_id: str, payload: dict, sender_id: str | None,
+                     chat_type: str | None, message_id: str | None) -> None:
+        """富文本消息：保留文字，把内嵌图片存到工作区后交给 agent。"""
+        text = str(payload.get('text') or '').strip()
+        images = [key for key in (payload.get('images') or []) if key][:6]
+        inbox = self._inbox_dir(chat_id)
+        if inbox is None:
             return
-        if kind == 'image':
-            hint = ('[用户发来图片]' + chr(10) + f'path: {path}' + chr(10)
-                    + '请先用 view_image 查看图片内容，再回答用户的问题。')
-        else:
-            hint = (f'[用户发来文件] name: {payload.get("name") or path.name}'
-                    + chr(10) + f'path: {path}' + chr(10)
-                    + '请按需用 read_document 读取（PDF/Word/Excel/PPT/图片），'
-                      '或直接用 read 读取文本文件。')
+        saved = []
+        for index, key in enumerate(images, 1):
+            try:
+                path = self._save_attachment(inbox, 'image', key, message_id or '')
+            except Exception as exc:
+                saved.append(f'图片 {index}: 下载失败（{exc}）')
+                continue
+            saved.append(f'图片 {index}: {path}')
+        lines = ['[用户发来富文本消息]']
+        if text:
+            lines.append(text)
+        if saved:
+            lines.append(chr(10).join(saved))
+            lines.append('请用 view_image 查看上述图片后再回答。')
+        hint = chr(10).join(lines)
         self.on_message(chat_id, hint, sender_id=sender_id,
                         chat_type=chat_type, message_id=message_id)
 
@@ -1941,7 +2034,7 @@ class FeishuGateway:
                     else:
                         with self._chat_lock(chat_id):
                             if isinstance(text, dict):
-                                if text.get('kind') in ('image', 'file'):
+                                if text.get('kind') in ('image', 'file', 'post'):
                                     self._handle_attachment(chat_id, text, sender_id,
                                                             chat_type, message_id)
                                 elif text.get('unsupported'):
@@ -1999,17 +2092,41 @@ class FeishuGateway:
         def on_lark_message(data) -> None:
             try:
                 message = data.event.message
-                if message.message_type not in ('text', 'image', 'file'):
+                if message.message_type == 'post':
+                    text, images = parse_post_content(message.content)
+                    if images:
+                        payload = {'kind': 'post', 'text': text, 'images': images}
+                        self.dispatch(message.chat_id, payload,
+                                      sender_id=getattr(
+                                          getattr(getattr(data.event, 'sender', None),
+                                                  'sender_id', None), 'open_id', None),
+                                      chat_type=getattr(message, 'chat_type', None),
+                                      message_id=getattr(message, 'message_id', None))
+                    elif text:
+                        self.dispatch(message.chat_id, text,
+                                      sender_id=getattr(
+                                          getattr(getattr(data.event, 'sender', None),
+                                                  'sender_id', None), 'open_id', None),
+                                      chat_type=getattr(message, 'chat_type', None),
+                                      message_id=getattr(message, 'message_id', None))
+                    else:
+                        self.dispatch(message.chat_id, {'unsupported': 'post'},
+                                      chat_type=None,
+                                      message_id=getattr(message, 'message_id', None))
+                    return
+                if message.message_type not in ('text', 'image', 'file', 'audio', 'media'):
                     self.dispatch(message.chat_id,
                                   {'unsupported': message.message_type},
                                   sender_id=None, chat_type=None,
                                   message_id=getattr(message, 'message_id', None))
                     return
                 content = json.loads(message.content or '{}')
-                if message.message_type in ('image', 'file'):
+                if message.message_type in ('image', 'file', 'audio', 'media'):
+                    is_image = message.message_type == 'image'
                     payload = {
                         'kind': message.message_type,
-                        'key': content.get('image_key') if message.message_type == 'image'
+                        'resource_kind': 'image' if is_image else 'file',
+                        'key': content.get('image_key') if is_image
                         else content.get('file_key'),
                         'name': content.get('file_name') or '',
                     }

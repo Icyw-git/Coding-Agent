@@ -20,7 +20,7 @@ ORDER = [
     'remove_worktree', 'keep_worktree',
 ]
 
-SCHEMA_SHA1 = '9f8c31b5dc434afcfad61c1b2dc222786a7a2dc1'
+SCHEMA_SHA1 = 'f4bb585ae3bb098fe8fdad0fca49d90d455ca311'
 
 
 def test_tool_order_is_stable():

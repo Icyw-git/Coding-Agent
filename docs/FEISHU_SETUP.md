@@ -11,9 +11,25 @@
    - 订阅方式选 **长连接**（不需要公网 IP）；
    - 订阅事件 `im.message.receive_v1`；
    - 卡片回调选长连接（控制台按钮与审批按钮依赖它）。
-4. 权限：`im:message`（以应用身份发消息/读单聊消息）；
-   如需在群里 @ 机器人，再加 `im:message.group_at_msg`。
+4. 权限（按用到的功能勾选，详见下表）：
+   - 必选：`im:message`（发消息、更新卡片）、`im:message.p2p_msg:readonly`（读单聊消息）
+   - 收发图片/文件必选：`im:resource`（下载消息里的图片/文件资源）
+   - 群聊里 @ 机器人才需要：`im:message.group_at_msg:readonly`
 5. 在「凭证与基础信息」复制 `App ID` / `App Secret`，发布版本并让管理员审核通过。
+
+### 权限与功能对照
+
+| 功能 | 需要的权限 / 配置 |
+|---|---|
+| 私聊收发文字、流式更新回复卡、审批按钮 | `im:message` + `im:message.p2p_msg:readonly` |
+| 发送/引用回复（`im.message.reply`） | `im:message` |
+| 更新卡片（PATCH message） | `im:message` |
+| 下载用户发来的图片/PDF/Office 文件 | `im:resource` |
+| 群聊 @ 机器人 | `im:message.group_at_msg:readonly`（网关默认只处理单聊） |
+| 接收事件与按钮回调 | 事件订阅选「长连接」，订阅 `im.message.receive_v1`；回调订阅卡片回传交互 |
+
+不需要文档（Drive）读写、通讯录、群管理权限：文件是通过消息资源下载到本地工作区，
+再由 `read_document` / `view_image` 读取，不访问飞书云文档。
 
 ## 2. 配置（一次性）
 
@@ -90,7 +106,11 @@ python src/feishu_gateway.py
   PDF / Word / Excel / PPT（DOCX/PPTX 转换需要服务端装 LibreOffice），文本文件也可用
   `read`。
 - 单文件默认上限 20MB，可用 `FEISHU_MAX_ATTACHMENT_MB` 调整；超限直接拒绝。
-- 语音、表情等暂不支持，会回一句提示。
+- **富文本（post）消息**：保留文字与链接，内嵌图片同样落到 `.cache/feishu-inbox/`
+  后交给 `view_image`（一次最多 6 张）。
+- **音频**：会下载并保存为工作区附件，但当前不自动转写（需要另接 ASR）。
+- **视频/media**：会下载并保存为工作区附件，但当前不自动做视频理解。
+- 语音、表情、转发卡片、位置、联系人等暂不自动解析，会回一句提示。
 
 斜杠命令（`/sessions`、`/archive`、`/cron` 等）仍可用，适合批处理、排障和脚本；
 日常操作不需要记忆它们。

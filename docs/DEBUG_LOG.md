@@ -4413,3 +4413,28 @@ Invalid request param`。
 
 测试：真实 SDK 请求对象断言（message_id/file_key/type 均正确），加图片/PDF 下载替身回归。
 全量 **1565 passed / 1 skipped**。
+
+## post（富文本）消息支持
+
+飞书里带标题/分段/链接/内嵌图片的消息是 `message_type: post`，之前直接落到
+“暂不支持 post 消息”。现在 `parse_post_content` 兼容 `{title, content}` 与按语言包装的
+`{zh_cn: {...}}`，把段落拼成文本、链接转成 `文字 (href)`、收集 `image_key`；纯文字 post
+按普通消息处理，带图 post 则把图片经 `messages/{id}/resources` 下载到工作区
+（最多 6 张），合成一条“[用户发来富文本消息] + 原文 + 图片路径”的提示交给 agent，
+由 `view_image` 查看。语音/表情仍然只回提示。
+
+## 飞书其它消息类型与文件扩展名
+
+“文件类型”与“消息类型”要分开：`file` 消息本身不需要扩展名白名单，PDF/DOCX/XLSX/PPTX/
+CSV/TXT/ZIP 等都按字节下载；能否解析由后续工具决定（`read_document` 支持 PDF、新版
+Office，扫描 PDF/旧 OLE 文档仍有各自限制）。
+
+补充接收 `audio` 与 `media`（视频）消息：二者也通过消息资源接口下载到
+`.cache/feishu-inbox/`，再把路径交给正常会话；回复明确“已保存、当前不自动转写/视频理解”，
+不假装模型已经看懂。音频转写可以接 ASR（dsh-im 的做法是下载 opus → ffmpeg 16k mono →
+ASR API），但这会引入 ffmpeg、ASR provider/key、音频时长/费用和隐私配置，所以暂不默认启用。
+视频理解同理，后续可先做缩略图/关键帧，再决定是否接视觉模型。
+
+仍然不自动解析 sticker、interactive、share_chat、share_user、location 等非文件消息；
+这些类型会明确提示。测试覆盖 audio/media 落盘、文件扩展名无 gateway 限制和能力提示。
+全量 **1569 passed / 1 skipped**。
