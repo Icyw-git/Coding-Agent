@@ -4,6 +4,8 @@
 
 - 只消费增量：每个会话保存 ``cursor``（已处理的最大 ``seq``）；
 - 终态只认 ``turn_terminal``（阶段 1 引入），不靠“长时间没进展”推断失败；
+- 审批超时（``approval_timeout``，由审批门观察者写入）单独推送一次：远程端要能
+  区分“用户拒绝”与“无人应答”；同样按 request id 去重；
 - 投递语义是 **至少一次**：先发送再落盘状态，崩溃窗口内允许重复，不允许漏发；
 - 按 ``(session_id, turn_id, status)`` 去重，重放事件不会重复通知；
 - 来源过滤：``source='feishu'`` 的回合已经在手机上流式展示过，不再主动推；
@@ -192,6 +194,23 @@ class TurnWatcher:
                         'session': session_id,
                         'started_at': float(event.get('ts') or self._clock()),
                     }
+                continue
+            if kind == 'approval_timeout':
+                # 审批无人应答：与回合终态独立的一次性通知。事件可能属于已经
+                # 结束的回合（超时后回合继续跑完），所以不依赖 _started_turns。
+                request_id = str(event.get('request_id') or f'seq{seq}')
+                key = f'{session_id}:approval:{request_id}'
+                if self.state.notified(session_id, key):
+                    continue
+                self.state.bump_attempt(session_id, key)
+                try:
+                    self._notify(session_id, 'approval_timeout', event)
+                except Exception:
+                    # 与终态一致：发送失败不推进游标，下一轮重试（至少一次）
+                    return {'session': session_id, 'notified': notified,
+                            'error': 'notify_failed'}
+                self.state.commit(session_id, cursor=latest, notified_key=key)
+                notified += 1
                 continue
             if kind != 'turn_terminal':
                 continue

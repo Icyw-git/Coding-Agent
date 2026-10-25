@@ -108,7 +108,7 @@ def test_hook_approval_reaches_the_tool_boundary_once(env, asks):
 
     # 凭据一次性：同一条命令再调一次要重新审批（无头队列，超时拒绝）
     assert hooks.enforce_headless('bash', {'command': 'rm build'}) \
-        == 'Permission denied by user'
+        == 'Permission denied: approval timed out after 0.2s with no response'
     assert GATE.history()[0].status == 'timeout'
 
 
@@ -152,8 +152,9 @@ def test_headless_ask_waits_for_a_remote_decision(env):
 
 
 def test_headless_ask_without_a_decision_times_out_to_deny(env, capsys):
+    # 超时不是「用户拒绝」：拒绝语要带原因，远程端据事件流区分两者
     assert hooks.enforce_headless('bash', {'command': 'del f'}) \
-        == 'Permission denied by user'
+        == 'Permission denied: approval timed out after 0.2s with no response'
     assert GATE.history()[0].status == 'timeout'
     printed = capsys.readouterr().out
     assert '等待审批' in printed
@@ -227,7 +228,7 @@ def test_untrusted_tier_does_not_honor_the_session_allowlist(env, monkeypatch):
     monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'untrusted')
     GATE._session_allows.add(session_allow_key('bash', 'rm', ''))
     assert hooks.permission_hook('bash', {'command': 'rm x'}) \
-        == 'Permission denied by user'
+        == 'Permission denied: approval timed out after 0.2s with no response'
     assert GATE.history(), '白名单命中不该省掉这次审批'
 
     monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'on-request')

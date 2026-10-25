@@ -107,6 +107,9 @@ def main(argv=None) -> int:
         raise SystemExit(f'[config] {exc}') from exc
 
     harness.load_durable_jobs()
+    # 默认心跳与 API 常驻模式共用同一张 cron 表；稳定 ID 保证重复启动不叠加。
+    import heartbeat
+    heartbeat.ensure_registered()
     _warn_legacy_sessions()
     harness.start_storage_maintenance()
     # 后台预热 LLM 客户端（openai SDK import ~1.5s）：用户敲第一条消息时已就绪

@@ -1,6 +1,6 @@
 # Personal Agent 升级方案
 
-状态：方案制定完成（2026-10-24），未开工。目标形态：一台常驻机器上的个人代理，手机（飞书）可以监视进度、回合中插话、审批命令并收到完成通知；空闲时可由定时任务唤醒；记忆跨会话沉淀。不做公网中继、不做自研手机端，飞书承担消息入口和通知端。
+状态：阶段 0–2 主体已落地（2026-10-25），剩余真实终端/飞书端到端验收与副作用任务授权。目标形态：一台常驻机器上的个人代理，手机（飞书）可以监视进度、回合中插话、审批命令并收到完成通知；空闲时可由定时任务唤醒；记忆跨会话沉淀。不做公网中继、不做自研手机端，飞书承担消息入口和通知端。
 
 ## 1. 调研依据与边界
 
@@ -27,7 +27,7 @@
 | 定时唤醒 | cron 表、队列和处理循环已存在（`src/cron_scheduler.py`）；CLI 启动时接线（`entrypoint.py`） | 循环不可停止；API lifespan 未接线；触发时间和投递记录不是持久状态 | 阶段 0 |
 | 会话并发 | `AgentRuntime` 有进程内会话锁；`SessionEventStore` 有进程内路径锁 | TUI 与 API 跨进程没有共同执行锁；不同会话也可能并发修改同一工作区 | 阶段 0 |
 | 记忆提取与合并 | 每个成功回合的后台 housekeeping 已调用 `extract_memories` 和 `consolidate_memories`；合并受阈值控制（`harness.py`、`src/memory.py`） | 无需重复添加定时合并；需解决合并原子性、并发写入和关闭时后台线程收尾 | 阶段 0/2 |
-| 心跳/日报 | 尚无默认心跳任务 | 需要稳定任务 ID、时区、错过调度策略、投递语义和只读权限边界 | 阶段 2 |
+| 心跳/日报 | 默认每日 09:00（本机时间）只读摘要，稳定 ID `heartbeat`；本地生成，outbox 至少一次投递（`src/heartbeat.py`、`src/api_heartbeat.py`） | 已覆盖任务板计数、git 改动、待审批数量；副作用任务的授权与审批仍未开放 | 阶段 2 |
 | TUI 共存 | TUI 与 API 进程共享 `.cache/sessions` | 同一会话和同一工作区都需要明确的跨进程并发策略；TUI 转为 daemon 客户端仍可选 | 阶段 0/3 |
 
 可复用底座：飞书端会话新建/绑定/切换/fork/搜索、审批卡片、`/run`、`/status`、`/logs`、`/stop`、进度卡片、跨会话记忆召回和 SSE `after` 游标。SSE 游标表示事件读取进度，不等同于飞书消息已恰好投递一次。
@@ -140,7 +140,7 @@
 - 多网关实例的会话分配（当前单写者假设：一个网关一个进程）。
 - 真实终端 / 真实飞书端到端验收（手机审批、steer、interrupt、通知去重）。
 
-### 阶段 2：主动性与安全边界（进行中，2026-10-24 完成 cron 管理）
+### 阶段 2：主动性与安全边界（进行中，2026-10-25 完成心跳与审批超时可观测）
 
 已完成：
 
@@ -149,13 +149,45 @@
   支持 list / add / delete，表达式可用引号或五段裸写；错误把服务端 detail 透传给用户。
 - **occurrence 去重**：`CronJob.last_fired` 随 durable job 一起落盘，`tick()` 抽出为可测试
   函数；进程在同一分钟内重启不会重复触发同一个 occurrence。`schedule_job` 支持稳定
-  `job_id`，重复注册返回错误（为 heartbeat 做准备）。
+  `job_id`，重复注册返回错误。
 
-仍欠：heartbeat 默认任务（只读摘要）、misfire/时区策略、副作用任务的授权与审批。
-- **任务触发状态**：job 配置持久化不代表触发记录持久化。为每次触发计算稳定 occurrence ID，定义本地时区或显式时区、停机期间的 misfire 策略（跳过/补跑/仅补最近一次）、并发时是否合并，以及失败重试上限。确保默认心跳使用稳定 job ID，上线/重启不会重复注册。
-- **心跳摘要**：默认每日一次，初始仅只读汇总任务板、最近改动和待审批数量，不自动执行写操作；内容不包含不必要的命令正文、凭据或敏感工具参数。仅在明确授权的定时任务中开放副作用。审批等待必须有超时和通知策略，不能无限占用唯一回合槽。
-- **记忆安全**：`extract_memories` 和阈值触发的 `consolidate_memories` 已随成功回合的 housekeeping 执行；不再额外加 cron 重复触发。合并流程已改为「校验 → 暂存 → 先落新文件再删旧文件」：校验 schema、类型、条数与重名，暂存文件回读校验后才替换，失败保留旧记忆；写入已加进程内 RLock 与跨进程 OS 锁，单文件与索引都是临时文件 + 原子替换（2026-10-24 完成）。仍欠：daemon 关闭时等待或记录未完成的 housekeeping。
-- **测试**：稳定 job ID 重启不重复注册；occurrence 重启/错过/失败语义；心跳只读约束和副作用审批；无效或空模型输出、写入中途失败、并发提取与合并、服务关闭时 housekeeping 超时恢复。记忆部分的故障测试已完成（`tests/test_memory_safety.py`），调度与关闭部分待开工。
+第二批（2026-10-25）：
+
+- **默认心跳**：`src/heartbeat.py` 以稳定 ID `heartbeat` 注册每日 09:00（本机时间）
+  任务；`ensure_registered()` 在 `entrypoint.py` 与 `scheduler_service.py` 两个入口
+  幂等调用，已存在时保留用户改过的表达式，手动删除后下次启动按稳定 ID 重新注册。
+  `run_agent_turn_locked` 在消费 cron 队列时按 ID 拦截，本地生成只读摘要，不进入
+  模型、不占用全局回合槽。
+- **触发与漏跑策略**：cron 表达式按本机时间匹配，不另建时区配置。进程错过触发
+  分钟则跳过该 occurrence、不补跑（时效性内容，补跑会与下一次撞车）。触发标记
+  `last_fired` 随 durable job 落盘，同一分钟重启不重复触发；occurrence ID 取
+  `heartbeat:YYYY-MM-DDTHH:MM`（来自触发分钟），生成与入队两层去重。
+- **只读摘要与投递**：摘要包含任务板状态计数（最近 500 个任务文件）、工作区
+  `git status` 改动与最近提交、待审批数量（只按工具名计数），不含命令正文、凭据
+  或工具参数；git 调用带 `GIT_OPTIONAL_LOCKS=0`。摘要写入本地 outbox（最多 7 条）
+  后才记 state；`GET /v1/heartbeat` 拉取、`POST /v1/heartbeat/{occurrence}/ack`
+  确认，网关每 60s 轮询并推送到所有绑定会话，全部发送成功才 ack，失败保留重试
+  （至少一次，崩溃窗口允许重复）。开关：`HARNESS_HEARTBEAT=0` 关闭，
+  `HARNESS_HEARTBEAT_CRON` 覆盖表达式。
+- **审批超时可观测**：`PermissionGate` 支持注入 `on_timeout` 观察者（锁外调用，
+  异常只打印）；`hooks.py` 在超时后向会话流追加
+  `approval_timeout{request_id, tool, reason, source, timeout_s}`。watcher 按
+  request_id 去重并推送“审批超时、已按拒绝处理”，与 agent/用户主动拒绝可区分。
+  模型侧的拒绝文案改为 `Permission denied: approval timed out after Ns with no
+  response`，保留 `Permission denied` 前缀以兼容工具失败判定。
+- **记忆安全**：`extract_memories` 和阈值触发的 `consolidate_memories` 已随成功回合的
+  housekeeping 执行；不再额外加 cron 重复触发。合并流程已改为「校验 → 暂存 → 先落新
+  文件再删旧文件」：校验 schema、类型、条数与重名，暂存文件回读校验后才替换，失败
+  保留旧记忆；写入已加进程内 RLock 与跨进程 OS 锁，单文件与索引都是临时文件 + 原子
+  替换（2026-10-24 完成）。仍欠：daemon 关闭时等待或记录未完成的 housekeeping。
+- **测试**：新增 `tests/test_heartbeat.py`（注册幂等/保留手改表达式/关闭开关、摘要
+  计数与非 git 工作区、空活动、occurrence 去重、outbox 上限与 ack、cron 拦截不经过
+  模型、混合普通 cron 仍正常下发、API 列表/ack/404/401）与
+  `tests/test_approval_timeout_event.py`（观察者只触发一次、观察者异常不影响拒绝、
+  超时文案与事件、无孤儿会话文件）；watcher 与网关补审批超时推送/去重、心跳投递
+  与未 ack 保留。记忆故障测试见 `tests/test_memory_safety.py`。
+
+仍欠：副作用任务的授权与审批；真实终端/飞书端到端验收（心跳推送、审批超时卡片）。
 
 ### 阶段 3（可选，单独评估）：TUI 转客户端
 
@@ -183,5 +215,5 @@ TUI attach 到 daemon（SSE 渲染、steer/审批下发），让终端和手机�
 
 - **阶段 0**：两个进程争抢全局回合协调器，只有一个成功；同一进程中的 API、TUI、cron 不绕过协调器；竞争者得到明确拒绝，TUI 原文仍可取回；变更会话元数据与活动回合不会交错；杀死持锁子进程后可立即重新获取；重复启动/关闭 API lifespan 不遗留 scheduler 线程。
 - **阶段 1**：手机 steer 能影响后续模型轮次，竞态下不会丢失；interrupt 只影响目标活动回合；完成、失败、取消都有持久终态事件；TUI 发起的回合按来源策略通知；watcher 重启可从持久游标续传，允许并记录发送与游标提交之间的重复窗口，不承诺不重放且不漏发。
-- **阶段 2**：`/cron` 权限、持久化、时区、misfire 和重启行为符合定义；默认心跳每天只创建一个逻辑 occurrence，内容只读；通知遵循至少一次语义并允许记录到的重复；记忆合并失败或中途崩溃时旧数据完整，连续多会话后索引与文件一致。
+- **阶段 2**：`/cron` 权限、持久化、时区、misfire 和重启行为符合定义；默认心跳每天只创建一个逻辑 occurrence，内容只读，网关离线期间不漏发且允许记录到的重复；审批超时产生可区分的 `approval_timeout` 事件并推送到手机；记忆合并失败或中途崩溃时旧数据完整，连续多会话后索引与文件一致。
 - **全程**：自动化测试与真实终端/飞书验收分开记录；按 [UI_TERMINAL_ACCEPTANCE.md](UI_TERMINAL_ACCEPTANCE.md) 留存版本、设备、逐项结果、失败和复测记录。

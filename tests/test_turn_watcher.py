@@ -111,6 +111,50 @@ def test_stalled_hint_is_sent_once_and_never_called_a_failure(tmp_path):
     assert watcher.check_stalled() == 0
 
 
+def test_approval_timeout_notifies_once_per_request(tmp_path):
+    """超时事件与回合终态独立：即使回合随后跑完，也只推一次『无人应答』。"""
+    sent = []
+    events = [{'seq': 1, 'type': 'approval_timeout', 'request_id': 'perm_1',
+               'tool': 'bash', 'reason': 'destructive', 'timeout_s': 300.0,
+               'ts': time.time()},
+              _started(2, 't1', time.time()), _terminal(3, 't1')]
+    watcher, state, _fetch = _watcher(tmp_path, [events, events], sent)
+
+    first = watcher.poll_once('s1')
+    assert first['notified'] == 2
+    assert [item[1] for item in sent] == ['approval_timeout', 'terminal']
+    assert sent[0][2]['request_id'] == 'perm_1'
+    assert state.cursor('s1') == 3
+
+    assert watcher.poll_once('s1')['notified'] == 0
+    assert len(sent) == 2
+
+
+def test_approval_timeout_delivery_failure_retries(tmp_path):
+    sent = []
+    state = WatchState(tmp_path / 'watch.json')
+    event = {'seq': 1, 'type': 'approval_timeout', 'request_id': 'perm_2',
+             'tool': 'write', 'reason': 'sensitive path', 'timeout_s': 60.0}
+    attempts = {'fail': True}
+
+    def fetch(session_id, after):
+        return [event], 1
+
+    def notify(session_id, kind, payload):
+        if attempts['fail']:
+            attempts['fail'] = False
+            raise RuntimeError('feishu down')
+        sent.append((session_id, kind, dict(payload)))
+
+    watcher = TurnWatcher(state, fetch=fetch, notify=notify,
+                          sessions=lambda: ['s1'])
+    assert watcher.poll_once('s1')['error'] == 'notify_failed'
+    assert state.cursor('s1') == 0
+    assert watcher.poll_once('s1')['notified'] == 1
+    assert sent and sent[0][1] == 'approval_timeout'
+    assert state.cursor('s1') == 1
+
+
 def test_state_survives_restart(tmp_path):
     sent = []
     events = [_started(1, 't1', time.time()), _terminal(2, 't1')]

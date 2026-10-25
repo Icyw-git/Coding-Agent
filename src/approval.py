@@ -5,6 +5,8 @@
 懒加载。这样 gate 可以脱离运行时单测，也不会把审批状态复制到两个模块。
 
 超时未决议一律拒绝（fail-safe），默认 300s（HARNESS_APPROVAL_TIMEOUT 可调）。
+超时不是一次普通的「用户拒绝」：调用方可通过 ``on_timeout`` 注入观察者，把
+「无人应答」写成显式会话事件，远程端因此能区分主动拒绝与审批通道失联。
 """
 
 import os
@@ -112,12 +114,18 @@ class PermissionGate:
 
     def __init__(self, timeout: float | None = None, *,
                  session_id_provider: Callable[[], str] | None = None,
-                 reset_grants: Callable[[], None] | None = None) -> None:
-        """session_id_provider / reset_grants 由 hooks 注入（见模块说明）。"""
+                 reset_grants: Callable[[], None] | None = None,
+                 on_timeout: Callable[[PermissionRequest], None] | None = None) -> None:
+        """session_id_provider / reset_grants / on_timeout 由 hooks 注入（见模块说明）。
+
+        ``on_timeout`` 在请求因超时被判为 ``timeout`` 后调用一次（已离开 Gate 内部锁）；
+        观察者抛异常只打印，不影响拒绝结果 —— 记录观察性事件不能反过来放行操作。
+        """
         self.timeout = (float(timeout) if timeout is not None
                         else approval_timeout())
         self._session_id_provider = session_id_provider or (lambda: '')
         self._reset_grants = reset_grants or (lambda: None)
+        self._on_timeout = on_timeout
         self.backend = 'console'   # console | remote
         self._lock = threading.RLock()
         self._requests: dict[str, PermissionRequest] = {}
@@ -321,12 +329,33 @@ class PermissionGate:
     def _await_remote(self, req: PermissionRequest) -> None:
         signalled = req._event.wait(self.timeout)
         if not signalled:
+            timed_out = False
             with self._lock:
                 if req.status == 'pending':
                     req.status, req.resolved_by = 'timeout', 'gate'
+                    timed_out = True
+            # 观察者在锁外调用：写会话事件要走文件 I/O，不能卡住别的登记/决议。
+            if timed_out:
+                self._report_timeout(req)
+
+    def _report_timeout(self, req: PermissionRequest) -> None:
+        """通知超时观察者；观察本身失败不能让审批链路改变结果。"""
+        callback = self._on_timeout
+        if callback is None:
+            return
+        try:
+            callback(req)
+        except Exception as exc:
+            print(f'  \033[33m[permission] timeout observer failed: '
+                  f'{type(exc).__name__}: {exc}\033[0m', file=sys.stderr)
 
     def _conclude(self, req: PermissionRequest, *,
                   quiet: bool = False) -> tuple[bool, str]:
+        """返回 ``(allowed, '<status> [req_id] tool: reason')``。
+
+        首段是终态（approved / denied / timeout），调用方据此区分「用户拒绝」与
+        「无人应答」；只把两者都折成一句固定拒绝语，模型和远程端都看不到审批
+        通道是否失联。"""
         allowed = req.status == 'approved'
         message = f'{req.status} [{req.req_id}] {req.tool}: {req.reason}'
         status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}[req.status]

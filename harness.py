@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import checkpoint_commands
 import checkpoints
+import heartbeat
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import llm_config
 import llm_route
@@ -1663,6 +1664,18 @@ def run_agent_turn_locked():
         slot = turn_slot(Path(SESSIONS_DIR).parent)
         with slot:
             fired = consume_cron_queue()
+            if not fired:
+                return
+            # 默认心跳在本地生成只读摘要，不经过模型：拦截掉它的 prompt，避免
+            # 一次巡检变成 AI 回合（占全局回合槽 + 不可预测的写入口）。
+            heartbeats = [job for job in fired if job.id == heartbeat.JOB_ID]
+            for job in heartbeats:
+                try:
+                    heartbeat.run_due(job, workspace=get_workdir())
+                except Exception as exc:
+                    print(f'  \033[31m[heartbeat] failed: '
+                          f'{type(exc).__name__}: {exc}\033[0m')
+            fired = [job for job in fired if job.id != heartbeat.JOB_ID]
             if not fired:
                 return
             prompts = [f'[Scheduled] {job.prompt}' for job in fired]

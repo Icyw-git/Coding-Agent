@@ -112,6 +112,30 @@ def _isolate_storage_dirs(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cron_state():
+    """cron 表是进程级全局：用例之间泄漏会让稳定 ID / 触发断言随执行顺序变化。
+
+    默认心跳按稳定 ID 注册（服务启动路径），如果它从某个用例泄漏到下一个
+    「注册同 ID 应成功」的用例，失败会看起来像随机顺序问题。这里对每个用例
+    保存并清空，结束后按原样还原，不改变任何被测逻辑。
+    """
+    import cron_scheduler
+
+    with cron_scheduler.cron_lock:
+        saved_jobs = dict(cron_scheduler.scheduled_jobs)
+        saved_queue = list(cron_scheduler.cron_queue)
+        cron_scheduler.scheduled_jobs.clear()
+        cron_scheduler.cron_queue.clear()
+    try:
+        yield
+    finally:
+        with cron_scheduler.cron_lock:
+            cron_scheduler.scheduled_jobs.clear()
+            cron_scheduler.scheduled_jobs.update(saved_jobs)
+            cron_scheduler.cron_queue[:] = saved_queue
+
+
+@pytest.fixture(autouse=True)
 def _restore_permission_backend(tmp_path):
     """create_app 会把后端切到 remote；无论测试以何种顺序运行，结束后还原，
     并清空审批历史（请求登记是全局的，泄漏会让后续测试拾取到脏 pending）。

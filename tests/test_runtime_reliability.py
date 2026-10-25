@@ -474,6 +474,9 @@ def test_shell_permission_check_is_case_insensitive(monkeypatch):
             return Path.cwd()
 
     monkeypatch.setattr(hooks, '_h', lambda: HarnessConfig)
+    # 显式钉住 console 后端：别的用例（create_app）会切成 remote，靠用例顺序
+    # 「恰好还是 console」会让这条断言随执行顺序变化。
+    monkeypatch.setattr(hooks.GATE, 'backend', 'console')
     monkeypatch.setattr('builtins.input', lambda _prompt: 'n')
 
     assert hooks.permission_hook('bash', {'command': 'DEL file.txt'}) == 'Permission denied by user'

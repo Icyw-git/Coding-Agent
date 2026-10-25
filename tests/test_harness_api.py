@@ -414,7 +414,9 @@ def test_http_task_is_gated_by_the_policy_tier(tmp_path, api_client, monkeypatch
             break
         time.sleep(0.05)
     assert record['status'] == 'cancelled'
-    assert record['detail'] == 'Permission denied by user'
+    # 超时不是「用户拒绝」：任务详情要保留原因，和审批历史里的 timeout 对齐
+    assert record['detail'] == \
+        'Permission denied: approval timed out after 0.2s with no response'
     assert client.get(f"/v1/tasks/{record['id']}/logs", headers=headers).text == ''
 
 

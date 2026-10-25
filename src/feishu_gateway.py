@@ -67,6 +67,7 @@ from workspace_choices import find_workspace
 
 BINDINGS_PATH = Path(os.getenv('FEISHU_BINDINGS') or paths.cache_path('feishu_bindings.json'))
 PERMISSION_POLL_INTERVAL = 3.0
+HEARTBEAT_POLL_INTERVAL = 60.0   # 心跳是每日摘要，轮询间隔远大于审批
 DISPATCH_WORKERS = 4   # 消息分发线程数：同一聊天内保序，不同聊天并行
 WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须重新 /new
 
@@ -1945,6 +1946,15 @@ class FeishuGateway:
         if kind == 'stalled':
             minutes = max(1, round(float(payload.get('elapsed_s') or 0) / 60))
             text = f'⏳ 回合仍在运行（约 {minutes} 分钟），可能在等待审批或卡住。'
+        elif kind == 'approval_timeout':
+            # 与「用户点了拒绝」区分：这里是审批通道没人应答，操作已按拒绝处理。
+            waited = payload.get('timeout_s')
+            waited_text = f'{waited:g}s' if isinstance(waited, (int, float)) else '超时'
+            tool = approval_view.safe_text(str(payload.get('tool') or '工具'))
+            text = f'⚠️ 审批超时（{waited_text} 无人应答）：{tool} 已按拒绝处理'
+            reason = approval_view.safe_text(str(payload.get('reason') or '')).strip()
+            if reason:
+                text += f'\n原因：{reason[:120]}'
         else:
             status = str(payload.get('status') or 'completed')
             if status == 'completed':
@@ -1970,13 +1980,67 @@ class FeishuGateway:
         return self.watcher.stop(timeout=timeout)
 
     def start_permission_poller(self) -> threading.Thread:
+        """审批轮询（3s）+ 心跳摘要补发（60s），共用一个后台线程。
+
+        心跳不需要卡点：它一天只生成一份，网关离线时摘要留在 API 的 outbox 里，
+        重启后按当前绑定补发；发送与 ack 之间的重复窗口见 heartbeat 模块说明。
+        """
+        next_heartbeat = 0.0   # 启动后第一轮就检查一次（补发离线期间的摘要）
+
         def loop() -> None:
+            nonlocal next_heartbeat
             while not self._poll_stop.wait(PERMISSION_POLL_INTERVAL):
                 self.poll_permissions()
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    next_heartbeat = now + HEARTBEAT_POLL_INTERVAL
+                    try:
+                        self.poll_heartbeat()
+                    except Exception as exc:
+                        print(f'[feishu] heartbeat delivery failed: {exc}')
 
         thread = threading.Thread(target=loop, daemon=True)
         thread.start()
         return thread
+
+    def poll_heartbeat(self) -> int:
+        """把未确认的心跳摘要推给所有已绑定聊天，全部成功后才 ack。
+
+        至少一次：任何一次发送失败都保留 pending，下一轮重试（可能重复推给已经
+        成功的聊天）；没有绑定聊天时也不 ack，等用户绑定后补发。
+        """
+        if self.transport is None:
+            return 0
+        try:
+            pending = self.api.pending_heartbeat()
+        except Exception:
+            return 0
+        if not pending:
+            return 0
+        with self._bindings_lock:
+            chats = list(self.bindings)
+        if not chats:
+            return 0
+        delivered = 0
+        for item in pending:
+            occurrence = str(item.get('occurrence_id') or '')
+            text = str(item.get('text') or '').strip()
+            if not occurrence or not text:
+                continue
+            try:
+                for chat_id in chats:
+                    self.transport.send_text(chat_id, text)
+            except Exception as exc:
+                print(f'[feishu] heartbeat send failed: {exc}')
+                continue
+            try:
+                self.api.ack_heartbeat(occurrence)
+            except Exception as exc:
+                # 已发出但没记上：下一轮会重复推送一次（接受这个窗口）
+                print(f'[feishu] heartbeat ack failed: {exc}')
+                continue
+            delivered += 1
+        return delivered
 
     def stop(self) -> None:
         self._poll_stop.set()

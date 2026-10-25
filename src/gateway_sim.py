@@ -328,6 +328,20 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['pending']
 
+    # ---------- 心跳摘要（至少一次投递） ----------
+
+    def pending_heartbeat(self) -> list[dict]:
+        response = self.http.get('/v1/heartbeat')
+        response.raise_for_status()
+        return response.json()['pending']
+
+    def ack_heartbeat(self, occurrence_id: str) -> dict:
+        from urllib.parse import quote
+        response = self.http.post(
+            f'/v1/heartbeat/{quote(occurrence_id, safe="")}/ack')
+        response.raise_for_status()
+        return response.json()
+
     def search_sessions(self, q: str, limit: int = 10) -> list[dict]:
         response = self.http.get('/v1/sessions/search',
                                  params={'q': q, 'limit': limit})

@@ -45,6 +45,10 @@ class SchedulerService:
                 return False
             if self._load_jobs:
                 cron_scheduler.load_durable_jobs()
+                # 默认心跳按稳定 ID 注册：已有任务时原样保留（用户改过表达式也
+                # 不改），因此重启/重复 start 不会多出一份。
+                import heartbeat
+                heartbeat.ensure_registered()
             self._stop_event = threading.Event()
             scheduler = threading.Thread(
                 target=cron_scheduler.cron_scheduler_loop,

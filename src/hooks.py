@@ -206,9 +206,54 @@ def _reset_grants() -> None:
 # 审批门（approval.PermissionGate）
 # ============================================================
 
+def _record_approval_timeout(req: PermissionRequest) -> None:
+    """审批无人应答 → 写入会话事件流（观察性，不改变流程）。
+
+    远程端/网关看到的是「审批超时」而不是「用户拒绝」：前者说明审批通道失联或
+    没人处理，后者是明确决定。事件只进事件流（SSE / watcher 可选推送），不进
+    消息历史 —— 模型已经从 enforce 的拒绝语拿到原因了。
+
+    没有活动会话（console 路径不会超时、单测没有会话文件）时静默跳过；写事件
+    失败也只打印：观察性记录不能反过来改变一次已经被拒绝的调用。
+    """
+    session_id = req.session_id or current_session_id()
+    if not session_id:
+        return
+    try:
+        h = _h()
+        # 测试用的假 harness 没有会话存储：跳过而不是把它当成写入失败。
+        sessions_dir = getattr(h, 'SESSIONS_DIR', None)
+        store_cls = getattr(h, 'SessionEventStore', None)
+        if sessions_dir is None or store_cls is None:
+            return
+        path = sessions_dir / f'session_{session_id}.jsonl'
+        if not path.is_file():
+            return
+        source = ''
+        try:
+            import turn_control
+            token = turn_control.first_token(session_id)
+            source = token.source if token is not None else ''
+        except Exception:
+            source = ''
+        store_cls.open(path).append(
+            'approval_timeout',
+            request_id=req.req_id,
+            tool=req.tool,
+            reason=str(req.reason)[:200],
+            session_id=session_id,
+            source=source,
+            timeout_s=round(float(GATE.timeout), 1),
+        )
+    except Exception as exc:
+        print(f'  \033[33m[permission] failed to record approval timeout: '
+              f'{type(exc).__name__}: {exc}\033[0m')
+
+
 GATE = PermissionGate(
     session_id_provider=current_session_id,
     reset_grants=_reset_grants,
+    on_timeout=_record_approval_timeout,
 )
 
 
@@ -315,8 +360,14 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         issue_grant(tool, args)
         return None
     ask = GATE.decide if interactive else GATE.decide_queued
-    allowed, _message = ask(tool, args, decision.reason)
+    allowed, message = ask(tool, args, decision.reason)
     if not allowed:
+        # message 首段是终态（approval.PermissionGate._conclude）。超时要和「用户
+        # 拒绝」区分开：模型据此决定是换个方式还是稍后重试，远程端也能看到审批
+        # 通道失联（会话事件由 _record_approval_timeout 落盘）。
+        if message.split(' ', 1)[0] == 'timeout':
+            return (f'Permission denied: approval timed out after '
+                    f'{GATE.timeout:g}s with no response')
         # 对模型的固定拒绝语（保持旧契约）；细节（req_id / 原因）在审批历史里
         return 'Permission denied by user'
     issue_grant(tool, args)

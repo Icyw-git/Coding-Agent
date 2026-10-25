@@ -1173,6 +1173,53 @@ def test_watcher_skips_feishu_turns_and_reports_failures(gateway, tmp_path):
     assert 'turn' not in fake.last() and '来源' not in fake.last()
 
 
+def test_watcher_pushes_approval_timeout_distinctly(gateway, tmp_path):
+    """审批超时通知要和「用户拒绝」「回合失败」区分开，且只推一次。"""
+    from session_store import SessionEventStore
+
+    gw, fake = gateway
+    gw.on_message('chat-approval-timeout', 'hi')
+    session_id = gw.bindings['chat-approval-timeout']
+    store = SessionEventStore.open(
+        tmp_path / 'sessions' / f'session_{session_id}.jsonl')
+    store.append('approval_timeout', request_id='perm_timeout', tool='bash',
+                 reason='destructive command', timeout_s=300.0)
+
+    assert gw.watcher.poll_once(session_id)['notified'] == 1
+    text = fake.last()
+    assert '审批超时' in text and 'bash' in text and '无人应答' in text
+    assert '回合失败' not in text
+
+    assert gw.watcher.poll_once(session_id)['notified'] == 0
+
+
+def test_heartbeat_summary_is_delivered_and_acked(gateway, tmp_path, monkeypatch):
+    """网关领走 outbox 摘要 → 推给绑定聊天 → ack；重复轮询不再推。"""
+    import heartbeat
+
+    monkeypatch.setattr(heartbeat, 'OUTBOX_PATH', tmp_path / 'outbox.json')
+    gw, fake = gateway
+    gw.on_message('chat-heartbeat', 'hi')
+    heartbeat.queue_summary('heartbeat:2026-10-25T09:00', '🫀 每日摘要 · 测试')
+
+    assert gw.poll_heartbeat() == 1
+    assert '每日摘要' in fake.last()
+    assert heartbeat.pending() == []
+    assert gw.poll_heartbeat() == 0
+
+
+def test_heartbeat_stays_pending_without_a_bound_chat(gateway, tmp_path, monkeypatch):
+    import heartbeat
+
+    monkeypatch.setattr(heartbeat, 'OUTBOX_PATH', tmp_path / 'outbox.json')
+    gw, _fake = gateway
+    heartbeat.queue_summary('heartbeat:2026-10-25T09:00', '🫀 每日摘要 · 无人接收')
+
+    assert gw.poll_heartbeat() == 0
+    assert [item['occurrence_id'] for item in heartbeat.pending()] \
+        == ['heartbeat:2026-10-25T09:00']
+
+
 def test_cron_commands_list_add_and_delete(gateway, tmp_path, monkeypatch):
     import cron_scheduler
 
