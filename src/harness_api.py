@@ -104,6 +104,14 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             if scheduler is not None:
                 if not scheduler.stop():
                     logger.warning('cron scheduler threads did not stop in time')
+            if owns_runtime:
+                # 回合后的标题/记忆整理可能还在写会话日志：有界等待并记录
+                # 未完成的作业（线程名带会话 id），再进入 MCP 关闭流程。
+                pending = await asyncio.to_thread(
+                    harness.shutdown_housekeeping, 10)
+                if pending:
+                    logger.warning('housekeeping still running: %s',
+                                   ', '.join(pending))
             try:
                 try:
                     await asyncio.to_thread(tasks.close)

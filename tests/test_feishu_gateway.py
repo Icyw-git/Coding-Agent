@@ -1254,6 +1254,27 @@ def test_cron_command_usage_and_unknown_job(gateway):
     assert 'not found' in fake.last() or '404' in fake.last()
 
 
+def test_cron_add_is_read_only_unless_writes_flag(gateway, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    gw, fake = gateway
+
+    gw.on_message('chat-cron-w', '/cron add "0 9 * * *" 只读汇报')
+    assert '只读' in fake.last()
+
+    gw.on_message('chat-cron-w', '/cron add --writes "0 10 * * *" 修改文件')
+    assert '可写' in fake.last() and '修改文件' in fake.last()
+
+    gw.on_message('chat-cron-w', '/cron list')
+    assert '[recurring · 只读]' in fake.last()
+    assert '[recurring · 可写]' in fake.last()
+
+    # 只有开关没有表达式：退回用法，不创建任务
+    gw.on_message('chat-cron-w', '/cron add --writes')
+    assert '用法' in fake.last()
+
+
 def _last_card_text(fake) -> str:
     """把最近一张卡片拍平成字符串，便于断言内容（卡片是结构化 JSON）。"""
     import json

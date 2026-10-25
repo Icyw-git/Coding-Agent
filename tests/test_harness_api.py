@@ -672,3 +672,28 @@ def test_api_cron_crud(api_client, tmp_path, monkeypatch):
     assert client.delete('/v1/crons/heartbeat', headers=headers).status_code == 200
     assert client.delete('/v1/crons/heartbeat', headers=headers).status_code == 404
     assert client.get('/v1/crons', headers=headers).json()['jobs'] == []
+
+
+@pytest.mark.skipif(not fastapi_available, reason="FastAPI is an optional dependency")
+def test_api_cron_defaults_to_read_only(api_client, tmp_path, monkeypatch):
+    import cron_scheduler
+
+    monkeypatch.setattr(cron_scheduler, 'DURABLE_PATH', tmp_path / 'crons.json')
+    client = api_client(create_app(FakeRuntime(), api_token='t',
+                                   task_root=tmp_path / 'tasks'))
+    headers = {'Authorization': 'Bearer t'}
+
+    default = client.post('/v1/crons', json={
+        'cron': '0 9 * * *', 'prompt': 'report', 'id': 'ro'}, headers=headers)
+    assert default.status_code == 201
+    assert default.json()['allow_side_effects'] is False
+
+    writable = client.post('/v1/crons', json={
+        'cron': '0 10 * * *', 'prompt': 'patch', 'id': 'rw',
+        'allow_side_effects': True}, headers=headers)
+    assert writable.status_code == 201
+    assert writable.json()['allow_side_effects'] is True
+
+    modes = {job['id']: job['allow_side_effects']
+             for job in client.get('/v1/crons', headers=headers).json()['jobs']}
+    assert modes == {'ro': False, 'rw': True}

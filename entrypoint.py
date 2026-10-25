@@ -143,6 +143,9 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print('\n[会话已中断]')
     finally:
+        # 回合后的标题/记忆整理还在写会话日志：先有界等待，超时留下带会话
+        # id 的告警，再关 MCP，避免后台写入与进程退出赛跑。
+        harness.shutdown_housekeeping(timeout=10)
         harness.wait_for_mcp_tools(10)
         harness.shutdown_mcp()
     return 0

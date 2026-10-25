@@ -11,7 +11,8 @@ from api_models import CreateCronRequest
 def _as_dict(job) -> dict:
     return {'id': job.id, 'cron': job.cron, 'prompt': job.prompt,
             'recurring': job.recurring, 'durable': job.durable,
-            'last_fired': job.last_fired}
+            'last_fired': job.last_fired,
+            'allow_side_effects': bool(getattr(job, 'allow_side_effects', False))}
 
 
 def build_router():
@@ -31,7 +32,8 @@ def build_router():
     def create_cron(request: CreateCronRequest):
         job = cron_scheduler.schedule_job(
             request.cron, request.prompt, request.recurring,
-            request.durable, job_id=request.id)
+            request.durable, job_id=request.id,
+            allow_side_effects=request.allow_side_effects)
         if isinstance(job, str):
             status = 409 if 'already exists' in job else 400
             raise HTTPException(status_code=status, detail=job)

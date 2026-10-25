@@ -120,9 +120,11 @@ class GatewayClient:
 
     def create_cron(self, cron: str, prompt: str, *,
                     recurring: bool = True, durable: bool = True,
-                    job_id: str | None = None) -> dict:
+                    job_id: str | None = None,
+                    allow_side_effects: bool = False) -> dict:
         payload = {'cron': cron, 'prompt': prompt,
-                   'recurring': recurring, 'durable': durable}
+                   'recurring': recurring, 'durable': durable,
+                   'allow_side_effects': allow_side_effects}
         if job_id:
             payload['id'] = job_id
         return self._json(self.http.post('/v1/crons', json=payload), 'create cron')

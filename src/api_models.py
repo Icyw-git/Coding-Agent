@@ -28,6 +28,8 @@ if BaseModel is not None:
         recurring: bool = True
         durable: bool = True
         id: str | None = Field(default=None, max_length=80)
+        # 默认只读；显式开启后定时回合才允许写操作/联网/第三方工具（仍走审批）。
+        allow_side_effects: bool = False
 
     class SteerRequest(BaseModel):
         content: str = Field(min_length=1)

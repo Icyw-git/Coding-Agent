@@ -18,6 +18,9 @@ class CronJob:
     # 本分钟标记（"YYYY-MM-DD HH:MM"）。随 durable job 一起落盘：进程在同一分钟内
     # 重启不会把同一个 occurrence 再触发一次。
     last_fired:str=''
+    # 默认 False = 定时回合只读：写文件、联网、第三方工具、子代理一律拒绝。
+    # 创建时显式开启才允许副作用，届时仍走正常审批（远程队列，不读 stdin）。
+    allow_side_effects:bool=False
 
 scheduled_jobs:dict[str,CronJob]={} # id -> job
 cron_queue:list[CronJob]=[] #任务队列
@@ -143,11 +146,13 @@ def load_durable_jobs(): #加载持久化任务，将有效任务添加到schedu
         print(f"  \033[31m[cron] failed to load durable jobs: {exc}\033[0m")
 
 def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
-                 job_id:str|None=None): #注册一个cron任务
+                 job_id:str|None=None,allow_side_effects:bool=False): #注册一个cron任务
     """
     Register a cron job with the scheduler.
 
     job_id 可指定稳定 ID（如 heartbeat）：已存在时返回错误字符串，由调用方转成 409。
+    allow_side_effects 默认 False：定时回合按只读策略执行，写操作/联网/第三方工具
+    会被拒绝；只有在创建时显式开启的任务里才走正常审批。
     """
 
     err=validate_cron(cron)
@@ -163,6 +168,7 @@ def schedule_job(cron:str,prompt:str,recurring:bool=True,durable:bool=True,
             prompt=prompt,
             recurring=recurring, # 是否重复执行
             durable=durable, # 是否持久化存储
+            allow_side_effects=bool(allow_side_effects),
         )
         scheduled_jobs[job.id]=job
     if durable: # 如果任务持久化存储，保存持久化存储
@@ -219,13 +225,21 @@ def cron_scheduler_loop(stop_event=None): #cron任务调度循环，每秒检查
         tick()
 
 
-def consume_cron_queue()->list[CronJob]: #消费cron队列中的任务，返回已触发的任务列表，
-    """
-    Consume cron jobs from the queue.
+def consume_cron_queue(predicate=None)->list[CronJob]: #消费cron队列中的任务，返回已触发的任务列表，
+    """取走队列里的任务；predicate 为空时全部取走。
+
+    带 predicate 时只取匹配的任务，其余留在队列里（不丢弃）：交互回合执行期间
+    只应消费「心跳」与显式允许副作用的任务，只读任务留给专用 cron 回合，避免
+    借当前会话的写权限执行。
     """
     with cron_lock:
-        fired=list(cron_queue) # 复制队列，避免并发修改
-        cron_queue.clear() # 清空队列
+        if predicate is None:
+            fired=list(cron_queue) # 复制队列，避免并发修改
+            cron_queue.clear() # 清空队列
+        else:
+            fired=[job for job in cron_queue if predicate(job)]
+            if fired:
+                cron_queue[:]=[job for job in cron_queue if not predicate(job)]
     return fired
 
 def _has_cron_queue()->bool: #检查cron队列是否为空

@@ -51,6 +51,7 @@ from exec_policy import (
     READ_ONLY_FILE_TOOLS,
     READ_WRITE_TOOLS,
     Decision,
+    Policy,
     approval_class,
     classify_path,
     grant_key,
@@ -100,7 +101,10 @@ __all__ = [
     'take_grant',
     'take_grants',
     'use_grants',
+    'use_scheduled_turn',
     'use_session',
+    'scheduled_read_only',
+    'scheduled_turn',
 ]
 
 
@@ -115,6 +119,31 @@ def _h():
 
 _SESSION_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
     'harness_session_id', default='')
+
+
+# 定时回合上下文：None = 普通交互/API 回合；True = 只读定时回合；
+# False = 创建时显式允许副作用的定时回合。只读定时回合不能借当前会话的
+# 交互权限执行写操作；两种定时回合都不读 stdin（审批进远程/本地队列）。
+_SCHEDULED_READ_ONLY: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    'harness_scheduled_read_only', default=None)
+
+
+@contextlib.contextmanager
+def use_scheduled_turn(*, read_only: bool = True):
+    """标记当前线程正在执行定时任务回合（run_agent_turn_locked 使用）。"""
+    token = _SCHEDULED_READ_ONLY.set(bool(read_only))
+    try:
+        yield
+    finally:
+        _SCHEDULED_READ_ONLY.reset(token)
+
+
+def scheduled_turn() -> bool:
+    return _SCHEDULED_READ_ONLY.get() is not None
+
+
+def scheduled_read_only() -> bool:
+    return _SCHEDULED_READ_ONLY.get() is True
 
 
 @contextlib.contextmanager
@@ -265,8 +294,11 @@ def is_tool_hook(tool:str,args:dict):
 
 def permission_hook(tool:str,args:dict):
     """PreToolUse：交互式（CLI 主循环 / API 会话主线程）策略闸门。
-    返回 None 放行，返回字符串即拒绝（写回 tool 消息给模型）。"""
-    return enforce(tool, args, interactive=True)
+    返回 None 放行，返回字符串即拒绝（写回 tool 消息给模型）。
+
+    定时任务回合跑在后台线程：即使创建时授权了副作用，审批也进队列
+    （decide_queued），不能从 cron 线程抢 stdin。"""
+    return enforce(tool, args, interactive=not scheduled_turn())
 
 
 # ============================================================
@@ -280,6 +312,16 @@ def permission_hook(tool:str,args:dict):
 # 批准一次后同会话内同名工具不再重复问。
 
 EXTERNAL_TOOLS: set[str] = set()
+# 定时只读回合额外拦掉的工具：它们要么会改写状态但不经过文件/命令策略
+# （任务板、todo、cron 表、团队协作），要么会把只读标记带丢后重新获得写权限
+# （子代理、worktree）。返回值是给模型看的拒绝语，不是安全边界。
+SCHEDULED_FORBIDDEN_TOOLS = frozenset({
+    'task', 'spawn_teammate', 'send_message', 'request_shutdown',
+    'request_plan', 'review_plan', 'schedule_cron', 'cancel_cron',
+    'create_task', 'claim_task', 'complete_task', 'todo_write',
+    'create_worktree', 'remove_worktree', 'keep_worktree',
+    'kill_background',
+})
 # 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
 # 整批就按该分区判定，避免被同批的工作区内文件稀释。
 _PATH_ZONE_RANK = {
@@ -335,9 +377,25 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     interactive=True：调用线程可以问人（PreToolUse hook 跑在主循环里）；
     False：工作线程（teammate / 后台 worker / 任务 runner），询问进远程审批队列，
     超时拒绝。
+
+    定时任务默认按 read-only 档重判：写文件、联网、第三方工具、子代理直接拒绝，
+    不进入审批 —— 没人授权过这个任务的副作用，不能让它借当前会话的档位执行。
     """
     policy = load_policy()
     decision = evaluate_call(tool, args, policy=policy)
+    if scheduled_read_only():
+        if tool in SCHEDULED_FORBIDDEN_TOOLS:
+            return _scheduled_readonly_error(tool)
+        if decision.denied:
+            return deny_message(decision)
+        # 用 read-only + never 复核：工作区写改在默认档是 ALLOW，只读档才会
+        # 变成 ASK，never 再把它折成 DENY。硬拒（秘密路径/黑名单）保持原文案。
+        readonly = evaluate_call(
+            tool, args, policy=Policy(sandbox_mode='read-only',
+                                      approval_policy='never'))
+        if readonly.denied:
+            return _scheduled_readonly_error(tool)
+        return None
     if decision.allowed:
         return None
     if decision.denied:
@@ -386,6 +444,16 @@ def enforce_headless(tool: str, args: dict) -> str | None:
     if error is None:
         take_grant(tool, args)   # 消费掉刚登记的凭据，不留给下一次同名调用
     return error
+
+
+def _scheduled_readonly_error(tool: str) -> str:
+    """只读定时任务触碰副作用时的拒绝语。
+
+    文案要点名「这是任务配置，不是一次审批」：模型不该反复换写法重试，用户
+    需要到 /cron 重新创建任务并显式允许副作用。"""
+    return (f'Error: scheduled task is read-only; {tool} is not allowed. '
+            'Re-create the job with allow_side_effects enabled to permit '
+            'side effects (approval still applies).')
 
 
 def deny_message(decision) -> str:

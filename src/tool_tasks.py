@@ -51,10 +51,12 @@ def run_complete_task(task_id: str) -> str:
 
 def run_schedule_cron(cron: str, prompt: str,
                       recurring: bool = True, durable: bool = True) -> str:
+    # 模型不能给自己授权副作用：schedule_job 的默认值就是只读；需要写操作
+    # 由用户在 /cron add --writes 里显式开启。
     result = schedule_job(cron, prompt, recurring, durable)
     if isinstance(result, str):
         return f"Error: {result}"
-    return f"Scheduled {result.id}: '{cron}' → {prompt}"
+    return f"Scheduled {result.id}: '{cron}' → {prompt} (read-only)"
 
 
 def run_list_crons() -> str:
@@ -66,8 +68,9 @@ def run_list_crons() -> str:
     for j in jobs:
         tag = "recurring" if j.recurring else "one-shot"
         dur = "durable" if j.durable else "session"
+        mode = "" if getattr(j, 'allow_side_effects', False) else " (read-only)"
         lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
-                     f"[{tag}, {dur}]")
+                     f"[{tag}, {dur}]{mode}")
     return "\n".join(lines)
 
 

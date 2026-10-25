@@ -795,6 +795,32 @@ def housekeeping_busy() -> bool:
         return any(thread.is_alive() for thread in _housekeeping_threads)
 
 
+def housekeeping_pending() -> list[str]:
+    """仍在运行的整理作业（线程名带会话 id，便于关闭时定位）。"""
+    with _housekeeping_lock:
+        _housekeeping_threads[:] = [thread for thread in _housekeeping_threads
+                                    if thread.is_alive()]
+        return [thread.name for thread in _housekeeping_threads]
+
+
+def shutdown_housekeeping(timeout: float = 10.0) -> list[str]:
+    """退出前等待后台整理；返回超时仍未结束的作业名并打印告警。
+
+    与 ``wait_for_housekeeping`` 的区别是「收尾」：发生超时会留下可诊断的
+    warning（线程名带会话 id），不会静默丢弃未写完的标题/记忆。"""
+    deadline = time.time() + timeout
+    with _housekeeping_lock:
+        threads = list(_housekeeping_threads)
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.time()))
+    pending = housekeeping_pending()
+    if pending:
+        shown = '、'.join(pending[:5]) + ('…' if len(pending) > 5 else '')
+        print(f'  \033[33m[housekeeping] {len(pending)} 项未在 {timeout:g}s '
+              f'内结束：{shown}\033[0m')
+    return pending
+
+
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
         return f'{n / 1_000_000:.2f}M'
@@ -1234,6 +1260,7 @@ def _finish_response(state: _TurnState, message, *, pre_compress: list,
         housekeeping_thread = threading.Thread(
             target=_post_turn_housekeeping,
             args=(pre_compress, list(state.messages), state.session_store, state.turn_no),
+            name=f'housekeeping:{state.session_store.session_id}:{state.turn_no}',
             daemon=True,
         )
         with _housekeeping_lock:
@@ -1445,7 +1472,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                 session_store.append_message(reminder)
                 state.rounds_since_todo = 0
 
-            fired = consume_cron_queue()   # 消费 cron 任务列
+            fired = _consume_cron_for_running_turn()   # 只取心跳与显式可写任务
             for job in fired:
                 cron_message = {
                     'role': 'user',
@@ -1651,6 +1678,35 @@ def create_runtime(*, initialize_tools: bool = True) -> AgentRuntime:
     )
 
 
+def _run_heartbeat_jobs(jobs) -> None:
+    """本地生成心跳摘要；失败只告警（摘要不能拖垮回合）。"""
+    for job in jobs:
+        try:
+            heartbeat.run_due(job, workspace=get_workdir())
+        except Exception as exc:
+            print(f'  \033[31m[heartbeat] failed: '
+                  f'{type(exc).__name__}: {exc}\033[0m')
+
+
+def _consume_cron_for_running_turn():
+    """交互回合执行中消费 cron：只取心跳与创建时显式允许副作用的任务。
+
+    只读任务留在队列里，等专用 cron 回合按 read-only 策略跑 —— 当前回合的写
+    权限属于正在操作的用户，不属于那份任务配置。心跳是本地只读摘要，随时可跑。
+    当前回合本身就是只读定时回合时，也不再吞别的任务（避免可写任务被注入到
+    只读上下文里执行）。
+    """
+    if hooks.scheduled_read_only():
+        _run_heartbeat_jobs(
+            consume_cron_queue(lambda job: job.id == heartbeat.JOB_ID))
+        return []
+    fired = consume_cron_queue(
+        lambda job: job.id == heartbeat.JOB_ID
+        or bool(getattr(job, 'allow_side_effects', False)))
+    _run_heartbeat_jobs(job for job in fired if job.id == heartbeat.JOB_ID)
+    return [job for job in fired if job.id != heartbeat.JOB_ID]
+
+
 def run_agent_turn_locked():
     """持锁状态下执行一轮对话（供 queue_processor_loop 调用）：
     消费 cron 队列 → 构造 user 消息 → agent_loop。
@@ -1669,20 +1725,23 @@ def run_agent_turn_locked():
             # 默认心跳在本地生成只读摘要，不经过模型：拦截掉它的 prompt，避免
             # 一次巡检变成 AI 回合（占全局回合槽 + 不可预测的写入口）。
             heartbeats = [job for job in fired if job.id == heartbeat.JOB_ID]
-            for job in heartbeats:
-                try:
-                    heartbeat.run_due(job, workspace=get_workdir())
-                except Exception as exc:
-                    print(f'  \033[31m[heartbeat] failed: '
-                          f'{type(exc).__name__}: {exc}\033[0m')
+            _run_heartbeat_jobs(heartbeats)
             fired = [job for job in fired if job.id != heartbeat.JOB_ID]
             if not fired:
                 return
             prompts = [f'[Scheduled] {job.prompt}' for job in fired]
-            print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s)\033[0m")
+            # 一批任务按最严档执行：只要混入一个默认只读任务，整批都只读。
+            # 同一分钟混跑只读与可写任务很少见，保守处理优于让只读 prompt
+            # 借同批可写任务的授权执行。
+            read_only = not all(getattr(job, 'allow_side_effects', False)
+                                for job in fired)
+            mode = 'read-only' if read_only else 'side-effects'
+            print(f"  \033[35m[cron turn] {len(fired)} scheduled job(s) "
+                  f"[{mode}]\033[0m")
             try:
-                agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}],
-                           turn_source='cron')
+                with hooks.use_scheduled_turn(read_only=read_only):
+                    agent_loop([{'role': 'user', 'content': '\n'.join(prompts)}],
+                               turn_source='cron')
             except KeyboardInterrupt:
                 print('\n[会话已中断]')
     except TurnBusy:

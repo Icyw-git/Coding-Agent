@@ -261,23 +261,38 @@ def _is_missing_session(exc: BaseException) -> bool:
     return getattr(response, 'status_code', None) == 404
 
 
-def _split_cron_add(rest: str) -> tuple[str, str]:
+_CRON_WRITE_FLAGS = ('--writes', '--allow-writes', '--side-effects')
+
+
+def _split_cron_add(rest: str) -> tuple[str, str, bool]:
     """解析 `/cron add` 的参数：支持引号包住表达式，也支持五段裸写。
 
     cron 表达式本身含空格（5 段），所以不能直接 `partition(' ')`；引号形式
     `"0 9 * * *" 提示词` 与裸写 `0 9 * * * 提示词` 都接受。
+
+    默认创建只读任务；`--writes` 必须写在最前面，表示显式授权定时回合产生
+    副作用（写文件、联网、第三方工具）。返回值第三项就是这份授权。
     """
     text = rest.strip()
+    allow_side_effects = False
+    for flag in _CRON_WRITE_FLAGS:
+        if text.casefold() == flag:
+            return '', '', False
+        if text.casefold().startswith(flag + ' '):
+            allow_side_effects = True
+            text = text[len(flag):].strip()
+            break
     if text[:1] in (chr(34), chr(39)):
         quote = text[0]
         end = text.find(quote, 1)
         if end == -1:
-            return '', ''
-        return text[1:end].strip(), text[end + 1:].strip()
+            return '', '', allow_side_effects
+        return (text[1:end].strip(), text[end + 1:].strip(),
+                allow_side_effects)
     parts = text.split(None, 5)
     if len(parts) < 6:
-        return '', ''
-    return ' '.join(parts[:5]), parts[5].strip()
+        return '', '', allow_side_effects
+    return ' '.join(parts[:5]), parts[5].strip(), allow_side_effects
 
 
 class LarkTransport:
@@ -1135,6 +1150,7 @@ class FeishuGateway:
             '用法:',
             '/cron                     列出定时任务',
             '/cron add "<分 时 日 月 周>" <提示词>',
+            '/cron add --writes "<分 时 日 月 周>" <提示词>  允许副作用',
             '/cron delete <job_id>',
         ])
         text = argument.strip()
@@ -1151,8 +1167,9 @@ class FeishuGateway:
             lines = ['定时任务:']
             for job in jobs:
                 kind = 'recurring' if job.get('recurring') else 'one-shot'
+                mode = '可写' if job.get('allow_side_effects') else '只读'
                 lines.append(f"  {job['id']}: '{job['cron']}' → "
-                             f"{job.get('prompt', '')[:40]} [{kind}]")
+                             f"{job.get('prompt', '')[:40]} [{kind} · {mode}]")
             self._reply(chat_id, chr(10).join(lines))
             return
 
@@ -1160,17 +1177,19 @@ class FeishuGateway:
         action = action.casefold()
         rest = rest.strip()
         if action in ('add', 'create'):
-            expr, prompt = _split_cron_add(rest)
+            expr, prompt, allow_side_effects = _split_cron_add(rest)
             if not expr or not prompt:
                 self._reply(chat_id, usage)
                 return
             try:
-                job = self.api.create_cron(expr, prompt)
+                job = self.api.create_cron(
+                    expr, prompt, allow_side_effects=allow_side_effects)
             except Exception as exc:
                 self._reply(chat_id, f'[cron] {exc}')
                 return
+            mode = '可写（副作用仍需审批）' if allow_side_effects else '只读'
             self._reply(chat_id, f"已创建 {job['id']}: '{job['cron']}' → "
-                                 f"{job['prompt']}")
+                                 f"{job['prompt']}（{mode}）")
             return
         if action in ('delete', 'del', 'rm'):
             if not rest:

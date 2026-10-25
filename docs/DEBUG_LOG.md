@@ -4438,3 +4438,23 @@ ASR API），但这会引入 ffmpeg、ASR provider/key、音频时长/费用和�
 仍然不自动解析 sticker、interactive、share_chat、share_user、location 等非文件消息；
 这些类型会明确提示。测试覆盖 audio/media 落盘、文件扩展名无 gateway 限制和能力提示。
 全量 **1569 passed / 1 skipped**。
+
+## 定时任务默认只读、后台审批与关闭收尾
+
+cron 任务原先继承创建时的会话档位，谁建的任务就以谁的权限在后台跑，没人授权过副作用。
+现在 `CronJob.allow_side_effects` 默认 `False`：只有 `POST /v1/crons` 显式传字段或飞书
+`/cron add --writes ...` 才打开；模型侧 `schedule_cron` 不接受该参数，不能给自己授权。
+
+只读回合在 `hooks.use_scheduled_turn(read_only=True)` 中重判：先按当前策略保留硬拒
+（秘密路径/黑名单），再用 `Policy('read-only', 'never')` 复核，写文件、联网、第三方工具和
+任务/会话控制类工具直接拒绝，**不进入审批**；拒绝语指向“重建任务并显式允许副作用”。
+可写任务的审批走 `decide_queued`，后台线程不会去读 stdin；混合批次取最严档。
+交互回合进行中触发的心跳也不再以 `[Scheduled]` 注入模型，只在本地生成并投递，
+只读任务留到专门的 cron 回合，不借用用户的写权限。
+
+关闭时 housekeeping（标题 + 记忆提炼）不再裸退：`shutdown_housekeeping(timeout)` 有界等待，
+未完成线程按 `housekeeping:<session>:<turn>` 打印告警；API lifespan 与 CLI 退出都调用它。
+
+测试：`tests/test_cron_side_effects.py`（默认只读持久化、只读拒绝矩阵、可写任务走队列、
+混批严格档、长回合过滤）、`tests/test_housekeeping_shutdown.py`、API 与飞书入口用例。
+全量 **1601 passed / 1 skipped**（`test_turn_slot_released_after_turn` 偶发红，单跑通过）。
