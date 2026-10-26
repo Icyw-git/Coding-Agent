@@ -83,14 +83,16 @@ def run_revoke_permissions() -> str:
         removed = []
         if session_id:
             import grants
+            import net_grants
 
-            # 只收回本会话创建的目录授权：人经 API/飞书下的永久授权不归模型管。
+            # 只收回本会话创建的目录/域名授权：人经 API/飞书下的永久授权不归模型管。
             removed = grants.revoke_for_session(session_id)
+            domains = net_grants.revoke_for_session(session_id)
     except Exception as exc:
         return f'Error: {type(exc).__name__}: {exc}'
     for record in removed:
         _record_grant_removal(record, session_id)
-    if removed:
-        return (f'Revoked {count} permission grant(s) and {len(removed)} '
-                'path grant(s) for this session.')
+    if removed or domains:
+        return (f'Revoked {count} permission grant(s), {len(removed)} '
+                f'path grant(s) and {len(domains)} domain rule(s) for this session.')
     return f'Revoked {count} permission grant(s) for this session.'

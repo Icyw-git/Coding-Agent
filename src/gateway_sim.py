@@ -457,6 +457,30 @@ class GatewayClient:
         return self._json(self.http.post('/v1/grants/remove', json=payload),
                           'remove grant')['removed']
 
+    # ---------- 域名策略 ----------
+
+    def list_domains(self) -> list[dict]:
+        return self._json(self.http.get('/v1/net-grants'), 'list domains')['domains']
+
+    def add_domain(self, host: str, *, scope: str = 'allow',
+                   expires: str | None = None, note: str = '',
+                   session_id: str | None = None, by: str = 'feishu') -> dict:
+        payload: dict = {'host': host, 'scope': scope, 'note': note, 'by': by}
+        if expires:
+            payload['expires'] = expires
+        if session_id:
+            payload['session_id'] = session_id
+        return self._json(self.http.post('/v1/net-grants', json=payload),
+                          'add domain')
+
+    def remove_domain(self, host: str, *, session_id: str | None = None,
+                      by: str = 'feishu') -> dict:
+        payload: dict = {'host': host, 'by': by}
+        if session_id:
+            payload['session_id'] = session_id
+        return self._json(self.http.post('/v1/net-grants/remove', json=payload),
+                          'remove domain')['removed']
+
     # ---------- 执行档位 ----------
 
     def get_policy(self) -> dict:

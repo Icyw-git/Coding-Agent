@@ -5101,3 +5101,39 @@ PowerShell 契约含 `$modMap`/`invalid_button`/`invalid_count`/`invalid_wait`�
 ruff 通过。真机只读冒烟：对当前前台窗口（Qoder）执行仅含一个 `wait` 步骤的序列，返回
 `steps=({action:'wait', ok:True})`、1297ms，验证了步骤循环与 wait 分支的运行时路径；本轮
 未注入任何真实键鼠输入，点击/组合键/滚轮仍按验收表由人执行。
+
+
+## P4.2 落地：域名策略（allow / deny / 需审批）
+
+动机：联网请求现在一律审批，日常噪音最大；但直接「联网免审」等于拆掉 exfiltration 边界。
+这里只做「问不问」的分层，不放松「能不能」的校验。
+
+- **`src/net_policy.py`（纯函数）**：匹配只有两种形态——精确主机，和 `*.example.com` 通配子域
+  （**不含**根域本身，想同时放行要两条）。刻意不支持正则与 `*` 全匹配：一条写错的正则等于
+  把出口全开。非 ASCII 主机不参与匹配（IDN 由网络层处理），宁可多问一次。
+  `classify()` 里 **deny 先于 allow**：同时命中按拒绝处理。
+- **`src/net_grants.py`（账本）**：`paths.cache_path('net_grants.json')`，`version: 1`，
+  记录 `host` / `scope` / `expires` / `created_by` / `session_id` / `created_at`。
+  写入走 `exclusive_file_lock` + 临时文件原子替换；读取不加锁。**损坏、未知版本、坏日期
+  一律 fail-closed**（策略层看不到任何规则 = 回到逐个审批），而修改操作直接报错，
+  不静默覆盖用户数据。坏记录逐条跳过并打印，不让一条脏数据废掉整个名单。
+- **策略接入**：`exec_policy.Policy.evaluate` 新增 `net_rules`，只传给 `_evaluate_web`。
+  URL 语法校验在最前，非法 URL 仍是 `invalid_url` 硬拒；随后 `deny` → `domain_denied`（硬拒），
+  `allow` → `domain_allowed`，未命中维持 `network_egress` 询问。**allow 不绕过私网拦截**：
+  那个校验在 `tool_exec.fetch_url` 的 `check_url` 里，发生在审批之前，名单不参与。
+- **与档位的关系**：`deny` 与秘密文件同性质——`danger-full-access` + `never` 也绕不过；
+  `allow` 只免除出口审批，不改变 `read-only` 档对其它操作的判定。
+- **授权只能由人给**：飞书 `/domains [allow|deny|remove] <主机>` 与卡片撤销按钮
+  （10 分钟 token、按聊天隔离）、`GET/POST /v1/net-grants` 与 `/v1/net-grants/remove`。
+  模型工具面没有新增入口；`revoke_permissions` 只收回 `session_id` 等于当前会话的规则，
+  人手动加的全局规则保留。审计写 `domain_added` / `domain_removed`。
+- **可见性**：`/status` 显示「域名策略：允许 N · 拒绝 M」；卡片按 allow/deny 分色标注，
+  空态直接告诉用户默认仍是逐个审批。
+- **测试**：`tests/test_net_policy.py`（31）覆盖匹配边界（通配不含根域、后缀按点边界、
+  非 ASCII 不匹配）、deny 优先、账本增删/过期/损坏/未知版本/坏记录隔离、会话级撤销、
+  策略三态与档位交互；`tests/test_net_grants_api.py`（6）覆盖 API 增删、非法输入、
+  审计事件、撤销语义与「名单真的改变判定」；`tests/test_feishu_domain_card.py`（7）
+  覆盖命令、卡片、翻页、过期 token 与撤销。
+
+未做：`bash` 里的 `curl`/`wget` 不受这份名单影响（那属于命令文本分析层，误伤面太大）；
+没有「按路径/方法」的细粒度规则；没有规则的导入导出与全局审计检索（P6）。

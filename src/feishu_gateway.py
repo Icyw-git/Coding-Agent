@@ -63,6 +63,7 @@ import turn_screenshots
 from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, approval_class, clipboard_tools_enabled, screen_tools_enabled
 from feishu_approval_card import approval_card, approval_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
+from feishu_domain_card import domain_card, domain_text
 from feishu_grant_card import grant_card, grant_text
 from feishu_help_card import help_card
 from feishu_panel import control_card
@@ -703,6 +704,7 @@ class FeishuGateway:
         self._cron_views: dict[str, tuple[str, float]] = {}
         # chat_id → (token, created_at)：目录授权卡片按钮同理
         self._grant_views: dict[str, tuple[str, float]] = {}
+        self._domain_views: dict[str, tuple[str, float]] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
@@ -1867,6 +1869,133 @@ class FeishuGateway:
                              '只放宽工作区外写入的审批；秘密文件与系统目录仍硬拒。')
         self._show_grants(chat_id)
 
+    # ---------- 域名策略 ----------
+
+    def _show_domains(self, chat_id: str, *, page: int = 0,
+                      intro: str = '', message_id: str | None = None) -> None:
+        """域名策略卡片：列出 allow/deny，每条带「撤销」。"""
+        try:
+            rows = self.api.list_domains()
+        except Exception as exc:
+            self._reply(chat_id, f'[domains] {exc}')
+            return
+        token = secrets.token_hex(4)
+        self._domain_views[chat_id] = (token, time.monotonic())
+        card = domain_card(rows, token=token, intro=intro, page=page)
+        patcher = getattr(self.transport, 'update_step_card', None)
+        if message_id and patcher is not None:
+            try:
+                patcher(message_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] domain card patch failed, sending new: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] domain card failed, fallback to text: {exc}')
+        self._reply(chat_id, (intro + chr(10) if intro else '')
+                    + domain_text(rows))
+
+    def _domain_view_ok(self, chat_id: str, value: dict) -> bool:
+        view = self._domain_views.get(chat_id)
+        return bool(view and value.get('domain_view') == view[0]
+                    and time.monotonic() - view[1] <= 600)
+
+    def _handle_domain_action(self, chat_id: str, value: dict,
+                              sender_id: str | None = None,
+                              message_id: str | None = None) -> None:
+        """卡片按钮：翻页 / 撤销某条域名规则。"""
+        action = str(value.get('domain_action') or '')
+        if not self._domain_view_ok(chat_id, value):
+            self._reply(chat_id, '这张域名卡片已过期，请重新发送 /domains 打开。')
+            return
+        if action == 'page':
+            target = value.get('page')
+            if type(target) is not int or target < 0:
+                self._reply(chat_id, '无效的页码，请重新打开 /domains。')
+                return
+            self._show_domains(chat_id, page=target, message_id=message_id)
+            return
+        if action != 'remove':
+            self._reply(chat_id, '未知的域名操作，请重新发送 /domains。')
+            return
+        host = str(value.get('domain_host') or '')
+        if not host:
+            self._reply(chat_id, '无效的域名规则，请重新打开 /domains。')
+            return
+        try:
+            self.api.remove_domain(
+                host, session_id=self.bindings.get(chat_id),
+                by=f'feishu:{sender_id or chat_id}')
+        except Exception as exc:
+            self._reply(chat_id, f'[domains] {exc}')
+            return
+        self._reply(chat_id, f'已撤销域名规则: {host}')
+        self._show_domains(chat_id, message_id=message_id)
+
+    def _handle_domain_command(self, chat_id: str, argument: str,
+                               sender_id: str | None = None) -> None:
+        """/domains [allow|deny|remove] <主机> [until YYYY-MM-DD] [note 备注]"""
+        usage = ('用法:\n'
+                 '/domains                       查看（按钮可撤销）\n'
+                 '/domains allow <主机> [until YYYY-MM-DD] [note 备注]\n'
+                 '/domains deny  <主机> [until YYYY-MM-DD] [note 备注]\n'
+                 '/domains remove <主机>\n'
+                 '主机写精确名（api.example.com）或通配子域（*.example.com）；\n'
+                 '通配不含根域本身，想同时放行要两条都写。')
+        parts = argument.split(maxsplit=2)
+        action = parts[0].casefold() if parts else ''
+        rest = parts[1] if len(parts) > 1 else ''
+        tail = parts[2] if len(parts) > 2 else ''
+        if not action:
+            self._show_domains(chat_id)
+            return
+        if action not in ('allow', 'deny', 'remove'):
+            self._reply(chat_id, usage)
+            return
+        try:
+            host, options = grants.split_path_argument(
+                (rest + ' ' + tail).strip())
+        except ValueError as exc:
+            self._reply(chat_id, f'[domains] {exc}')
+            return
+        if not host:
+            self._reply(chat_id, usage)
+            return
+        by = f'feishu:{sender_id or chat_id}'
+        session_id = self.bindings.get(chat_id)
+        if action == 'remove':
+            if options:
+                self._reply(chat_id, usage)
+                return
+            try:
+                self.api.remove_domain(host, session_id=session_id, by=by)
+            except Exception as exc:
+                self._reply(chat_id, f'[domains] {exc}')
+                return
+            self._reply(chat_id, f'已撤销域名规则: {host}')
+            self._show_domains(chat_id)
+            return
+        try:
+            expires, note = grants.parse_options(options)
+            record = self.api.add_domain(host, scope=action, expires=expires,
+                                         note=note, session_id=session_id,
+                                         by=by)
+        except Exception as exc:
+            self._reply(chat_id, f'[domains] {exc}')
+            return
+        expiry = (f"有效至 {record.get('expires')}" if record.get('expires')
+                  else '永久')
+        effect = ('访问会直接拒绝（硬拒，任何档位都绕不过）'
+                  if record.get('scope') == 'deny'
+                  else '访问不再逐次审批（仍受私网拦截与 URL 校验）')
+        self._reply(chat_id, f"已添加域名规则: {record.get('scope')} "
+                             f"{record.get('host')}（{expiry}）\n{effect}")
+        self._show_domains(chat_id)
+
     def _send_help(self, chat_id: str) -> None:
         """帮助卡：常用入口按钮 + 折叠命令清单；无 2.0 卡片能力时回退纯文本。"""
         sender = getattr(self.transport, 'send_step_card', None)
@@ -2281,6 +2410,8 @@ class FeishuGateway:
                 self._handle_cron(chat_id, argument)
             elif command in ('/grants', '/grant'):
                 self._handle_grant_command(chat_id, argument, sender_id)
+            elif command in ('/domains', '/domain'):
+                self._handle_domain_command(chat_id, argument, sender_id)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
@@ -2514,6 +2645,15 @@ class FeishuGateway:
         if (value or {}).get('grant_action'):
             if not self._grant_view_ok(chat_id, value):
                 return '目录授权卡片已过期，请重新打开', False
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理…', True
+        if (value or {}).get('domain_action'):
+            if not self._domain_view_ok(chat_id, value):
+                return '域名卡片已过期，请重新打开', False
             try:
                 self._events.put_nowait((chat_id, value, open_id, None,
                                          message_id))
@@ -2976,6 +3116,9 @@ class FeishuGateway:
                                 elif text.get('grant_action'):
                                     self._handle_grant_action(chat_id, text, sender_id,
                                                               message_id)
+                                elif text.get('domain_action'):
+                                    self._handle_domain_action(chat_id, text, sender_id,
+                                                               message_id)
                                 elif text.get('task_action'):
                                     self._handle_task_action(chat_id, text, sender_id,
                                                              message_id)

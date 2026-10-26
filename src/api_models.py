@@ -94,6 +94,21 @@ if BaseModel is not None:
         by: str = Field(default='api', min_length=1, max_length=200)
         session_id: str | None = Field(default=None, max_length=200)
 
+    class AddDomainGrantRequest(BaseModel):
+        # 域名规则：精确主机或 `*.example.com`；scope 只有 allow/deny。
+        host: str = Field(min_length=1, max_length=253)
+        scope: str = Field(default='allow', pattern='^(allow|deny)$')
+        expires: str | None = Field(default=None, max_length=10)   # YYYY-MM-DD
+        note: str | None = Field(default=None, max_length=200)
+        by: str = Field(default='api', min_length=1, max_length=200)
+        session_id: str | None = Field(default=None, max_length=200)
+
+
+    class RemoveDomainGrantRequest(BaseModel):
+        host: str = Field(min_length=1, max_length=253)
+        by: str = Field(default='api', min_length=1, max_length=200)
+        session_id: str | None = Field(default=None, max_length=200)
+
 
     class PolicyRequest(BaseModel):
         sandbox_mode: str | None = None       # 缺省表示不改这一档

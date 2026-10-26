@@ -370,8 +370,16 @@ UTF-8 字节截到 200 KiB（截断时 `errors='ignore'`，避免半个字符）
    与控制台计数、`POST /v1/grants/remove`、`revoke_permissions`（只撤 `session_id`
    等于当前会话的授权，人手动加的全局授权保留）。审计事件 `grant_added` /
    `grant_removed` 写入对应会话日志。
-2. **网络域名策略**（`src/net_policy.py`）：`allow` / `deny` / 需审批 三态，接在 `web_access.check_url` 前；
-   默认仍是“未知域名需审批”。对标 Codex 的 `allowed_domains/denied_domains`。
+2. **网络域名策略**（`src/net_policy.py` + `src/net_grants.py`）— **已完成（2026-10-26）**
+   三态 `allow` / `deny` / 需审批，接在 `exec_policy._evaluate_web` 里。匹配只有两种形态：
+   精确主机与 `*.` 通配子域（不含根域自身），不接受 `*` 或正则。deny 先于 allow，
+   且在任何档位下都是硬拒（`danger-full-access` 也绕不过）；allow 只免除出口审批，
+   仍受 URL 语法与私网拦截。账本在 `paths.cache_path('net_grants.json')`，写入走文件锁 +
+   原子替换，损坏/未知版本按“无规则”处理（回到逐个审批）。
+   入口：飞书 `/domains [allow|deny|remove] <主机>` 与卡片撤销按钮（10 分钟 token）、
+   `GET/POST /v1/net-grants` 与 `/v1/net-grants/remove`、`/status` 与控制台计数；
+   模型没有新增入口，`revoke_permissions` 只能收回本会话创建的规则。
+   审计事件 `domain_added` / `domain_removed`。
 3. **用户规则文件**（`src/rules.py`，YAML/TOML）：`prefix_rule([...], decision, justification)` 的简化版，
    只支持 `allow`/`ask`/`deny` 三态与命令前缀匹配；加载失败**不影响启动**，只打印并忽略。
 4. **自动复核**（`auto_review`）：把现有 `HARNESS_LLM_APPROVAL` 审查官升级成默认 reviewer：
@@ -466,7 +474,8 @@ P1 完成的最小验收（举例）：
 | P3a | 剪贴板读写（已完成，2026-10-26） | 1 天 | P1 的审批模式 |
 | P4.1 | 目录级持久授权 + 撤销 UI（已完成，2026-10-26） | 3 天 | 飞书卡片模式（已有） |
 | P3b | 键鼠控制（默认关） | 5 天 | P1 截图存证 + P4 规则 |
-| P4.2 | 域名策略 + 规则文件 | 3 天 | 无 |
+| P4.2 | 域名策略（已完成，2026-10-26） | 3 天 | 无 |
+| P4.2b | 用户规则文件（命令前缀三态） | 2 天 | 无 |
 | P4.3 | auto_review 默认化 | 3 天 | `HARNESS_LLM_APPROVAL` 现有实现 |
 | P5 | 浏览器（MCP 接入） | 3–5 天 | P4.2 |
 | P6 | 审计查询 + 卡片 | 2 天 | P1 起持续 |
@@ -474,8 +483,8 @@ P1 完成的最小验收（举例）：
 先做 P1，因为它是后续所有“桌面类”能力的地基（截图是证据、OCR 是低成本理解），
 而且零依赖、可完全用现有 `view_image` + 审批链复用。
 
-截至 2026-10-26，P1 / P2 / P3a / P4.1 已完成；P3b 键鼠控制基础版已实现、真机交互待验收。
-剩余按依赖关系推进：P4.2 / P4.3、浏览器登录态与统一审计查询。
+截至 2026-10-26，P1 / P2 / P3a / P4.1 / P4.2（域名策略）已完成；P3b 键鼠控制基础版与
+序列/修饰键已实现、真机交互待验收。下一步：P4.2b 用户规则文件 → P6 审计查询 → P4.3。
 
 ---
 

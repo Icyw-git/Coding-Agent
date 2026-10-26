@@ -43,9 +43,11 @@ def build_router(permission_gate):
         count = permission_gate.revoke_session(request.session_id)
         grants_revoked = 0
         grant_error = ''
+        domains_revoked = 0
         if request.session_id:
             import api_grants
             import grants
+            import net_grants
 
             try:
                 removed = grants.revoke_for_session(request.session_id)
@@ -56,7 +58,17 @@ def build_router(permission_gate):
                 for record in removed:
                     api_grants._audit(request.session_id, 'grant_removed',
                                       record, 'revoke')
-        payload = {'revoked': count, 'grants_revoked': grants_revoked}
+            try:
+                domain_records = net_grants.revoke_for_session(request.session_id)
+            except (net_grants.NetGrantError, OSError) as exc:
+                grant_error = grant_error or str(exc)
+            else:
+                domains_revoked = len(domain_records)
+                for record in domain_records:
+                    api_grants._audit_domain(request.session_id, 'domain_removed',
+                                             record, 'revoke')
+        payload = {'revoked': count, 'grants_revoked': grants_revoked,
+                   'domains_revoked': domains_revoked}
         if grant_error:
             payload['grant_error'] = grant_error
         return payload

@@ -127,6 +127,16 @@ def _isolate_grant_ledger(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_net_grant_ledger(tmp_path, monkeypatch):
+    """域名账本按用例隔离：本机真实 net_grants.json 不能影响策略断言。"""
+    import net_grants
+
+    monkeypatch.setattr(net_grants, 'DURABLE_PATH', tmp_path / 'net_grants.json')
+    monkeypatch.setattr(net_grants, 'LOCK_PATH',
+                        tmp_path / 'locks' / 'net_grants.lock')
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cron_jobs():
     """cron 表是进程级全局：用例之间泄漏会让稳定 ID / 触发断言随执行顺序变化。
 

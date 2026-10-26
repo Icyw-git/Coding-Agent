@@ -18,6 +18,7 @@ import os
 
 import checkpoints
 import grants
+import net_grants
 from agent_core import register_hook
 from approval import (
     DEFAULT_APPROVAL_TIMEOUT,
@@ -394,6 +395,9 @@ def evaluate_call(tool: str, args: dict, policy=None):
     # 账本损坏时 active_write_paths 返回空元组（fail-closed），不会误放行。
     write_grants = (grants.active_write_paths()
                     if policy.sandbox_mode == 'workspace-write' else ())
+    # 域名名单与执行档位无关：deny 是硬拒，连 danger-full-access 也绕不过。
+    # 账本损坏时返回空元组，等价于「未知域名逐个审批」。
+    net_rules = net_grants.active_rules()
     return policy.evaluate(
         tool, eval_args,
         deny_list=_h().DENY_LIST,
@@ -403,6 +407,7 @@ def evaluate_call(tool: str, args: dict, policy=None):
         external_tools=EXTERNAL_TOOLS,
         workspace=str(_h().get_workdir()),
         write_grants=write_grants,
+        net_rules=net_rules,
         paths=paths)
 
 

@@ -198,7 +198,7 @@ class Policy:
                  deny_list=(), destructive=(), secrets=(),
                  path_zone: str = PATH_OUTSIDE,
                  external_tools=(), workspace: str | None = None,
-                 write_grants=(), paths=None) -> Decision:
+                 write_grants=(), paths=None, net_rules=()) -> Decision:
         """判定一次工具调用。
 
         deny_list / destructive / secrets 由调用方注入（生产上分别来自 harness
@@ -237,7 +237,7 @@ class Policy:
         elif tool in WORKTREE_TOOLS:
             decision = self._evaluate_worktree(tool, args)
         elif tool == 'web_fetch':
-            decision = self._evaluate_web(args)
+            decision = self._evaluate_web(args, net_rules)
         elif tool in SCREEN_TOOLS:
             if screen_tools_enabled():
                 decision = Decision(
@@ -455,11 +455,15 @@ class Policy:
 
     # ---------- 联网 ----------
 
-    def _evaluate_web(self, args: dict) -> Decision:
+    def _evaluate_web(self, args: dict, net_rules=()) -> Decision:
         """外发请求与 curl 同语义：无论档位都要审批（exfiltration 是边界问题）。
 
         这里只做语法校验，不解析 DNS：策略层保持纯函数，私网/重定向校验在
         网络层（web_access.check_url）发出请求前完成。
+
+        net_rules 是人显式给出的域名名单（``((pattern, scope), ...)``）。它只影响
+        「要不要问」：deny 直接硬拒，allow 跳过审批；没命中就维持默认询问。
+        名单不能绕过 URL 语法校验，也不会让私网地址变合法。
         """
         from web_access import WebAccessError, validate_url
 
@@ -468,8 +472,21 @@ class Policy:
             parsed = validate_url(url)
         except WebAccessError as exc:
             return Decision(DENY, 'invalid_url', f'invalid URL ({exc})')
+        host = parsed.hostname or ''
+        if net_rules:
+            from net_policy import ALLOW as NET_ALLOW
+            from net_policy import DENY as NET_DENY
+            from net_policy import classify
+
+            verdict = classify(host, net_rules)
+            if verdict == NET_DENY:
+                return Decision(DENY, 'domain_denied',
+                                f'network access to {host} is denied by the domain policy')
+            if verdict == NET_ALLOW:
+                return Decision(ALLOW, 'domain_allowed',
+                                f'network access to {host} is allowed by the domain policy')
         return Decision(ASK, 'network_egress',
-                        f'outbound network request (web_fetch to {parsed.hostname})')
+                        f'outbound network request (web_fetch to {host})')
 
     # ---------- worktree ----------
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import approval_view
 import grants
+import net_grants
 import sandbox
 import screen_capture
 import tool_cache
@@ -118,6 +119,10 @@ def format_status(session_store) -> str:
         '\n  桌面控制：开（每步需审批）'
         if desktop_control_enabled()
         else f'\n  桌面控制：关（设置 {DESKTOP_ENV}=1 启用）')
+    allow_domains, deny_domains = net_grants.counts()
+    domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
+                    if allow_domains or deny_domains
+                    else '\n  域名策略：无（未知域名逐个审批）')
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -136,6 +141,7 @@ def format_status(session_store) -> str:
         f'{screen_line}'
         f'{clipboard_line}'
         f'{desktop_line}'
+        f'{domains_line}'
         f'{usage_line}'
     )
 
