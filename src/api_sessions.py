@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import paths
+import turn_screenshots
 from agent_runtime import SessionAlreadyExistsError
 from api_models import (
     CreateSessionRequest,
@@ -168,7 +170,13 @@ def build_router(client, runtime):
         from agent_runtime import TurnCancelled
         from turn_coordinator import TurnBusy
 
+        store = None
+        before = 0
         try:
+            opener = getattr(runtime, 'open_session', None)
+            if opener is not None:
+                store = opener(session_id)
+                before = turn_screenshots.offset(store)
             response = client.messages.create(session_id, request.content,
                                               origin_chat=request.origin_chat)
         except TurnCancelled as exc:
@@ -179,6 +187,25 @@ def build_router(client, runtime):
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"session_id": response.session_id, "content": response.content}
+        return {"session_id": response.session_id, "content": response.content,
+                "screenshots": turn_screenshots.collect_tail(store, before)}
+
+    @router.get("/v1/sessions/{session_id}/screenshots/{name}")
+    def download_screenshot(session_id: str, name: str):
+        from fastapi.responses import FileResponse
+
+        opener = getattr(runtime, 'open_session', None)
+        if opener is not None:
+            try:
+                opener(session_id)
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not turn_screenshots.valid_name(name):
+            raise HTTPException(status_code=400, detail='invalid screenshot name')
+        target = paths.cache_path('screenshots') / name
+        if target.is_symlink() or not target.is_file():
+            raise HTTPException(status_code=404, detail='screenshot not found')
+        return FileResponse(target, media_type='image/png',
+                            headers={'Cache-Control': 'private, max-age=300'})
 
     return router

@@ -4759,3 +4759,76 @@ computer-use 各家做法，结论写进 `docs/PERSONAL_AGENT_ROADMAP.md`。
 方案分 P1–P6：P1 截屏+本地 OCR（地基，零依赖）、P2 自启+toast+空闲、P3a 剪贴板、
 P3b 键鼠（默认关、需显式开启）、P4 权限模型 v2（目录级授权/域名策略/规则文件/auto-review）、
 P5 浏览器（优先走 MCP）、P6 审计。含每阶段工具接口、权限与审批、测试与验收、风险缓解。
+
+## P1 落地：截屏与本地 OCR（逐次审批，后台拒绝）
+
+按路线图 P1 实现桌面观察，分三层：
+
+- `src/screen_capture.py`：PowerShell + `System.Windows.Forms.Screen` /
+  `Graphics.CopyFromScreen`，支持主屏/全部屏幕、`x,y,w,h` 区域、延迟与 DPI 感知；
+  PNG 内容寻址（SHA1）落盘，附带 7 天清理与 `stats()`。
+- `src/ocr_windows.py`：PowerShell + `Windows.Media.Ocr`。PowerShell 5.1 不能直接 await
+  WinRT 的 `IAsyncOperation`，脚本里用反射拿 `AsTask` 再同步 `Wait()`；支持
+  `zh-Hans-CN` / `auto`（跟随系统）、区域裁剪（`BitmapTransform.Bounds`，bbox 加回偏移）
+  与行/词框合并。缺语言包时返回可用语言和
+  `Get-WindowsCapability -Online -Name "Language.OCR*"` 提示，不返回空文本。
+- `src/tool_screen.py`：工具层。`screen_capture` 返回 `ImageResult`，复用现有
+  `expand_image_parts` 多模态链路；`screen_ocr` 默认读最近一张截图，并且**只接受
+  `.cache/screenshots` 目录内的文件**，避免变成“识别任意图片”的后门。
+
+安全口径（与路线图初稿的差异已回写文档）：
+
+- 三种 sandbox 档位下屏幕工具一律 `screen_access` **逐次询问**，且不参与会话白名单；
+  `never` 按 fail-closed 拒绝，只有 `danger-full-access` + `never` 放行，和既有语义一致。
+- 后台 worker、定时任务（`SCHEDULED_FORBIDDEN_TOOLS`）和子代理工具面直接排除；
+  `HARNESS_SCREEN_TOOLS=0` 在策略层硬拒。
+- 审计只记路径/SHA1/尺寸/字符数，不记 OCR 文本。截图存 harness 缓存而不是工作区，
+  避免被 checkpoint、补丁和文件检索扫到。
+
+验证中踩到的两个坑：
+
+1. 合成图片做 PowerShell 探针时只传了 `PATH` 和图片变量，进程以 `-65536` 退出；
+   `System.Drawing` 还依赖 `SystemRoot` 等系统变量，后续统一传
+   `{**os.environ, ...}`。
+2. OCR 结果在 GBK 控制台显示成 `??`，检查码点（`0x4f60 0x597d…`）与 UTF-8 字节后确认
+   只是终端显示问题，数据未损坏；这与之前的 emoji 事故是同一类现象。
+3. ruff 报 PowerShell 脚本里三行 `E501`，把嵌套的 WinRT 调用拆成
+   `$open/$read/$create` 中间变量（PowerShell 换行会断句，不能直接折行）。
+4. 区域 OCR 的真机冒烟抓到一个假测试盖不住的 bug：`BitmapDecoder.GetSoftwareBitmapAsync`
+   没有「只传 BitmapTransform」的单参数重载，脚本却写成了
+   `GetSoftwareBitmapAsync($transform)`，实际报“找不到方法重载”。改用五参数重载
+   （Bgra8 / Premultiplied / transform / IgnoreExifOrientation / DoNotColorManage），
+   并补静态回归断言，防止脚本再被“简化”回去。区域裁剪后 bbox 已加回全图偏移。
+
+测试新增 `tests/test_screen_capture.py`（11）、`tests/test_ocr_windows.py`（11）、
+`tests/test_tool_screen.py`（9）、`tests/test_tool_screen_handlers.py`（3）、
+`tests/test_screen_policy.py`（4），并更新 schema 快照（42 个工具，
+SHA1 `1fb660f8…`）、exec policy、审批文案、定时只读、子代理排除与 `/status` 断言。
+真机验证：320×200 区域截图 9306 字节、1 块屏幕，OCR 返回 5 行 21 字符且中文码点正确；
+420×240 截图再按 `0,0,220,120` 裁剪识别，行框坐标正确加回了全图偏移。
+全量 1735 passed / 1 skipped，ruff 通过。
+
+## P1b 落地：截图回传飞书
+
+需求：模型在飞书回合里截了屏，用户手机上也要看到原图，而不是只有文字结论。
+
+- **API 侧只传元数据**：`src/turn_screenshots.py` 用回合开始前的文件字节偏移
+  （`store.path.stat().st_size`）作为分界，回合结束后 `tail_events(after)` 只收集本回合新写的
+  `screen_captured`，按 sha1 去重、默认最多 4 张；只返回 `<sha1>.png`、宽高与字节数，
+  不返回 `path`。SSE `done` 与非流式消息响应都带上 `screenshots`。
+- **受控下载**：`GET /v1/sessions/{id}/screenshots/{name}` 先校验会话存在，再用
+  `^[0-9a-f]{40}\.png$` 校验文件名，拒绝符号链接，只从 `.cache/screenshots` 返回 PNG。
+- **网关上传**：`GatewayClient` 新增 `on_screenshots` 回调和 `download_screenshot()`；
+  `LarkTransport.send_image()` 通过 `im/v1/images` 上传（`image_type=message`），再以
+  `msg_type=image` 回复原消息。回合成功后才发送，失败卡不发半套图。
+- **边界与降级**：默认开启，每回合最多 4 张、单张飞书上限 10MB；截断/超限会回一句说明。
+  下载或上传失败只打印日志，文字答复照常。`FEISHU_SEND_SCREENSHOTS=0` 可整体关闭。
+  旧式 transport 没有 `send_image`、旧式 streamer 不接受 `on_screenshots` 时自动跳过。
+- **测试**：新增 `tests/test_turn_screenshots.py`、`tests/test_screenshot_api.py`、
+  `tests/test_feishu_screenshot_reply.py`，并扩展 `tests/test_gateway_sim.py`；
+  覆盖字节偏移、去重上限、SSE/非流式元数据、下载路由 400/404/符号链接、图片上传与
+  回复请求体、环境开关、4 张上限、10MB 跳过、下载/发送失败隔离、旧客户端兼容。
+  全量 1762 passed / 2 skipped，ruff 通过；真机飞书上传仍需在配好 `im:resource`
+  的应用上按验收单确认（本机测试用 fake Lark client 验证请求结构）。
+
+未做：锁屏/UAC 安全桌面截图受系统限制，工具返回明确失败原因。

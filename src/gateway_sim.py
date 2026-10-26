@@ -198,7 +198,7 @@ class GatewayClient:
         response.raise_for_status()
 
     def send(self, content: str, session_id: str | None = None,
-             origin_chat: str | None = None) -> str:
+             origin_chat: str | None = None, on_screenshots=None) -> str:
         session_id = session_id or self.session_id
         if not session_id:
             raise RuntimeError('no active session; use /new first')
@@ -210,11 +210,16 @@ class GatewayClient:
             json=payload,
         )
         response.raise_for_status()
-        return response.json()['content']
+        data = response.json()
+        shots = data.get('screenshots') or []
+        if shots and on_screenshots:
+            on_screenshots(shots)
+        return data['content']
 
     def send_stream(self, content: str, session_id: str | None = None,
                     on_delta=None, on_progress=None,
-                    origin_chat: str | None = None) -> str:
+                    origin_chat: str | None = None,
+                    on_screenshots=None) -> str:
         """Run a turn over the message SSE endpoint and return final text."""
         session_id = session_id or self.session_id
         if not session_id:
@@ -244,6 +249,9 @@ class GatewayClient:
                         final = payload.get('content', final)
                         self.last_duration_ms = payload.get('duration_ms')
                         self.last_duration = payload.get('duration')
+                        shots = payload.get('screenshots') or []
+                        if shots and on_screenshots:
+                            on_screenshots(shots)
                         completed = True
                     elif event == 'progress' and on_progress:
                         on_progress(payload)
@@ -252,6 +260,12 @@ class GatewayClient:
         if not completed:
             raise RuntimeError('回复流提前结束，任务状态未知；请先检查状态，避免重复执行。')
         return final
+
+    def download_screenshot(self, session_id: str, name: str) -> bytes:
+        response = self.http.get(
+            f'/v1/sessions/{session_id}/screenshots/{name}')
+        response.raise_for_status()
+        return response.content
 
     def start_stream(self) -> bool:
         """Follow the active session's SSE stream on a background thread."""

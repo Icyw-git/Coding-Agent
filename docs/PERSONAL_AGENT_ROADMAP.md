@@ -25,8 +25,8 @@
 
 | # | 能力 | 现状 | 缺口性质 |
 |---|---|---|---|
-| A1 | 截屏 / 看屏幕 | 只能 `render_document` 渲染文档页 | 缺能力 |
-| A2 | 本地 OCR | 无，扫描件走视觉模型 | 缺能力（且当前系统已具备 `Windows.Media.Ocr`，见 §4.1） |
+| A1 | 截屏 / 看屏幕 | 已支持：`screen_capture`（P1，2026-10-26） | 已补齐（截图可回传飞书） |
+| A2 | 本地 OCR | 已支持：`screen_ocr` 走 `Windows.Media.Ocr`（P1，2026-10-26） | 已补齐（仅限截图目录） |
 | A3 | 剪贴板读写 | 无 | 缺能力 |
 | A4 | 鼠标键盘控制 | 无 | 缺能力（高风险，最后做） |
 | A5 | 窗口/进程管理 | 只能 `bash` 间接 tasklist/taskkill | 缺封装 |
@@ -43,7 +43,8 @@
 | H1 | 资源限额 | bash 有 timeout，无内存/CPU/配额 | 缺护栏 |
 | H2 | 自动复核 | 有 LLM 审查官（`HARNESS_LLM_APPROVAL`），默认关闭 | 缺默认策略 |
 
-一句话：**写有闸、读和网络近乎放开、桌面与系统层完全没碰。**
+一句话：**写有闸、读和网络近乎放开、桌面观察刚起步（截屏 + OCR，仍受逐次审批），
+系统层（自启/通知/自动化）尚未碰。**
 
 ---
 
@@ -148,42 +149,61 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 
 ### P1：桌面观察（截屏 + 本地 OCR）— 1 个迭代
 
+**状态：已实施（2026-10-26）**。能力层、工具层、策略/后台/子代理边界、保留清理、状态展示、
+文档与测试均已完成；P1b（把截图原图通过飞书 `im/v1/images` 发回聊天）随后也已落地。
+
 **目标**：飞书发“看看我屏幕上的报错”“把截图里的表格读出来”，agent 能自己取到画面。
 
-**工具接口**（新增 `src/tool_screen.py`，注册进 `tools.TOOLS`）
+**工具接口**（`src/tool_screen.py`，已注册进 `tools.TOOLS`，共 42 个工具）
 
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `screen_capture` | `screen`（`primary`/`all`，默认 primary）、`region`（可选 `x,y,w,h`）、`delay_ms` | 截屏存到 `workspace/.cache/screenshots/<sha1>.png`，返回路径 + 尺寸；`ImageResult` 自动附带图片给视觉模型 |
-| `screen_ocr` | `path`（默认最新截图）、`lang`（默认 `zh-Hans-CN`）、`region`（可选） | 走 PowerShell + `Windows.Media.Ocr`，返回纯文本 + 每行 bbox；无 OCR 语言包时给安装提示 |
+| `screen_capture` | `screen`（`primary`/`all`，默认 primary）、`region`（可选 `x,y,w,h`）、`delay_ms` | 截屏存到 harness 缓存 `.cache/screenshots/<sha1>.png`，返回路径 + 尺寸 + 显示器信息；`ImageResult` 自动附带图片给视觉模型 |
+| `screen_ocr` | `path`（默认最新截图）、`lang`（默认 `zh-Hans-CN`，`auto` 跟随系统）、`region`（可选） | 走 PowerShell + `Windows.Media.Ocr`，返回纯文本 + 每行 bbox；无 OCR 语言包时列出可用语言并给安装提示 |
 
-**权限与审批**
+**权限与审批**（落地口径，与初稿不同）
 
-- 策略：`screen_capture` / `screen_ocr` 属“读本机屏幕”，按 `READ_ONLY_SCREEN_TOOLS` 处理：
-  `read-only` 档放行、`never` 策略仍需审批一次（截图可能含密码/私信，视同数据外发风险）；
-  **后台/定时回合直接拒绝**（`use_scheduled_turn` 分支）。
-- 落盘路径固定在工作区 `.cache/`，受 `safe_path` 与 secret 通配约束。
-- 审计事件：`screen_captured{path,sha1,bytes,screen,region,duration_ms}`、
-  `screen_ocr{path,chars,lang,duration_ms}`。
+- 三种 sandbox 档位下 `screen_capture` / `screen_ocr` 一律按 `screen_access` **逐次询问**；
+  **不参与会话白名单**——批准一次截屏不该让本会话此后随时能看屏幕。`never` 策略下按
+  fail-closed 直接拒绝（`danger-full-access` + `never` 才放行），与既有审批语义一致。
+- **后台/定时回合直接拒绝**：`SCHEDULED_FORBIDDEN_TOOLS` 与 `enforce(interactive=False)`
+  双重兜底，错误文案明确“需要交互式回合”。
+- **子代理不暴露**这两个工具；`HARNESS_SCREEN_TOOLS=0` 可在策略层硬拒（默认开启）。
+- 截图落盘固定在 harness 缓存 `.cache/screenshots`（不进工作区，避免被 checkpoint/补丁扫到）；
+  OCR 只接受该目录内的文件，不能借它识别任意图片。
+- 审计事件：`screen_captured{path,sha1,bytes,screen,region,width,height,duration_ms}`、
+  `screen_ocr{path,chars,lang,region,lines,duration_ms}`；**不记录 OCR 文本内容**。
+- 保留 7 天，进程启动时的 `start_storage_maintenance` 清理过期文件；`/status`、`--doctor`
+  与飞书控制台显示截图数量/占用。
 
 **实现要点**
 
-1. `src/screen_capture.py`：PowerShell 脚本（`System.Windows.Forms.Screen` + `Graphics.CopyFromScreen`），
-   单屏/多屏/区域，DIP→像素用 `GetDpiForWindow` 或 `Screen.Bounds` 直接给像素。
-2. `src/ocr_windows.py`：`pwsh -NoProfile -Command` 调 `Windows.Media.Ocr`，
-   输入 PNG 路径，输出 JSON（`lines[].text` + `words[].bounding_rect`）。
-   中文模型已验证存在；缺语言包时返回 `Get-WindowsCapability -Online -Name "Language.OCR*"` 提示。
-3. 复用 `tool_documents.cache_image` + `ImageResult`，让截图走现有多模态链路，不新造传输路径。
-4. 飞书：“看看屏幕”触发时，附件提示里带上截图路径，模型自然调用 `screen_capture`。
+1. `src/screen_capture.py`：PowerShell（`System.Windows.Forms.Screen` + `Graphics.CopyFromScreen`），
+   单屏/多屏/区域、DPI 感知、内容寻址落盘、7 天清理与统计；错误结构化返回，不把原始异常
+   直接抛给模型。
+2. `src/ocr_windows.py`：`Windows.Media.Ocr`（WinRT），支持语言选择、区域裁剪、行/词 bbox 合并；
+   缺语言包时返回可用语言与 `Get-WindowsCapability -Online -Name "Language.OCR*"` 提示。
+3. 复用 `tool_documents.ImageResult`，截图走现有多模态链路，不新造传输路径。
+4. 飞书：模型按工具描述自然调用 `screen_capture`；成功回合的截图自动回传本聊天
+   （最多 4 张/回合、单张 ≤10MB，`FEISHU_SEND_SCREENSHOTS=0` 关闭）。
 
-**测试**：fake PowerShell 后端（注入返回固定 PNG/JSON）；区域裁剪尺寸断言；
-后台回合拒绝；secret 目录不可写；审计事件字段。
+**测试**：fake PowerShell 后端（注入固定 PNG/JSON）；区域裁剪与越界断言；能力层失败路径；
+后台回合拒绝、白名单不生效、环境开关硬拒；子代理排除；审计字段；7 天清理；`/status` 展示。
 
-**验收**：真机截一张含中英文的窗口 → `screen_ocr` 文本与肉眼一致；
-飞书说“看看我现在屏幕上的报错”能拿到截图并回答。
+**验收**：真机截一张含中英文的窗口 → `screen_ocr` 文本与肉眼一致；说“看看我现在屏幕上的报错”
+能拿到截图并回答，飞书聊天里同时收到截图图片。
 
-**风险与缓解**：截图含敏感信息 → 默认只存 `.cache/`、7 天自动清理、`/status` 显示截图数量；
-多屏 DPI 错位 → 记录每屏 rect 并在返回里说明。
+**P1b 截图回传（2026-10-26，已完成）**
+
+- API：SSE `done` 与非流式响应附带本回合 `screenshots` 元数据（`<sha1>.png`、尺寸），
+  不返回绝对路径；`GET /v1/sessions/{id}/screenshots/{name}` 校验会话、严格文件名校验、
+  拒绝符号链接后返回 PNG。
+- 网关：`GatewayClient` 支持 `on_screenshots` 回调与受控下载，`LarkTransport.send_image`
+  走 `im/v1/images` 上传后以图片消息回复；上传失败只影响图片，不回滚文字答复。
+- 默认开启、每回合最多 4 张、单张 10MB；截断/超限附说明，`FEISHU_SEND_SCREENSHOTS=0` 关闭。
+
+**风险与缓解**：截图含敏感信息 → 只存 `.cache/screenshots`、7 天清理、逐次审批、后台拒绝、
+`/status` 可见；多屏 DPI 错位 → 返回里记录每屏 rect 与虚拟桌面范围。
 
 ### P2：常驻（自启 + 本地通知 + 空闲感知）— 1 个迭代
 

@@ -548,4 +548,39 @@ TOOL_SCHEMAS = [{'type': 'function',
                'description': 'Keep a worktree for review (logs the event).',
                'parameters': {'type': 'object',
                               'properties': {'name': {'type': 'string'}},
-                              'required': ['name']}}}]
+                              'required': ['name']}}},
+ {'type': 'function',
+  'function': {'name': 'screen_capture',
+               'description': 'Capture the local screen to a PNG and attach it for '
+                              'inspection (requires approval). Use screen_ocr for text.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'screen': {'type': 'string',
+                                             'enum': ['primary', 'all'],
+                                             'description': "Screen to capture: 'primary' "
+                                                            "(default) or 'all' monitors"},
+                                  'region': {'type': 'string',
+                                             'description': "Optional crop 'x,y,w,h' "
+                                                            'relative to the captured screen'},
+                                  'delay_ms': {'type': 'number',
+                                               'description': 'Wait 0-5000 ms before '
+                                                              'capturing'}},
+                              'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'screen_ocr',
+               'description': 'Extract text from a screenshot with the local Windows OCR '
+                              'engine (requires approval).',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'path': {'type': 'string',
+                                           'description': 'Screenshot path from '
+                                                          'screen_capture; defaults to the '
+                                                          'latest screenshot'},
+                                  'lang': {'type': 'string',
+                                           'description': "OCR language tag (default "
+                                                          "zh-Hans-CN; 'auto' follows the "
+                                                          'system languages)'},
+                                  'region': {'type': 'string',
+                                             'description': "Optional crop 'x,y,w,h' in "
+                                                            'image pixels'}},
+                              'required': []}}}]

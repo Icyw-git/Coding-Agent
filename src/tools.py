@@ -22,6 +22,8 @@ from tool_files import edit_file, read_file, write_file
 from tool_patch import PatchError, parse_patch, patch_paths  # noqa: F401
 from tool_patch import apply_patch as _apply_patch
 from tool_schemas import TOOL_SCHEMAS
+from tool_screen import capture as _screen_capture_tool
+from tool_screen import ocr as _screen_ocr_tool
 from tool_search import _grep_with_ripgrep, _rg_binary, glob_files, grep_files, ls_dir
 from tool_sessions import (
     run_find_sessions,
@@ -118,6 +120,35 @@ _IMAGE_MAX_BYTES = 8 * 1024 * 1024   # 实现读取这个值，测试按模块�
 def _tool_results_dir():
     """缓存根目录在调用时读取：跟随 conftest 的隔离与 /cache 的统计口径。"""
     return getattr(_h(), 'TOOL_RESULTS_DIR', None)
+
+
+def _screenshot_dir():
+    return getattr(_h(), 'SCREENSHOT_DIR', None)
+
+
+def _screen_audit(event: str, **payload) -> None:
+    """截图/OCR 审计进当前会话事件流；没有会话上下文（测试/单次）就跳过。"""
+    try:
+        manager = _h().active_checkpoint_manager()
+    except Exception:
+        return
+    store = getattr(manager, 'session_store', None)
+    if store is None:
+        return
+    store.append(event, **payload)
+
+
+def run_screen_capture(screen: str = 'primary', region: str = None,
+                       delay_ms: float = 0):
+    return _screen_capture_tool(
+        screen, region, delay_ms,
+        directory=_screenshot_dir(), audit=_screen_audit)
+
+
+def run_screen_ocr(path: str = None, lang: str = None, region: str = None) -> str:
+    return _screen_ocr_tool(
+        path, lang=lang, region=region,
+        directory=_screenshot_dir(), audit=_screen_audit)
 
 
 def run_view_image(path: str, cwd: str = None):
@@ -228,6 +259,8 @@ tool_registry = {
     'write': run_write,
     'edit': run_edit,
     'view_image': run_view_image,
+    'screen_capture': run_screen_capture,
+    'screen_ocr': run_screen_ocr,
     'read_document': run_read_document,
     'render_document': run_render_document,
     'apply_patch': run_apply_patch,

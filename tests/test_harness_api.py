@@ -100,7 +100,8 @@ def test_api_routes_use_runtime(monkeypatch, api_client):
         json={"content": "hello"}, headers=headers,
     )
     assert response.status_code == 200
-    assert response.json() == {"session_id": "api-test", "content": "done"}
+    assert response.json() == {"session_id": "api-test", "content": "done",
+                               "screenshots": []}
 
     history = client.get("/v1/sessions/api-test", headers=headers)
     assert history.status_code == 200

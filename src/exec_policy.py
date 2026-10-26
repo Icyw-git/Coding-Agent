@@ -79,6 +79,8 @@ __all__ = [
     'READ_WRITE_TOOLS',
     'SANDBOX_ENV',
     'SANDBOX_MODES',
+    'SCREEN_ENV',
+    'SCREEN_TOOLS',
     'WORKTREE_TOOLS',
     'approval_class',
     'classify_path',
@@ -88,6 +90,7 @@ __all__ = [
     'is_secret_path',
     'load_policy',
     'resolve_tool_path',
+    'screen_tools_enabled',
     'secret_references',
     'session_allow_key',
     'set_tier',
@@ -130,6 +133,17 @@ READ_WRITE_TOOLS = ('write', 'edit', 'apply_patch')
 # 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
 READ_ONLY_FILE_TOOLS = ('read', 'view_image', 'read_document',
                         'render_document', 'glob', 'grep', 'ls')
+# 屏幕读取：内容可能含密码/私信，每次都问；定时/后台回合由 hooks 直接拒绝。
+SCREEN_TOOLS = ('screen_capture', 'screen_ocr')
+SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
+
+
+def screen_tools_enabled(environ=None) -> bool:
+    """默认开；显式 `HARNESS_SCREEN_TOOLS=0/off/false` 关闭。"""
+    raw = (environ if environ is not None else os.environ).get(SCREEN_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().casefold() not in ('0', 'off', 'false', 'no', 'disabled')
 
 
 @dataclass(frozen=True)
@@ -189,6 +203,16 @@ class Policy:
             decision = self._evaluate_worktree(tool, args)
         elif tool == 'web_fetch':
             decision = self._evaluate_web(args)
+        elif tool in SCREEN_TOOLS:
+            if screen_tools_enabled():
+                decision = Decision(
+                    ASK, 'screen_access',
+                    f'{tool} reads the local screen, which may contain '
+                    'passwords or private messages')
+            else:
+                decision = Decision(
+                    DENY, 'screen_tools_disabled',
+                    f'{tool} is disabled ({SCREEN_ENV}=0)')
         elif tool in external_tools:
             decision = Decision(
                 ASK, 'external_tool',

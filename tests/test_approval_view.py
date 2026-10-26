@@ -64,3 +64,15 @@ def test_non_bash_tools_render_as_pairs():
 
 def test_safe_text_accepts_non_strings():
     assert safe_text(42) == '42'
+
+
+def test_screen_tools_render_as_readable_actions():
+    assert detail('screen_capture', {'screen': 'all'}) == (
+        'capture the local all screen (full screen)')
+    assert detail('screen_capture', {'region': '0,0,100,50', 'delay_ms': 250}) == (
+        'capture the local primary screen (0,0,100,50) after 250ms')
+    assert detail('screen_ocr', {}) == (
+        'run local OCR on the latest screenshot (lang=zh-Hans-CN)')
+    assert detail('screen_ocr', {'path': 'C:/x/a.png', 'lang': 'en-US',
+                                 'region': '1,2,3,4'}) == (
+        'run local OCR on C:/x/a.png (lang=en-US, region 1,2,3,4)')

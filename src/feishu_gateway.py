@@ -37,6 +37,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import os
 import queue
@@ -53,7 +54,10 @@ import httpx
 import approval_view
 import llm_route
 import paths
-from exec_policy import approval_class
+import screen_capture
+import tool_cache
+import turn_screenshots
+from exec_policy import SCREEN_ENV, approval_class, screen_tools_enabled
 from feishu_approval_card import approval_card, approval_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
 from feishu_help_card import help_card
@@ -83,6 +87,11 @@ WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须
 # 卡片更新的合流：多会话并发逐秒刷新时，同一网关实例内合并到全局
 # 最小间隔，避免飞书卡片 PATCH 接口被高频调用触发频控
 MIN_CARD_PATCH_INTERVAL = 0.45
+
+# 截图回传：飞书图片上传上限 10MB，单回合最多回传 4 张；可用环境变量关闭。
+SCREENSHOT_REPLY_LIMIT = 4
+SCREENSHOT_REPLY_ENV = 'FEISHU_SEND_SCREENSHOTS'
+FEISHU_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _format_task_duration(task: dict) -> str:
@@ -381,6 +390,65 @@ class LarkTransport:
                 f'feishu send failed: {response.code} {response.msg}')
         data = getattr(response, 'data', None)
         return getattr(data, 'message_id', None) if data else None
+
+    def send_image(self, chat_id: str, image: bytes, *,
+                   reply_to: str | None = None) -> str | None:
+        """上传 PNG 并作为图片消息发送；reply_to 时引用原消息。"""
+        self.validate_chat_id(chat_id)
+        data = bytes(image)
+        if not data.startswith(screen_capture.PNG_MAGIC):
+            raise ValueError('feishu image must be a PNG screenshot')
+        if len(data) > FEISHU_IMAGE_MAX_BYTES:
+            raise ValueError(f'image too large for feishu: {len(data)} bytes')
+        from lark_oapi.api.im.v1 import (
+            CreateImageRequest,
+            CreateImageRequestBody,
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+            ReplyMessageRequest,
+            ReplyMessageRequestBody,
+        )
+        upload = CreateImageRequest.builder().request_body(
+            CreateImageRequestBody.builder()
+            .image_type('message')
+            .image(io.BytesIO(data))
+            .build()
+        ).build()
+        response = self._client.im.v1.image.create(upload)
+        if not response.success():
+            raise RuntimeError(
+                f'feishu image upload failed: {response.code} {response.msg}')
+        payload = getattr(response, 'data', None)
+        image_key = getattr(payload, 'image_key', None) if payload else None
+        if not image_key:
+            raise RuntimeError('feishu image upload returned no image_key')
+        content = json.dumps({'image_key': image_key})
+        if reply_to:
+            request = ReplyMessageRequest.builder().message_id(reply_to).request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type('image')
+                .content(content)
+                .build()
+            ).build()
+            response = self._client.im.v1.message.reply(request)
+            action = 'reply'
+        else:
+            request = CreateMessageRequest.builder() \
+                .receive_id_type('chat_id') \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type('image')
+                    .content(content)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.create(request)
+            action = 'send'
+        if not response.success():
+            raise RuntimeError(
+                f'feishu image {action} failed: {response.code} {response.msg}')
+        payload = getattr(response, 'data', None)
+        return getattr(payload, 'message_id', None) if payload else None
 
     def update_text(self, message_id: str, text: str) -> None:
         from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
@@ -757,6 +825,7 @@ class FeishuGateway:
                         and _accepts_kwarg(sender, 'reply_to') else {})
         message_id = None
         parts = []
+        screenshots: list[dict] = []
         last_update = 0.0
         last_sent = None
         stream_failed = False
@@ -841,11 +910,15 @@ class FeishuGateway:
             if streamer is not None:
                 extra = ({'origin_chat': chat_id}
                          if _accepts_kwarg(streamer, 'origin_chat') else {})
+                if _accepts_kwarg(streamer, 'on_screenshots'):
+                    extra['on_screenshots'] = screenshots.extend
                 return streamer(text, session_id=target_session,
                                 on_delta=on_delta, on_progress=on_progress,
                                 **extra)
             extra = ({'origin_chat': chat_id}
                      if _accepts_kwarg(self.api.send, 'origin_chat') else {})
+            if _accepts_kwarg(self.api.send, 'on_screenshots'):
+                extra['on_screenshots'] = screenshots.extend
             return self.api.send(text, session_id=target_session, **extra)
 
         try:
@@ -857,6 +930,7 @@ class FeishuGateway:
                 # 老绑定指向已删除的会话：新建一个再重试，不把 404 丢给用户。
                 session_id = self._rebind_new_session(chat_id)
                 parts.clear()
+                screenshots.clear()
                 reply = _invoke(session_id)
         except Exception as exc:
             print(f'[feishu] agent reply failed: {exc}')
@@ -900,6 +974,8 @@ class FeishuGateway:
             return
 
         reply = reply or '本轮已结束，未生成文本回复。'
+        self._send_turn_screenshots(chat_id, session_id, screenshots,
+                                    reply_to=reply_to)
         duration = getattr(self.api, 'last_duration', None)
         if step_mode:
             elapsed = duration or format_duration(time.monotonic() - _t_entry)
@@ -938,6 +1014,56 @@ class FeishuGateway:
             except Exception:
                 pass
         self._reply(chat_id, reply)
+
+    @staticmethod
+    def _screenshots_enabled() -> bool:
+        raw = (os.getenv(SCREENSHOT_REPLY_ENV) or '').strip().lower()
+        return raw not in ('0', 'false', 'no', 'off', 'disabled')
+
+    def _send_turn_screenshots(self, chat_id: str, session_id: str, items,
+                               *, reply_to: str | None = None) -> int:
+        """把本回合截到的图传回聊天；失败只记日志，不影响文字答复。"""
+        if not items or self.transport is None or not self._screenshots_enabled():
+            return 0
+        sender = getattr(self.transport, 'send_image', None)
+        downloader = getattr(self.api, 'download_screenshot', None)
+        if sender is None or downloader is None:
+            return 0
+        valid = []
+        seen = set()
+        for item in items:
+            name = str((item or {}).get('name') or '')
+            if not turn_screenshots.valid_name(name) or name in seen:
+                continue
+            seen.add(name)
+            valid.append(name)
+        selected = valid[:SCREENSHOT_REPLY_LIMIT]
+        sent = 0
+        too_large = 0
+        for name in selected:
+            try:
+                data = downloader(session_id, name)
+            except Exception as exc:
+                print(f'[feishu] screenshot download failed: {exc}')
+                continue
+            if len(data) > FEISHU_IMAGE_MAX_BYTES:
+                too_large += 1
+                continue
+            kwargs = ({'reply_to': reply_to}
+                      if reply_to and _accepts_kwarg(sender, 'reply_to') else {})
+            try:
+                sender(chat_id, data, **kwargs)
+                sent += 1
+            except Exception as exc:
+                print(f'[feishu] screenshot send failed: {exc}')
+        notes = []
+        if len(valid) > len(selected):
+            notes.append(f'只回传前 {len(selected)} 张')
+        if too_large:
+            notes.append(f'{too_large} 张超过飞书 10MB 限制未上传')
+        if notes:
+            self._reply(chat_id, '截图回传：' + '；'.join(notes) + '。')
+        return sent
 
     # ---------- 快捷审批 ----------
 
@@ -1298,6 +1424,13 @@ class FeishuGateway:
             lines.append(f"定时任务 {len(self.api.list_crons())} 个（点「定时任务」管理）")
         except Exception as exc:
             lines.append(f'定时任务不可用: {exc}')
+        try:
+            shots = screen_capture.stats(paths.cache_path('screenshots'))
+            state = '开' if screen_tools_enabled() else f'关（{SCREEN_ENV}=0）'
+            lines.append(f"屏幕工具 {state} · 截图 {shots['files']} 张"
+                         f"（{tool_cache.human_size(shots['bytes'])}）")
+        except Exception as exc:
+            lines.append(f'屏幕工具不可用: {exc}')
         lines.append('直接发消息即可；停止与详情都在控制台卡片上。')
         self._reply(chat_id, chr(10).join(lines))
 

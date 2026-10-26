@@ -50,6 +50,7 @@ from exec_policy import (
     PATH_WORKSPACE,
     READ_ONLY_FILE_TOOLS,
     READ_WRITE_TOOLS,
+    SCREEN_TOOLS,
     Decision,
     Policy,
     approval_class,
@@ -342,6 +343,7 @@ SCHEDULED_FORBIDDEN_TOOLS = frozenset({
     'create_task', 'claim_task', 'complete_task', 'todo_write',
     'create_worktree', 'remove_worktree', 'keep_worktree',
     'kill_background', 'rename_session', 'revoke_permissions',
+    'screen_capture', 'screen_ocr',
 })
 # 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
 # 整批就按该分区判定，避免被同批的工作区内文件稀释。
@@ -422,9 +424,15 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     if decision.denied:
         print(f'\n\033[31m[blocked] {decision.pattern or decision.reason}\033[0m')
         return deny_message(decision)
+    # 屏幕内容可能包含锁屏后的私密信息，且没人能确认「现在屏幕上是用户想让我看
+    # 的那一屏」：后台/定时回合不进入审批队列，直接拒绝。
+    if tool in SCREEN_TOOLS and not interactive:
+        return _screen_background_error(tool)
     # untrusted 档的语义是「每条都问」，而会话白名单是一种预授权：命中它就等于
-    # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单。
-    if policy.approval_policy != 'untrusted' and GATE.session_allows(tool, args):
+    # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单，
+    # 屏幕工具同理：截屏/OCR 每次都应按当下屏幕重新审批。
+    if (policy.approval_policy != 'untrusted' and tool not in SCREEN_TOOLS
+            and GATE.session_allows(tool, args)):
         print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
         issue_grant(tool, args)   # 白名单命中同样是一次「本调用已批准」
         return None
@@ -475,6 +483,11 @@ def _scheduled_readonly_error(tool: str) -> str:
     return (f'Error: scheduled task is read-only; {tool} is not allowed. '
             'Re-create the job with allow_side_effects enabled to permit '
             'side effects (approval still applies).')
+
+
+def _screen_background_error(tool: str) -> str:
+    return (f'Error: {tool} requires an interactive turn; background and '
+            'scheduled tasks cannot read the local screen.')
 
 
 def deny_message(decision) -> str:

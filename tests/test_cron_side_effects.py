@@ -58,6 +58,10 @@ def test_read_only_turn_denies_writes_network_and_coordination(workspace):
         assert 'scheduled task is read-only' in hooks.enforce(
             'web_fetch', {'url': 'https://example.com'}, interactive=False)
         assert 'scheduled task is read-only' in hooks.enforce(
+            'screen_capture', {'screen': 'primary'}, interactive=True)
+        assert 'scheduled task is read-only' in hooks.enforce(
+            'screen_ocr', {}, interactive=False)
+        assert 'scheduled task is read-only' in hooks.enforce(
             'task', {'description': 'write it'}, interactive=False)
         # 会话元数据与授权也不许后台回合改：不经过文件/命令策略，必须显式列入。
         assert 'scheduled task is read-only' in hooks.enforce(

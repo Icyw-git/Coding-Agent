@@ -16,6 +16,8 @@ _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
              # 行为」的测试前提一起改掉。需要特定档位的用例自己 setenv。
              'HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
              'HARNESS_APPROVAL_ALL',
+             # 屏幕工具默认开；本机 .env 若配了 0，不能把默认档测试前提改掉。
+             'HARNESS_SCREEN_TOOLS',
              # LLM 审查官默认关：开着会让审批类测试偷偷打真实 LLM API
              # （test_approval_scope 曾因此慢 12s 且卡片断言落空）。专测文件自己
              # delenv 打开。
@@ -96,11 +98,13 @@ def _isolate_storage_dirs(tmp_path):
     """
     saved = (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR,
              harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR,
+             harness.SCREENSHOT_DIR,
              harness.MEMORY_DIR, harness.MEMORY_INDEX)
     harness.SESSIONS_DIR = tmp_path / 'sessions'
     harness.CHECKPOINT_DIR = tmp_path / 'checkpoints'
     harness.TRANSCRIPT_DIR = tmp_path / 'transcripts'
     harness.TOOL_RESULTS_DIR = tmp_path / 'tool_results'
+    harness.SCREENSHOT_DIR = tmp_path / 'screenshots'
     harness.MEMORY_DIR = tmp_path / 'memories'
     harness.MEMORY_INDEX = harness.MEMORY_DIR / 'MEMORY.md'
     try:
@@ -108,6 +112,7 @@ def _isolate_storage_dirs(tmp_path):
     finally:
         (harness.SESSIONS_DIR, harness.CHECKPOINT_DIR,
          harness.TRANSCRIPT_DIR, harness.TOOL_RESULTS_DIR,
+         harness.SCREENSHOT_DIR,
          harness.MEMORY_DIR, harness.MEMORY_INDEX) = saved
 
 
@@ -168,6 +173,7 @@ def _restore_permission_backend(tmp_path):
     os.environ['HARNESS_LLM_APPROVAL'] = '0'
     for key in _TIER_KEYS:
         os.environ.pop(key, None)   # 用例默认跑默认档，需要别的档位自己 setenv
+    os.environ.pop('HARNESS_SCREEN_TOOLS', None)
     previous = permission_gate.backend
     previous_timeout = permission_gate.timeout
     permission_gate.timeout = 3   # GATE 在导入时已读走 timeout，setenv 来不及

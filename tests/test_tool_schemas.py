@@ -19,10 +19,10 @@ ORDER = [
     'kill_background',
     'web_fetch', 'apply_patch', 'checkpoint', 'task', 'load_skill', 'compact',
     'request_shutdown', 'request_plan', 'review_plan', 'create_worktree',
-    'remove_worktree', 'keep_worktree',
+    'remove_worktree', 'keep_worktree', 'screen_capture', 'screen_ocr',
 ]
 
-SCHEMA_SHA1 = 'a47680c42cd81c146dbc73eecbf3a882f3d716b3'
+SCHEMA_SHA1 = '1fb660f82b16d779fdd357a097a8481a8e42b319'
 
 
 def test_tool_order_is_stable():

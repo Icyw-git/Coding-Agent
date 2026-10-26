@@ -85,6 +85,20 @@ def _pairs(args: dict) -> str:
                      if value not in (None, ''))
 
 
+def _screen_detail(tool: str, args: dict) -> str:
+    if tool == 'screen_capture':
+        screen = args.get('screen') or 'primary'
+        region = args.get('region') or 'full screen'
+        delay = args.get('delay_ms')
+        suffix = f' after {delay}ms' if delay else ''
+        return f'capture the local {screen} screen ({region}){suffix}'
+    path = args.get('path') or 'the latest screenshot'
+    language = args.get('lang') or 'zh-Hans-CN'
+    region = args.get('region')
+    suffix = f', region {region}' if region else ''
+    return f'run local OCR on {path} (lang={language}{suffix})'
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -92,6 +106,8 @@ def detail(tool: str, args) -> str:
     内容，只换写法）。
     """
     args = args if isinstance(args, dict) else {}
+    if tool in ('screen_capture', 'screen_ocr'):
+        return safe_text(_screen_detail(tool, args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

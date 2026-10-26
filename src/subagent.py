@@ -21,6 +21,7 @@ _SUBAGENT_EXCLUDED = frozenset({
     'rename_session', 'revoke_permissions',
     'create_worktree', 'remove_worktree', 'keep_worktree',
     'background_output', 'kill_background',
+    'screen_capture', 'screen_ocr',
 })
 
 

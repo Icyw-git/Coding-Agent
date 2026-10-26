@@ -10,9 +10,10 @@ from pathlib import Path
 
 import approval_view
 import sandbox
+import screen_capture
 import tool_cache
 import workspace_diff
-from exec_policy import load_policy, set_tier
+from exec_policy import SCREEN_ENV, load_policy, screen_tools_enabled, set_tier
 
 SANDBOX_MODE_HELP = (
     ('read-only', '只放公认只读的命令，写改与其余命令都要审批'),
@@ -90,6 +91,12 @@ def format_status(session_store) -> str:
     summary = session_store.session_summary()
     usage = session_store.usage_totals()   # 从 usage 事件聚合，跨重启准确
     policy = load_policy()
+    shots = screen_capture.stats(h.SCREENSHOT_DIR)
+    screen_line = (
+        f"\n  屏幕工具：开 · 截图 {shots['files']} 张"
+        f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）"
+        if screen_tools_enabled()
+        else f'\n  屏幕工具：关（{SCREEN_ENV}=0）')
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -104,6 +111,7 @@ def format_status(session_store) -> str:
         f'{h.hooks.GATE.judge_summary() if h.hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
+        f'{screen_line}'
         f'{usage_line}'
     )
 
@@ -176,7 +184,8 @@ def run_doctor() -> int:
     cache_root = h.SESSIONS_DIR.parent
     print(f'[home] {h.HOME_DIR}（会话/记忆/快照的根，可用 HARNESS_HOME 覆盖）')
     print(f'[sessions] {h.SESSIONS_DIR}')
-    for directory in (h.SESSIONS_DIR, h.CHECKPOINT_DIR, h.MEMORY_DIR, h.TOOL_RESULTS_DIR):
+    for directory in (h.SESSIONS_DIR, h.CHECKPOINT_DIR, h.MEMORY_DIR,
+                      h.TOOL_RESULTS_DIR, h.SCREENSHOT_DIR):
         try:
             directory.mkdir(parents=True, exist_ok=True)
             try:
@@ -199,6 +208,10 @@ def run_doctor() -> int:
     cache = tool_cache.scan(h.TOOL_RESULTS_DIR)
     print(f"[cache] tool_results: {cache['files']} files, "
           f"{tool_cache.human_size(cache['bytes'])} (use /cache gc)")
+    shots = screen_capture.stats(h.SCREENSHOT_DIR)
+    state = 'on' if screen_tools_enabled() else f'off ({SCREEN_ENV}=0)'
+    print(f"[screen] tools={state} · screenshots: {shots['files']} files, "
+          f"{tool_cache.human_size(shots['bytes'])} (retained 7 days)")
     try:
         print(storage_profile.format_summary(storage_profile_data(deep=False)))
     except Exception as exc:

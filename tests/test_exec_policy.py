@@ -836,3 +836,51 @@ def test_explicit_paths_never_share_a_session_grant():
     # URL 不是文件路径，主机级免审键不受影响
     assert approval_class(
         'bash', {'command': 'curl https://a.invalid/x'}) == 'curl:a.invalid'
+
+
+# ============================================================
+# 屏幕读取：每次都问，显式关闭后硬拒
+# ============================================================
+
+def screen(tool='screen_capture', mode=DEFAULT_SANDBOX_MODE,
+           policy=DEFAULT_APPROVAL_POLICY):
+    return Policy(mode, policy).evaluate(tool, {})
+
+
+def test_screen_tools_always_ask_even_in_read_only(monkeypatch):
+    monkeypatch.delenv('HARNESS_SCREEN_TOOLS', raising=False)
+    for tool in ('screen_capture', 'screen_ocr'):
+        for mode in ('read-only', 'workspace-write'):
+            decision = screen(tool, mode=mode)
+            assert decision.action == ASK
+            assert decision.code == 'screen_access'
+
+
+def test_screen_tools_never_policy_denies(monkeypatch):
+    monkeypatch.delenv('HARNESS_SCREEN_TOOLS', raising=False)
+    assert screen(policy='never').action == DENY
+    assert screen(mode='danger-full-access', policy='never').action == ALLOW
+
+
+def test_screen_tools_can_be_disabled(monkeypatch):
+    monkeypatch.setenv('HARNESS_SCREEN_TOOLS', '0')
+    for tool in ('screen_capture', 'screen_ocr'):
+        decision = screen(tool)
+        assert decision.action == DENY
+        assert decision.code == 'screen_tools_disabled'
+        assert 'HARNESS_SCREEN_TOOLS=0' in decision.reason
+
+
+def test_screen_tools_enabled_parsing():
+    from exec_policy import screen_tools_enabled
+
+    assert screen_tools_enabled({}) is True
+    assert screen_tools_enabled({'HARNESS_SCREEN_TOOLS': ''}) is True
+    assert screen_tools_enabled({'HARNESS_SCREEN_TOOLS': '1'}) is True
+    for value in ('0', 'off', 'false', 'NO', 'disabled'):
+        assert screen_tools_enabled({'HARNESS_SCREEN_TOOLS': value}) is False
+
+
+def test_screen_tools_keep_their_own_approval_class():
+    assert approval_class('screen_capture', {'screen': 'primary'}) == 'screen_capture'
+    assert approval_class('screen_ocr', {'path': 'x.png'}) == 'screen_ocr'

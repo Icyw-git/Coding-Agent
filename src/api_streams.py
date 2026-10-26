@@ -12,6 +12,7 @@ import time
 import traceback
 from collections.abc import Iterable
 
+import turn_screenshots
 from api_models import SendMessageRequest
 from session_store import SessionReplayError
 from turn_progress import TurnProgress, format_duration
@@ -95,11 +96,14 @@ def build_router(client, runtime, logger):
 
         def run() -> None:
             started = time.monotonic()
+            store = None
+            before = 0
             try:
                 opener = getattr(runtime, 'open_session', None)
                 if opener is not None:
                     store = opener(session_id)
-                    deltas.put(('source', (store, store.path.stat().st_size)))
+                    before = turn_screenshots.offset(store)
+                    deltas.put(('source', (store, before)))
                 response = client.messages.create(
                     session_id, request.content,
                     on_delta=lambda text: deltas.put(("delta", text)),
@@ -108,6 +112,8 @@ def build_router(client, runtime, logger):
                 duration_ms = round((time.monotonic() - started) * 1000)
                 deltas.put(("done", {"session_id": response.session_id,
                                      "content": response.content,
+                                     "screenshots": turn_screenshots.collect_tail(
+                                         store, before),
                                      "duration_ms": duration_ms,
                                      "duration": format_duration(duration_ms / 1000)}))
             except TurnCancelled as exc:

@@ -188,6 +188,19 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   这两条渲染路径需要可选的 `requirements-docs.txt`，DOCX/PPTX 还需要系统里的 `soffice`；
   不需要看排版时直接用 `read_document`。默认前 3 页、单次最多 8 页，`dpi` 支持 72–200；
   XLSX 请用 `read_document` 读单元格。
+- `screen_capture` 截取本机屏幕并作为图片附件交给模型查看（`screen=primary|all`，可用
+  `region="x,y,w,h"` 只截一块，`delay_ms` 躲开窗口切换动画）。截图按内容寻址存到 harness 缓存
+  `.cache/screenshots`（不是工作区），保留 7 天，进程启动时的后台维护会清理过期文件。
+  多显示器时 `all` 截的是整个虚拟桌面。
+- `screen_ocr` 用 Windows 自带的 WinRT OCR 在本地识别文字，返回纯文本与每行的边界框，
+  不联网也不经过视觉模型；不传 `path` 时读最近一张截图，只接受 `.cache/screenshots` 里的文件。
+  默认语言 `zh-Hans-CN`，`lang=auto` 跟随系统语言；识别区域可用 `region` 限定。语言包缺失时
+  会列出本机可用语言并提示安装，不会静默返回空文本。
+- 屏幕工具默认开启，但**每次调用都要审批**（不提供「本会话允许同类」；`never` 档位下按
+  fail-closed 直接拒绝，`danger-full-access` + `never` 沿用既有语义放行）；后台与定时回合
+  直接拒绝，子代理也拿不到这两个工具。`HARNESS_SCREEN_TOOLS=0` 可整体关闭。从飞书发起的
+  成功回合会把本轮截图回传到原聊天（最多 4 张、单张 ≤10MB），`FEISHU_SEND_SCREENSHOTS=0`
+  可关闭；传输只使用内容哈希文件名，API 端校验会话与文件名，不暴露本地路径。
 - `todo_write` / `todo_read` 维护当前会话的任务清单：整表替换、状态只能是
   `pending/in_progress/completed`、最多 100 项、同一时间只允许一个 `in_progress`。
   清单按会话隔离，并作为 `todos` 事件写入事件流，会话恢复后 `todo_read` 仍能读到。
@@ -209,14 +222,15 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   策略。配置了 HTTP 代理时 DNS 由代理解析，固定地址不生效，预检结果也不代表代理的解析。
 - 子代理启动时按当时的工具注册表生成工具面，不会拿到启动时快照里已删除的工具；`task`、
   teammate/计划/定时任务、worktree、`background_output`/`kill_background` 等控制类工具不向
-  子代理暴露，bash 也不提供 `run_in_background`。
+  子代理暴露，屏幕工具（`screen_capture`/`screen_ocr`）同样排除，bash 也不提供
+  `run_in_background`。
 
 ## 执行安全与审批
 
 所有内建工具中会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
 PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / `run_read_document` /
 `run_render_document` / `run_glob` / `run_grep` / `run_ls` / `run_write` / `run_edit` /
-`run_apply_patch` / `run_web_fetch`）、Teammate 线程、后台与 HTTP
+`run_apply_patch` / `run_web_fetch` / `run_screen_capture` / `run_screen_ocr`）、Teammate 线程、后台与 HTTP
 任务——共用同一套规则和同一句拒绝文案，
 不再各写一份黑名单。
 
@@ -260,6 +274,12 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
 - `web_fetch` 不豁免出口审批：合法 URL 一律 `network_egress` 询问，「同类」键为
   `web_fetch:主机`；URL 形状不合法或指向非公网地址在审批前就硬拒（`invalid_url`）。
   这是防 SSRF 的地址校验，不替代人工判断——批准前仍应看清主机。
+- 屏幕工具（`screen_capture` / `screen_ocr`）在三种档位下都按 `screen_access` 逐次询问，
+  不参与会话白名单：批准一次截屏不该让本会话此后随时能看屏幕（`never` 下 fail-closed，
+  `danger-full-access` + `never` 按既有语义放行）。后台 worker、定时任务与子代理线程拿不到
+  这两个工具（定时任务的只读工具面同样排除）；`HARNESS_SCREEN_TOOLS=0` 时在审批前直接硬拒。
+  OCR 只读 `.cache/screenshots` 里的截图，不能借它识别任意图片文件。审计事件记录截图
+  路径/SHA1/尺寸与 OCR 字符数，不记录识别出的文字。
 - 复合命令（`&&`、`;`、`|`、换行）要每一段归到同一类才记「同类」：只按第一段归类的话，
   批准 `ls && rm x` 会写下 `bash:ls`，之后 `ls; rm -rf ~` 就被同一个键放行。
 - `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位下需要审批的
@@ -731,7 +751,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |
 | `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
 | `src/tools.py` | 工具接线：路径边界、`run_*` 薄包装、`tool_registry` |
-| `src/tool_schemas.py` | 37 个工具的 schema（顺序即契约，有快照测试锁定） |
+| `src/tool_schemas.py` | 42 个工具的 schema（顺序即契约，有快照测试锁定） |
 | `src/tool_teams.py` | 团队协作：派生 teammate、消息收发、shutdown/plan 协议 |
 | `src/background_watch.py` | `/watch`：后台任务列表与跟踪到终态（Ctrl-C 可脱离） |
 | `src/tool_activity.py` | CLI 工具活动行：参数摘要、耗时与成功/失败标记 |
@@ -739,6 +759,10 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_tasks.py` | 任务与 cron 工具：封装 task_system/cron_scheduler 并统一输出 |
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |
 | `src/tool_documents.py` | `view_image`/`read_document`/`render_document`：图片缓存与文档渲染引用 |
+| `src/tool_screen.py` | `screen_capture`/`screen_ocr` 工具层：截图落盘、OCR 范围限制与审计事件 |
+| `src/turn_screenshots.py` | 回合截图元数据：字节偏移、sha1 去重与数量上限（不暴露绝对路径） |
+| `src/screen_capture.py` | Windows 截屏能力层：DPI、多屏/区域、PowerShell 调用、保留清理与统计 |
+| `src/ocr_windows.py` | WinRT OCR 能力层：语言选择、区域裁剪与行级边界框 |
 | `src/documents.py` | 文档文本抽取入口：格式识别、PDF 解析与页选择 |
 | `src/document_formats.py` | DOCX/PPTX/XLSX 解析：OOXML zip/XML 工具与成员读取上限 |
 | `src/tool_search.py` | `glob`/`grep`/`ls`：只读边界、秘密文件过滤与 ripgrep 快路径 |

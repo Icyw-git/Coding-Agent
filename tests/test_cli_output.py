@@ -16,6 +16,25 @@ def test_status_is_readable_without_internal_ids(tmp_path, monkeypatch):
     assert 'internal-session-id' not in output and 'events=' not in output
 
 
+def test_status_reports_screenshot_count_and_switch(tmp_path, monkeypatch):
+    import harness
+    import screen_capture
+
+    store = harness.SessionEventStore(tmp_path, session_id='screen-status')
+    monkeypatch.setattr(harness, 'get_checkpoint_manager',
+                        lambda _: SimpleNamespace(list=lambda **kwargs: []))
+    monkeypatch.setattr(harness, 'list_tasks', lambda: [])
+    monkeypatch.setattr(harness, 'SCREENSHOT_DIR', tmp_path / 'screenshots')
+    screen_capture.save_png(screen_capture.PNG_MAGIC + b'x', harness.SCREENSHOT_DIR)
+
+    output = harness.format_status(store)
+    assert '屏幕工具：开' in output
+    assert '截图 1 张' in output
+
+    monkeypatch.setenv('HARNESS_SCREEN_TOOLS', '0')
+    assert '屏幕工具：关（HARNESS_SCREEN_TOOLS=0）' in harness.format_status(store)
+
+
 def test_checkpoint_listing_keeps_actionable_reference():
     import time
 

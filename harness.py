@@ -425,6 +425,7 @@ TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 
 
 # ---------- 缓存目录 ----------
 TOOL_RESULTS_DIR=CACHE_DIR/'tool_results'
+SCREENSHOT_DIR=CACHE_DIR/'screenshots'
 TRANSCRIPT_DIR=CACHE_DIR/'transcripts'
 SESSIONS_DIR=CACHE_DIR/'sessions'
 
@@ -469,6 +470,13 @@ def start_storage_maintenance(emit=print, *, purge_orphans=False) -> None:
                          '本次仅预览，未删除')
         except Exception as exc:
             emit(f'  [cleanup] 孤儿子日志维护异常：{exc}')
+        try:
+            from screen_capture import prune as prune_screenshots
+            removed = prune_screenshots(SCREENSHOT_DIR)
+            if removed:
+                emit(f'  [cleanup] 已清理 {removed} 张超过保留期的截图')
+        except Exception as exc:
+            emit(f'  [cleanup] 截图保留维护异常：{exc}')
 
     threading.Thread(target=_run, name='storage-maintenance', daemon=True).start()
 
