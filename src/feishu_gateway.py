@@ -27,6 +27,7 @@ gateway_sim 共用同一套端点契约（sessions / tasks / permissions）。
     /workspaces      列出已登记工作区；/workspace add|remove 维护登记表
     /sessions /use <前缀> /cd [dir] /run <cmd> /status [id]
     /logs <id> /stop <id> /perms /approve [req_id] y|n /sandbox /quit(解绑)
+    /grants [add|remove]  查看/维护目录级持久写授权
     审批卡片按钮  —— 点【允许/拒绝】直接决议（首选，零输入）
     y / n、y2 / n2 —— 快捷审批：按序号决议本聊天的待审批请求
     /use <前缀>    —— 切换该聊天绑定的会话（/sessions 查列表，前缀唯一即可）
@@ -52,6 +53,7 @@ from pathlib import Path
 import httpx
 
 import approval_view
+import grants
 import llm_route
 import notify
 import paths
@@ -61,6 +63,7 @@ import turn_screenshots
 from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, approval_class, clipboard_tools_enabled, screen_tools_enabled
 from feishu_approval_card import approval_card, approval_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
+from feishu_grant_card import grant_card, grant_text
 from feishu_help_card import help_card
 from feishu_panel import control_card
 from feishu_sessions import PAGE_SIZE, detail_card, list_card, workspace_card
@@ -690,6 +693,8 @@ class FeishuGateway:
         self._session_filters: dict[str, bool] = {}
         # chat_id → (token, created_at)：定时任务卡片的按钮有效期（10 分钟）
         self._cron_views: dict[str, tuple[str, float]] = {}
+        # chat_id → (token, created_at)：目录授权卡片按钮同理
+        self._grant_views: dict[str, tuple[str, float]] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
@@ -1362,6 +1367,10 @@ class FeishuGateway:
             crons = len(self.api.list_crons())
         except Exception:
             crons = 0   # 面板不能因为 cron 接口抖动就打不开
+        try:
+            path_grants = len(self.api.list_grants())
+        except Exception:
+            path_grants = 0
         sender = getattr(self.transport, 'send_session_card', None)
         if sender is not None:
             try:
@@ -1369,7 +1378,7 @@ class FeishuGateway:
                                              workspace=workspace,
                                              model=self._model_summary(),
                                              intro=intro, pending=pending,
-                                             crons=crons))
+                                             crons=crons, grants=path_grants))
                 return
             except Exception as exc:
                 print(f'[feishu] panel card failed, fallback to text: {exc}')
@@ -1390,6 +1399,8 @@ class FeishuGateway:
             self._panel_status(chat_id)
         elif action in ('crons', 'cron'):
             self._show_crons(chat_id)
+        elif action in ('grants', 'grant'):
+            self._show_grants(chat_id)
         elif action in ('perms', 'approvals'):
             pending = [req for req in self.api.pending_permissions()
                        if self._request_belongs_to(chat_id, req)]
@@ -1437,6 +1448,11 @@ class FeishuGateway:
             lines.append(f"定时任务 {len(self.api.list_crons())} 个（点「定时任务」管理）")
         except Exception as exc:
             lines.append(f'定时任务不可用: {exc}')
+        try:
+            lines.append(f"目录写授权 {len(self.api.list_grants())} 个"
+                         '（点「目录授权」管理）')
+        except Exception as exc:
+            lines.append(f'目录授权不可用: {exc}')
         try:
             shots = screen_capture.stats(paths.cache_path('screenshots'))
             state = '开' if screen_tools_enabled() else f'关（{SCREEN_ENV}=0）'
@@ -1698,6 +1714,123 @@ class FeishuGateway:
             return
         self._reply(chat_id, '未知的定时任务操作，请重新发送 /cron。')
 
+    def _show_grants(self, chat_id: str, *, page: int = 0,
+                     intro: str = '', message_id: str | None = None) -> None:
+        """目录写授权卡片：列出现有授权，每条带「撤销」。"""
+        try:
+            rows = self.api.list_grants()
+        except Exception as exc:
+            self._reply(chat_id, f'[grant] {exc}')
+            return
+        token = secrets.token_hex(4)
+        self._grant_views[chat_id] = (token, time.monotonic())
+        card = grant_card(rows, token=token, intro=intro, page=page)
+        patcher = getattr(self.transport, 'update_step_card', None)
+        if message_id and patcher is not None:
+            try:
+                patcher(message_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] grant card patch failed, sending new: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] grant card failed, fallback to text: {exc}')
+        self._reply(chat_id, (intro + chr(10) if intro else '')
+                    + grant_text(rows))
+
+    def _grant_view_ok(self, chat_id: str, value: dict) -> bool:
+        view = self._grant_views.get(chat_id)
+        return bool(view and value.get('grant_view') == view[0]
+                    and time.monotonic() - view[1] <= 600)
+
+    def _handle_grant_action(self, chat_id: str, value: dict,
+                             sender_id: str | None = None,
+                             message_id: str | None = None) -> None:
+        """卡片按钮：翻页 / 撤销某条目录写授权。"""
+        action = str(value.get('grant_action') or '')
+        if not self._grant_view_ok(chat_id, value):
+            self._reply(chat_id, '这张目录授权卡片已过期，请重新发送 /grants 打开。')
+            return
+        if action == 'page':
+            target = value.get('page')
+            if type(target) is not int or target < 0:
+                self._reply(chat_id, '无效的页码，请重新打开 /grants。')
+                return
+            self._show_grants(chat_id, page=target, message_id=message_id)
+            return
+        if action != 'remove':
+            self._reply(chat_id, '未知的目录授权操作，请重新发送 /grants。')
+            return
+        path = str(value.get('grant_path') or '')
+        if not path:
+            self._reply(chat_id, '无效的授权路径，请重新打开 /grants。')
+            return
+        try:
+            self.api.remove_grant(
+                path, session_id=self.bindings.get(chat_id),
+                by=f'feishu:{sender_id or chat_id}')
+        except Exception as exc:
+            self._reply(chat_id, f'[grant] {exc}')
+            return
+        self._reply(chat_id, f'已撤销目录写授权: {path}')
+        self._show_grants(chat_id, message_id=message_id)
+
+    def _handle_grant_command(self, chat_id: str, argument: str,
+                              sender_id: str | None = None) -> None:
+        """/grants [add|remove]：查看/维护目录级持久写授权。"""
+        usage = ('用法:\n'
+                 '/grants                    查看（按钮可撤销）\n'
+                 '/grants add "<目录>" [until YYYY-MM-DD] [note 备注]\n'
+                 '/grants remove "<目录>"\n'
+                 '路径含空格时用引号包起来；只允许已存在的绝对目录。')
+        parts = argument.split(maxsplit=1)
+        action = parts[0].casefold() if parts else ''
+        rest = parts[1] if len(parts) > 1 else ''
+        if not action:
+            self._show_grants(chat_id)
+            return
+        if action not in ('add', 'remove'):
+            self._reply(chat_id, usage)
+            return
+        try:
+            path, options = grants.split_path_argument(rest)
+        except ValueError as exc:
+            self._reply(chat_id, f'[grant] {exc}')
+            return
+        if not path:
+            self._reply(chat_id, usage)
+            return
+        by = f'feishu:{sender_id or chat_id}'
+        session_id = self.bindings.get(chat_id)
+        if action == 'remove':
+            if options:
+                self._reply(chat_id, usage)
+                return
+            try:
+                self.api.remove_grant(path, session_id=session_id, by=by)
+            except Exception as exc:
+                self._reply(chat_id, f'[grant] {exc}')
+                return
+            self._reply(chat_id, f'已撤销目录写授权: {path}')
+            self._show_grants(chat_id)
+            return
+        try:
+            expires, note = grants.parse_options(options)
+            record = self.api.add_grant(path, expires=expires, note=note,
+                                        session_id=session_id, by=by)
+        except Exception as exc:
+            self._reply(chat_id, f'[grant] {exc}')
+            return
+        expiry = (f"有效至 {record.get('expires')}" if record.get('expires')
+                  else '永久')
+        self._reply(chat_id, f"已授权目录写操作: {record.get('path')}（{expiry}）\n"
+                             '只放宽工作区外写入的审批；秘密文件与系统目录仍硬拒。')
+        self._show_grants(chat_id)
+
     def _send_help(self, chat_id: str) -> None:
         """帮助卡：常用入口按钮 + 折叠命令清单；无 2.0 卡片能力时回退纯文本。"""
         sender = getattr(self.transport, 'send_step_card', None)
@@ -1732,6 +1865,7 @@ class FeishuGateway:
             '/revoke                 撤销当前会话已允许的同类操作',
             '/sandbox [档位|approvals <档位>]  查看/切换执行与审批档位',
             '/cron [list|add "<表达式>" <提示词>|delete <id>]  定时任务',
+            '/grants [add|remove]   查看/维护目录级持久写授权',
             '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
             '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
             '/find <关键词>           跨会话搜索历史内容',
@@ -2085,11 +2219,17 @@ class FeishuGateway:
                     self._reply(chat_id, '用法: /revoke')
                     return
                 try:
-                    count = self.api.revoke_permissions(self.bindings.get(chat_id))
+                    result = self.api.revoke_permissions(self.bindings.get(chat_id))
                 except Exception as exc:
                     self._reply(chat_id, f'[revoke] {exc}')
                     return
-                self._reply(chat_id, f'已撤销 {count} 条当前会话预授权。')
+                text = f"已撤销 {result['revoked']} 条当前会话预授权"
+                if result.get('grants_revoked'):
+                    text += f"，以及 {result['grants_revoked']} 条目录写授权"
+                text += '。'
+                if result.get('grant_error'):
+                    text += f"\n目录授权撤销失败: {result['grant_error']}"
+                self._reply(chat_id, text)
             elif command == '/model':
                 main = llm_route.target_for('main')
                 if main is not None:
@@ -2103,6 +2243,8 @@ class FeishuGateway:
                 self._change_policy(chat_id, argument)
             elif command == '/cron':
                 self._handle_cron(chat_id, argument)
+            elif command in ('/grants', '/grant'):
+                self._handle_grant_command(chat_id, argument, sender_id)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
@@ -2327,6 +2469,15 @@ class FeishuGateway:
                 return '当前消息较多，请稍后重试', False
             return '正在重试…', True
         if (value or {}).get('task_action'):
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理…', True
+        if (value or {}).get('grant_action'):
+            if not self._grant_view_ok(chat_id, value):
+                return '目录授权卡片已过期，请重新打开', False
             try:
                 self._events.put_nowait((chat_id, value, open_id, None,
                                          message_id))
@@ -2786,6 +2937,9 @@ class FeishuGateway:
                                 elif text.get('cron_action'):
                                     self._handle_cron_action(chat_id, text, sender_id,
                                                              message_id)
+                                elif text.get('grant_action'):
+                                    self._handle_grant_action(chat_id, text, sender_id,
+                                                              message_id)
                                 elif text.get('task_action'):
                                     self._handle_task_action(chat_id, text, sender_id,
                                                              message_id)

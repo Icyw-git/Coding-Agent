@@ -35,6 +35,32 @@ def test_cli_commands_and_aliases_exist_in_tui():
             assert commands.find(alias.lstrip('/')) is spec, alias
 
 
+def test_tui_grants_add_list_remove_and_audit(tmp_path):
+    notes = tmp_path / 'notes'
+    notes.mkdir()
+    store = harness.SessionEventStore(tmp_path)
+
+    async def scenario():
+        app = HarnessApp([], session_store=store, session_id=store.session_id)
+        async with app.run_test() as pilot:
+            app.submit_text(f'/grants add "{notes}" note TUI')
+            await pilot.pause()
+            assert '已授权目录写操作' in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text('/grants')
+            await pilot.pause()
+            assert str(notes.resolve()) in app.model.snapshot()[-1].payload['text']
+
+            app.submit_text(f'/grants remove "{notes}"')
+            await pilot.pause()
+            assert '已撤销目录写授权' in app.model.snapshot()[-1].payload['text']
+
+    asyncio.run(scenario())
+    events = [event['type'] for event in store.read_events()]
+    assert events.count('grant_added') == 1
+    assert events.count('grant_removed') == 1
+
+
 def test_busy_task_blocks_session_and_workspace_switch(tmp_path, monkeypatch):
     store = harness.SessionEventStore(tmp_path)
 

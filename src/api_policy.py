@@ -35,8 +35,31 @@ def build_router(permission_gate):
 
     @router.post("/v1/permissions/revoke")
     def revoke_permissions(request: RevokePermissionRequest):
-        """撤销一个会话的预授权；未指定会话时撤销全部。"""
-        return {"revoked": permission_gate.revoke_session(request.session_id)}
+        """撤销一个会话的预授权；未指定会话时撤销全部。
+
+        目录级持久授权按会话归属一起收回：它们在策略层是「以后免问」，与
+        会话白名单同属预授权，一条 /revoke 不该只清掉一半。
+        """
+        count = permission_gate.revoke_session(request.session_id)
+        grants_revoked = 0
+        grant_error = ''
+        if request.session_id:
+            import api_grants
+            import grants
+
+            try:
+                removed = grants.revoke_for_session(request.session_id)
+            except (grants.GrantError, OSError) as exc:
+                grant_error = str(exc)
+            else:
+                grants_revoked = len(removed)
+                for record in removed:
+                    api_grants._audit(request.session_id, 'grant_removed',
+                                      record, 'revoke')
+        payload = {'revoked': count, 'grants_revoked': grants_revoked}
+        if grant_error:
+            payload['grant_error'] = grant_error
+        return payload
 
     @router.get('/v1/policy')
     def get_policy():

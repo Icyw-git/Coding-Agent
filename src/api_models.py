@@ -79,6 +79,22 @@ if BaseModel is not None:
         session_id: str | None = None
 
 
+    class AddGrantRequest(BaseModel):
+        # 目录级持久写授权：只能是绝对路径且已存在（服务端还会拒绝系统目录）。
+        path: str = Field(min_length=1, max_length=1024)
+        expires: str | None = Field(default=None, max_length=10)   # YYYY-MM-DD
+        note: str | None = Field(default=None, max_length=200)
+        by: str = Field(default='api', min_length=1, max_length=200)
+        # 会话 id 用于审计事件，也让本会话的 revoke_permissions 能收回它。
+        session_id: str | None = Field(default=None, max_length=200)
+
+
+    class RemoveGrantRequest(BaseModel):
+        path: str = Field(min_length=1, max_length=1024)
+        by: str = Field(default='api', min_length=1, max_length=200)
+        session_id: str | None = Field(default=None, max_length=200)
+
+
     class PolicyRequest(BaseModel):
         sandbox_mode: str | None = None       # 缺省表示不改这一档
         approval_policy: str | None = None

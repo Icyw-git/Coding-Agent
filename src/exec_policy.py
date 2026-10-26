@@ -186,7 +186,8 @@ class Policy:
     def evaluate(self, tool: str, args: dict, *,
                  deny_list=(), destructive=(), secrets=(),
                  path_zone: str = PATH_OUTSIDE,
-                 external_tools=(), workspace: str | None = None) -> Decision:
+                 external_tools=(), workspace: str | None = None,
+                 write_grants=(), paths=None) -> Decision:
         """判定一次工具调用。
 
         deny_list / destructive / secrets 由调用方注入（生产上分别来自 harness
@@ -204,15 +205,24 @@ class Policy:
         external_tools 是调用方登记的第三方工具名（MCP 注册进来的那批）。本模块
         只认识内置工具的副作用，第三方工具能写盘、能发请求，内容静态不可知 ——
         一律询问，而不是猜一个 ALLOW。名单为空时行为与既往完全一致。
+
+        write_grants 是人显式给出的持久目录授权（已解析的绝对路径）。它只放宽
+        PATH_OUTSIDE 的写入审批：秘密/系统目录仍在授权之前硬拒，read-only 档
+        也仍按只读档询问。paths 用于 apply_patch 这类一次涉及多个路径的调用；
+        缺省时只看 args['path']。
         """
         args = args if isinstance(args, dict) else {}
         if tool == 'bash':
             decision = self._evaluate_bash(str(args.get('command', '') or ''),
                                            deny_list, destructive, secrets,
                                            cwd=args.get('cwd'),
-                                           workspace=workspace)
+                                           workspace=workspace,
+                                           write_grants=write_grants)
         elif tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
-            decision = self._evaluate_file(tool, args, path_zone)
+            decision = self._evaluate_file(tool, args, path_zone,
+                                           workspace=workspace,
+                                           write_grants=write_grants,
+                                           paths=paths)
         elif tool in WORKTREE_TOOLS:
             decision = self._evaluate_worktree(tool, args)
         elif tool == 'web_fetch':
@@ -256,7 +266,8 @@ class Policy:
 
     def _evaluate_bash(self, command: str, deny_list, destructive,
                        secrets=(), *, cwd: str | None = None,
-                       workspace: str | None = None) -> Decision:
+                       workspace: str | None = None,
+                       write_grants=()) -> Decision:
         if not command.strip():
             return Decision(ALLOW)
         # 0) 前缀包装器：真正执行的是内层命令。按外层名字判定，等于
@@ -362,6 +373,13 @@ class Policy:
             root = workspace or str(Path.cwd())
             outside = _outside_write_targets(command, cwd=cwd or root,
                                              workspace=root, secrets=secrets)
+            if outside and write_grants:
+                outside = [
+                    target for target in outside
+                    if not _grant_covers(target, cwd=cwd or root,
+                                         workspace=root, secrets=secrets,
+                                         write_grants=write_grants)
+                ]
             if outside:
                 return Decision(ASK, 'outside_workspace_write',
                                 f'write outside workspace needs approval ({outside[0]})')
@@ -374,7 +392,9 @@ class Policy:
 
     # ---------- 文件工具 ----------
 
-    def _evaluate_file(self, tool: str, args: dict, path_zone: str) -> Decision:
+    def _evaluate_file(self, tool: str, args: dict, path_zone: str, *,
+                       workspace: str | None = None,
+                       write_grants=(), paths=None) -> Decision:
         path = str(args.get('path', '') or '')
         if path_zone == PATH_INVALID:
             return Decision(DENY, 'invalid_path', f'invalid path ({path})')
@@ -394,9 +414,16 @@ class Policy:
             # 读是开放的：项目外的文档、日志、配置本来就是个人助手的日常输入。
             return Decision(ALLOW)
         if self.sandbox_mode == 'read-only':
+            # 持久授权放宽的是「要不要问越界写」，不是只读档本身：换档仍要人确认。
             return Decision(ASK, 'sandbox_read_only',
                             f'sandbox is read-only; {tool} needs approval')
         if path_zone == PATH_OUTSIDE:
+            targets = list(paths) if paths else [path]
+            if (write_grants and _file_paths_granted(
+                    targets, cwd=args.get('cwd'), workspace=workspace,
+                    write_grants=write_grants)):
+                return Decision(ALLOW, 'path_grant',
+                                f'persistent path grant covers ({path})')
             return Decision(ASK, 'outside_workspace_write',
                             f'write outside workspace needs approval ({path})')
         return Decision(ALLOW)
@@ -621,3 +648,45 @@ def _outside_write_targets(command: str, *, cwd, workspace, secrets) -> list[str
                          secrets=secrets) in (PATH_OUTSIDE, PATH_SYSTEM):
             found.append(target)
     return found
+
+
+# ============================================================
+# 持久目录授权（grants）的覆盖判定
+# ============================================================
+# 授权只在「工作区外、且不是秘密/系统目录」这一格里起作用。系统目录即使有人
+# 手工往账本里塞了路径也不放宽 —— 重新分类而不是直接信任授权表，避免账本被
+# 误编辑后变成提权通道。
+
+def _grant_covers(target: str, *, cwd, workspace, secrets, write_grants) -> bool:
+    """bash 的单个写入目标是否被某条持久授权覆盖。"""
+    if not write_grants:
+        return False
+    try:
+        # 授权只放宽 PATH_OUTSIDE；秘密/系统目录命中时保持原判定。
+        if classify_path(target, cwd=cwd, workspace=workspace,
+                         secrets=secrets) != PATH_OUTSIDE:
+            return False
+        resolved = resolve_tool_path(target, cwd=cwd, workspace=workspace)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(resolved == grant or resolved.is_relative_to(grant)
+               for grant in write_grants)
+
+
+def _file_paths_granted(paths, *, cwd, workspace, write_grants) -> bool:
+    """文件工具的所有目标是否都在授权目录内（工作区内路径不计）。"""
+    if not write_grants or not paths:
+        return False
+    base = workspace or cwd or str(Path.cwd())
+    root = Path(base).resolve()
+    for raw in paths:
+        try:
+            resolved = resolve_tool_path(str(raw), cwd=cwd, workspace=root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if resolved.is_relative_to(root):
+            continue
+        if not any(resolved == grant or resolved.is_relative_to(grant)
+                   for grant in write_grants):
+            return False
+    return True

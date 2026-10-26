@@ -423,11 +423,39 @@ class GatewayClient:
         response.raise_for_status()
         return response.json()['request']
 
-    def revoke_permissions(self, session_id: str | None = None) -> int:
+    def revoke_permissions(self, session_id: str | None = None) -> dict:
+        """撤销会话预授权；服务端同时收回该会话创建的目录级持久授权。"""
         response = self.http.post('/v1/permissions/revoke',
                                   json={'session_id': session_id})
         response.raise_for_status()
-        return int(response.json().get('revoked', 0))
+        data = response.json()
+        return {'revoked': int(data.get('revoked', 0)),
+                'grants_revoked': int(data.get('grants_revoked', 0)),
+                'grant_error': str(data.get('grant_error') or '')}
+
+    # ---------- 目录级持久授权 ----------
+
+    def list_grants(self) -> list[dict]:
+        return self._json(self.http.get('/v1/grants'), 'list grants')['grants']
+
+    def add_grant(self, path: str, *, expires: str | None = None,
+                  note: str = '', session_id: str | None = None,
+                  by: str = 'feishu') -> dict:
+        payload: dict = {'path': path, 'note': note, 'by': by}
+        if expires:
+            payload['expires'] = expires
+        if session_id:
+            payload['session_id'] = session_id
+        return self._json(self.http.post('/v1/grants', json=payload),
+                          'add grant')
+
+    def remove_grant(self, path: str, *, session_id: str | None = None,
+                     by: str = 'feishu') -> dict:
+        payload: dict = {'path': path, 'by': by}
+        if session_id:
+            payload['session_id'] = session_id
+        return self._json(self.http.post('/v1/grants/remove', json=payload),
+                          'remove grant')['removed']
 
     # ---------- 执行档位 ----------
 

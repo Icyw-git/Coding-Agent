@@ -2352,3 +2352,80 @@ def test_help_panel_button_opens_pending_approvals(gateway):
     gw._chat_pending['chat-help-perms'] = []
     gw._handle_panel_action('chat-help-perms', 'perms')
     assert '(无待审批请求)' in fake.last()
+
+
+def _grant_button(card, action, path=None):
+    for button in _card_buttons(card):
+        value = button.get('value') or {}
+        if value.get('grant_action') == action and (
+                path is None or value.get('grant_path') == path):
+            return value
+    raise AssertionError(f'no grant {action} button for {path}')
+
+
+def test_grant_command_add_list_and_remove(gateway, tmp_path):
+    gw, fake = gateway
+    notes = tmp_path / 'notes'
+    notes.mkdir()
+    gw.on_message('chat-grant', f'/grants add "{notes}" until 2030-01-01 note 周报')
+
+    assert '已授权目录写操作' in fake.last()
+    assert '有效至 2030-01-01' in fake.last()
+    rows = gw.api.list_grants()
+    assert [row['path'] for row in rows] == [str(notes.resolve())]
+    assert rows[0]['note'] == '周报'
+    # 人从飞书加的授权不挂会话，模型不能顺手撤销
+    assert not rows[0]['session_id']
+
+    gw.on_message('chat-grant', '/grants')
+    card = fake.cards[-1][1]
+    assert card['header']['title']['content'] == '目录写授权'
+    assert _grant_button(card, 'remove', str(notes.resolve()))
+
+    gw.on_message('chat-grant', f'/grants remove "{notes}"')
+    assert '已撤销目录写授权' in fake.last()
+    assert gw.api.list_grants() == []
+
+
+def test_grant_command_rejects_relative_and_missing_paths(gateway, tmp_path):
+    gw, fake = gateway
+    gw.on_message('chat-grant-bad', '/grants add relative/path')
+    assert 'absolute' in fake.last().lower() or '绝对' in fake.last()
+
+    gw.on_message('chat-grant-bad', f'/grants add "{tmp_path / "missing"}"')
+    assert '[grant]' in fake.last()
+
+    gw.on_message('chat-grant-bad', '/grants add')
+    assert '用法' in fake.last()
+
+
+def test_grant_card_revoke_button_checks_view_token(gateway, tmp_path):
+    gw, fake = gateway
+    notes = tmp_path / 'notes'
+    notes.mkdir()
+    gw.on_message('chat-grant-card', f'/grants add "{notes}"')
+    gw.on_message('chat-grant-card', '/grants')
+    value = _grant_button(fake.cards[-1][1], 'remove', str(notes.resolve()))
+
+    toast, ok = gw.handle_card_action(
+        'ou_me', {**value, 'grant_view': 'stale'}, None,
+        chat_id='chat-grant-card')
+    assert not ok and '过期' in toast
+
+    toast, ok = gw.handle_card_action('ou_me', value, None,
+                                      chat_id='chat-grant-card')
+    assert ok
+    gw._handle_grant_action('chat-grant-card', value)
+    assert '已撤销目录写授权' in fake.last()
+    assert gw.api.list_grants() == []
+    assert not gw._grant_view_ok('chat-grant-card', value)
+
+
+def test_control_panel_counts_directory_grants(gateway, tmp_path):
+    gw, fake = gateway
+    notes = tmp_path / 'notes'
+    notes.mkdir()
+    gw.on_message('chat-grant-panel', f'/grants add "{notes}"')
+    fake.cards.clear()
+    gw._handle_panel_action('chat-grant-panel', 'menu')
+    assert '目录授权 1 个' in fake.last_card()

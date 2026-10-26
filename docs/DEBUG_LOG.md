@@ -4976,3 +4976,45 @@ API/网关孤儿，后续可用 Job Object 的 `KILL_ON_JOB_CLOSE` 补上）。
 文件/HTML 等非文本剪贴板格式；超长文本只返回前 200 KiB，没有“分段读取”入口。
 
 
+
+## P4.1 落地：目录级持久写授权与撤销入口
+
+目标是让“长期放行某个目录”不再靠改 `HARNESS_WORKSPACE_ROOTS` 重启，同时保持
+“模型不能给自己扩权、人能一键收回”的边界。
+
+- **账本**：新增 `src/grants.py`，`version: 1`，记录 `path` / `scope=write` /
+  `expires` / `created_by` / `note` / `session_id` / `created_at`，存在
+  `paths.cache_path('grants.json')`。所有写入走 `exclusive_file_lock` + 临时文件
+  `replace`，避免并发 CLI/API 写坏。路径必须是**已存在、非文件系统根、非系统目录**的
+  绝对路径；读取时跳过格式错误的记录，未知版本或 JSON 损坏时策略层按“无授权”处理
+  （fail closed），而增删操作直接报错，不静默覆盖用户数据。
+- **策略接入**：`exec_policy.Policy.evaluate` 增加 `write_grants`（已解析的 `Path`
+  元组）与 `paths`。只在该档位为 `workspace-write` 时由 `hooks` 注入，且只影响
+  `PATH_OUTSIDE` 的写入：命中授权目录或其子树才放行；秘密文件、系统目录仍硬拒，
+  `read-only` 照旧询问。`apply_patch` 多文件时要求每个工作区外目标都被覆盖，工作区内
+  目标不需要授权；bash 的写目标逐个过同一判定。`_grant_covers` 会重新分类路径，
+  即使有人手改账本把 secret/system 目录写进去也不会放宽。
+- **授权只能由人给**：CLI `/grants add|remove`、飞书 `/grants add|remove`、
+  `POST /v1/grants` / `POST /v1/grants/remove`；模型工具面没有新增授权的入口。
+  CLI 与飞书解析路径时不用 `shlex`（POSIX 转义会吃掉 Windows 反斜杠），自己按引号
+  切分；`until YYYY-MM-DD` 与 `note ...` 为可选尾巴。
+- **撤销面**：飞书 `/grants` 卡片每个目录一个「撤销授权」按钮，按钮带每次渲染生成的
+  短 token（10 分钟、按聊天隔离），旧卡片/别的聊天重放只得到“已过期”；控制台面板显示
+  `目录授权 N 个`。`/v1/permissions/revoke`、`/revoke` 和工具 `revoke_permissions`
+  先撤会话白名单，再撤 `session_id` 等于当前会话的目录授权——人手动添加的全局授权
+  （`session_id` 为空）不会被模型顺手清掉。审计写 `grant_added` / `grant_removed`，
+  只在对应会话日志存在时追加。
+- **可见性**：`/status` 与控制台显示条数，`--doctor` 打印生效授权数；`exec_policy`
+  命中授权时返回 `path_grant` 理由，方便排障时区分“授权放行”和“工作区内写”。
+- **测试**：新增 `tests/test_grants.py`（20），覆盖账本增删/幂等更新/过期/会话级撤销/
+  损坏与未知版本、策略矩阵（工作区外、跨目录、秘密/系统、read-only、apply_patch 多路径、
+  bash 兄弟目录）、hooks 注入时机、API 增删与审计、GatewayClient、工具撤销与审计；
+  `tests/test_feishu_gateway.py` 新增 4 条（命令增删/参数拒绝/卡片 token/控制台计数）；
+  `tests/test_ui_lifecycle.py` 新增 1 条 TUI `/grants` 增删与审计，并顺手覆盖了
+  “新命令必须同时在 `ui/commands.py` 注册”的回归。schema 只改描述不改工具数
+  （仍 44 个，快照 SHA1 更新为 `cc00ce9f1b7191bd76a7e96bc093e016b2065d0e`）。
+  定向 grants/schema/tool/CLI/Feishu/TUI **170 passed**；全量 **1899 passed / 2 skipped**，
+  ruff 通过。
+
+未做：域名与工具级授权（账本里预留 `scope` 概念但只实现 `write`）；卡片上直接输入路径
+（飞书回调不带表单值，新增仍走命令）；授权变更的全局审计检索（P6 再做）。

@@ -367,7 +367,8 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'required': ['title']}}},
  {'type': 'function',
   'function': {'name': 'revoke_permissions',
-               'description': 'Revoke all permission grants remembered for the current session. '
+               'description': 'Revoke all permission grants remembered for the current session, '
+                              'including directory write grants this session created. '
                               'Use when the user asks to undo earlier approvals. This removes '
                               'approvals only; changes already made are not undone.',
                'parameters': {'type': 'object', 'properties': {}}}},

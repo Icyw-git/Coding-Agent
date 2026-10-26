@@ -17,6 +17,7 @@ import contextvars
 import os
 
 import checkpoints
+import grants
 from agent_core import register_hook
 from approval import (
     DEFAULT_APPROVAL_TIMEOUT,
@@ -371,6 +372,7 @@ def evaluate_call(tool: str, args: dict, policy=None):
     """
     zone = PATH_WORKSPACE
     eval_args = args
+    paths = None
     if tool == 'apply_patch':
         try:
             paths = patch_paths(str(args.get('patch') or ''))
@@ -385,14 +387,21 @@ def evaluate_call(tool: str, args: dict, policy=None):
         # grep / ls / glob 的 path 缺省是工作区；用它参与分区判定，显式指向
         # 秘密文件时同样在策略层硬拒。
         zone = _path_zone(str(args.get('path') or '.'), args.get('cwd'))
-    return (policy or load_policy()).evaluate(
+    policy = policy or load_policy()
+    # 持久授权只在默认档参与判定：read-only 仍要审批，danger 本来全放行。
+    # 账本损坏时 active_write_paths 返回空元组（fail-closed），不会误放行。
+    write_grants = (grants.active_write_paths()
+                    if policy.sandbox_mode == 'workspace-write' else ())
+    return policy.evaluate(
         tool, eval_args,
         deny_list=_h().DENY_LIST,
         destructive=_h().DESTRUCTIVE,
         secrets=checkpoints.DEFAULT_SECRETS,
         path_zone=zone,
         external_tools=EXTERNAL_TOOLS,
-        workspace=str(_h().get_workdir()))
+        workspace=str(_h().get_workdir()),
+        write_grants=write_grants,
+        paths=paths)
 
 
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import api_cron_results
 import api_crons
+import api_grants
 import api_heartbeat
 import api_policy
 import api_sessions
@@ -178,6 +179,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     app.include_router(api_sessions.build_router(client, runtime))
     app.include_router(api_crons.build_router())
     app.include_router(api_cron_results.build_router())
+    app.include_router(api_grants.build_router())
     app.include_router(api_heartbeat.build_router())
     app.include_router(api_streams.build_router(client, runtime, logger))
     app.include_router(api_system.build_router())

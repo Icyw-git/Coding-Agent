@@ -23,7 +23,7 @@ ORDER = [
     'clipboard_read', 'clipboard_write',
 ]
 
-SCHEMA_SHA1 = '441671449b9b05c4ac42a7bc97e22b5a34758467'
+SCHEMA_SHA1 = 'cc00ce9f1b7191bd76a7e96bc093e016b2065d0e'
 
 
 def test_tool_order_is_stable():

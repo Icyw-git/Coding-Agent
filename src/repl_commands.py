@@ -9,11 +9,42 @@ from __future__ import annotations
 import os
 import sys
 
+import grants
 import hooks
 import llm_route
 from checkpoint_commands import format_checkpoint_list, format_restore_report, rewind_to
 from checkpoints import CheckpointError
 from cli_commands import command_error, format_command_help, parse_command
+
+
+def _grant_audit(session_store, event: str, record: dict | None, by: str) -> None:
+    if session_store is None or record is None:
+        return
+    try:
+        session_store.append(event, path=record.get('path', ''),
+                             scope=record.get('scope', 'write'),
+                             expires=record.get('expires', ''), by=by,
+                             note=record.get('note', ''),
+                             session_id=session_store.session_id)
+    except Exception as exc:
+        print(f'  [grants] 审计写入失败: {type(exc).__name__}: {exc}')
+
+
+def _format_grants() -> str:
+    rows = grants.list_grants()
+    if not rows:
+        return ('  （没有目录写授权）\n'
+                '  用法：/grants add "<目录>" [until YYYY-MM-DD] [note 备注]')
+    lines = ['  目录写授权：']
+    for row in rows:
+        expiry = (f"有效至 {row['expires']}" if row.get('expires')
+                  else '永久')
+        if not row.get('active'):
+            expiry = f"已过期（{row['expires']}）"
+        note = f" · {row['note']}" if row.get('note') else ''
+        lines.append(f"    {row['path']}  [{expiry}{note}]")
+    lines.append('  撤销：/grants remove "<目录>"；秘密文件与系统目录不受授权影响。')
+    return '\n'.join(lines)
 
 
 def _h():
@@ -102,8 +133,60 @@ def handle_command(line: str, messages: list, session_store) -> None:
             print(h.format_pending_approvals())
 
     elif command == '/revoke':
-        count = hooks.GATE.revoke_session(hooks.current_session_id() or None)
-        print(f'  已撤销 {count} 条当前会话预授权。')
+        session_id = hooks.current_session_id() or ''
+        count = hooks.GATE.revoke_session(session_id or None)
+        removed = grants.revoke_for_session(session_id) if session_id else []
+        for record in removed:
+            _grant_audit(session_store, 'grant_removed', record,
+                         'revoke_permissions')
+        extra = f'，{len(removed)} 条目录写授权' if removed else ''
+        print(f'  已撤销 {count} 条当前会话预授权{extra}。')
+
+    elif command == '/grants':
+        parts = argument.split(maxsplit=1)
+        action = parts[0].casefold() if parts else ''
+        rest = parts[1] if len(parts) > 1 else ''
+        if not action:
+            print(_format_grants())
+            return
+        if action not in ('add', 'remove'):
+            print('  用法：/grants [add "<目录>" [until YYYY-MM-DD] [note 备注]'
+                  '|remove "<目录>"]')
+            return
+        try:
+            path, options = grants.split_path_argument(rest)
+        except ValueError as exc:
+            print(f'  [grants] {exc}')
+            return
+        if not path:
+            print('  用法：/grants add|remove "<目录>"')
+            return
+        session_id = hooks.current_session_id() or ''
+        try:
+            if action == 'remove':
+                if options:
+                    print('  用法：/grants remove "<目录>"（路径含空格时加引号）')
+                    return
+                record = grants.remove_path(path)
+                if record is None:
+                    print(f'  没有找到该目录的授权：{path}')
+                    return
+            else:
+                expires, note = grants.parse_options(options)
+                record = grants.add_path(path, expires=expires, note=note,
+                                         created_by='cli', session_id=session_id)
+        except (grants.GrantError, OSError) as exc:
+            print(f'  [grants] {exc}')
+            return
+        _grant_audit(session_store,
+                     'grant_removed' if action == 'remove' else 'grant_added',
+                     record, 'cli')
+        if action == 'remove':
+            print(f"  已撤销目录写授权：{record['path']}")
+        else:
+            expiry = (f"有效至 {record['expires']}" if record.get('expires')
+                      else '永久')
+            print(f"  已授权目录写操作：{record['path']}（{expiry}）")
 
     elif command == '/compact':
         if not messages:

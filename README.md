@@ -102,7 +102,8 @@ Enter 切换、Esc 返回，Ctrl+A 切换当前/全部工作区。Tab/Shift+Tab 
 - `/archive select 1 3`：选择列表中的会话，预览后用 `/confirm` 执行，或 `/cancel` 取消。
 - `/delete`、`/delete select 1 3`：选择已归档会话；必须用 `/confirm 删除` 才永久删除。
 - `/sandbox [档位|approvals <档位>]`：查看或切换服务端的执行/审批档位，对所有会话立即生效。
-- `/revoke`：撤销当前会话已批准的「同类」预授权（换档时服务端会连带全部撤销）。
+- `/revoke`：撤销当前会话已批准的「同类」预授权与该会话添加的目录写授权（换档时服务端会连带全部撤销）。
+- `/grants [add|remove]`：查看、授权或撤销目录级持久写授权；卡片每条带撤销按钮（10 分钟有效）。
 
 网关默认只处理单聊（p2p），群聊/话题群消息直接忽略；启动时必须配置 `FEISHU_ALLOWED_USERS`，
 只有本地测试可用 `FEISHU_ALLOW_ANY_USER=1` 显式放开。审批卡片和 `/approve <id>` 只接受已经推送给
@@ -325,7 +326,7 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
   只要有一个目标是秘密文件或非法路径就整份拒绝，有越界写则整份询问；不存在「前面几个文件
   免审、到最后一个才拦」的半执行状态。补丁格式错误在策略层直接 `invalid_patch` 硬拒。
 - 文件工具的审批没有「本会话允许同类」：一次写 `a.txt` 的批准不该变成整会话任意路径免审。
-  目录范围授权留到后续；越界写每次都看卡片。
+  需要长期放行某个目录时用目录级写授权（`/grants add`，见下文）；未授权的越界写每次都看卡片。
 - bash 的写路径按同一套分区判：`cp`/`mv`/`tee`/`dd`/`tar`/`unzip`/`mkdir`/`install` 等
   写命令的路径参数与重定向目标（含 `bash -c`/`cmd /c` 载荷、`dd of=`、`--output=`）指向
   工作区外或系统目录时询问 `outside_workspace_write`；读命令（`cat`/`find`/`ls`…）不进
@@ -376,6 +377,28 @@ content 不会刷进控制台和审批历史。被截断的命令不提供「本
 ⚠ 没有开启 OS 沙箱时，这一层只是策略级判定：它不隔离文件读取和网络，也不保证进程无法绕开。
 出口审批只覆盖登记的网络客户端命令；解释器代码（`python -c`）、未登记的程序仍可直连网络——
 这一项的作用是把常见出口变成一次明确的人工同意，不是网络隔离。
+
+### 目录级写授权（`/grants`）
+
+跨工作区的长期写入不必每次改 `HARNESS_WORKSPACE_ROOTS` 再重启，可以给某个已存在的
+目录做持久授权：
+
+```
+/grants                                  查看当前授权（带撤销按钮/序号）
+/grants add "D:\notes" [until 2026-12-31] [note 周报目录]
+/grants remove "D:\notes"
+/revoke                                  撤销当前会话的预授权，以及该会话添加的目录授权
+```
+
+飞书的 `/grants` 会发卡片，每条授权一个「撤销授权」按钮（10 分钟内有效）；
+`/revoke` 与 CLI 行为一致。授权记录存在 `<agent home>/cache/grants.json`，
+`--doctor` 和 `/status` 会显示生效条数，`GET/POST /v1/grants` 供外部客户端维护。
+
+边界是刻意收窄的：只放宽 **`workspace-write` 档下工作区外写入**的审批；秘密文件
+（`.env`、私钥等）和系统目录仍然直接拒绝；`read-only` 档照旧逐次审批；`apply_patch`
+里每个工作区外路径都要被授权覆盖才放行。授权只能由人创建（CLI/飞书/API），模型没有
+新增授权的工具；`revoke_permissions` 只能撤销由当前会话添加的授权，人手动加的全局授权
+不会被模型顺手清掉。账本损坏时按“没有授权”处理并继续询问，不会静默放行。
 
 ### OS 沙箱（可选，Windows）
 
@@ -507,7 +530,8 @@ HARNESS_PERF=1
 
 常用交互命令还包括 `/diff`（只读查看当前工作区改动：文件状态 + 逐行统一 diff，未跟踪文件也会
 展开）、`/compact`（保存完整记录后压缩当前上下文）、`/undo`（回到最近一个用户回合开始前）、`/revoke`
-（撤销本会话已批的同类预授权）和 `/approvals`（查看待审批操作）。
+（撤销本会话已批的同类预授权及本会话添加的目录授权）、`/grants`（维护目录级持久写授权）
+和 `/approvals`（查看待审批操作）。
 `/cache profile` 查看完整存储占用（源数据、派生缓存、未识别目录和可回收量）；
 `/cache gc` 默认只预览，按文件名匹配会话事件里的引用，宁可少删也不误删；
 被清理的图片在恢复旧会话时降级为文本。存储策略与调研见
@@ -515,7 +539,7 @@ HARNESS_PERF=1
 每个回合正常结束时，若本轮
 改动了文件，终端会打印改动清单（`M/A/D/R` + 路径 + `/diff` 提示），同时写入 `files_changed`
 事件；非 Git 工作区回退到 checkpoint 记录的 `write`/`edit`/`apply_patch` 文件。
-飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke` 和 `/sandbox`；
+飞书网关同步支持 `/model`、`/approvals`、`/perms`、`/revoke`、`/grants` 和 `/sandbox`；
 文件查看、代码审阅（`/review`）与上下文压缩仍建议在 CLI 中执行。
 飞书里的日常操作不需要记命令：直接说“每天早上 9 点提醒我……”即可创建定时任务
 并把结果推回本聊天，说“等我离开电脑再整理今天的记录”会创建空闲门控任务（到点不空闲
@@ -684,6 +708,7 @@ python entrypoint.py --workspace D:\work\project -i screenshot.png "复现这个
   API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
   `GET /v1/sessions/{id}/events`（SSE）；`GET/POST /v1/tasks` 系列管理长命令，
   `GET /v1/permissions` 与 `POST /v1/permissions/{id}/resolve` 用于远程决议审批，
+  `GET/POST /v1/grants` 与 `POST /v1/grants/remove` 维护目录写授权，
   `GET/POST /v1/policy` 读写执行/审批档位，`GET /v1/system/state` 读取本机空闲/锁屏快照。
   所有 `/v1/` 请求都需要
   `Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
@@ -796,6 +821,9 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_screen.py` | `screen_capture`/`screen_ocr` 工具层：截图落盘、OCR 范围限制与审计事件 |
 | `src/tool_clipboard.py` | `clipboard_read`/`clipboard_write` 工具层：文本截断提示、审批摘要与审计事件 |
 | `src/clipboard_windows.py` | 剪贴板能力层：PowerShell 读写、UTF-8/base64 通道与 200 KiB 字节上限 |
+| `src/grants.py` | 目录级写授权账本：版本化 JSON、文件锁原子写、过期与会话归属 |
+| `src/api_grants.py` | 授权路由：`GET/POST /v1/grants`、`POST /v1/grants/remove` |
+| `src/feishu_grant_card.py` | 飞书目录授权卡片：分页、撤销按钮与纯文本回退 |
 | `src/turn_screenshots.py` | 回合截图元数据：字节偏移、sha1 去重与数量上限（不暴露绝对路径） |
 | `src/screen_capture.py` | Windows 截屏能力层：DPI、多屏/区域、PowerShell 调用、保留清理与统计 |
 | `src/ocr_windows.py` | WinRT OCR 能力层：语言选择、区域裁剪与行级边界框 |

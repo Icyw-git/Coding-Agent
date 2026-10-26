@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import approval_view
+import grants
 import sandbox
 import screen_capture
 import tool_cache
@@ -92,6 +93,9 @@ def format_status(session_store) -> str:
     usage = session_store.usage_totals()   # 从 usage 事件聚合，跨重启准确
     policy = load_policy()
     shots = screen_capture.stats(h.SCREENSHOT_DIR)
+    path_grants = grants.active_write_paths()
+    grants_line = (f'\n  目录写授权：{len(path_grants)} 个（/grants 查看）'
+                   if path_grants else '')
     screen_line = (
         f"\n  屏幕工具：开 · 截图 {shots['files']} 张"
         f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）"
@@ -115,6 +119,7 @@ def format_status(session_store) -> str:
         f'{h.hooks.GATE.judge_summary() if h.hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
+        f'{grants_line}'
         f'{screen_line}'
         f'{clipboard_line}'
         f'{usage_line}'
@@ -220,6 +225,10 @@ def run_doctor() -> int:
     clip_state = ('on' if clipboard_tools_enabled()
                   else f'off ({CLIPBOARD_ENV}=0)')
     print(f'[clipboard] tools={clip_state} (read and write require approval)')
+    active_grants = grants.active_write_paths()
+    print(f'[grants] {len(active_grants)} active path grant(s)'
+          + (': ' + ', '.join(str(path) for path in active_grants)
+             if active_grants else ' (directory writes outside workspace still ask)'))
     try:
         print(storage_profile.format_summary(storage_profile_data(deep=False)))
     except Exception as exc:

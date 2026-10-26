@@ -162,10 +162,17 @@ class CommandActionsMixin:
             else:
                 self._notice(harness.format_pending_approvals())
         elif verb == 'revoke':
+            import grants
             import hooks
-            count = hooks.GATE.revoke_session(
-                self._session_id or hooks.current_session_id() or None)
-            self._notice(f'已撤销 {count} 条当前会话预授权。')
+            session_id = (self._session_id or hooks.current_session_id() or '')
+            count = hooks.GATE.revoke_session(session_id or None)
+            removed = grants.revoke_for_session(session_id) if session_id else []
+            for record in removed:
+                self._audit_grant('grant_removed', record)
+            extra = (f'，以及 {len(removed)} 条目录写授权' if removed else '')
+            self._notice(f'已撤销 {count} 条当前会话预授权{extra}。')
+        elif verb == 'grants':
+            self.handle_grants(argument)
         elif verb == 'workspaces':
             self.show_workspaces()
         elif verb == 'workspace':
@@ -230,6 +237,81 @@ class CommandActionsMixin:
 
     def _display_status(self) -> dict:
         return dict(self._status)
+
+    def _audit_grant(self, event: str, record: dict) -> None:
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.append(event, path=record.get('path', ''),
+                         scope=record.get('scope', 'write'),
+                         expires=record.get('expires', ''),
+                         by='cli', note=record.get('note', ''),
+                         session_id=store.session_id)
+        except Exception as exc:
+            self._notice(f'[grants] 审计写入失败: {exc}', level='error')
+
+    def handle_grants(self, argument: str) -> None:
+        import grants
+
+        parts = argument.split(maxsplit=1)
+        action = parts[0].casefold() if parts else ''
+        rest = parts[1] if len(parts) > 1 else ''
+        usage = ('用法：/grants（查看）\n'
+                 '/grants add "<目录>" [until YYYY-MM-DD] [note 备注]\n'
+                 '/grants remove "<目录>"')
+        if not action:
+            rows = grants.list_grants()
+            if not rows:
+                self._notice('（没有目录写授权）\n' + usage)
+                return
+            lines = ['目录写授权：']
+            for row in rows:
+                expiry = (f"有效至 {row['expires']}" if row.get('expires')
+                          else '永久')
+                if not row.get('active'):
+                    expiry = f"已过期（{row['expires']}）"
+                note = f" · {row['note']}" if row.get('note') else ''
+                lines.append(f"  {row['path']}  [{expiry}{note}]")
+            lines.append('撤销：/grants remove "<目录>"；秘密文件与系统目录不受影响。')
+            self._notice(chr(10).join(lines))
+            return
+        if action not in ('add', 'remove'):
+            self._notice(usage, level='error')
+            return
+        try:
+            path, options = grants.split_path_argument(rest)
+        except ValueError as exc:
+            self._notice(f'[grants] {exc}', level='error')
+            return
+        if not path:
+            self._notice(usage, level='error')
+            return
+        session_id = self._session_id or ''
+        try:
+            if action == 'remove':
+                if options:
+                    self._notice(usage, level='error')
+                    return
+                record = grants.remove_path(path)
+                if record is None:
+                    self._notice(f'没有找到该目录的授权：{path}')
+                    return
+            else:
+                expires, note = grants.parse_options(options)
+                record = grants.add_path(path, expires=expires, note=note,
+                                         created_by='cli', session_id=session_id)
+        except (grants.GrantError, OSError) as exc:
+            self._notice(f'[grants] {exc}', level='error')
+            return
+        self._audit_grant('grant_removed' if action == 'remove' else 'grant_added',
+                          record)
+        if action == 'remove':
+            self._notice(f"已撤销目录写授权：{record['path']}")
+        else:
+            expiry = (f"有效至 {record['expires']}" if record.get('expires')
+                      else '永久')
+            self._notice(f"已授权目录写操作：{record['path']}（{expiry}）")
 
     def open_model_picker(self) -> None:
         import harness

@@ -18,7 +18,7 @@
 | 策略闸 | `src/exec_policy.py` | 三档 sandbox（`read-only` / `workspace-write` 默认 / `danger-full-access`）× 三种审批策略（`untrusted` / `on-request` 默认 / `never`）；路径四区：workspace / outside / secret（直接拒）/ system（默认拒写）；联网一律审批 |
 | 内核层 | `src/sandbox.py` | Windows Low IL，子进程只能写工作区；**默认 `off`**，文档明确“读和网络不受限制” |
 | 回合层 | `turn_coordinator` + `session_locks` | 全局单回合、同会话写锁；跨进程 steer/interrupt |
-| 授权账本 | 会话级白名单 + `revoke_permissions` | 只覆盖工具审批，不覆盖“给过哪个目录/账号” |
+| 授权账本 | 会话级白名单 + `revoke_permissions` + `src/grants.py`（P4.1） | 目录写授权已可持久化、查看与撤销；域名/工具级仍是规划 |
 | 审计 | `session_store` 事件全量落盘 | 无统一检索/导出，无“我批准过什么”的汇总 |
 
 ### 1.2 缺口清单（按个人助理日常价值排序）
@@ -35,7 +35,7 @@
 | B3 | 空闲/锁屏感知 | 已支持：`src/idle.py` + `GET /v1/system/state` + 定时任务空闲门控（2026-10-26） | 已补齐（P2d 接线） |
 | C1 | 凭据存储 | `.env` 明文 | 缺安全边界 |
 | C2 | 浏览器登录态 | `web_fetch` 无 cookie | 缺能力 |
-| D1 | 目录级持久授权 | 只能改 `HARNESS_WORKSPACE_ROOTS` 重启 | 缺策略能力 |
+| D1 | 目录级持久授权 | 已支持：`src/grants.py` + `/grants`（P4.1，2026-10-26） | 已补齐（仅放宽工作区外写审批） |
 | D2 | 删除可撤销 | `bash del` 不进回收站 | 缺安全网 |
 | E1 | 语音输入/输出 | 只保存不转写；无 TTS | 缺能力 |
 | F1 | 浏览器自动化 | 无（可外接 MCP） | 缺能力 |
@@ -330,16 +330,24 @@ UTF-8 字节截到 200 KiB（截断时 `errors='ignore'`，避免半个字符）
 
 四个子项，建议按顺序：
 
-1. **目录级持久授权**（`src/grants.py`）
+1. **目录级持久授权**（`src/grants.py`）— **已完成（2026-10-26）**
    ```json
    {"version": 1,
     "paths": [{"path": "D:/work", "scope": "write", "expires": "2026-12-31",
-               "created_by": "feishu:oc_xxx", "note": "项目目录"}],
-    "domains": [{"host": "*.corp.example.com", "scope": "read"}],
-    "tools": [{"name": "clipboard_read", "scope": "session"}]}
+               "created_by": "feishu:ou_xxx", "note": "项目目录",
+               "session_id": null, "created_at": "2026-10-26T09:00:00+00:00"}]}
    ```
-   读 `grants` 后 `exec_policy` 在 `PATH_OUTSIDE` 判定时先查表；飞书卡片可增删（复用「定时任务」卡片的
-   按钮 + token 模式）；`revoke_permissions` 扩展到撤销 grants。
+   已落地的部分只包含 `paths`（`scope` 目前只有 `write`）；账本存在
+   `paths.cache_path('grants.json')`，写入走文件锁 + 临时文件原子替换，损坏时
+   **策略层按“无授权”处理**（fail closed），修改操作直接报错而不是覆盖。
+   生效边界：只在 `workspace-write` 档、只放宽 `PATH_OUTSIDE` 的写入；秘密文件、
+   系统目录仍硬拒；`read-only` 档照旧审批；`apply_patch` 要求每个工作区外路径都被
+   授权覆盖。授权只能由人创建（CLI `/grants add`、飞书 `/grants add` 或
+   `POST /v1/grants`），模型没有新增授权的工具。
+   查看与撤销：CLI `/grants` / `/revoke`、飞书 `/grants` 卡片（按钮 + 10 分钟 token）
+   与控制台计数、`POST /v1/grants/remove`、`revoke_permissions`（只撤 `session_id`
+   等于当前会话的授权，人手动加的全局授权保留）。审计事件 `grant_added` /
+   `grant_removed` 写入对应会话日志。
 2. **网络域名策略**（`src/net_policy.py`）：`allow` / `deny` / 需审批 三态，接在 `web_access.check_url` 前；
    默认仍是“未知域名需审批”。对标 Codex 的 `allowed_domains/denied_domains`。
 3. **用户规则文件**（`src/rules.py`，YAML/TOML）：`prefix_rule([...], decision, justification)` 的简化版，
@@ -434,7 +442,7 @@ P1 完成的最小验收（举例）：
 | P1 | 截屏 + 本地 OCR + 审计事件 | 2–3 天 | 无（PowerShell 零依赖） |
 | P2 | 自启 + toast + 空闲感知 | 2 天 | P1 的 notify 需求 |
 | P3a | 剪贴板读写（已完成，2026-10-26） | 1 天 | P1 的审批模式 |
-| P4.1 | 目录级持久授权 + 撤销 UI | 3 天 | 飞书卡片模式（已有） |
+| P4.1 | 目录级持久授权 + 撤销 UI（已完成，2026-10-26） | 3 天 | 飞书卡片模式（已有） |
 | P3b | 键鼠控制（默认关） | 5 天 | P1 截图存证 + P4 规则 |
 | P4.2 | 域名策略 + 规则文件 | 3 天 | 无 |
 | P4.3 | auto_review 默认化 | 3 天 | `HARNESS_LLM_APPROVAL` 现有实现 |
@@ -443,6 +451,9 @@ P1 完成的最小验收（举例）：
 
 先做 P1，因为它是后续所有“桌面类”能力的地基（截图是证据、OCR 是低成本理解），
 而且零依赖、可完全用现有 `view_image` + 审批链复用。
+
+截至 2026-10-26，P1 / P2 / P3a / P4.1 已完成；剩余按依赖关系推进：P3b（键鼠控制）
+依赖 P4.1 的目录授权与撤销口，其次是 P4.2 / P4.3。
 
 ---
 

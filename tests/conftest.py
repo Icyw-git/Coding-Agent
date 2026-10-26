@@ -117,6 +117,15 @@ def _isolate_storage_dirs(tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_grant_ledger(tmp_path, monkeypatch):
+    """持久目录授权账本按用例隔离：本机真实 grants.json 不能影响策略断言。"""
+    import grants
+
+    monkeypatch.setattr(grants, 'DURABLE_PATH', tmp_path / 'grants.json')
+    monkeypatch.setattr(grants, 'LOCK_PATH', tmp_path / 'locks' / 'grants.lock')
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cron_state():
     """cron 表是进程级全局：用例之间泄漏会让稳定 ID / 触发断言随执行顺序变化。
 

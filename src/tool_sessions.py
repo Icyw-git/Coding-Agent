@@ -60,10 +60,37 @@ def run_rename_session(title: str) -> str:
     return f'Renamed current session to: {title}'
 
 
+def _record_grant_removal(record: dict, session_id: str) -> None:
+    try:
+        store = getattr(_h().active_checkpoint_manager(), 'session_store', None)
+        if store is None:
+            return
+        store.append('grant_removed', path=record.get('path', ''),
+                     scope=record.get('scope', 'write'),
+                     expires=record.get('expires', ''),
+                     by='revoke_permissions', note=record.get('note', ''),
+                     session_id=session_id)
+    except Exception as exc:
+        print(f'  [grants] failed to record grant_removed: '
+              f'{type(exc).__name__}: {exc}')
+
+
 def run_revoke_permissions() -> str:
     try:
         gate = _gate()
-        count = gate.GATE.revoke_session(gate.current_session_id() or None)
+        session_id = gate.current_session_id() or ''
+        count = gate.GATE.revoke_session(session_id or None)
+        removed = []
+        if session_id:
+            import grants
+
+            # 只收回本会话创建的目录授权：人经 API/飞书下的永久授权不归模型管。
+            removed = grants.revoke_for_session(session_id)
     except Exception as exc:
         return f'Error: {type(exc).__name__}: {exc}'
+    for record in removed:
+        _record_grant_removal(record, session_id)
+    if removed:
+        return (f'Revoked {count} permission grant(s) and {len(removed)} '
+                'path grant(s) for this session.')
     return f'Revoked {count} permission grant(s) for this session.'
