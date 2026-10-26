@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import os
 
+import approval_view
 import checkpoints
 import grants
 import net_grants
@@ -306,6 +307,46 @@ def _record_approval_timeout(req: PermissionRequest) -> None:
               f'{type(exc).__name__}: {exc}\033[0m')
 
 
+def _record_auto_approval(tool: str, args: dict, decision, *,
+                          by: str, reason: str) -> None:
+    """自动放行写审计事件（观察性，不改变流程）。
+
+    审查官放行是本机唯一「不经人点头就执行」的路径，必须留下痕迹：谁批的
+    （llm-judge / rule）、什么工具、命中的策略码、以及模型给出的理由。
+    参数只记摘要（`approval_view.summarize` 的口径），命令留头尾——审计要能
+    回答「当时放行了什么」，但不该变成第二份完整历史。
+
+    没有活动会话、或会话文件不存在时静默跳过；写失败只打印：审计不能反过来
+    让一次已经放行的调用失败。
+    """
+    session_id = current_session_id()
+    if not session_id:
+        return
+    try:
+        h = _h()
+        sessions_dir = getattr(h, 'SESSIONS_DIR', None)
+        store_cls = getattr(h, 'SessionEventStore', None)
+        if sessions_dir is None or store_cls is None:
+            return
+        path = sessions_dir / f'session_{session_id}.jsonl'
+        if not path.is_file():
+            return
+        summary = approval_view.summarize(tool, args or {})
+        command = summary.get('command')
+        store_cls.open(path).append(
+            'approval_auto',
+            tool=tool,
+            by=by,
+            code=getattr(decision, 'code', '') or '',
+            reason=str(reason or '')[:200],
+            command=str(command)[:400] if command else '',
+            args_keys=sorted(str(key) for key in (args or {}))[:20],
+            session_id=session_id,
+        )
+    except Exception as exc:
+        print(f'  \033[33m[permission] failed to record auto approval: '
+              f'{type(exc).__name__}: {exc}\033[0m')
+
 GATE = PermissionGate(
     session_id_provider=current_session_id,
     reset_grants=_reset_grants,
@@ -445,6 +486,10 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             return _scheduled_readonly_error(tool)
         return None
     if decision.allowed:
+        # 规则放行同样要留痕：它和审查官放行一样是「没人点头就执行」。
+        if decision.code == 'rule_allowed':
+            _record_auto_approval(tool, args, decision, by='rule',
+                                  reason=decision.reason)
         return None
     if decision.denied:
         print(f'\n\033[31m[blocked] {decision.pattern or decision.reason}\033[0m')
@@ -475,6 +520,8 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             and policy.approval_policy == 'on-request'
             and decision.code in JUDGEABLE_CODES
             and _judge_auto_approve(tool, args, decision)):
+        _record_auto_approval(tool, args, decision, by='llm-judge',
+                              reason=decision.reason)
         issue_grant(tool, args)
         return None
     ask = GATE.decide if interactive else GATE.decide_queued

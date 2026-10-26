@@ -5194,3 +5194,28 @@ ruff 通过。真机只读冒烟：对当前前台窗口（Qoder）执行仅含�
 未做：规则的增删命令（目前直接编辑 YAML）；规则命中的审计事件（`rule_allowed` 只
 体现在 Decision 的 code 上，未落 `policy_denied` 类事件流）；没有 TTL/到期时间。
 
+## P4.3 落地：自动放行的审计（不是改默认）
+
+先核对现状：「把审查官升级成默认 reviewer」这件事**早就完成了**——`HARNESS_LLM_APPROVAL`
+不设即启用，`0/false/off/no` 显式关闭；已有缓存、连续 3 次失败熔断、批级合并、独立超时
+（`HARNESS_JUDGE_TIMEOUT`），只对 `destructive` / `opaque_command` / `network_egress`
+三类询问生效，非交互线程不旁路，`/status` 有放行/升级/失败计数。
+
+所以 P4.3 真正的缺口是**可审计**：放行只打印一行到控制台，事件流里什么都没有。
+一旦出现「这条命令我没批准怎么执行了」，事后无从查起。
+
+- 新增 `hooks._record_auto_approval`，两条自动放行路径统一留痕：
+  - `by=llm-judge`：`enforce` 里审查官放行后；
+  - `by=rule`：`evaluate_call` 返回 `rule_allowed` 时（规则文件 `allow`）。
+- 事件 `approval_auto{tool, by, code, reason, command, args_keys}`：命令走
+  `approval_view.summarize` 的口径（留头尾），参数只记键名不记值——审计要能回答
+  「当时放行了什么」，但不该变成第二份完整历史。
+- 失败处理一律静默：无活动会话、会话文件不存在、写入抛错都只打印，**不改变**已经
+  发生的放行结果。观察层不能反向影响执行。
+- `audit.AUDIT_EVENTS` 与审计卡收录该类型（`🤖`），卡片摘要显示 `by · tool · reason`。
+- 测试：`tests/test_auto_approval_audit.py`（6）覆盖规则放行的审计内容、参数不落值、
+  审计写入失败不影响放行、无会话不写、普通 ALLOW 不写、`/v1/audit` 可查。
+
+未做：审查官判定所用的模型名没有进事件（只记 `by`）；`approval_auto` 没有单独的
+限流/聚合视图，量大时需要按 `types` 过滤查看。
+

@@ -22,6 +22,7 @@ from pathlib import Path
 # 新增安全相关事件时在这里登记；不登记的事件不会出现在 /v1/audit。
 AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
     'approval_timeout': ('request_id', 'tool', 'reason', 'source', 'timeout_s'),
+    'approval_auto': ('tool', 'by', 'code', 'reason', 'command'),
     'screen_captured': ('sha1', 'bytes', 'screen', 'region', 'width', 'height',
                         'duration_ms'),
     'screen_ocr': ('chars', 'lang', 'region', 'lines', 'duration_ms'),

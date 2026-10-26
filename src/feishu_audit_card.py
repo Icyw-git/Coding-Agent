@@ -14,6 +14,7 @@ PAGE_SIZE = 8
 
 _ICONS = {
     'approval_timeout': '⌛',
+    'approval_auto': '🤖',
     'screen_captured': '🖥️',
     'screen_ocr': '🔎',
     'clipboard_read': '📋',
@@ -89,6 +90,10 @@ def _detail(event: dict) -> str:
         bits = [f"{event.get('chars')} 字" if event.get('chars') is not None else '',
                 '已截断' if event.get('truncated') else '']
         return ' · '.join(bit for bit in bits if bit)
+    if kind == 'approval_auto':
+        bits = [str(value) for value in (
+            event.get('by'), event.get('tool'), event.get('reason')) if value]
+        return ' · '.join(bits)
     if kind == 'approval_timeout':
         return f"{event.get('tool', '')} · 等待 {event.get('timeout_s', '')}s"
     if kind == 'policy_denied':
