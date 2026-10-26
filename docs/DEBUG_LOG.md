@@ -5250,3 +5250,38 @@ secret 与 API token。`checkpoints.DEFAULT_SECRETS` 只挡住「模型主动读
 **边界**：这是静态数据保护，不是运行时隔离。进程内存仍是明文，同用户权限的调试器
 或恶意进程照样能读到。DPAPI 绑定当前用户，换机器后必须用原 `.env` 重新加密。
 
+
+## P5 落地：浏览器通过 MCP 接入 + 凭据保护补齐
+
+浏览器不进内核：项目已有 MCP 桥（`src/mcp_bridge.py`，`MCP_SERVERS_FILE` 配置），
+把 Playwright/Puppeteer 当作可替换的外部 server 接入即可，不新增执行路径。
+
+本轮补的是三件真正缺的东西：
+
+1. **浏览器凭据不再可读**。`Cookies`、`Cookies-journal`、`Login Data`、
+   `Web Data`、`Local State`、`key4.db`、`logins.json`、`cookies.sqlite` 加入
+   `checkpoints.DEFAULT_SECRETS`。这是真实缺口：浏览器 profile 通常在工作区之外，
+   而读策略对工作区外是**放开**的，`read`/`grep` 原本可以整库读走登录态。
+   刻意只挡这几份库——`History`/`Bookmarks`/`Preferences` 照常可读，否则正常排障
+   无从下手。
+2. **独立 profile 目录**（`src/browser_profile.py`）：`<home>/.cache/browser-profile`，
+   `HARNESS_BROWSER_PROFILE` 可覆盖。放 `.cache` 下顺带获得 `DEFAULT_IGNORE` 保护
+   （检索工具默认跳过），POSIX 权限 0700。指到日常 Chrome/Edge 目录时
+   `describe()` 与 `/status` 明确标 ⚠——那种配置会和已开着的浏览器抢 profile，
+   也会让「撤销 agent 登录」变成清理日常浏览器。
+3. **配置助手**（`scripts/browser_setup.py`）：`snippet` 生成两种配置
+   （`--isolated` 临时 / `--user-data-dir` 复用登录），`check` 检查现有配置。
+   `_looks_like_browser` 按 name/command/args 三处识别，因为用户常把 server
+   命名成 `pw`——只看 name 会让「没写 profile 参数」的警告失效。
+
+审批语义不变：MCP 工具登记为第三方工具，三种档位下都默认审批，`never` 下
+fail-closed。登录/支付/2FA/改密码仍是使用约定（不做自动登录工具），模型看不到
+密码是设计目标。
+
+测试：`tests/test_browser_credentials.py`（19）验证秘密文件命中与读/检索硬拒、
+普通浏览器文件不被误挡、大小写与 `classify_path` 分区；
+`tests/test_browser_profile.py`（11，1 skip 因 Windows 无 POSIX 权限位）；
+`tests/test_browser_setup.py`（11）覆盖两种 snippet、四类 check 分支与标记识别。
+
+未做：不安装 `@playwright/mcp`（只生成配置）；浏览器 server 的生命周期不由 agent
+管理；没有「页面截图回传飞书」的内置链路。

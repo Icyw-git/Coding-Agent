@@ -398,13 +398,21 @@ UTF-8 字节截到 200 KiB（截断时 `errors='ignore'`，避免半个字符）
    文件不存在或写入失败都静默跳过——审计不能反过来让一次已放行的调用失败。
    审计卡与 `/v1/audit` 已收录该类型（`🤖` 图标）。
 
-### P5：浏览器与登录态（依赖外部能力，单独评估）
+### P5：浏览器与登录态 — **已完成（2026-10-26）**
 
-- 方案 A（推荐）：接 MCP（Playwright/Puppeteer MCP），把浏览器当作**可替换的外部工具**，
-  避免把浏览器代码塞进内核；登录态用独立 profile 目录，不进 agent 上下文。
-- 方案 B：内置 Playwright + persistent context；成本是被浏览器版本/依赖绑定。
-- 硬约束：登录、支付、2FA 一律转人工（对标 dots 的“密码不暴露给模型”）；浏览器 profile 目录纳入
-  secret 通配，模型不可读 cookie 文件。
+采用方案 A：浏览器作为**可替换的外部 MCP server**，不进内核。
+
+- **`src/browser_profile.py`**：独立 profile 目录 `<home>/.cache/browser-profile`，
+  可复用登录态但不碰日常 Chrome/Edge；放在 `.cache` 下顺带获得 `DEFAULT_IGNORE`
+  保护；POSIX 权限收到 0700。指向日常 profile 时明确警告（Windows）。
+- **`scripts/browser_setup.py`**：`snippet`（生成 `--isolated` 或
+  `--user-data-dir` 两种配置）/ `check`（按 name/command/args 识别浏览器 server，
+  提示「既没 isolated 也没 user-data-dir」这类会踢掉用户窗口的配置）。
+- **凭据保护补齐**：`Cookies`、`Login Data`、`Web Data`、`Local State`、
+  `key4.db`、`logins.json` 等加入 `checkpoints.DEFAULT_SECRETS`，文件工具读写直接
+  硬拒；`History`/`Bookmarks` 之类不挡，避免正常排障无从下手。
+- 审批沿用既有语义：MCP 工具是第三方工具，三档下都默认审批，`never` fail-closed。
+- 硬约束（使用约定而非配置）：登录、支付、2FA、改密码一律转人工。
 
 ### P6：审计与可观测（贯穿，P1 就开始）— **已完成（2026-10-26）**
 
@@ -496,7 +504,7 @@ P1 完成的最小验收（举例）：
 | P4.2 | 域名策略（已完成，2026-10-26） | 3 天 | 无 |
 | P4.2b | 用户规则文件（已完成，2026-10-26） | 2 天 | 无 |
 | P4.3 | auto_review 审计化（已完成，2026-10-26） | 3 天 | `HARNESS_LLM_APPROVAL` 现有实现 |
-| P5 | 浏览器（MCP 接入） | 3–5 天 | P4.2 |
+| P5 | 浏览器（MCP 接入，已完成 2026-10-26） | 3–5 天 | P4.2 |
 | P6 | 审计查询 + 卡片（已完成，2026-10-26） | 2 天 | P1 起持续 |
 
 先做 P1，因为它是后续所有“桌面类”能力的地基（截图是证据、OCR 是低成本理解），

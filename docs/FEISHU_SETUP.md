@@ -328,6 +328,56 @@ rules:
 - **数据在哪**：会话/记忆/快照在 agent home（默认仓库根，可用 `HARNESS_HOME` 覆盖），
   `python entrypoint.py --doctor` 会打印实际路径。
 
+## 浏览器自动化（P5，通过 MCP）
+
+浏览器**不在 agent 内核里实现**：它作为外部 MCP server 接入，用现成的
+`MCP_SERVERS_FILE` 配置。这样浏览器版本、驱动、依赖都留在 agent 之外，可以整体替换。
+
+### 1. 生成配置
+
+```bash
+python scripts/browser_setup.py snippet                 # 临时 profile，不留登录态
+python scripts/browser_setup.py snippet --keep-login    # 独立 profile，可复用登录
+python scripts/browser_setup.py check                   # 检查配置与 profile 状态
+```
+
+把输出写进 `.cache/mcp_servers.json`（就是 `MCP_SERVERS_FILE` 指向的文件），
+重启 API 后浏览器工具会出现在工具列表里。
+
+### 2. profile 与登录态
+
+`--keep-login` 会准备 `<home>/.cache/browser-profile` 作为**独立 profile**：
+
+- 在这个目录的浏览器里登录一次，之后 agent 复用那份 cookie；
+- 不碰你日常 Chrome/Edge 的 profile——那会和应用已开着的窗口冲突，也会让
+  「撤销 agent 的登录」变成要清理日常浏览器；
+- 放在 `.cache` 下：`DEFAULT_IGNORE` 会让 `grep`/`glob` 默认跳过，不会成为
+  「顺手翻出来的浏览历史」；
+- POSIX 上权限收到 `0700`；Windows 继承父目录 ACL。
+
+`HARNESS_BROWSER_PROFILE` 可以改位置。`/status` 会显示 profile 路径；如果它被
+指到日常浏览器目录，会明确标 ⚠。
+
+### 3. 审批与边界
+
+- MCP 工具一律登记为**第三方工具**：三种执行档位下默认都要审批，`never` 同样
+  fail-closed。批准一次后同会话内同名工具不再重复问（`EXTERNAL_TOOLS` 的既有语义）。
+- 浏览器 cookies / 登录库已加入 `checkpoints.DEFAULT_SECRETS`：`Cookie`、
+  `Login Data`、`Web Data`、`Local State`、`key4.db`、`logins.json` 等文件
+  被文件工具读写时**硬拒**。只挡这几份库，`History`/`Bookmarks` 之类照常可读。
+- **登录、支付、2FA、改密码一律转人工**：这条不靠配置，靠使用约定。不要给浏览器
+  server 传入你的主账号密码，也不要让它「自动完成登录」——模型看不到密码是设计
+  目标，不是限制。
+
+### 4. 已知限制
+
+- 浏览器由外部 MCP server 拉起，agent 不管理它的生命周期：server 崩了就是工具报错。
+- 每次调用都是独立审批；长流程（点十几次）会很啰嗦。要减少打扰，用 `/rules` 给
+  高频只读操作写规则，或接受这份噪音。
+- 没有内置的「页面截图回传飞书」——需要的话先用 `screen_capture`，或让浏览器工具
+  自己回传图片。
+- `python scripts/browser_setup.py snippet` 只生成配置，**不安装** `@playwright/mcp`。
+
 ## 凭据保护（DPAPI 加密）
 
 `.env` 是明文：任何能读这个文件的东西都能拿到飞书 secret 与 API token。

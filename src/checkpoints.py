@@ -27,7 +27,15 @@ DEFAULT_IGNORE = ('.cache', '.git', '.worktrees', '.mailbox', '__pycache__', '.p
 # 密钥材料：证书/私钥文件与 dot-env 的全部变体（.env.local、.env.production 常放真凭证），
 # 以及 OpenSSH 私钥的默认文件名。公开可写的示例模板在 exec_policy 里放行。
 DEFAULT_SECRETS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx',
-                   '*_rsa', 'id_ecdsa', 'id_ed25519', 'id_dsa')
+                   '*_rsa', 'id_ecdsa', 'id_ed25519', 'id_dsa',
+                   # 浏览器凭据：Cookies / Login Data 是 SQLite 库，里面是
+                   # 明文 cookie 与登录记录（Windows 上另有 DPAPI 加密列，
+                   # 但整库仍足以冒充登录态）。浏览器 profile 目录通常在工作区
+                   # 之外，可读策略照样放开——按文件名挡住这几份库，等于让
+                   # 「浏览器登录态」不会被模型顺手读走。
+                   'Cookies', 'Cookies-journal', 'Login Data',
+                   'Login Data-journal', 'Web Data', 'Local State',
+                   'key4.db', 'logins.json', 'cookies.sqlite')
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MESSAGES_FILE = 'messages.jsonl'
 MESSAGES_GZIP_FILE = 'messages.jsonl.gz'
