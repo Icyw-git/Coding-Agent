@@ -593,4 +593,19 @@ TOOL_SCHEMAS = [{'type': 'function',
                                   'region': {'type': 'string',
                                              'description': "Optional crop 'x,y,w,h' in "
                                                             'image pixels'}},
-                              'required': []}}}]
+                              'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'clipboard_read',
+               'description': 'Read the current local clipboard text (requires approval).',
+               'parameters': {'type': 'object',
+                              'properties': {},
+                              'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'clipboard_write',
+               'description': 'Replace the local clipboard text (requires approval; '
+                              'overwrites what the user copied).',
+               'parameters': {'type': 'object',
+                              'properties': {'text': {'type': 'string',
+                                                      'description': 'Text to put on the '
+                                                                     'local clipboard'}},
+                              'required': ['text']}}}]

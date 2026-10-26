@@ -36,6 +36,9 @@ def category(name, args=None):
     ('background_output', {'bg_id': 'bg_1'}),
     ('bash', {'command': 'ls -la'}),
     ('bash', {'command': 'git status'}),
+    ('find_sessions', {'query': 'x'}),
+    ('screen_ocr', {}),
+    ('clipboard_read', {}),
 ])
 def test_read_only_tools(name, args):
     assert category(name, args) == tool_recovery.READ_ONLY
@@ -49,6 +52,7 @@ def test_read_only_tools(name, args):
     ('cancel_cron', {'job_id': 'cron_1'}),
     ('kill_background', {'bg_id': 'bg_1'}),
     ('keep_worktree', {'name': 'wt'}),
+    ('clipboard_write', {'text': 'x'}),
 ])
 def test_idempotent_tools(name, args):
     assert category(name, args) == tool_recovery.IDEMPOTENT

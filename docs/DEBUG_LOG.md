@@ -4942,4 +4942,37 @@ API/网关孤儿，后续可用 Job Object 的 `KILL_ON_JOB_CLOSE` 补上）。
 未做：门控只在派发前判断，入队后用户立刻回来仍可能执行（毫秒级窗口，可接受）；
 没有“仅接通电源时执行”“仅工作日执行”等更细条件。
 
+## P3a 落地：剪贴板读写
+
+目标是让手机端能直接说“把我刚复制的发我”，同时不把剪贴板当成普通读工具放开。
+
+- **能力层**：`src/clipboard_windows.py` 调 PowerShell 5.1。读取脚本用 `Get-Clipboard -Raw`
+  取文本，把总字节数与 UTF-8 内容用 base64 写到 stdout（`<总字节>\n<base64>`）；写入把
+  base64 经 stdin 传给 `Set-Clipboard`。两端都走 ASCII，不用 JSON/环境变量传文本，避开
+  GBK 控制台转码和 Windows 环境变量长度上限；内容里出现引号、换行或中文都不会破坏命令。
+- **截断**：读取侧先算原始 UTF-8 字节数，超过 200 KiB 只取前 200 KiB 再 base64；解码时
+  截断场景用 `errors='ignore'`，未截断用 `errors='replace'`。工具层提示“已截断，只显示
+  前 200 KiB”，审计同时记录 `total_bytes`、`chars` 与 `truncated`。
+- **审批**：`clipboard_read` 归 `clipboard_access`、`clipboard_write` 归
+  `clipboard_write`，三种档位都逐次询问，且不参与会话白名单——批准一次不该让本会话此后
+  随便读剪贴板。`never` 下 fail-closed，`danger-full-access` + `never` 沿用既有语义放行。
+  后台与定时回合在任何审批之前就拒绝；定时任务的只读工具面也排除；子代理工具面排除。
+  `HARNESS_CLIPBOARD_TOOLS=0/off/false/no/disabled` 时在审批前直接硬拒。
+- **审计**：事件只写 `bytes`/`chars`/`truncated`/`duration_ms`，不写内容、不写哈希——
+  短密码的哈希同样可枚举。审批卡对写入只显示字符数和前 80 字预览（折叠空白），
+  对读取只显示“读取当前剪贴板文本”。
+- **工具面与展示**：schemas 追加两个工具（顺序即契约，快照更新为 44 个）；`/status`、
+  `doctor` 与控制台面板显示开关状态；`feishu.env.example` 给出关闭开关。
+- **测试**：新增 `tests/test_clipboard_windows.py`（9）、`tests/test_tool_clipboard.py`（7）、
+  `tests/test_clipboard_policy.py`（8）：UTF-8/截断/空文本/异常输出/PowerShell 失败与超时/
+  写入载荷与字符统计/非字符串拒绝/审计失败隔离，以及审批矩阵（read-only、
+  workspace-write、never、danger-full-access）、环境关闭、后台拒绝、白名单绕过、
+  定时只读面与可写定时任务的拒绝。定向剪贴板与接线 **108 passed**；策略与 schema
+  回归 **236 passed**；全量 **1874 passed / 2 skipped**，ruff 通过。
+- **真机验证**：只读调用返回 218 字节 / 172 字符 / 未截断 / 2.5 秒，未打印内容；真实写入
+  刻意未执行，避免覆盖用户当前的剪贴板内容与格式。
+
+未做：飞书端到端“把我刚复制的发我”尚未在真机走一遍（读能力已单独验证）；不处理图片/
+文件/HTML 等非文本剪贴板格式；超长文本只返回前 200 KiB，没有“分段读取”入口。
+
 

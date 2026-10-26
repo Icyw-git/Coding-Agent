@@ -13,7 +13,7 @@ import sandbox
 import screen_capture
 import tool_cache
 import workspace_diff
-from exec_policy import SCREEN_ENV, load_policy, screen_tools_enabled, set_tier
+from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, clipboard_tools_enabled, load_policy, screen_tools_enabled, set_tier
 
 SANDBOX_MODE_HELP = (
     ('read-only', '只放公认只读的命令，写改与其余命令都要审批'),
@@ -97,6 +97,10 @@ def format_status(session_store) -> str:
         f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）"
         if screen_tools_enabled()
         else f'\n  屏幕工具：关（{SCREEN_ENV}=0）')
+    clipboard_line = (
+        '\n  剪贴板工具：开（读写都需审批）'
+        if clipboard_tools_enabled()
+        else f'\n  剪贴板工具：关（{CLIPBOARD_ENV}=0）')
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -112,6 +116,7 @@ def format_status(session_store) -> str:
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
         f'{screen_line}'
+        f'{clipboard_line}'
         f'{usage_line}'
     )
 
@@ -212,6 +217,9 @@ def run_doctor() -> int:
     state = 'on' if screen_tools_enabled() else f'off ({SCREEN_ENV}=0)'
     print(f"[screen] tools={state} · screenshots: {shots['files']} files, "
           f"{tool_cache.human_size(shots['bytes'])} (retained 7 days)")
+    clip_state = ('on' if clipboard_tools_enabled()
+                  else f'off ({CLIPBOARD_ENV}=0)')
+    print(f'[clipboard] tools={clip_state} (read and write require approval)')
     try:
         print(storage_profile.format_summary(storage_profile_data(deep=False)))
     except Exception as exc:

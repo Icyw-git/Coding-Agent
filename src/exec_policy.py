@@ -55,6 +55,8 @@ __all__ = [
     'APPROVAL_ENV',
     'APPROVAL_POLICIES',
     'ASK',
+    'CLIPBOARD_ENV',
+    'CLIPBOARD_TOOLS',
     'DEFAULT_APPROVAL_POLICY',
     'DEFAULT_SANDBOX_MODE',
     'DENY',
@@ -84,6 +86,7 @@ __all__ = [
     'WORKTREE_TOOLS',
     'approval_class',
     'classify_path',
+    'clipboard_tools_enabled',
     'egress_hosts',
     'grant_key',
     'is_readonly_command',
@@ -136,11 +139,22 @@ READ_ONLY_FILE_TOOLS = ('read', 'view_image', 'read_document',
 # 屏幕读取：内容可能含密码/私信，每次都问；定时/后台回合由 hooks 直接拒绝。
 SCREEN_TOOLS = ('screen_capture', 'screen_ocr')
 SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
+# 剪贴板：读可能含密码/私信，写会覆盖用户刚复制的内容；两者都逐次询问。
+CLIPBOARD_TOOLS = ('clipboard_read', 'clipboard_write')
+CLIPBOARD_ENV = 'HARNESS_CLIPBOARD_TOOLS'
 
 
 def screen_tools_enabled(environ=None) -> bool:
     """默认开；显式 `HARNESS_SCREEN_TOOLS=0/off/false` 关闭。"""
     raw = (environ if environ is not None else os.environ).get(SCREEN_ENV)
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().casefold() not in ('0', 'off', 'false', 'no', 'disabled')
+
+
+def clipboard_tools_enabled(environ=None) -> bool:
+    """默认开；显式 `HARNESS_CLIPBOARD_TOOLS=0/off/false` 关闭。"""
+    raw = (environ if environ is not None else os.environ).get(CLIPBOARD_ENV)
     if raw is None or not str(raw).strip():
         return True
     return str(raw).strip().casefold() not in ('0', 'off', 'false', 'no', 'disabled')
@@ -213,6 +227,22 @@ class Policy:
                 decision = Decision(
                     DENY, 'screen_tools_disabled',
                     f'{tool} is disabled ({SCREEN_ENV}=0)')
+        elif tool in CLIPBOARD_TOOLS:
+            if clipboard_tools_enabled():
+                if tool == 'clipboard_write':
+                    decision = Decision(
+                        ASK, 'clipboard_write',
+                        f'{tool} replaces the local clipboard, overwriting '
+                        'what the user copied')
+                else:
+                    decision = Decision(
+                        ASK, 'clipboard_access',
+                        f'{tool} reads the local clipboard, which may contain '
+                        'passwords or private text')
+            else:
+                decision = Decision(
+                    DENY, 'clipboard_tools_disabled',
+                    f'{tool} is disabled ({CLIPBOARD_ENV}=0)')
         elif tool in external_tools:
             decision = Decision(
                 ASK, 'external_tool',

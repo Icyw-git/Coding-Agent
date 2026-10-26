@@ -27,7 +27,7 @@
 |---|---|---|---|
 | A1 | 截屏 / 看屏幕 | 已支持：`screen_capture`（P1，2026-10-26） | 已补齐（截图可回传飞书） |
 | A2 | 本地 OCR | 已支持：`screen_ocr` 走 `Windows.Media.Ocr`（P1，2026-10-26） | 已补齐（仅限截图目录） |
-| A3 | 剪贴板读写 | 无 | 缺能力 |
+| A3 | 剪贴板读写 | 已支持：`clipboard_read` / `clipboard_write`（P3a，2026-10-26） | 已补齐（读写均需审批） |
 | A4 | 鼠标键盘控制 | 无 | 缺能力（高风险，最后做） |
 | A5 | 窗口/进程管理 | 只能 `bash` 间接 tasklist/taskkill | 缺封装 |
 | B1 | 开机自启 / 守护 | 无，重启后要手动拉 API + 网关 | 缺能力（决定“常驻”是否成立） |
@@ -295,12 +295,24 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 
 ### P3：剪贴板与输入控制 — 2 个迭代（分两次发布）
 
-**P3a 剪贴板（低风险，先做）**
+**P3a 剪贴板（低风险，先做）— 已完成（2026-10-26）**
 
 | 工具 | 行为 |
 |---|---|
 | `clipboard_read` | `Get-Clipboard -Raw`；超过 200KB 截断并提示；返回文本长度与前 N 字符 |
 | `clipboard_write` | `Set-Clipboard`；**需要审批**（会覆盖用户剪贴板），内容摘要进审计 |
+
+**落地**：`src/clipboard_windows.py` 用 PowerShell 5.1 读写，stdout 返回
+`<总字节>\n<base64>`、写入经 stdin 收 base64，绕开 GBK 控制台与命令行长度限制；读取按
+UTF-8 字节截到 200 KiB（截断时 `errors='ignore'`，避免半个字符）。`clipboard_read` 与
+`clipboard_write` 都逐次审批、不参与会话白名单；后台/定时直接拒绝，子代理排除，
+`HARNESS_CLIPBOARD_TOOLS=0` 整体关闭；`read-only` 档位同样不可读（剪贴板可能含密码）。
+审计只记 bytes/chars/truncated/duration，不记内容或哈希。状态面板与控制台显示开关状态。
+
+**测试**：`tests/test_clipboard_windows.py`（9）、`tests/test_tool_clipboard.py`（7）、
+`tests/test_clipboard_policy.py`（8），覆盖截断/空文本/PowerShell 失败与超时/写入载荷/
+审批矩阵/后台与定时拒绝；schema 快照更新为 44 个工具。真机只读验证：读取 218 字节、
+172 字符，2.5 秒，未打印内容；未执行真实写入以免覆盖用户剪贴板。
 
 **P3b 键鼠控制（高风险，默认关）**
 
@@ -369,7 +381,7 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 |---|---|
 | `src/tool_screen.py`、`src/screen_capture.py`、`src/ocr_windows.py` | `tools.tool_registry`、`tool_documents.cache_image`、`ImageResult`、`tool_schemas.TOOLS` |
 | `src/notify.py`、`src/idle.py`、`scripts/install_autostart.py` | `paths.cache_path`、`api_*` 路由模式（`build_router`） |
-| `src/tool_clipboard.py` | 同上 + `exec_policy.READ_ONLY_*` 常量 |
+| `src/tool_clipboard.py`、`src/clipboard_windows.py` | `tools.tool_registry`、`tool_schemas.TOOLS`、`exec_policy` 审批分支（`clipboard_access` / `clipboard_write`） |
 | `src/tool_ui.py`（P3b） | `sandbox`、`approval`（新 `approval_class` 分类） |
 | `src/grants.py`、`src/net_policy.py`、`src/rules.py` | `exec_policy.evaluate` 前置查表、`web_access.check_url` |
 | `src/audit.py` + `api_audit.py` | `session_store` 事件、`feishu_*_card.py` 卡片风格 |
@@ -421,7 +433,7 @@ P1 完成的最小验收（举例）：
 |---|---|---|---|
 | P1 | 截屏 + 本地 OCR + 审计事件 | 2–3 天 | 无（PowerShell 零依赖） |
 | P2 | 自启 + toast + 空闲感知 | 2 天 | P1 的 notify 需求 |
-| P3a | 剪贴板读写 | 1 天 | P1 的审批模式 |
+| P3a | 剪贴板读写（已完成，2026-10-26） | 1 天 | P1 的审批模式 |
 | P4.1 | 目录级持久授权 + 撤销 UI | 3 天 | 飞书卡片模式（已有） |
 | P3b | 键鼠控制（默认关） | 5 天 | P1 截图存证 + P4 规则 |
 | P4.2 | 域名策略 + 规则文件 | 3 天 | 无 |

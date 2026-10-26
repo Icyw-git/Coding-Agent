@@ -201,6 +201,13 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   直接拒绝，子代理也拿不到这两个工具。`HARNESS_SCREEN_TOOLS=0` 可整体关闭。从飞书发起的
   成功回合会把本轮截图回传到原聊天（最多 4 张、单张 ≤10MB），`FEISHU_SEND_SCREENSHOTS=0`
   可关闭；传输只使用内容哈希文件名，API 端校验会话与文件名，不暴露本地路径。
+- `clipboard_read` / `clipboard_write` 读写**运行 API 那台机器**的剪贴板纯文本：读取走
+  `Get-Clipboard -Raw`，超过 200 KiB 按 UTF-8 字节截断并提示；写入走 `Set-Clipboard`，
+  会覆盖用户刚复制的内容。图片/文件等非文本格式不解析，也不需要额外依赖。
+- 剪贴板工具默认开启，但**读写都要审批**（不提供「本会话允许同类」；`never` 档位下按
+  fail-closed 直接拒绝，`danger-full-access` + `never` 沿用既有语义放行）；后台与定时回合
+  直接拒绝，子代理也拿不到这两个工具。`HARNESS_CLIPBOARD_TOOLS=0` 可整体关闭。审计事件只记
+  字节数/字符数/是否截断/耗时，不记录剪贴板内容或哈希。
 - 本地通知与空闲感知：`src/notify.py` 通过 Windows Toast 弹系统通知（PowerShell
   `-EncodedCommand` + base64 XML，绕开 GBK 控制台的引号/中文解析问题），10 秒内最多一条，
   失败只返回原因、不抛异常，`HARNESS_NOTIFY=0` 关闭；`src/idle.py` 用 `GetLastInputInfo`
@@ -232,7 +239,8 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   策略。配置了 HTTP 代理时 DNS 由代理解析，固定地址不生效，预检结果也不代表代理的解析。
 - 子代理启动时按当时的工具注册表生成工具面，不会拿到启动时快照里已删除的工具；`task`、
   teammate/计划/定时任务、worktree、`background_output`/`kill_background` 等控制类工具不向
-  子代理暴露，屏幕工具（`screen_capture`/`screen_ocr`）同样排除，bash 也不提供
+  子代理暴露，屏幕与剪贴板工具（`screen_capture`/`screen_ocr`/`clipboard_read`/
+  `clipboard_write`）同样排除，bash 也不提供
   `run_in_background`。
 
 ## 执行安全与审批
@@ -240,7 +248,8 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 所有内建工具中会动到系统的调用都经过同一层策略判定（`src/exec_policy.py`）。四个执行入口——CLI 的
 PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / `run_read_document` /
 `run_render_document` / `run_glob` / `run_grep` / `run_ls` / `run_write` / `run_edit` /
-`run_apply_patch` / `run_web_fetch` / `run_screen_capture` / `run_screen_ocr`）、Teammate 线程、后台与 HTTP
+`run_apply_patch` / `run_web_fetch` / `run_screen_capture` / `run_screen_ocr` /
+`run_clipboard_read` / `run_clipboard_write`）、Teammate 线程、后台与 HTTP
 任务——共用同一套规则和同一句拒绝文案，
 不再各写一份黑名单。
 
@@ -290,6 +299,11 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
   这两个工具（定时任务的只读工具面同样排除）；`HARNESS_SCREEN_TOOLS=0` 时在审批前直接硬拒。
   OCR 只读 `.cache/screenshots` 里的截图，不能借它识别任意图片文件。审计事件记录截图
   路径/SHA1/尺寸与 OCR 字符数，不记录识别出的文字。
+- 剪贴板工具（`clipboard_read` / `clipboard_write`）同样在三种档位下逐次询问（`never` 下
+  fail-closed，`danger-full-access` + `never` 按既有语义放行），不参与会话白名单；后台
+  worker、定时任务与子代理线程拿不到，`HARNESS_CLIPBOARD_TOOLS=0` 时在审批前直接硬拒。
+  剪贴板里可能有密码、验证码或私密文本，所以读取也按敏感数据处理；审计只记长度、截断
+  状态与耗时，不落内容或哈希。
 - 复合命令（`&&`、`;`、`|`、换行）要每一段归到同一类才记「同类」：只按第一段归类的话，
   批准 `ls && rm x` 会写下 `bash:ls`，之后 `ls; rm -rf ~` 就被同一个键放行。
 - `never` 的语义是「不用问我」：`danger-full-access` 下普通询问直接放行；其余档位下需要审批的
@@ -771,7 +785,7 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/review.py` | 只读 `/review`：未提交 diff 审阅、受限工具面与敏感文件过滤 |
 | `src/workspaces.py` | 工作区登记表：命名、排序与原子持久化（只发现，不授权） |
 | `src/tools.py` | 工具接线：路径边界、`run_*` 薄包装、`tool_registry` |
-| `src/tool_schemas.py` | 42 个工具的 schema（顺序即契约，有快照测试锁定） |
+| `src/tool_schemas.py` | 44 个工具的 schema（顺序即契约，有快照测试锁定） |
 | `src/tool_teams.py` | 团队协作：派生 teammate、消息收发、shutdown/plan 协议 |
 | `src/background_watch.py` | `/watch`：后台任务列表与跟踪到终态（Ctrl-C 可脱离） |
 | `src/tool_activity.py` | CLI 工具活动行：参数摘要、耗时与成功/失败标记 |
@@ -780,6 +794,8 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/tool_todos.py` | todo 清单：校验、会话分区、事件流持久化与格式化 |
 | `src/tool_documents.py` | `view_image`/`read_document`/`render_document`：图片缓存与文档渲染引用 |
 | `src/tool_screen.py` | `screen_capture`/`screen_ocr` 工具层：截图落盘、OCR 范围限制与审计事件 |
+| `src/tool_clipboard.py` | `clipboard_read`/`clipboard_write` 工具层：文本截断提示、审批摘要与审计事件 |
+| `src/clipboard_windows.py` | 剪贴板能力层：PowerShell 读写、UTF-8/base64 通道与 200 KiB 字节上限 |
 | `src/turn_screenshots.py` | 回合截图元数据：字节偏移、sha1 去重与数量上限（不暴露绝对路径） |
 | `src/screen_capture.py` | Windows 截屏能力层：DPI、多屏/区域、PowerShell 调用、保留清理与统计 |
 | `src/ocr_windows.py` | WinRT OCR 能力层：语言选择、区域裁剪与行级边界框 |

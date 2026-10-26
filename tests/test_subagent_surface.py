@@ -32,7 +32,8 @@ def test_surface_uses_live_registry_and_excludes_parent_orchestration():
     for excluded in ('task', 'compact', 'checkpoint', 'load_skill',
                      'spawn_teammate', 'schedule_cron', 'background_output',
                      'kill_background', 'rename_session', 'revoke_permissions',
-                     'screen_capture', 'screen_ocr'):
+                     'screen_capture', 'screen_ocr',
+                     'clipboard_read', 'clipboard_write'):
         assert excluded not in names
 
     bash = next(item for item in schemas if item['function']['name'] == 'bash')

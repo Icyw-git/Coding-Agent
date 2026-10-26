@@ -76,3 +76,11 @@ def test_screen_tools_render_as_readable_actions():
     assert detail('screen_ocr', {'path': 'C:/x/a.png', 'lang': 'en-US',
                                  'region': '1,2,3,4'}) == (
         'run local OCR on C:/x/a.png (lang=en-US, region 1,2,3,4)')
+
+
+def test_clipboard_tools_render_without_dumping_the_whole_text():
+    assert detail('clipboard_read', {}) == 'read the current local clipboard text'
+    assert detail('clipboard_write', {'text': 'hello\nworld'}) == (
+        'replace the local clipboard with 11 chars — starts with: hello world')
+    assert detail('clipboard_write', {'text': ''}) == (
+        'replace the local clipboard with 0 chars')

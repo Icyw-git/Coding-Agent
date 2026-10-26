@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Optional
 
 from exec_policy import resolve_tool_path
+from tool_clipboard import read as _clipboard_read_tool
+from tool_clipboard import write as _clipboard_write_tool
 from tool_documents import (
     ImageResult,  # noqa: F401
     read_document,
@@ -151,6 +153,14 @@ def run_screen_ocr(path: str = None, lang: str = None, region: str = None) -> st
         directory=_screenshot_dir(), audit=_screen_audit)
 
 
+def run_clipboard_read() -> str:
+    return _clipboard_read_tool(audit=_screen_audit)
+
+
+def run_clipboard_write(text: str) -> str:
+    return _clipboard_write_tool(text, audit=_screen_audit)
+
+
 def run_view_image(path: str, cwd: str = None):
     return view_image(path, cwd, gate=_gate_file, resolve=safe_path,
                       max_bytes=_IMAGE_MAX_BYTES,
@@ -261,6 +271,8 @@ tool_registry = {
     'view_image': run_view_image,
     'screen_capture': run_screen_capture,
     'screen_ocr': run_screen_ocr,
+    'clipboard_read': run_clipboard_read,
+    'clipboard_write': run_clipboard_write,
     'read_document': run_read_document,
     'render_document': run_render_document,
     'apply_patch': run_apply_patch,

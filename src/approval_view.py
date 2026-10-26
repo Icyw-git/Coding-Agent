@@ -99,6 +99,16 @@ def _screen_detail(tool: str, args: dict) -> str:
     return f'run local OCR on {path} (lang={language}{suffix})'
 
 
+def _clipboard_detail(tool: str, args: dict) -> str:
+    if tool == 'clipboard_read':
+        return 'read the current local clipboard text'
+    text = args.get('text')
+    chars = len(text) if isinstance(text, str) else 0
+    preview = ' '.join(text[:80].split()) if isinstance(text, str) else ''
+    suffix = f' — starts with: {preview}' if preview else ''
+    return f'replace the local clipboard with {chars} chars{suffix}'
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -108,6 +118,8 @@ def detail(tool: str, args) -> str:
     args = args if isinstance(args, dict) else {}
     if tool in ('screen_capture', 'screen_ocr'):
         return safe_text(_screen_detail(tool, args))
+    if tool in ('clipboard_read', 'clipboard_write'):
+        return safe_text(_clipboard_detail(tool, args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

@@ -33,6 +33,10 @@ def test_status_reports_screenshot_count_and_switch(tmp_path, monkeypatch):
 
     monkeypatch.setenv('HARNESS_SCREEN_TOOLS', '0')
     assert '屏幕工具：关（HARNESS_SCREEN_TOOLS=0）' in harness.format_status(store)
+    assert '剪贴板工具：开' in harness.format_status(store)
+
+    monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '0')
+    assert '剪贴板工具：关（HARNESS_CLIPBOARD_TOOLS=0）' in harness.format_status(store)
 
 
 def test_checkpoint_listing_keeps_actionable_reference():

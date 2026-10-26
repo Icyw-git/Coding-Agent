@@ -22,6 +22,7 @@ _SUBAGENT_EXCLUDED = frozenset({
     'create_worktree', 'remove_worktree', 'keep_worktree',
     'background_output', 'kill_background',
     'screen_capture', 'screen_ocr',
+    'clipboard_read', 'clipboard_write',
 })
 
 

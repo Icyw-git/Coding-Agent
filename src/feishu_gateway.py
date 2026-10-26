@@ -58,7 +58,7 @@ import paths
 import screen_capture
 import tool_cache
 import turn_screenshots
-from exec_policy import SCREEN_ENV, approval_class, screen_tools_enabled
+from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, approval_class, clipboard_tools_enabled, screen_tools_enabled
 from feishu_approval_card import approval_card, approval_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
 from feishu_help_card import help_card
@@ -1444,6 +1444,9 @@ class FeishuGateway:
                          f"（{tool_cache.human_size(shots['bytes'])}）")
         except Exception as exc:
             lines.append(f'屏幕工具不可用: {exc}')
+        clip_state = ('开（读写均需审批）' if clipboard_tools_enabled()
+                      else f'关（{CLIPBOARD_ENV}=0）')
+        lines.append(f'剪贴板工具 {clip_state}')
         lines.append('直接发消息即可；停止与详情都在控制台卡片上。')
         self._reply(chat_id, chr(10).join(lines))
 
