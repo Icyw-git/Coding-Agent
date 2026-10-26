@@ -102,7 +102,8 @@ def _detail(event: dict) -> str:
 
 
 def audit_card(events: list[dict], *, token: str = '', intro: str = '',
-               page: int = 0, counts: dict | None = None) -> dict:
+               page: int = 0, counts: dict | None = None,
+               truncated: bool = False) -> dict:
     elements: list[dict] = []
     if intro:
         elements.append(_text(intro))
@@ -120,6 +121,9 @@ def audit_card(events: list[dict], *, token: str = '', intro: str = '',
     summary = ' · '.join(f'{name} {count}'
                          for name, count in sorted((counts or {}).items()))
     head = f'共 {len(events)} 条 · 第 {page + 1}/{pages} 页'
+    if truncated:
+        # 只说「共 N 条」会让人以为这就是全部；服务端有上限时必须说清楚。
+        head += '\n（已达显示上限，更早的事件请用 /audit <类型> 缩小范围）'
     elements.append(_text(head + (f'\n{summary}' if summary else '')))
     for event in events[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
         elements.append(_text(event_line(event)))

@@ -141,17 +141,41 @@ def split_segments(command: str) -> list[str]:
     return _segments(normalize_command(command))
 
 
+def _basename_first_word(segment: str) -> str:
+    """把命令段的首个 token 换成它的 basename。
+
+    `/usr/bin/git status` 与 `git status` 在策略层是同一件事（`policy_bash` 判定
+    破坏性词时先做 basename 归一）。规则层若不归一，用户写了 `git status` 却仍被问
+    一次绝对路径调用——两层语义不一致会让人以为规则没生效。
+    """
+    head, _, rest = segment.partition(' ')
+    stripped = head.strip('"\'')
+    if not stripped:
+        return segment
+    if '/' not in stripped and '\\' not in stripped:
+        return segment
+    name = re.split(r'[\\/]', stripped)[-1]
+    if not name:
+        return segment
+    return f'{name} {rest}'.strip() if rest else name
+
+
 def _prefix_match(prefix: str, segment: str) -> bool:
     prefix = normalize_command(prefix)
     segment = normalize_command(segment)
     if not prefix or not segment:
         return False
-    if segment == prefix:
-        return True
-    if not segment.startswith(prefix):
-        return False
-    # 必须在「词边界」收尾：`git status` 匹配 `git status -s`，不匹配 `git statusx`。
-    return segment[len(prefix)] in ' \t;|&'
+    for candidate in {segment, _basename_first_word(segment)}:
+        if not candidate:
+            continue
+        if candidate == prefix:
+            return True
+        if not candidate.startswith(prefix):
+            continue
+        # 必须在「词边界」收尾：`git status` 匹配 `git status -s`，不匹配 `git statusx`。
+        if candidate[len(prefix)] in ' \t;|&':
+            return True
+    return False
 
 
 def _clean_prefix(raw) -> str:
@@ -218,11 +242,36 @@ def parse(data) -> list[Rule]:
     return rules
 
 
+# 每条工具调用都会读一次规则文件。YAML 解析实测占判定耗时的 60%
+# （50 次判定 127ms，其中 75ms 在 yaml.safe_load）。缓存键是
+# (路径, mtime_ns, size)：文件一改立刻失效，既省掉重复解析，又不会出现
+# 「改了规则不生效」的陷阱——那正是「常驻缓存」最容易被诟病的地方。
+_CACHE: dict[tuple[str, int, int], RuleSet] = {}
+_CACHE_LIMIT = 8
+
+
+def _cache_key(target: Path) -> tuple[str, int, int]:
+    stat = target.stat()
+    return (str(target), stat.st_mtime_ns, stat.st_size)
+
+
 def load(path=None) -> RuleSet:
-    """读取规则文件；缺失或损坏都返回空规则集，不抛给调用方。"""
+    """读取规则文件；缺失或损坏都返回空规则集，不抛给调用方。
+
+    结果按 (路径, mtime, 大小) 缓存：手工改完文件下一次判定就生效，
+    不需要重启。
+    """
     target = Path(path) if path is not None else Path(DURABLE_PATH)
     if not target.exists():
         return RuleSet()
+    try:
+        key = _cache_key(target)
+    except OSError:
+        return RuleSet()
+    cached = _CACHE.get(key)
+    if cached is not None:
+        return cached
+
     try:
         import yaml
 
@@ -231,13 +280,17 @@ def load(path=None) -> RuleSet:
     except Exception as exc:      # 缺 yaml / 语法错 / 读失败：都不该挡住启动
         message = f'{type(exc).__name__}: {exc}'
         print(f'  \033[33m[rules] {target} 加载失败，忽略全部规则（{message}）\033[0m')
-        return RuleSet(error=message)
-    try:
-        rules = parse(data or {'version': VERSION, 'rules': []})
-    except RuleError as exc:
-        print(f'  \033[33m[rules] {target} 内容无效，忽略全部规则（{exc}）\033[0m')
-        return RuleSet(error=str(exc))
-    return RuleSet(rules=rules)
+        result = RuleSet(error=message)
+    else:
+        try:
+            result = RuleSet(rules=parse(data or {'version': VERSION, 'rules': []}))
+        except RuleError as exc:
+            print(f'  \033[33m[rules] {target} 内容无效，忽略全部规则（{exc}）\033[0m')
+            result = RuleSet(error=str(exc))
+    if len(_CACHE) >= _CACHE_LIMIT:
+        _CACHE.clear()      # 只有测试会换路径；正常只有一个文件
+    _CACHE[key] = result
+    return result
 
 
 def explain(ruleset: RuleSet, tool: str, args: dict) -> tuple[str, str]:
@@ -260,11 +313,11 @@ def explain(ruleset: RuleSet, tool: str, args: dict) -> tuple[str, str]:
         if not hit:
             continue
         if rule.decision == DENY:
-            return DENY, rule.note or f'denied by rule ({rule.prefixes[0]})'
+            return DENY, rule.note or rule.prefixes[0]
         if rule.decision == ASK and not verdict:
-            verdict, reason = ASK, rule.note or f'asked by rule ({rule.prefixes[0]})'
+            verdict, reason = ASK, rule.note or rule.prefixes[0]
         elif rule.decision == ALLOW and not verdict:
-            verdict, reason = ALLOW, rule.note or f'allowed by rule ({rule.prefixes[0]})'
+            verdict, reason = ALLOW, rule.note or rule.prefixes[0]
     return verdict, reason
 
 

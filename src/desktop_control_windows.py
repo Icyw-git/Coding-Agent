@@ -444,11 +444,37 @@ def _run(payload: dict, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> dic
     if runner is None and _worker_enabled():
         try:
             return _run_worker(payload, timeout=timeout)
-        except Exception as exc:
+        except ps_worker_error_types() as exc:
             if not _worker_fallback_allowed():
                 raise DesktopControlError(str(exc)) from exc
-            print(f'  [33m[desktop] worker unavailable, falling back: {exc}[0m')
+            # 结构化失败（窗口变了、坐标越界）不是 worker 故障：重跑一次独立进程
+            # 只会得到同样的结果，还会把可读的 message 换成「unexpected output」。
+            # 只有 worker 真的不可用（启动失败/超时/协议错）才降级。
+            if _is_worker_failure(exc):
+                print(f'  [33m[desktop] worker unavailable, falling back: {exc}[0m')
+            else:
+                raise DesktopControlError(str(exc)) from exc
     return _run_standalone(payload, runner=runner, timeout=timeout)
+
+
+def ps_worker_error_types():
+    """worker 层可能抛出的异常类型（延迟 import，避免模块级循环）。"""
+    import ps_worker
+
+    return ps_worker.WorkerError
+
+
+# 这些关键字说明是 worker 本身不可用，而不是「请求被正确拒绝」。
+_WORKER_FAILURE_HINTS = (
+    'not available', 'cannot start', 'did not become ready', 'closed unexpectedly',
+    'stdin closed', 'non-JSON', 'not running', 'is unavailable', 'timed out',
+    'exited during startup',
+)
+
+
+def _is_worker_failure(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return any(hint in text for hint in _WORKER_FAILURE_HINTS)
 
 
 def _worker_enabled() -> bool:

@@ -90,3 +90,14 @@ def test_audit_command_all_lists_types(gateway):
     gw, fake = gateway
     gw.on_message('chat-audit3', '/audit all')
     assert 'screen_captured' in fake.last()
+
+
+def test_truncated_card_says_there_is_more():
+    """只写「共 N 条」会让人以为看到了全部；上限必须明说。"""
+    events = [{'type': 'screen_captured', 'ts': 0, 'sha1': str(i)}
+              for i in range(20)]
+    plain = str(card.audit_card(events))
+    truncated = str(card.audit_card(events, truncated=True))
+    assert '已达显示上限' not in plain
+    assert '已达显示上限' in truncated
+    assert '共 20 条' in truncated

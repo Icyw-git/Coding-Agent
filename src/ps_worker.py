@@ -328,5 +328,16 @@ def run(name: str, script, request: dict, *, fallback=None,
             return fallback()
         raise
     if fail_on_error and not reply.get('ok'):
-        raise WorkerError(str(reply.get('error') or 'worker reported failure'))
+        # 失败回包带的不只是 error 代码：能力模块还会给 message（含 step i/total
+        # 之类的重试提示）与 steps_done。只把代码抛给上层，模型就只能看到
+        # 「out_of_window」这种没法照做的词，所以这里把可读信息拼进去。
+        raise WorkerError(_failure_text(reply))
     return reply
+
+
+def _failure_text(reply: dict) -> str:
+    message = str(reply.get('message') or '').strip()
+    code = str(reply.get('error') or '').strip()
+    if message and code and code not in message:
+        return f'{code}: {message}'
+    return message or code or 'worker reported failure'

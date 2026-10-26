@@ -5462,3 +5462,90 @@ marker 是 `[snipped N messages]`，N = 本次截掉的消息数，**每轮都�
 - 策略账本没有内存缓存（理由见上）。
 - `desktop_snapshot` 的 UIA 查询仍是每步都做：这是「每步重新校验前台窗口」的安全要求，
   去掉它会让序列在窗口切换后继续盲打，属于用安全换速度，不做。
+## 功能可用性 profile（2026-10-26，第二轮）
+
+上一轮只看速度，这一轮按「真实会怎么用」逐项跑一遍，找「能跑但不好用」的地方。
+共修 6 处，其中 3 处是会让用户以为功能坏了的缺陷。
+
+### 修掉的可用性缺陷
+
+**1. 序列失败时模型看不到可指导的信息**（`src/ps_worker.py` + `desktop_control_windows.py`）
+
+worker 回包是 `{ok:false, error:'out_of_window', message:'step 2/3 (click): coordinates...'}`
+这样带定位信息的结构，但 `run()` 只把 `error` 代码抛出去，工具层于是显示：
+
+    Error: desktop action failed: unexpected desktop control output:
+
+模型既不知道第几步失败，也不知道为什么。更糟的是这个错误被当成「worker 故障」触发了
+降级，独立进程重跑一次得到同样结果，可读信息全被换成 `unexpected output`。
+
+两头都修：`_failure_text()` 把 `error` 与 `message` 拼起来；`_is_worker_failure()`
+按关键字区分「worker 真不可用」与「请求被正确拒绝」，后者不再降级。
+现在模型看到 `out_of_window: step 2/2 (click): coordinates are outside the target window`。
+
+**2. `*.com` 能通过校验，等于放开整个顶级域**
+
+`normalize_pattern('*.com')` 原本返回 `*.com`，匹配**任意** `.com` 域名。写规则的人
+通常想放行某个站点的子域，一次手滑就把出口全开了。现在只覆盖一个标签的通配直接拒绝，
+并提示改用具体域名。`*.co.uk` 这类多标签的仍然允许。
+
+**3. 粘完整 URL 被拒，且不说怎么改**
+
+`/domains allow https://docs.example.com/a?x=1` 是最自然的输入，原来报
+「host must not contain scheme, port, path or spaces」——让用户自己拆，而拆错
+（留下 `/a`）会更难查。新增 `strip_url_noise()`：去协议、路径、查询、片段、端口，
+`*.` 前缀保留。还原后仍受通配与 TLD 规则约束（`https://*.com/x` 照样拒）。
+
+**4. 规则不认绝对路径调用，与策略层语义不一致**
+
+策略层判破坏性词时先对 `/usr/bin/git` 做 basename 归一，但规则层用的是原文前缀匹配。
+结果：用户写了 `git status` 规则，`/usr/bin/git status` 仍然被问一次——看起来像规则没生效。
+`_prefix_match` 现在同时试原文与 basename 归一后的形式，且不放宽词边界
+（`/usr/bin/git log`、`/usr/bin/git statusx` 仍不命中）。
+
+**5. 审计截断时不说「还有更多」**
+
+服务端按 `limit` 截断，卡片只说「共 50 条」。用户会以为这就是全部。`audit_card` 新增
+`truncated` 参数，达到上限时补一句「已达显示上限，更早的事件请用 /audit <类型> 缩小范围」。
+
+**6. 自动放行的 reason 文案重复**
+
+审计事件里是 `allowed by rule: allowed by rule (npm test)`——`explain()` 与 `apply()`
+各加了一次前缀。现在 reason 只保留规则本身（命中的前缀或用户写的 note），前缀由
+`apply()` 统一加。
+
+### 顺手做掉的一处性能优化
+
+`evaluate_call` 3.5ms 里 **60% 是每次重新 YAML 解析**（profiler：50 次判定 127ms，
+其中 75ms 在 `yaml.safe_load`）。`rules.load()` 加 `(路径, mtime_ns, size)` 缓存：
+文件一改立刻失效，不会出现「改了规则不生效」——那正是常驻缓存最容易被诟病的地方。
+实测 **3.5ms → 0.42–0.65ms**，改文件后下一次判定立即生效（有测试覆盖）。
+
+### 优化后的延迟基线
+
+| 项 | p50 | 对比 |
+|---|---|---|
+| `desktop_snapshot` | 16.7 ms | 独立进程 913 ms |
+| `clipboard_read` | 1.9 ms | 独立进程 403 ms |
+| `evaluate_call`（bash / web_fetch / desktop） | 0.44–0.65 ms | 原 3.5–4.0 ms |
+| `audit.collect`（56 会话） | 62 ms | 原 282 ms |
+
+### 确认没问题的部分
+
+按真实输入逐项验过、**不需要改**的：
+
+- 桌面动作的参数校验 8 类（缺坐标、超长文本、无效键、scroll=0、空序列、超 12 步、
+  未知动作、单步带 steps）都给出明确拒绝文案；
+- 域名匹配语义：`*.example.com` 匹配多层子域但不含根域，大小写与末尾点归一，非 ASCII 不匹配；
+- 审计卡片渲染、跨会话聚合、类型过滤、损坏行跳过；
+- 规则三态与 `allow_permitted`（read-only/untrusted 下 allow 不生效）的边界。
+
+测试：`test_rules` 38（+3 绝对路径）、`test_net_policy` 40（+9 URL 还原与 TLD 护栏）、
+`test_net_grants_api` 7（+1 URL 还原）、`test_feishu_audit_card` 7（+1 截断提示）。
+全量 2166 passed / 3 skipped，ruff 通过。
+
+### 未做
+
+- `screen_capture` 仍未接 worker（1.6s 里主要是 PNG 编码，进程开销占小头）。
+- 审计没有建持久索引：62ms 对按需查询够用，建索引会引入一致性维护成本。
+- `desktop_snapshot` 每步仍查 UIA：这是「每步重新校验前台窗口」的安全要求。

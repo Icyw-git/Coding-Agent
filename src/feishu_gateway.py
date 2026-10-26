@@ -96,6 +96,9 @@ MIN_CARD_PATCH_INTERVAL = 0.45
 
 # 流式延迟诊断：FEISHU_STREAM_TRACE=1 时每个回合打印一行时间戳，
 # 用来区分「模型慢」「SSE 慢」「卡片 PATCH 慢」。默认关闭，不刷屏。
+# 审计卡一次最多显示多少条：再多卡片过长，也没人翻。
+AUDIT_DISPLAY_LIMIT = 100
+
 STREAM_TRACE_ENV = 'FEISHU_STREAM_TRACE'
 
 
@@ -2025,15 +2028,18 @@ class FeishuGateway:
                     types: list[str] | None = None) -> None:
         """审计卡片：跨会话列最近的安全相关事件。"""
         try:
-            payload = self.api.list_audit(limit=100, types=types)
+            payload = self.api.list_audit(limit=AUDIT_DISPLAY_LIMIT,
+                                         types=types)
         except Exception as exc:
             self._reply(chat_id, f'[audit] {exc}')
             return
         rows = payload.get('events') or []
         token = secrets.token_hex(4)
         self._audit_views[chat_id] = (token, time.monotonic())
+        # 服务端按 limit 截断：「共 N 条」若不说清，用户会以为看到了全部。
         card = audit_card(rows, token=token, intro=intro, page=page,
-                          counts=payload.get('counts'))
+                          counts=payload.get('counts'),
+                          truncated=len(rows) >= AUDIT_DISPLAY_LIMIT)
         patcher = getattr(self.transport, 'update_step_card', None)
         if message_id and patcher is not None:
             try:

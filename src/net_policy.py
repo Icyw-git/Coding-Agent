@@ -35,9 +35,40 @@ class NetPolicyError(ValueError):
     """域名模式不合法。"""
 
 
+def strip_url_noise(raw) -> str:
+    """把用户粘进来的完整 URL 还原成主机名。
+
+    `/domains allow https://docs.example.com/a?x=1` 是最自然的输入方式；直接报
+    「host must not contain scheme」等于让用户自己拆，而拆错（留下 `/a`）会被
+    当成非法主机名。这里只做**确定无歧义**的还原：去协议、去路径/查询/片段、
+    去端口。通配前缀 `*.` 原样保留。
+    """
+    text = str(raw or '').strip()
+    if not text:
+        return text
+    lowered = text.casefold()
+    for scheme in ('https://', 'http://', '//'):
+        if lowered.startswith(scheme):
+            text = text[len(scheme):]
+            break
+    # 只在第一个 `/` 处截断：DNS 名里不会有 `/`。
+    text = text.split('/', 1)[0]
+    text = text.split('?', 1)[0].split('#', 1)[0]
+    # 去端口：最后一个冒号后面全是数字才当端口，避免误伤 IPv6。
+    host, sep, tail = text.rpartition(':')
+    if sep and tail.isdigit():
+        text = host
+    return text.strip()
+
+
+def normalize_host_input(raw) -> str:
+    """先剥 URL 噪声再归一化大小写与末尾点。"""
+    return strip_url_noise(raw).casefold().rstrip('.')
+
+
 def normalize_pattern(raw) -> str:
     """校验并归一化一条域名模式（可带 `*.` 前缀）。"""
-    text = str(raw or '').strip().casefold().rstrip('.')
+    text = normalize_host_input(raw)
     if not text:
         raise NetPolicyError('host must not be empty')
     if len(text) > MAX_HOST_CHARS:
@@ -54,6 +85,14 @@ def normalize_pattern(raw) -> str:
         base = text[2:]
         if not _HOST_RE.match(base):
             raise NetPolicyError('wildcard host must be a valid DNS name')
+        # `*.com` / `*.cn` 这类只覆盖一个标签的通配等于放开整个顶级域：写的人
+        # 通常想要的是「某个站点的子域」，而不是「所有 .com」。真正需要整域放行
+        # 时应该写明具体域名，或用两条精确规则。这里直接拒绝，避免一次手滑把
+        # 出口全开——这比事后从账本里发现要便宜。
+        if '.' not in base:
+            raise NetPolicyError(
+                f'{text!r} would allow an entire top-level domain; '
+                'list the specific domains instead')
     return text
 
 

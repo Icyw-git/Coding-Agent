@@ -241,3 +241,28 @@ def test_allow_rule_is_ignored_when_allow_not_permitted():
     denied = rules.apply(ask, ruleset, 'bash', {'command': 'shutdown now'},
                          allow_permitted=False)
     assert denied.action == DENY
+
+
+def test_absolute_path_invocation_matches_the_same_prefix():
+    """`/usr/bin/git status` 与 `git status` 在策略层是同一件事，规则层也要一致。
+
+    策略层判破坏性词时先做 basename 归一；规则层若不归一，用户写了 `git status`
+    却仍被问一次绝对路径调用，会以为规则没生效。
+    """
+    ruleset = _ruleset((ALLOW, ['git status'], None, ''))
+    assert rules.explain(ruleset, 'bash',
+                         {'command': '/usr/bin/git status -s'})[0] == ALLOW
+    assert rules.explain(ruleset, 'bash',
+                         {'command': '"/usr/bin/git" status'})[0] == ALLOW
+
+
+def test_absolute_path_normalisation_does_not_widen_the_rule():
+    ruleset = _ruleset((ALLOW, ['git status'], None, ''))
+    assert rules.explain(ruleset, 'bash',
+                         {'command': '/usr/bin/git log'})[0] == ''
+    assert rules.explain(ruleset, 'bash',
+                         {'command': '/usr/bin/git statusx'})[0] == ''
+
+
+def test_bare_command_is_not_rewritten():
+    assert rules._basename_first_word('git status -s') == 'git status -s'

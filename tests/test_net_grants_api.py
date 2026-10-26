@@ -43,11 +43,19 @@ def test_api_rejects_invalid_domains(api_client):
     client = api_client
 
     for payload in ({'host': '*'},
-                    {'host': 'http://x.com/path'},
+                    {'host': '*.com'},          # 放开整个 TLD
                     {'host': 'x.com', 'scope': 'maybe'},
                     {'host': 'x.com', 'expires': '2000-01-01'}):
         response = client.post('/v1/net-grants', headers=_auth(), json=payload)
         assert response.status_code in (400, 422), payload
+
+
+def test_api_accepts_pasted_url_and_reduces_to_host(api_client):
+    """粘完整 URL 是最自然的输入；接口负责还原，不必让用户自己拆。"""
+    response = api_client.post('/v1/net-grants', headers=_auth(),
+                               json={'host': 'https://docs.example.com/a?x=1'})
+    assert response.status_code == 201
+    assert response.json()['host'] == 'docs.example.com'
 
 
 def test_api_remove_missing_returns_404(api_client):

@@ -29,8 +29,11 @@ def test_deny_wins_over_allow():
     assert net_policy.classify('b.example.com', rules) == ''
 
 
-@pytest.mark.parametrize('raw', ['', '*', 'http://x.com', 'x.com/path', 'x.com:80',
-                                 'a.*.com', 'x y.com', '-bad.com'])
+@pytest.mark.parametrize('raw', [
+    '', '*', 'a.*.com', 'x y.com', '-bad.com',
+    # 只覆盖一个标签的通配 = 放开整个 TLD
+    '*.com', '*.cn', '*.io',
+])
 def test_rejects_unsafe_patterns(raw):
     with pytest.raises(net_policy.NetPolicyError):
         net_policy.normalize_pattern(raw)
@@ -96,8 +99,7 @@ def test_malformed_records_are_skipped_not_fatal():
 def test_invalid_inputs_rejected():
     with pytest.raises(net_policy.NetPolicyError):
         net_grants.add('*')
-    with pytest.raises(net_policy.NetPolicyError):
-        net_grants.add('http://x.com/path')
+
     with pytest.raises(net_grants.NetGrantError):
         net_grants.add('x.com', scope='maybe')
     with pytest.raises(net_grants.NetGrantError):
@@ -157,3 +159,35 @@ def test_allow_does_not_bypass_private_address_check():
     from web_access import WebAccessError, check_url
     with pytest.raises(WebAccessError):
         check_url('http://127.0.0.1:8000/admin')
+
+
+def test_wildcard_needs_at_least_two_labels():
+    """`*.example.com` 可以，`*.com` 不行：后者等于放开整个顶级域。"""
+    assert net_policy.normalize_pattern('*.example.com') == '*.example.com'
+    assert net_policy.normalize_pattern('*.co.uk') == '*.co.uk'
+    with pytest.raises(net_policy.NetPolicyError, match='top-level'):
+        net_policy.normalize_pattern('*.com')
+
+
+def test_exact_single_label_still_allowed():
+    """精确主机不受限制（`localhost` 这类单标签在测试里常用）。"""
+    assert net_policy.normalize_pattern('localhost') == 'localhost'
+
+
+@pytest.mark.parametrize('raw,expected', [
+    ('https://docs.example.com', 'docs.example.com'),
+    ('http://docs.example.com/a/b?x=1', 'docs.example.com'),
+    ('//docs.example.com', 'docs.example.com'),
+    ('docs.example.com:443', 'docs.example.com'),
+    ('  https://docs.example.com/  ', 'docs.example.com'),
+    ('https://*.example.com/x', '*.example.com'),
+])
+def test_pasted_urls_are_reduced_to_the_host(raw, expected):
+    """粘完整 URL 是最自然的输入方式；能确定还原的就不该让用户自己拆。"""
+    assert net_policy.normalize_pattern(raw) == expected
+
+
+def test_url_reduction_does_not_widen_the_rule():
+    """还原后仍然受通配与 TLD 规则约束。"""
+    with pytest.raises(net_policy.NetPolicyError, match='top-level'):
+        net_policy.normalize_pattern('https://*.com/x')
