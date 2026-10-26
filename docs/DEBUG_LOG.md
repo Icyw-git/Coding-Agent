@@ -5038,3 +5038,66 @@ P3b 增加 `src/desktop_control_windows.py` 能力层与 `src/tool_desktop.py` �
 新增测试覆盖后端 payload、键鼠参数边界、窗口身份契约、默认关闭/never 档、逐次审批、后台拒绝、审计脱敏和 cron 隔离。定向 **70 passed**；全量 **1921 passed / 2 skipped**，ruff 通过。
 
 **未做真机桌面输入**：当前进程运行环境不能由自动化用例安全验证键鼠副作用。实际启用前需用户在自己的飞书/CLI交互会话中显式配置环境变量，第一次仅对记事本测试，且逐步核对审批卡和目标窗口。敏感窗口拦截不可当作保证。
+
+
+## P3b 复审修复 + 动作序列（2026-10-26）
+
+复审 7034c23 的桌面控制实现，用惰性探针（纯 PowerShell 语义测试、stdout 字节转储、DPI 前后
+对比）实锤三个缺陷后修复：
+
+1. **`$pid` 撞只读自动变量 `$PID`**：`Get-WindowState` 里 `$pid = [uint32]0` 在
+   `$ErrorActionPreference='Stop'` 下必抛“无法覆盖变量 PID”，此前**每次 snapshot/action 都会
+   失败**。探针：`try { $pid=[uint32]0 } catch { … }` → CAUGHT。已改名 `$procId`。单测没抓到
+   是因为 runner 全注入、脚本只做字符串断言——运行时契约现在靠两条腿：契约断言（脚本内禁止
+   `$pid =`）+ 真机只读冒烟。
+2. **stdout GBK**：重定向的 PowerShell 5.1 输出走 OEM 码页（探针：`中文` → `d6 d0 ce c4`），
+   Python 按 UTF-8 解码后中文窗口标题全是 U+FFFD。改为脚本输出单个 base64(UTF-8 JSON) 行
+   （与 clipboard 模块同一模式），Python 侧 `b64decode(validate=True)` + UTF-8 解码，控制台
+   码页彻底不碰载荷。
+3. **DPI 不对齐**：desktop 脚本未调 `SetProcessDPIAware`，与 `screen_capture`（显式调用）坐标
+   系可能不一致（本机 100% 缩放不触发，探针前后均 1440x960）。已对齐为物理像素。
+
+顺手修：`scroll` 前把光标 clamp 进目标窗口矩形（滚轮落在光标所在窗口，可能滚错）；snapshot
+无前台窗口时 `_state_text` 透出 `error`（原来只显示 unknown 占位）；`run_desktop_action` 类型
+注解补 `| None`。
+
+**动作序列**：`desktop_action` 新增 `action=sequence` + `steps`（1–12 步，每步
+`move/click/type/key/scroll` 及其参数，按动作白名单拒未知字段；单步模式禁带 `steps`）。一次
+审批覆盖整组计划——审批卡逐行列出每步（`1.click(10,20) 2.type len=8 "…" 3.key=enter`）。
+脚本逐步执行，每步前重读前台窗口（身份 + 敏感词），命中即中止，错误带 `step i/total` 与
+`steps_done`；步间 50ms。序列超时 `min(60, 10 + 2×步数)`。审计记 `steps=N` 不记文本；工具
+结果逐行列出已完成步骤。schema 枚举加 `sequence`，SHA1 更新为
+`e2c3c02abb80f5741b00f3447b7d5dd5703cb855`。
+
+真机验证（全部只读，未注入键鼠）：能力层直调 snapshot 成功（explorer 任务栏 pid=12000，
+rect=(0,1368,2160,72)，无 U+FFFD，3298ms）；PowerShell `Parser::ParseInput` 静态校验整个
+CONTROL_SCRIPT（含序列分支）PARSE_OK。定向 51 passed + ruff 通过；全量 **1937 passed /
+2 skipped**。
+
+### 键鼠流畅度第二轮：修饰键、右键/双击、wait（2026-10-26）
+
+序列解决了“一次审批管一组”，但每一步仍只覆盖最基础形态：没有 `ctrl+v` 就做不了复制粘贴，
+没有右键/双击就打不开上下文菜单和文件，序列里没有等待就等不及菜单动画。本轮补齐三项：
+
+1. **修饰键组合**：`key` 接受 `+` 连接（`ctrl+v`、`ctrl+shift+s`、`alt+f4`、`win+d`）。Python
+   侧拆段归一化（小写、去空白、最多 4 个修饰键、重复修饰键/空段/未知修饰键直接拒），
+   PowerShell 侧按 ctrl=17/alt=18/shift=16/win=91 依次按下、敲基础 VK、再**逆序释放**，
+   避免修饰键卡在按下状态。
+2. **右键/双击**：`click` 新增 `button=left|right|middle` 与 `count=1|2`（双击间隔 40ms）。
+   按下前停留 20ms，等菜单/提示条在光标下稳定。右/中键用 `mouse_event` 的
+   0x0008/0x0010 与 0x0020/0x0040 事件对。
+3. **等待步骤**：序列里可插入 `{action: wait, ms: 50..3000}`，仅序列可用（单步模式直接拒）。
+   序列超时从 `10 + 2×步数` 改为 `10 + 2×步数 + wait 总秒数`，仍封顶 60s，避免等待被超时打断。
+
+审批面同步：序列摘要显示 `right click(3,4)`、`double click(5,6)`、`wait 300ms`；单步 `click`
+显示 `button=right, count=2`。schema 增加顶层 `button`/`count` 与 step 的 `button`/`count`/`ms`，
+`key` 描述注明组合写法；SHA1 更新为 `dbad5aa01eff9ba25cc001500479a4334bd71cf3`。
+
+验证：新增 18 条测试（组合归一化、13 个非法组合/点击/等待用例、wait 仅序列、超时覆盖 wait、
+PowerShell 契约含 `$modMap`/`invalid_button`/`invalid_count`/`invalid_wait`、审批面渲染、
+工具层透传 button/count）。`Parser::ParseInput` 静态解析整个 CONTROL_SCRIPT 为 PARSE_OK
+（注意：用 `ParseFile` 读 UTF-8 无 BOM 文件会按 ANSI 解析，中文注释导致假报错；探针改为
+`ReadAllText(..., UTF8)` + `ParseInput`）。定向 64 passed，全量 **1955 passed / 2 skipped**，
+ruff 通过。真机只读冒烟：对当前前台窗口（Qoder）执行仅含一个 `wait` 步骤的序列，返回
+`steps=({action:'wait', ok:True})`、1297ms，验证了步骤循环与 wait 分支的运行时路径；本轮
+未注入任何真实键鼠输入，点击/组合键/滚轮仍按验收表由人执行。

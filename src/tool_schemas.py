@@ -618,15 +618,22 @@ TOOL_SCHEMAS = [{'type': 'function',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_action',
-               'description': 'Perform one approved mouse or keyboard action in the '
-                              'foreground desktop. Requires HARNESS_DESKTOP_CONTROL=1 '
-                              'and explicit approval every time. First call '
+               'description': 'Perform approved mouse or keyboard input in the '
+                              'foreground desktop: either one action, or a '
+                              'deliberate sequence of steps (action=sequence) '
+                              'executed left to right under a single approval — '
+                              'use it to combine click, typing, and keys into one '
+                              'plan. Requires HARNESS_DESKTOP_CONTROL=1 and '
+                              'explicit approval every time. First call '
                               'desktop_snapshot; expected_pid and expected_window_id '
-                              'must match that window. Sensitive windows are blocked.',
+                              'must match that window. Every step re-checks the '
+                              'foreground window; the run stops at the first change '
+                              'or sensitive window. Sensitive windows are blocked.',
                'parameters': {'type': 'object',
                               'properties': {
                                   'action': {'type': 'string',
-                                             'enum': ['move', 'click', 'type', 'key', 'scroll']},
+                                             'enum': ['move', 'click', 'type', 'key',
+                                                      'scroll', 'sequence']},
                                   'expected_pid': {'type': 'integer',
                                                    'description': 'PID from desktop_snapshot'},
                                   'expected_window_id': {'type': 'string',
@@ -638,8 +645,42 @@ TOOL_SCHEMAS = [{'type': 'function',
                                   'text': {'type': 'string',
                                            'description': 'Text to type, max 1000 characters'},
                                   'key': {'type': 'string',
-                                          'description': 'Key name such as enter, tab, escape, or F1'},
+                                          'description': 'Key name (enter, tab, escape, F1) '
+                                                         'or a combo joined with + such as '
+                                                         'ctrl+v, ctrl+shift+s, alt+f4'},
                                   'amount': {'type': 'integer',
-                                             'description': 'Scroll notches from -20 to 20, excluding 0'}},
+                                             'description': 'Scroll notches from -20 to 20, excluding 0'},
+                                  'button': {'type': 'string',
+                                             'enum': ['left', 'right', 'middle'],
+                                             'description': 'Mouse button for click (default left)'},
+                                  'count': {'type': 'integer', 'enum': [1, 2],
+                                            'description': 'click count: 2 is a double-click'},
+                                  'steps': {'type': 'array', 'maxItems': 12,
+                                            'description': 'For action=sequence: 1-12 '
+                                                           'ordered steps, each an object '
+                                                           'with action (move/click/type/key/'
+                                                           'scroll/wait) and that action\'s '
+                                                           'parameters (x/y/button/count, text, '
+                                                           'key, amount, ms). One approval '
+                                                           'covers the whole plan.',
+                                            'items': {'type': 'object',
+                                                      'properties': {
+                                                          'action': {'type': 'string',
+                                                                     'enum': ['move', 'click',
+                                                                              'type', 'key',
+                                                                              'scroll', 'wait']},
+                                                          'x': {'type': 'integer'},
+                                                          'y': {'type': 'integer'},
+                                                          'text': {'type': 'string'},
+                                                          'key': {'type': 'string'},
+                                                          'amount': {'type': 'integer'},
+                                                          'button': {'type': 'string',
+                                                                     'enum': ['left', 'right',
+                                                                              'middle']},
+                                                          'count': {'type': 'integer',
+                                                                    'enum': [1, 2]},
+                                                          'ms': {'type': 'integer',
+                                                                 'description': 'wait step: '
+                                                                                '50-3000 ms'}}}}},
                               'required': ['action', 'expected_pid',
                                            'expected_window_id']}}}]

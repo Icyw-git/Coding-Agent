@@ -1,4 +1,5 @@
 """Desktop input backend validation and PowerShell contract tests; never touch a real desktop."""
+import base64
 import json
 import subprocess
 
@@ -7,17 +8,22 @@ import pytest
 import desktop_control_windows as desktop
 
 
-def _record(state=None, action='snapshot'):
+def _record(state=None, action='snapshot', steps=None):
     state = state or {
         'available': True, 'title': 'Notepad', 'process': 'notepad', 'pid': 123,
         'window_id': 'ABCD', 'class_name': 'Notepad', 'rect': [0, 0, 800, 600],
         'focused_name': 'Text area', 'focused_control_type': 'ControlType.Document',
         'focused_is_password': False, 'sensitive_target': False,
     }
-    data = {'ok': True, 'state': state}
-    if action != 'snapshot':
+    if action == 'snapshot':
+        data = {'ok': True, 'state': state}
+    elif action == 'sequence':
+        data = {'ok': True, 'action': 'sequence',
+                'steps': steps if steps is not None else [], 'state_after': state}
+    else:
         data = {'ok': True, 'state_after': state, 'action': action}
-    return subprocess.CompletedProcess([], 0, json.dumps(data), '')
+    blob = base64.b64encode(json.dumps(data).encode('utf-8')).decode('ascii')
+    return subprocess.CompletedProcess([], 0, blob, '')
 
 
 def _runner(record=None, seen=None):
@@ -78,6 +84,69 @@ def test_invalid_actions_rejected_before_runner(kwargs):
     assert called == []
 
 
+SEQUENCE_STEPS = [
+    {'action': 'click', 'x': 10, 'y': 20},
+    {'action': 'type', 'text': '你好'},
+    {'action': 'key', 'key': 'enter'},
+]
+
+
+def test_sequence_encodes_steps_and_reports_outcomes():
+    seen = {}
+    outcome = [{'action': 'click', 'ok': True},
+               {'action': 'type', 'ok': True},
+               {'action': 'key', 'ok': True}]
+    result = desktop.action(
+        'sequence', expected_pid=123, expected_window_id='abcd',
+        steps=SEQUENCE_STEPS, runner=_runner(
+            record=_record(action='sequence', steps=outcome), seen=seen))
+    payload = json.loads(base64.b64decode(seen['env']['HARNESS_DESKTOP_PAYLOAD']))
+    assert payload['action'] == 'sequence'
+    assert payload['expected_window_id'] == 'ABCD'
+    assert payload['steps'] == [
+        {'action': 'click', 'x': 10, 'y': 20},
+        {'action': 'type', 'text': '你好'},
+        {'action': 'key', 'key': 'enter'},
+    ]
+    assert [step['action'] for step in result.steps] == ['click', 'type', 'key']
+    assert result.state.pid == 123
+
+
+def test_sequence_scales_timeout_with_step_count():
+    seen = {}
+    desktop.action(
+        'sequence', expected_pid=1, expected_window_id='A',
+        steps=[{'action': 'key', 'key': 'enter'}] * 12,
+        runner=_runner(record=_record(action='sequence', steps=[]), seen=seen))
+    assert seen['timeout'] > desktop.DEFAULT_TIMEOUT
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [], 'x': 1},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A'},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': []},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'click', 'x': 1, 'y': 2}] * 13},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'click', 'x': 1, 'y': 2, 'text': 'no'}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'click'}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'invoke'}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': ['click']},
+    {'action': 'click', 'expected_pid': 1, 'expected_window_id': 'A',
+     'x': 1, 'y': 2, 'steps': [{'action': 'key', 'key': 'enter'}]},
+])
+def test_invalid_sequences_rejected_before_runner(kwargs):
+    called = []
+    with pytest.raises(desktop.DesktopControlError):
+        desktop.action(**kwargs, runner=lambda *args: called.append(args))
+    assert called == []
+
+
 def test_power_shell_contract_checks_window_identity_and_sensitive_focus():
     assert 'GetForegroundWindow' in desktop.CONTROL_SCRIPT
     assert 'expected_window_id' in desktop.CONTROL_SCRIPT
@@ -86,8 +155,98 @@ def test_power_shell_contract_checks_window_identity_and_sensitive_focus():
     assert 'SendInput' in desktop.CONTROL_SCRIPT
 
 
+def test_powershell_script_contract_covers_fixed_output_and_dpi():
+    # $pid 撞只读自动变量曾让每次调用必失败；编码曾把 GBK 标题喂给 UTF-8 解码。
+    assert '$pid =' not in desktop.CONTROL_SCRIPT
+    assert '$procId' in desktop.CONTROL_SCRIPT
+    assert 'ToBase64String' in desktop.CONTROL_SCRIPT
+    assert 'SetProcessDPIAware' in desktop.CONTROL_SCRIPT
+    assert 'Invoke-Step' in desktop.CONTROL_SCRIPT
+    assert 'foreach ($step in $steps)' in desktop.CONTROL_SCRIPT
+    assert 'steps_done' in desktop.CONTROL_SCRIPT
+
+
 def test_powershell_timeout_is_reported():
     def timed_out(*args):
         raise subprocess.TimeoutExpired('powershell', 1)
     with pytest.raises(desktop.DesktopControlError, match='timed out'):
         desktop.snapshot(runner=timed_out)
+
+
+def test_key_combo_and_click_options_are_normalized():
+    seen = {}
+    desktop.action('sequence', expected_pid=1, expected_window_id='A',
+                   steps=[{'action': 'key', 'key': ' Ctrl+Shift+S '},
+                          {'action': 'click', 'x': 1, 'y': 2,
+                           'button': 'RIGHT', 'count': 2}],
+                   runner=_runner(record=_record(action='sequence'), seen=seen))
+    payload = json.loads(base64.b64decode(
+        seen['env']['HARNESS_DESKTOP_PAYLOAD']))
+    assert payload['steps'] == [
+        {'action': 'key', 'key': 'ctrl+shift+s'},
+        {'action': 'click', 'x': 1, 'y': 2, 'button': 'right', 'count': 2},
+    ]
+    plain = desktop.validate_action(
+        'click', expected_pid=1, expected_window_id='A', x=3, y=4)
+    assert plain == {'action': 'click', 'expected_pid': 1,
+                     'expected_window_id': 'A', 'x': 3, 'y': 4}
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'action': 'key', 'expected_pid': 1, 'expected_window_id': 'A',
+     'key': 'ctrl+ctrl+s'},
+    {'action': 'key', 'expected_pid': 1, 'expected_window_id': 'A',
+     'key': 'hyper+s'},
+    {'action': 'key', 'expected_pid': 1, 'expected_window_id': 'A',
+     'key': 'ctrl+'},
+    {'action': 'key', 'expected_pid': 1, 'expected_window_id': 'A',
+     'key': 'ctrl+alt+shift+win+ctrl+s'},
+    {'action': 'key', 'expected_pid': 1, 'expected_window_id': 'A',
+     'key': 'ctrl+unknown'},
+    {'action': 'click', 'expected_pid': 1, 'expected_window_id': 'A',
+     'x': 1, 'y': 2, 'button': 'back'},
+    {'action': 'click', 'expected_pid': 1, 'expected_window_id': 'A',
+     'x': 1, 'y': 2, 'count': 3},
+    {'action': 'move', 'expected_pid': 1, 'expected_window_id': 'A',
+     'x': 1, 'y': 2, 'button': 'left'},
+    {'action': 'type', 'expected_pid': 1, 'expected_window_id': 'A',
+     'text': 'x', 'count': 2},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'wait'}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'wait', 'ms': 49}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'wait', 'ms': 3001}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'wait', 'ms': 100, 'x': 1}]},
+    {'action': 'sequence', 'expected_pid': 1, 'expected_window_id': 'A',
+     'steps': [{'action': 'wait', 'ms': 100}], 'button': 'left'},
+])
+def test_invalid_combos_clicks_and_waits_rejected(kwargs):
+    called = []
+    with pytest.raises(desktop.DesktopControlError):
+        desktop.action(**kwargs, runner=lambda *args: called.append(args))
+    assert called == []
+
+
+def test_wait_step_is_sequence_only_and_extends_timeout():
+    with pytest.raises(desktop.DesktopControlError, match='action must be'):
+        desktop.validate_action('wait', expected_pid=1, expected_window_id='A')
+    seen = {}
+    desktop.action('sequence', expected_pid=1, expected_window_id='A',
+                   steps=[{'action': 'wait', 'ms': 3000}],
+                   runner=_runner(record=_record(action='sequence'), seen=seen))
+    assert seen['timeout'] >= desktop.DEFAULT_TIMEOUT + 3.0
+    payload = json.loads(base64.b64decode(
+        seen['env']['HARNESS_DESKTOP_PAYLOAD']))
+    assert payload['steps'] == [{'action': 'wait', 'ms': 3000}]
+
+
+def test_powershell_script_contract_covers_combos_buttons_and_wait():
+    assert '$modMap' in desktop.CONTROL_SCRIPT
+    assert 'invalid_button' in desktop.CONTROL_SCRIPT
+    assert 'invalid_count' in desktop.CONTROL_SCRIPT
+    assert 'invalid_wait' in desktop.CONTROL_SCRIPT
+    assert '0x0008' in desktop.CONTROL_SCRIPT
+    assert '0x0020' in desktop.CONTROL_SCRIPT
+    assert 'Start-Sleep -Milliseconds $ms' in desktop.CONTROL_SCRIPT

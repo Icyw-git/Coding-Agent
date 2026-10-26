@@ -24,7 +24,7 @@ ORDER = [
     'desktop_snapshot', 'desktop_action',
 ]
 
-SCHEMA_SHA1 = '21c026beb25e799ba7275097c6b4cfbddff7943a'
+SCHEMA_SHA1 = 'dbad5aa01eff9ba25cc001500479a4334bd71cf3'
 
 
 def test_tool_order_is_stable():

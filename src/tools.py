@@ -167,12 +167,15 @@ def run_desktop_snapshot() -> str:
     return _desktop_snapshot_tool(audit=_screen_audit)
 
 
-def run_desktop_action(action: str, x: int = None, y: int = None,
-                       text: str = None, key: str = None,
-                       amount: int = None, expected_pid: int = None,
-                       expected_window_id: str = None) -> str:
+def run_desktop_action(action: str, x: int | None = None, y: int | None = None,
+                       text: str | None = None, key: str | None = None,
+                       amount: int | None = None, button: str | None = None,
+                       count: int | None = None, expected_pid: int | None = None,
+                       expected_window_id: str | None = None,
+                       steps: list | None = None) -> str:
     return _desktop_action_tool(
-        action, x=x, y=y, text=text, key=key, amount=amount,
+        action, x=x, y=y, text=text, key=key, amount=amount, button=button,
+        count=count, steps=steps,
         expected_pid=expected_pid, expected_window_id=expected_window_id,
         audit=_screen_audit)
 

@@ -84,3 +84,37 @@ def test_clipboard_tools_render_without_dumping_the_whole_text():
         'replace the local clipboard with 11 chars — starts with: hello world')
     assert detail('clipboard_write', {'text': ''}) == (
         'replace the local clipboard with 0 chars')
+
+
+def test_desktop_tools_render_as_readable_actions():
+    assert detail('desktop_snapshot', {}) == (
+        'inspect foreground window metadata and focused UI control')
+    assert detail('desktop_action', {'action': 'click', 'expected_pid': 7,
+                                     'expected_window_id': 'AB', 'x': 1, 'y': 2}) == (
+        'desktop input: action=click, foreground pid=7, window id=AB, '
+        'coordinates=(1,2), button=left')
+    assert detail('desktop_action', {
+        'action': 'click', 'expected_pid': 7, 'expected_window_id': 'AB',
+        'x': 1, 'y': 2, 'button': 'right', 'count': 2}).endswith(
+            'coordinates=(1,2), button=right, count=2')
+    assert detail('desktop_action', {
+        'action': 'key', 'expected_pid': 7, 'expected_window_id': 'AB',
+        'key': 'ctrl+v'}).endswith('key=ctrl+v')
+
+
+def test_desktop_sequence_detail_lists_every_step():
+    text = detail('desktop_action', {
+        'action': 'sequence', 'expected_pid': 7, 'expected_window_id': 'AB',
+        'steps': [{'action': 'click', 'x': 10, 'y': 20},
+                  {'action': 'type', 'text': '你好 world'},
+                  {'action': 'key', 'key': 'ctrl+enter'},
+                  {'action': 'click', 'x': 3, 'y': 4, 'button': 'right'},
+                  {'action': 'click', 'x': 5, 'y': 6, 'count': 2},
+                  {'action': 'wait', 'ms': 300}]})
+    assert 'action=sequence, foreground pid=7, window id=AB' in text
+    assert 'steps (6)=1.click(10,20)' in text
+    assert '2.type len=8 "你好 world"' in text
+    assert '3.key=ctrl+enter' in text
+    assert '4.right click(3,4)' in text
+    assert '5.double click(5,6)' in text
+    assert '6.wait 300ms' in text

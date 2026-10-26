@@ -109,6 +109,31 @@ def _clipboard_detail(tool: str, args: dict) -> str:
     return f'replace the local clipboard with {chars} chars{suffix}'
 
 
+def _desktop_step_summary(step) -> str:
+    if not isinstance(step, dict):
+        return '?'
+    action = step.get('action') or '?'
+    if action == 'move':
+        return f"move({step.get('x')},{step.get('y')})"
+    if action == 'click':
+        button = step.get('button') or 'left'
+        count = step.get('count') or 1
+        label = f'{button} ' if button != 'left' else ''
+        label += 'double click' if count == 2 else 'click'
+        return f"{label}({step.get('x')},{step.get('y')})"
+    if action == 'type':
+        text = step.get('text') if isinstance(step.get('text'), str) else ''
+        preview = ' '.join(text[:40].split())
+        return f'type len={len(text)}' + (f' "{preview}"' if preview else '')
+    if action == 'key':
+        return f"key={step.get('key', '')}"
+    if action == 'scroll':
+        return f"scroll={step.get('amount', '')}"
+    if action == 'wait':
+        return f"wait {step.get('ms', '')}ms"
+    return str(action)
+
+
 def _desktop_detail(tool: str, args: dict) -> str:
     if tool == 'desktop_snapshot':
         return 'inspect foreground window metadata and focused UI control'
@@ -118,8 +143,18 @@ def _desktop_detail(tool: str, args: dict) -> str:
         fields.append(f"foreground pid={args['expected_pid']}")
     if args.get('expected_window_id'):
         fields.append(f"window id={args['expected_window_id']}")
-    if action in ('move', 'click'):
+    steps = args.get('steps')
+    if action == 'sequence' and isinstance(steps, list) and steps:
+        rendered = ' '.join(
+            f'{index}.{_desktop_step_summary(step)}'
+            for index, step in enumerate(steps, 1))
+        fields.append(f'steps ({len(steps)})={rendered}')
+    elif action in ('move', 'click'):
         fields.append(f"coordinates=({args.get('x')},{args.get('y')})")
+        if action == 'click':
+            fields.append(f"button={args.get('button') or 'left'}")
+            if args.get('count') not in (None, 1):
+                fields.append(f'count={args["count"]}')
     elif action == 'type':
         text = args.get('text') if isinstance(args.get('text'), str) else ''
         fields.append(f'text length={len(text)}')

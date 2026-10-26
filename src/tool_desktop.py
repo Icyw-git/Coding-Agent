@@ -18,6 +18,9 @@ def _audit(audit, event: str, **payload) -> None:
 
 
 def _state_text(state) -> str:
+    if not state.available:
+        detail = f' ({state.error})' if state.error else ''
+        return f'No foreground window available{detail}'
     title = state.title or '(untitled)'
     process = state.process or 'unknown process'
     focused = state.focused_name or state.focused_control_type or 'unknown control'
@@ -40,21 +43,35 @@ def snapshot(*, runner=None, audit=None) -> str:
 
 
 def action(action_name: str, *, x=None, y=None, text=None, key=None,
-           amount=None, expected_pid=None, expected_window_id=None,
+           amount=None, button=None, count=None, steps=None,
+           expected_pid=None, expected_window_id=None,
            runner=None, audit=None) -> str:
     try:
         result = desktop_control_windows.action(
             action_name, x=x, y=y, text=text, key=key, amount=amount,
-            expected_pid=expected_pid, expected_window_id=expected_window_id,
+            button=button, count=count, steps=steps,
+            expected_pid=expected_pid,
+            expected_window_id=expected_window_id,
             runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action=str(action_name)[:30],
                reason=str(exc)[:120])
         return f'Error: desktop action failed: {exc}'
     state = result.state
-    _audit(audit, 'desktop_action', action=result.action, process=state.process,
-           pid=state.pid, window_id=state.window_id,
-           duration_ms=result.duration_ms,
-           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
-           sensitive_target=state.sensitive_target)
+    step_records = getattr(result, 'steps', ()) or ()
+    audit_payload = {
+        'action': result.action, 'process': state.process, 'pid': state.pid,
+        'window_id': state.window_id, 'duration_ms': result.duration_ms,
+        'title_sha1': hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
+        'sensitive_target': state.sensitive_target,
+    }
+    if result.action == 'sequence':
+        audit_payload['steps'] = len(step_records)
+    _audit(audit, 'desktop_action', **audit_payload)
+    if result.action == 'sequence':
+        lines = [f'Completed {len(step_records)} sequence steps:']
+        for index, step in enumerate(step_records, 1):
+            lines.append(f'  {index}. {step.get("action", "?")} ok')
+        lines.append(_state_text(state))
+        return '\n'.join(lines)
     return f'Completed desktop action {result.action}. {_state_text(state)}'
