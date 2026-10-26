@@ -761,6 +761,9 @@ python scripts/install_autostart.py install             # 当前用户，不提�
 
 配置自检：`python src/feishu_gateway.py --check`。完整步骤、日常用法和排障见
 [飞书接入](docs/FEISHU_SETUP.md)；端到端验收清单与记录见
+凭据可以加密存放（Windows DPAPI）：`python scripts/secure_credentials.py migrate`，
+详见 [飞书接入](docs/FEISHU_SETUP.md) 的「凭据保护」一节。
+
 [飞书验收](docs/FEISHU_ACCEPTANCE.md)；下一阶段能力规划（桌面/系统/账号）见
 [Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)。
 

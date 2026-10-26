@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import approval_view
+import credentials
 import grants
 import net_grants
 import rules as user_rules
@@ -122,6 +123,7 @@ def format_status(session_store) -> str:
         else f'\n  桌面控制：关（设置 {DESKTOP_ENV}=1 启用）')
     rules_line = ('\n  ' + user_rules.load().describe()
                   + f'（{user_rules.path_for_display()}）')
+    credentials_line = '\n  ' + credentials.describe()
     allow_domains, deny_domains = net_grants.counts()
     domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
                     if allow_domains or deny_domains
@@ -146,6 +148,7 @@ def format_status(session_store) -> str:
         f'{desktop_line}'
         f'{domains_line}'
         f'{rules_line}'
+        f'{credentials_line}'
         f'{usage_line}'
     )
 

@@ -5219,3 +5219,34 @@ ruff 通过。真机只读冒烟：对当前前台窗口（Qoder）执行仅含�
 未做：审查官判定所用的模型名没有进事件（只记 `by`）；`approval_auto` 没有单独的
 限流/聚合视图，量大时需要按 `types` 过滤查看。
 
+## C1 落地：凭据静态加密（DPAPI）
+
+`.env` 是明文，任何能读它的东西（别的进程、备份同步、误提交、截图）都能拿到飞书
+secret 与 API token。`checkpoints.DEFAULT_SECRETS` 只挡住「模型主动读」，不改变
+文件本身的形态。
+
+- **`src/credentials.py`**：Windows DPAPI（`win32crypt.CryptProtectData` + 额外熵
+  绑定本应用）加密 `LLM_API_KEY` / `HARNESS_API_TOKEN` / `FEISHU_APP_SECRET`，
+  存 `.cache/credentials.bin`（前缀 `HARNESS1` 便于识别格式）。密文绑定当前用户，
+  换用户或换机器解不开——这是特性不是缺陷。非 Windows 直接不可用，不做自研加密。
+- **加载顺序：密文优先，`.env` 兜底。** `harness.py` 在 `load_dotenv()` 之后调用
+  `_apply_secure_credentials()`，飞书网关与 `agent_service.py` 各自也接了一次
+  （它们是独立入口，不经过 harness）。任何失败都降级为空操作：缺 pywin32、文件
+  损坏、解密失败都只打印一行，启动不依赖这一步。
+- **只做密文副本，不改 `.env`。** 迁移是显式动作：`scripts/secure_credentials.py`
+  的 `status/migrate/rotate/clear`。`migrate` 默认**不删** `.env` 的行；
+  `--delete-env-secrets` 才删，且只删这三个键、保留注释与其它行（按行解析，
+  不重写整个文件）。
+- **合并而非覆盖**：已加密过一部分键时再 `migrate` 会把旧密文读出来合并，不会
+  因为这次 `.env` 里只有一项就丢掉上一份。
+- **可观测**：`/status` 与 `--doctor` 显示「凭据：加密文件（N 项）」/「明文 .env
+  （未迁移）」，并列出 `.env` 里仍存在的明文键——避免「以为加密了其实在跑明文」。
+  `HARNESS_DISABLE_SECURE_CREDENTIALS=1` 可临时忽略密文排障。
+- **测试**：`tests/test_credentials.py`（16）覆盖 DPAPI 往返、密文不含明文、
+  只保留已知键、损坏/未知格式、密文优先于环境变量、损坏时降级且 `.env` 仍生效、
+  指纹稳定、迁移脚本的四种模式（含只删指定行、无内容时退出码 2、与旧密文合并、
+  `clear` 幂等、`status` 报告明文残留）。
+
+**边界**：这是静态数据保护，不是运行时隔离。进程内存仍是明文，同用户权限的调试器
+或恶意进程照样能读到。DPAPI 绑定当前用户，换机器后必须用原 `.env` 重新加密。
+

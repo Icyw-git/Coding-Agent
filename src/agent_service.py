@@ -294,7 +294,11 @@ def main(argv=None) -> int:
     try:
         from dotenv import load_dotenv
         load_dotenv()
+        import credentials
+        credentials.apply()   # 密文凭据优先；失败时继续用 .env
     except ImportError:
+        pass
+    except Exception:
         pass
 
     service = start_service(host=args.host, port=args.port,

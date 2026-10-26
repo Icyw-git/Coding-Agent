@@ -3435,6 +3435,11 @@ def main(argv=()) -> int:
     args = parser.parse_args(argv)
     from dotenv import load_dotenv
     load_dotenv()   # 与 harness 共用项目根的 .env（FEISHU_*/HARNESS_* 都可放这里）
+    try:
+        import credentials
+        credentials.apply()   # 密文凭据优先；失败时继续用 .env
+    except Exception:
+        pass
     if args.check:
         problems = check_setup()
         for problem in problems:

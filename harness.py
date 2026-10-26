@@ -195,7 +195,25 @@ from workspace_context import current_workspace, use_workspace
 def _tools_fingerprint() -> str:
     return hashlib.sha1(repr(TOOLS).encode('utf-8', 'replace')).hexdigest()[:12]
 
+def _apply_secure_credentials() -> None:
+    """密文凭据优先于 .env：迁移过的密钥不该被同名的明文值盖回去。
+
+    只在 ``load_dotenv`` 之后调用。任何失败都降级为空操作（继续用 .env），
+    启动不因为这一步失败——凭据存储是数据保护，不是启动前置条件。
+    ``HARNESS_DISABLE_SECURE_CREDENTIALS=1`` 可以强制忽略密文（排障用）。
+    """
+    if (os.getenv('HARNESS_DISABLE_SECURE_CREDENTIALS') or '').strip() == '1':
+        return
+    try:
+        import credentials
+
+        credentials.apply()
+    except Exception as exc:      # 缺 win32crypt / 文件损坏 / 权限：都只提示
+        print(f'  \033[33m[credentials] 跳过加密凭据：{type(exc).__name__}: {exc}\033[0m')
+
+
 load_dotenv()
+_apply_secure_credentials()   # 密文凭据优先于 .env，见 credentials.py
 enforce_trusted_policy_env()   # 档位不认 .env，见文件顶部的说明
 WORKDIR = Path.cwd().resolve()   # CLI 当前工作区的进程级回退值，唯一写入方是 set_workspace
 APP_DIR = Path(__file__).resolve().parent

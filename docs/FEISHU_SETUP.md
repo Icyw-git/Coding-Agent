@@ -327,3 +327,29 @@ rules:
   `HARNESS_API_TOKEN` 两端一致；API 只监听本机时需要用 SSH 隧道或反代。
 - **数据在哪**：会话/记忆/快照在 agent home（默认仓库根，可用 `HARNESS_HOME` 覆盖），
   `python entrypoint.py --doctor` 会打印实际路径。
+
+## 凭据保护（DPAPI 加密）
+
+`.env` 是明文：任何能读这个文件的东西都能拿到飞书 secret 与 API token。
+本机可以把这些密钥加密存到 `.cache/credentials.bin`，加密绑定**当前 Windows
+用户**（DPAPI），换个用户或换台机器都解不开。
+
+```bash
+python scripts/secure_credentials.py status    # 现在用的是哪儿
+python scripts/secure_credentials.py migrate   # 加密写入（不改 .env）
+python scripts/secure_credentials.py migrate --delete-env-secrets
+python scripts/secure_credentials.py clear     # 删密文，回退 .env
+```
+
+- 默认**不删** `.env` 里的行。确认 API 与网关都能正常启动后，再加
+  `--delete-env-secrets` 删掉那几行（只删这几个键，保留注释与其它配置）。
+- 加密覆盖 `LLM_API_KEY`、`HARNESS_API_TOKEN`、`FEISHU_APP_SECRET` 三个键。
+  其余配置（base URL、模型名、白名单）留在 `.env`。
+- 加载顺序：**密文优先，`.env` 兜底**。密文不存在或解不开时自动降级，启动不受影响。
+- `/status` 与 `--doctor` 会显示「凭据：加密文件（N 项）」或「凭据：明文 .env
+  （未迁移）」，避免以为加密了其实还在用明文。
+- 排障：`HARNESS_DISABLE_SECURE_CREDENTIALS=1` 可临时忽略密文。
+- 非 Windows 平台不支持（不做自研加密），`status` 会明确说明。
+
+**这不是运行时隔离**：进程内存里仍是明文，被同用户权限的调试器或恶意进程读取时
+挡不住。它保护的是磁盘上的静态副本（备份、同步盘、误提交、截图）。
