@@ -2429,3 +2429,40 @@ def test_control_panel_counts_directory_grants(gateway, tmp_path):
     fake.cards.clear()
     gw._handle_panel_action('chat-grant-panel', 'menu')
     assert '目录授权 1 个' in fake.last_card()
+
+
+def test_control_panel_surfaces_domain_and_audit_entry(gateway):
+    """控制台是手机上的第一入口：域名与审计要能一键打开，不用记命令。"""
+    gw, fake = gateway
+    gw.on_message('chat-panel-dom', '/domains allow docs.example.com')
+    gw._send_panel('chat-panel-dom', intro='常用操作：')
+
+    # /panel 的回复是控制台卡；`/domains` 先发了一张域名卡，取最后一个控制台。
+    panel_cards = [payload for _, payload in fake.cards
+                   if 'Harness 控制台' in str(payload)]
+    assert panel_cards, 'no control panel card was sent'
+    card = panel_cards[-1]
+    actions = [(button.get('value') or {}).get('panel')
+               for element in card['elements']
+               for button in (element.get('actions') or [])]
+    assert 'domains' in actions and 'audit' in actions
+    assert '域名' in str(card)
+
+
+def test_panel_domain_action_opens_domain_card(gateway):
+    gw, fake = gateway
+    gw._handle_panel_action('chat-panel-dom2', 'domains')
+    assert gw.api.list_domains() == []
+    assert '域名' in str(fake.cards[-1][1]) or '域名' in fake.last()
+
+
+def test_panel_audit_action_opens_audit_card(gateway):
+    gw, fake = gateway
+    gw._handle_panel_action('chat-panel-audit', 'audit')
+    assert '审计' in str(fake.cards[-1][1]) or '审计' in fake.last()
+
+
+def test_panel_rules_action_reports_rule_status(gateway):
+    gw, fake = gateway
+    gw._handle_panel_action('chat-panel-rules', 'rules')
+    assert '规则文件' in fake.last()

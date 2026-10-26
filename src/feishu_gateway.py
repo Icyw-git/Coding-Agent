@@ -1411,6 +1411,12 @@ class FeishuGateway:
             path_grants = len(self.api.list_grants())
         except Exception:
             path_grants = 0
+        try:
+            rules_rows = self.api.list_domains()
+            domains = (sum(1 for row in rules_rows if row.get('scope') != 'deny'),
+                       sum(1 for row in rules_rows if row.get('scope') == 'deny'))
+        except Exception:
+            domains = None   # 控制台不能因为新接口抖动就打不开
         sender = getattr(self.transport, 'send_session_card', None)
         if sender is not None:
             try:
@@ -1418,7 +1424,8 @@ class FeishuGateway:
                                              workspace=workspace,
                                              model=self._model_summary(),
                                              intro=intro, pending=pending,
-                                             crons=crons, grants=path_grants))
+                                             crons=crons, grants=path_grants,
+                                             domains=domains))
                 return
             except Exception as exc:
                 print(f'[feishu] panel card failed, fallback to text: {exc}')
@@ -1441,6 +1448,14 @@ class FeishuGateway:
             self._show_crons(chat_id)
         elif action in ('grants', 'grant'):
             self._show_grants(chat_id)
+        elif action in ('domains', 'domain'):
+            self._show_domains(chat_id)
+        elif action == 'audit':
+            self._show_audit(chat_id)
+        elif action == 'rules':
+            import rules as user_rules
+
+            self._reply(chat_id, user_rules.load().describe())
         elif action in ('perms', 'approvals'):
             pending = [req for req in self.api.pending_permissions()
                        if self._request_belongs_to(chat_id, req)]
@@ -2089,39 +2104,48 @@ class FeishuGateway:
     def _help_text(self) -> str:
         return '\n'.join([
             '日常不用记命令：直接说“每天早上 9 点提醒我…”或“我们上次聊到哪了”，',
-            '常用会话操作也有按钮卡片。以下命令仅供高级用法/排障：',
+            '常用会话操作也有按钮卡片。可用命令（仅供高级用法/排障）：',
             '',
-            '可用命令:',
+            '会话',
             '/new [序号|路径|ws:名称|id:会话ID]  选择工作区新建会话并绑定到本聊天',
+            '/sessions [页码]       会话卡片列表、详情与切换',
+            '/resume、/use [关键词或序号]  搜索并切换会话',
+            '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
+            '/find <关键词>           跨会话搜索历史内容',
+            '/rename <新主题>        设置当前会话主题',
+            '/quit                  解除会话绑定',
+            '',
+            '工作区',
             '/workspaces            列出已登记工作区',
             '/workspace add|remove  登记或移除工作区（add 支持 --name 名称）',
-            '/sessions [页码]       会话卡片列表、详情与切换',
-            '/resume [关键词或序号]  搜索并切换会话（/use 兼容）',
+            '/cd [dir]、/pwd        查看/切换当前会话工作区',
+            '',
+            '清理',
             '/archive [天数|empty|all|restore]  选择归档或恢复会话',
             '/archive select <序号...|all>  多选后预览归档或恢复',
             '/delete                查看可永久删除的归档',
             '/delete select <序号...|all>  多选后预览删除',
             '/confirm、/cancel      确认或取消待执行操作',
-            '/cd [dir]              查看/切换当前会话工作区',
-            '/pwd                   查看当前会话工作区',
-            '/model                  查看当前模型配置',
-            '/approvals、/perms       查看待审批操作',
-            '/revoke                 撤销当前会话已允许的同类操作',
+            '',
+            '权限与安全',
             '/sandbox [档位|approvals <档位>]  查看/切换执行与审批档位',
+            '/approvals、/perms       查看待审批操作',
+            '/approve y|n           审批最早一条待审批操作',
+            'y / n、y2 / n2         快捷审批（也可直接点审批卡片按钮）',
+            '/revoke                 撤销本会话已允许的同类操作与授权',
+            '/grants [add|remove]   目录级持久写授权（工作区外写入）',
+            '/domains [allow|deny|remove]  域名策略（联网免审/拦截）',
+            '/rules                 查看用户规则文件（allow/ask/deny）',
+            '/audit [类型|all]      查看最近的安全相关事件',
+            '',
+            '任务',
             '/cron [list|add "<表达式>" <提示词>|delete <id>]  定时任务',
-            '/grants [add|remove]   查看/维护目录级持久写授权',
-            '/resume                 直达最近会话（带前缀/关键词则模糊匹配）',
-            '/fork [事件序号]         从当前会话分叉出新会话（原会话保留）',
-            '/find <关键词>           跨会话搜索历史内容',
-            '/rename <新主题>        设置当前会话主题',
             '/run <命令>            在任务目录执行命令',
             '/status [任务id]       查看任务状态（省略 id 看最近 10 条）',
             '/logs <任务id> [行数]  查看任务输出（默认 60 行）',
             '/stop <任务id>         终止任务',
-            '/perms                 查看待审批请求',
-            '/approve y|n           审批最早一条待审批操作',
-            '/quit                  解除会话绑定',
-            'y / n、y2 / n2         快捷审批（也可直接点审批卡片按钮）',
+            '/model                  查看当前模型配置',
+            '',
             '其余文本 → 作为消息发给当前绑定的 agent 会话',
         ])
 

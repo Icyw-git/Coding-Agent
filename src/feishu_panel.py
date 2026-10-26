@@ -19,7 +19,8 @@ def _button(label: str, action: str, *, primary: bool = False) -> dict:
 
 def control_card(*, session_id: str = '', workspace: str = '',
                  model: str = '', intro: str = '', pending: int = 0,
-                 crons: int = 0, grants: int = 0) -> dict:
+                 crons: int = 0, grants: int = 0,
+                 domains: tuple[int, int] | None = None) -> dict:
     """控制台卡片：新会话 / 会话列表 / 停止 / 状态 / 定时任务 / 目录授权 / 说明。
 
     pending / crons / grants 只是数量（待审批按条数、其余按个数），不贴命令
@@ -37,7 +38,11 @@ def control_card(*, session_id: str = '', workspace: str = '',
     pending_note = f'待审批 {pending} 条'
     if pending:
         pending_note += '（回 y / n 或点卡片按钮）'
-    lines.append(f'{pending_note} · 定时任务 {crons} 个 · 目录授权 {grants} 个')
+    summary = f'{pending_note} · 定时任务 {crons} 个 · 目录授权 {grants} 个'
+    if domains:
+        allow, deny = domains
+        summary += f' · 域名 允许{allow}/拒绝{deny}'
+    lines.append(summary)
     if not lines:
         lines.append('直接发消息即可开始；需要切换或停止时用下面的按钮。')
     return {
@@ -56,6 +61,10 @@ def control_card(*, session_id: str = '', workspace: str = '',
             {'tag': 'action', 'actions': [
                 _button('定时任务', 'crons'),
                 _button('目录授权', 'grants'),
+            ]},
+            {'tag': 'action', 'actions': [
+                _button('域名策略', 'domains'),
+                _button('审计', 'audit'),
             ]},
             {'tag': 'action', 'actions': [
                 _button('使用说明', 'help'),
