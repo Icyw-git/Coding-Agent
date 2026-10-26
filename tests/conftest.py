@@ -137,6 +137,14 @@ def _isolate_net_grant_ledger(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_user_rules(tmp_path, monkeypatch):
+    """用户规则文件按用例隔离：本机真实 rules.yaml 不能影响策略断言。"""
+    import rules
+
+    monkeypatch.setattr(rules, 'DURABLE_PATH', tmp_path / 'rules.yaml')
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cron_jobs():
     """cron 表是进程级全局：用例之间泄漏会让稳定 ID / 触发断言随执行顺序变化。
 

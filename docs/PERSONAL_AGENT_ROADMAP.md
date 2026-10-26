@@ -380,8 +380,12 @@ UTF-8 字节截到 200 KiB（截断时 `errors='ignore'`，避免半个字符）
    `GET/POST /v1/net-grants` 与 `/v1/net-grants/remove`、`/status` 与控制台计数；
    模型没有新增入口，`revoke_permissions` 只能收回本会话创建的规则。
    审计事件 `domain_added` / `domain_removed`。
-3. **用户规则文件**（`src/rules.py`，YAML/TOML）：`prefix_rule([...], decision, justification)` 的简化版，
-   只支持 `allow`/`ask`/`deny` 三态与命令前缀匹配；加载失败**不影响启动**，只打印并忽略。
+3. **用户规则文件**（`src/rules.py`）— **已完成（2026-10-26）**
+   YAML，`allow`/`ask`/`deny` 三态 + 命令词前缀匹配。实现上是**白名单**：只有
+   `destructive` / `opaque_command` / `external_tool` 三类「噪音」允许被规则改写，
+   以后新增决策码默认受保护。`allow` 在 `read-only` / `untrusted` 档下不生效（档位是
+   用户的显式选择），`deny` 永远生效；多段命令要求每段都命中。加载失败不影响启动，
+   打印一行后按「无规则」处理。入口：`/rules`（CLI 与 TUI）、`/status` 计数。
 4. **自动复核**（`auto_review`）：把现有 `HARNESS_LLM_APPROVAL` 审查官升级成默认 reviewer：
    低风险（只读、工作区内写）自动放行并记账；高风险仍问人；所有 auto 决策写审计事件
    `approval_auto{request,tool,decision,model,reason}`。**必须可一键关闭**。
@@ -482,7 +486,7 @@ P1 完成的最小验收（举例）：
 | P4.1 | 目录级持久授权 + 撤销 UI（已完成，2026-10-26） | 3 天 | 飞书卡片模式（已有） |
 | P3b | 键鼠控制（默认关） | 5 天 | P1 截图存证 + P4 规则 |
 | P4.2 | 域名策略（已完成，2026-10-26） | 3 天 | 无 |
-| P4.2b | 用户规则文件（命令前缀三态） | 2 天 | 无 |
+| P4.2b | 用户规则文件（已完成，2026-10-26） | 2 天 | 无 |
 | P4.3 | auto_review 默认化 | 3 天 | `HARNESS_LLM_APPROVAL` 现有实现 |
 | P5 | 浏览器（MCP 接入） | 3–5 天 | P4.2 |
 | P6 | 审计查询 + 卡片（已完成，2026-10-26） | 2 天 | P1 起持续 |
@@ -491,7 +495,8 @@ P1 完成的最小验收（举例）：
 而且零依赖、可完全用现有 `view_image` + 审批链复用。
 
 截至 2026-10-26，P1 / P2 / P3a / P4.1 / P4.2（域名策略）/ P6（审计查询）已完成；
-P3b 键鼠控制基础版与序列/修饰键已实现、真机交互待验收。下一步：P4.2b 用户规则文件 → P4.3。
+P4.2b 用户规则文件也已完成。P3b 键鼠控制基础版与序列/修饰键已实现、真机交互待验收。
+下一步：P4.3 auto_review。
 
 ---
 

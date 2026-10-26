@@ -12,6 +12,7 @@ import sys
 import grants
 import hooks
 import llm_route
+import rules as user_rules
 from checkpoint_commands import format_checkpoint_list, format_restore_report, rewind_to
 from checkpoints import CheckpointError
 from cli_commands import command_error, format_command_help, parse_command
@@ -45,6 +46,28 @@ def _format_grants() -> str:
         lines.append(f"    {row['path']}  [{expiry}{note}]")
     lines.append('  撤销：/grants remove "<目录>"；秘密文件与系统目录不受授权影响。')
     return '\n'.join(lines)
+
+
+def _format_rules() -> str:
+    ruleset = user_rules.load()
+    if ruleset.error:
+        return ('  规则文件加载失败：' + str(ruleset.error) + chr(10)
+                + '  修好之前所有规则都不生效（等同于没有规则文件）。')
+    if not ruleset.rules:
+        return ('  （没有用户规则）' + chr(10)
+                + f'  文件：{user_rules.path_for_display()}' + chr(10)
+                + '  可写 allow / ask / deny；只影响「问不问」，改不动硬拒与档位。')
+    lines = [f'  用户规则：{len(ruleset.rules)} 条'
+             f'（{user_rules.path_for_display()}）']
+    for rule in ruleset.rules:
+        tools = ','.join(rule.tools)
+        scope = '' if rule.scope == user_rules.SCOPE_GLOBAL else f' [{rule.scope}]'
+        note = f' · {rule.note}' if rule.note else ''
+        lines.append(f'    {rule.decision:<5} [{tools}]{scope} '
+                     f'{", ".join(rule.prefixes)}{note}')
+    lines.append('  说明：只作用于 destructive / opaque_command / external_tool 三类询问；'
+                 '档位、秘密文件、域名与桌面控制不受影响。')
+    return chr(10).join(lines)
 
 
 def _h():
@@ -141,6 +164,9 @@ def handle_command(line: str, messages: list, session_store) -> None:
                          'revoke_permissions')
         extra = f'，{len(removed)} 条目录写授权' if removed else ''
         print(f'  已撤销 {count} 条当前会话预授权{extra}。')
+
+    elif command == '/rules':
+        print(_format_rules())
 
     elif command == '/grants':
         parts = argument.split(maxsplit=1)

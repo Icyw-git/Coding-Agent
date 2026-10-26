@@ -19,6 +19,7 @@ import os
 import checkpoints
 import grants
 import net_grants
+import rules as user_rules
 from agent_core import register_hook
 from approval import (
     DEFAULT_APPROVAL_TIMEOUT,
@@ -398,7 +399,9 @@ def evaluate_call(tool: str, args: dict, policy=None):
     # 域名名单与执行档位无关：deny 是硬拒，连 danger-full-access 也绕不过。
     # 账本损坏时返回空元组，等价于「未知域名逐个审批」。
     net_rules = net_grants.active_rules()
-    return policy.evaluate(
+    # 用户规则文件：只能收窄或提前决定「问不问」。硬拒（秘密文件、黑名单、
+    # 系统路径、域名 deny）在 apply() 里被显式跳过，规则改不动它们。
+    decision = policy.evaluate(
         tool, eval_args,
         deny_list=_h().DENY_LIST,
         destructive=_h().DESTRUCTIVE,
@@ -409,6 +412,10 @@ def evaluate_call(tool: str, args: dict, policy=None):
         write_grants=write_grants,
         net_rules=net_rules,
         paths=paths)
+    # read-only / untrusted 是用户的显式选择，规则文件不能替他改回去。
+    allow_permitted = policy.sandbox_mode != 'read-only'         and policy.approval_policy != 'untrusted'
+    return user_rules.apply(decision, user_rules.load(), tool, eval_args,
+                            allow_permitted=allow_permitted)
 
 
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:

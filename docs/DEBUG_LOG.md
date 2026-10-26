@@ -5160,3 +5160,37 @@ ruff 通过。真机只读冒烟：对当前前台窗口（Qoder）执行仅含�
 
 未做：OTel 导出；审计的导出/归档（目前只读最近 N 条）；`policy_denied` 事件尚未在所有
 拒绝路径统一写入（策略层返回了 code，但只有部分入口落事件）。
+
+## P4.2b 落地：用户规则文件
+
+动机：命令审批的噪音集中在三类「静态判不准」的情况——破坏性词误伤（`npm test` 撞上
+`npm`）、解释器与编码载荷、MCP 工具的未知副作用。每次都要人点一次，但真正想保留的
+边界（秘密文件、域名、桌面控制）并不在这三类里。
+
+- **`src/rules.py`**：YAML，`allow` / `ask` / `deny` 三态 + 命令**词前缀**匹配。
+  `git status` 命中 `git status -s`，不命中 `git statusx` 也不命中 `echo git status`；
+  多段命令要求每一段都命中（与 `approval_class` 的一致性判定同源）。作用域
+  `session` / `global`。加载失败打印一行后按「无规则」处理，不影响启动。
+- **关键取舍：白名单而不是黑名单。** `RULEABLE_CODES = {destructive,
+  opaque_command, external_tool}`，只有这三类能被规则改写。以后新增任何决策码默认
+  受保护，不会因为忘了加进保护名单被规则悄悄放宽。
+- **两处实测出来的绕过，都已堵上：**
+  1. 最初写成「黑名单 + 硬拒码」，`allow` 规则能改写 `sandbox_read_only` 的 ASK，
+     `rm -rf` 在只读档被放行。改成白名单后不复存在。
+  2. 即使有白名单，read-only 下 `rm -rf build` 会先命中 `destructive`（属于可改写
+     类别），规则 allow 仍然绕过档位。因此 `apply()` 增加 `allow_permitted`，
+     由 `hooks` 按当前档位传入：`read-only` 与 `untrusted` 档下 allow 不生效，
+     deny 照旧生效（收窄永远是允许的方向）。
+- 规则在 `hooks.evaluate_call` 的最后一步作用于策略结论：硬拒、URL 校验、路径分区、
+  域名 deny 全部在它之前完成，规则只看得到最终 Decision。
+- **入口**：`/rules`（CLI 与 TUI，TUI 侧补了 `CommandSpec` 以通过「CLI 命令必须在
+  TUI 注册」的契约测试）；`/status` 显示「规则文件：允许 N · 询问 N · 拒绝 N」。
+  模型没有写规则的入口。
+- **测试**：`tests/test_rules.py`（35）覆盖前缀边界、多段一致性、deny 优先、
+  白名单可改写集、`allow_permitted` 行为、作用域、损坏/非法内容、往返写回；
+  `tests/test_rules_integration.py`（6）验证真实链路：allow 放开 destructive、
+  read-only 档不被绕过、域名 deny 不被绕过、`/status` 三种状态。
+
+未做：规则的增删命令（目前直接编辑 YAML）；规则命中的审计事件（`rule_allowed` 只
+体现在 Decision 的 code 上，未落 `policy_denied` 类事件流）；没有 TTL/到期时间。
+

@@ -43,6 +43,8 @@ COMMANDS = (
     Command('/revoke', (), '', '撤销当前会话已允许的同类操作与目录写授权', '常用'),
     Command('/grants', ('/grant',), '[add "<目录>" [until 日期] [note 备注]|remove "<目录>"]',
             '查看/维护目录级持久写授权；只放宽工作区外写入的审批', '常用'),
+    Command('/rules', (), '',
+            '查看用户规则文件（allow/ask/deny），只影响「问不问」，改不动硬拒与档位', '常用'),
     Command('/sandbox', (), '[档位|approvals <档位>]',
             '查看或切换执行档位（read-only|workspace-write|danger-full-access）与审批档位',
             '常用'),

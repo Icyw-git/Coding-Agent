@@ -344,6 +344,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('expand', '展开最近一个工具块'),
     CommandSpec('approvals', '查看待审批操作', '[序号 y|n]', ('perms',)),
     CommandSpec('revoke', '撤销同类预授权与目录写授权'),
+    CommandSpec('rules', '查看用户规则文件（allow/ask/deny）'),
     CommandSpec('grants', '查看/维护目录写授权',
                 '[add "<目录>" [until 日期] [note 备注]|remove "<目录>"]',
                 ('grant',)),

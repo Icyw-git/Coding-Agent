@@ -11,6 +11,7 @@ from pathlib import Path
 import approval_view
 import grants
 import net_grants
+import rules as user_rules
 import sandbox
 import screen_capture
 import tool_cache
@@ -119,6 +120,8 @@ def format_status(session_store) -> str:
         '\n  桌面控制：开（每步需审批）'
         if desktop_control_enabled()
         else f'\n  桌面控制：关（设置 {DESKTOP_ENV}=1 启用）')
+    rules_line = ('\n  ' + user_rules.load().describe()
+                  + f'（{user_rules.path_for_display()}）')
     allow_domains, deny_domains = net_grants.counts()
     domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
                     if allow_domains or deny_domains
@@ -142,6 +145,7 @@ def format_status(session_store) -> str:
         f'{clipboard_line}'
         f'{desktop_line}'
         f'{domains_line}'
+        f'{rules_line}'
         f'{usage_line}'
     )
 

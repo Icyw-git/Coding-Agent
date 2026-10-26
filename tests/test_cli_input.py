@@ -16,7 +16,7 @@ def test_commands_include_descriptions_and_resolve_alias(tmp_path):
     assert '/cache' in [item.text for item in items]
     assert all(item.display_meta for item in items)
     assert [item.text for item in choices(completer, '/r')] == [
-        '/resume', '/review', '/revoke', '/rename', '/rewind']
+        '/resume', '/review', '/revoke', '/rules', '/rename', '/rewind']
     assert choices(completer, '普通消息 /r') == []
 
 

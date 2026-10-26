@@ -171,6 +171,8 @@ class CommandActionsMixin:
                 self._audit_grant('grant_removed', record)
             extra = (f'，以及 {len(removed)} 条目录写授权' if removed else '')
             self._notice(f'已撤销 {count} 条当前会话预授权{extra}。')
+        elif verb == 'rules':
+            self.handle_rules()
         elif verb == 'grants':
             self.handle_grants(argument)
         elif verb == 'workspaces':
@@ -250,6 +252,31 @@ class CommandActionsMixin:
                          session_id=store.session_id)
         except Exception as exc:
             self._notice(f'[grants] 审计写入失败: {exc}', level='error')
+
+    def handle_rules(self) -> None:
+        import rules as user_rules
+
+        ruleset = user_rules.load()
+        if ruleset.error:
+            self._notice('规则文件加载失败：' + str(ruleset.error)
+                         + chr(10) + '修好之前所有规则都不生效。')
+            return
+        if not ruleset.rules:
+            self._notice('（没有用户规则）' + chr(10)
+                         + f'文件：{user_rules.path_for_display()}' + chr(10)
+                         + '可写 allow / ask / deny；只影响「问不问」，改不动硬拒与档位。')
+            return
+        lines = [f'用户规则：{len(ruleset.rules)} 条'
+                 f'（{user_rules.path_for_display()}）']
+        for rule in ruleset.rules:
+            tools = ','.join(rule.tools)
+            scope = '' if rule.scope == user_rules.SCOPE_GLOBAL else f' [{rule.scope}]'
+            note = f' · {rule.note}' if rule.note else ''
+            lines.append(f'  {rule.decision:<5} [{tools}]{scope} '
+                         f'{", ".join(rule.prefixes)}{note}')
+        lines.append('说明：只作用于 destructive / opaque_command / external_tool 三类询问；'
+                     '档位、秘密文件、域名与桌面控制不受影响。')
+        self._notice(chr(10).join(lines))
 
     def handle_grants(self, argument: str) -> None:
         import grants

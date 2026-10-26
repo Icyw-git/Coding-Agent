@@ -214,6 +214,64 @@ python scripts/install_autostart.py remove
 注意：这里管的是 `web_fetch` 与原生联网工具。`bash` 里的 `curl` 仍然按命令文本走
 出口审批，不受域名名单影响——那一条属于命令分析层。
 
+## 用户规则文件
+
+命令审批的噪音主要来自三类「静态判不准」的情况：破坏性词误伤（`npm test` 撞上
+`npm`）、解释器与编码载荷、MCP 工具的未知副作用。规则文件让这些情况可以按前缀
+提前决定，而**不需要**改档位或放开边界。
+
+文件位置：`<agent home>/.cache/rules.yaml`
+
+```yaml
+version: 1
+rules:
+  - decision: allow
+    tools: [bash]
+    prefixes: ["git status", "git diff", "npm test"]
+    note: 只读 git 与测试
+  - decision: ask
+    prefixes: ["git push"]
+    note: push 前总是确认
+  - decision: deny
+    prefixes: ["npm publish", "docker push"]
+    note: 绝不自动发布
+```
+
+- `decision`：`allow` / `ask` / `deny`。
+- `tools`：默认 `["bash"]`；`["*"]` 表示所有工具。
+- `prefixes`：按**命令词前缀**匹配。`git status` 命中 `git status -s`，不命中
+  `git statusx`，也不命中 `echo git status`。多条规则按拒优先生效。
+- `note`：出现在 `/rules` 与审批拒绝提示里，写清楚「为什么」。
+- `scope`：`session` 的规则只在当前会话生效，默认 `global`。
+
+查看：`/rules`（CLI 与 TUI）；`/status` 会显示「规则文件：允许 N · 询问 N · 拒绝 N」。
+
+**规则能改什么，不能改什么** —— 这是刻意设计，不是遗漏：
+
+| 能改 | 改不动 |
+|---|---|
+| `destructive`（破坏性词误伤） | `sandbox_read_only`、`untrusted` 档位 |
+| `opaque_command`（解释器/编码载荷） | `network_egress`（由域名账本管） |
+| `external_tool`（MCP 工具） | `secret_egress`、`secret_path`（秘密数据） |
+| | `outside_workspace_write`（由目录授权账本管） |
+| | `screen_*`、`clipboard_*`、`desktop_control_*`（每次都问是能力定义） |
+| | 黑名单、根删除、系统路径、参数错误 |
+
+实现上是**白名单**（`rules.RULEABLE_CODES`）：以后新增任何决策码默认受保护，
+不会因为忘了加进保护名单而被规则悄悄放宽。
+
+另外两条边界：
+
+- `allow` 在 `read-only` 与 `untrusted` 档下**不生效**——档位是用户的显式选择，
+  规则文件不能替他改回去（`rm -rf` 在 read-only 下会先命中破坏性询问，放行它就
+  等于让只读档形同虚设）。`deny` 不受此限，收窄永远是允许的方向。
+- 多段命令必须**每一段**都命中 `allow`：`ls && rm -rf ~` 只有第一段命中时整条
+  仍然要问。
+
+文件损坏或格式错误时，启动不受影响：打印一行提示后按「没有规则」处理，所有规则
+一起失效，而不是启用半份。需要改规则时直接编辑该文件，下一次工具调用即生效（每次
+判定都重新读盘，便于手工调整；文件很小，不是热点）。
+
 ## 审计
 
 - `/audit` 打开审计卡：最近 100 条安全相关事件（审批超时、截屏/OCR、剪贴板、
