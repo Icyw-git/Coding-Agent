@@ -52,7 +52,9 @@ FEISHU_ALLOWED_USERS=ou_xxx          # 允许使用机器人的人
 python src/feishu_gateway.py --check
 ```
 
-## 3. 启动（两条命令）
+## 3. 启动
+
+开发/排障时仍是两条命令：
 
 ```bash
 # 终端 A：Agent API（守护进程）
@@ -62,8 +64,35 @@ uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
 python src/feishu_gateway.py
 ```
 
+日常常驻建议用一个监督进程同时拉起两者：
+
+```bash
+python src/agent_service.py            # API + 网关；缺少 FEISHU_* 时只跑 API
+python src/agent_service.py --no-feishu
+```
+
+子进程输出写到 `.cache/logs/api.log` / `feishu.log`（超过 10MB 时下次启动轮转）。
+API 就绪后会弹一条本地 Toast；任一子进程退出会再弹一条失败通知并结束监督进程，
+默认不自动重启，避免坏配置下无限拉起。
+
+登录自启（当前用户、`ONLOGON`、`/RL LIMITED` 不提权）：
+
+```bash
+python scripts/install_autostart.py install --dry-run   # 只打印 schtasks 命令
+python scripts/install_autostart.py install
+python scripts/install_autostart.py status
+python scripts/install_autostart.py remove
+```
+
+安装器只注册任务，不执行安装；`install --dry-run` 不会修改系统。任务运行
+`src/agent_service.py`，优先使用同目录的 `pythonw.exe`，登录时不会闪控制台。
 网关会常驻并自动：接收消息、流式更新同一张回复卡片、推送审批卡片、
 在 TUI/API/cron 跑完回合后主动通知、每天同步 cron 任务。
+
+飞书发不出去时（断网、凭证失效、机器人被移出会话），网关会在本机弹一条 error Toast
+作为兜底：文字回复失败、回合终态/审批超时通知失败、心跳摘要与定时结果推送失败都会触发。
+同一类事件 120 秒内只弹一次，避免远端故障时刷屏；`FEISHU_LOCAL_ALERTS=0` 可关闭。
+这条降级只在 `src/feishu_gateway.py` 入口生效，直接用库构造网关不会弹通知。
 
 ## 日常使用（不需要输入命令）
 

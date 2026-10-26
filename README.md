@@ -201,6 +201,13 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   直接拒绝，子代理也拿不到这两个工具。`HARNESS_SCREEN_TOOLS=0` 可整体关闭。从飞书发起的
   成功回合会把本轮截图回传到原聊天（最多 4 张、单张 ≤10MB），`FEISHU_SEND_SCREENSHOTS=0`
   可关闭；传输只使用内容哈希文件名，API 端校验会话与文件名，不暴露本地路径。
+- 本地通知与空闲感知：`src/notify.py` 通过 Windows Toast 弹系统通知（PowerShell
+  `-EncodedCommand` + base64 XML，绕开 GBK 控制台的引号/中文解析问题），10 秒内最多一条，
+  失败只返回原因、不抛异常，`HARNESS_NOTIFY=0` 关闭；`src/idle.py` 用 `GetLastInputInfo`
+  读空闲秒数、用输入桌面句柄判断锁屏（启发式），结果缓存 2 秒，`HARNESS_IDLE=0` 关闭。
+  `GET /v1/system/state` 返回 `{available, idle_seconds, locked, checked_at}` 快照。
+  网关在飞书发送失败时（文字回复、回合终态/审批超时、心跳与定时结果）会降级弹一条本地
+  error Toast，同一事件键 120 秒内只弹一次，`FEISHU_LOCAL_ALERTS=0` 关闭。
 - `todo_write` / `todo_read` 维护当前会话的任务清单：整表替换、状态只能是
   `pending/in_progress/completed`、最多 100 项、同一时间只允许一个 `in_progress`。
   清单按会话隔离，并作为 `todos` 事件写入事件流，会话恢复后 `todo_read` 仍能读到。
@@ -659,7 +666,8 @@ python entrypoint.py --workspace D:\work\project -i screenshot.png "复现这个
   API 提供 `POST /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/messages` 和
   `GET /v1/sessions/{id}/events`（SSE）；`GET/POST /v1/tasks` 系列管理长命令，
   `GET /v1/permissions` 与 `POST /v1/permissions/{id}/resolve` 用于远程决议审批，
-  `GET/POST /v1/policy` 读写执行/审批档位。所有 `/v1/` 请求都需要
+  `GET/POST /v1/policy` 读写执行/审批档位，`GET /v1/system/state` 读取本机空闲/锁屏快照。
+  所有 `/v1/` 请求都需要
   `Authorization: Bearer <HARNESS_API_TOKEN>`；请求元数据写入 `.cache/api/api-access.log`（如需文件日志，
   通过 SDK/应用工厂传入 `access_log_path`）。API 默认启用每个客户端和路径每分钟 60 次的轻量限流。
 
@@ -682,6 +690,14 @@ python entrypoint.py --workspace D:\work\project -i screenshot.png "复现这个
 ```bash
 uvicorn api:create_app --factory --port 8000     # 终端 A
 python src/feishu_gateway.py                     # 终端 B
+```
+
+   常驻时可以用一个监督进程同时拉起两者（日志在 `.cache/logs/`，启动失败/子进程退出会弹本地通知）：
+
+```bash
+python src/agent_service.py
+python scripts/install_autostart.py install --dry-run   # 先看登录自启命令
+python scripts/install_autostart.py install             # 当前用户，不提权
 ```
 
 配置自检：`python src/feishu_gateway.py --check`。完整步骤、日常用法和排障见
@@ -763,6 +779,11 @@ python -m pytest --basetemp /tmp/harness-pytest
 | `src/turn_screenshots.py` | 回合截图元数据：字节偏移、sha1 去重与数量上限（不暴露绝对路径） |
 | `src/screen_capture.py` | Windows 截屏能力层：DPI、多屏/区域、PowerShell 调用、保留清理与统计 |
 | `src/ocr_windows.py` | WinRT OCR 能力层：语言选择、区域裁剪与行级边界框 |
+| `src/notify.py` | Windows Toast 本地通知：PowerShell 编码调用、XML 转义、10 秒限频与失败收敛 |
+| `src/idle.py` | 空闲秒数与锁屏启发式判断：`GetLastInputInfo`、输入桌面句柄、2 秒缓存 |
+| `src/api_system.py` | 系统状态路由：`GET /v1/system/state` |
+| `src/agent_service.py` | 常驻监督进程：启动 API/飞书网关、日志轮转、就绪/失败 Toast、子进程退出检测 |
+| `scripts/install_autostart.py` | Windows 登录自启任务：`schtasks` install/remove/status 与 dry-run（不自动安装） |
 | `src/documents.py` | 文档文本抽取入口：格式识别、PDF 解析与页选择 |
 | `src/document_formats.py` | DOCX/PPTX/XLSX 解析：OOXML zip/XML 工具与成员读取上限 |
 | `src/tool_search.py` | `glob`/`grep`/`ls`：只读边界、秘密文件过滤与 ripgrep 快路径 |

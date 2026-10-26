@@ -18,6 +18,7 @@ import api_heartbeat
 import api_policy
 import api_sessions
 import api_streams
+import api_system
 import api_tasks
 from agent_runtime import AgentRuntime
 from harness_sdk import HarnessClient
@@ -179,6 +180,7 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
     app.include_router(api_cron_results.build_router())
     app.include_router(api_heartbeat.build_router())
     app.include_router(api_streams.build_router(client, runtime, logger))
+    app.include_router(api_system.build_router())
     app.include_router(api_tasks.build_router(tasks))
     app.include_router(api_policy.build_router(permission_gate))
 

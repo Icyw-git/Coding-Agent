@@ -53,6 +53,7 @@ import httpx
 
 import approval_view
 import llm_route
+import notify
 import paths
 import screen_capture
 import tool_cache
@@ -92,6 +93,12 @@ MIN_CARD_PATCH_INTERVAL = 0.45
 SCREENSHOT_REPLY_LIMIT = 4
 SCREENSHOT_REPLY_ENV = 'FEISHU_SEND_SCREENSHOTS'
 FEISHU_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+# 飞书发不出去时的本机兜底通知。远端故障一般是持续的（断网、凭证失效、
+# 被移出群），每轮轮询都会失败，所以按事件键在窗口内只弹一次。
+LOCAL_ALERT_WINDOW = 120.0
+LOCAL_ALERT_ENV = 'FEISHU_LOCAL_ALERTS'
+LOCAL_ALERT_BODY = 400
 
 
 def _format_task_duration(task: dict) -> str:
@@ -645,9 +652,15 @@ class FeishuGateway:
     def __init__(self, api: GatewayClient, transport=None,
                  bindings_path: Path | None = None,
                  allowed_users: set[str] | None = None,
-                 p2p_only: bool = True) -> None:
+                 p2p_only: bool = True,
+                 notifier=None) -> None:
         self.api = api
         self.transport = transport          # 需实现 send_text(chat_id, text)
+        # 飞书发不出去时的兜底：人在机器旁至少能看到系统通知。默认关闭，
+        # 由入口显式注入 notify.notify；测试不注入就不会弹真通知。
+        self.notifier = notifier
+        self._alerted: dict[str, float] = {}
+        self._alert_lock = threading.Lock()
         self.bindings_path = Path(bindings_path or BINDINGS_PATH)
         self.bindings: dict[str, str] = {}   # chat_id → session_id
         # 个人助手只服务单聊；群聊里任何人都能 @ 机器人，审批也只该归属
@@ -2571,7 +2584,12 @@ class FeishuGateway:
                 text = '⏹ 回合已取消'
             else:
                 text = '⚠️ 回合失败（' + str(payload.get('error_type') or 'error') + '）'
-        self.transport.send_text(chat_id, text)
+        try:
+            self.transport.send_text(chat_id, text)
+        except Exception:
+            self._local_alert('watch', '飞书回合通知失败', text)
+            # 仍向上抛：TurnWatcher 依赖异常判定本轮未送达，下轮重试。
+            raise
 
     def announce_startup(self) -> int:
         """服务启动时给已绑定的聊天发一次常驻控制台入口。"""
@@ -2647,6 +2665,8 @@ class FeishuGateway:
                     self.transport.send_text(chat_id, text)
             except Exception as exc:
                 print(f'[feishu] heartbeat send failed: {exc}')
+                self._local_alert('heartbeat', '飞书心跳推送失败',
+                                  f'摘要未能送达：{type(exc).__name__}: {exc}')
                 continue
             try:
                 self.api.ack_heartbeat(occurrence)
@@ -2685,6 +2705,8 @@ class FeishuGateway:
                 self.transport.send_text(chat_id, text)
             except Exception as exc:
                 print(f'[feishu] cron result send failed: {exc}')
+                self._local_alert('cron', '飞书定时结果推送失败',
+                                  f'任务结果未能送达：{type(exc).__name__}: {exc}')
                 continue
             try:
                 self.api.ack_cron_result(item_id)
@@ -2789,6 +2811,30 @@ class FeishuGateway:
         with self._chat_locks_guard:
             return self._chat_locks.setdefault(chat_id, threading.Lock())
 
+    def _local_alert(self, key: str, title: str, body: str) -> bool:
+        """飞书发送失败时弹一条本机通知；同一事件键在窗口内只弹一次。
+
+        远端故障通常是持续的，轮询每轮都失败；不按 key 去重会一分钟一条。
+        返回是否真的弹出（测试与排障用）。通知失败只影响通知本身。
+        """
+        if self.notifier is None:
+            return False
+        if (os.getenv(LOCAL_ALERT_ENV) or '').strip().casefold() in (
+                '0', 'false', 'no', 'off'):
+            return False
+        now = time.monotonic()
+        with self._alert_lock:
+            last = self._alerted.get(key)
+            if last is not None and now - last < LOCAL_ALERT_WINDOW:
+                return False
+            self._alerted[key] = now
+        try:
+            self.notifier(title, body[:LOCAL_ALERT_BODY], level='error')
+        except Exception as exc:
+            print(f'[feishu] local alert failed: {exc}')
+            return False
+        return True
+
     def _reply(self, chat_id: str, text: str):
         if self.transport is None or not text:
             return
@@ -2800,7 +2846,12 @@ class FeishuGateway:
                 return
             except Exception as exc:
                 print(f'[feishu] card send failed, fallback to text: {exc}')
-        return self.transport.send_text(chat_id, text)
+        try:
+            return self.transport.send_text(chat_id, text)
+        except Exception as exc:
+            self._local_alert('reply', '飞书回复发送失败',
+                              f'文字消息未能送达：{type(exc).__name__}: {exc}')
+            raise
 
     # ---------- 飞书长连接（需真实凭证） ----------
 
@@ -3003,7 +3054,8 @@ def _run_gateway(*, api_base: str, token: str, app_id: str, app_secret: str,
     api = GatewayClient(api_base, token)
     transport = LarkTransport(app_id, app_secret)
     gateway = FeishuGateway(api, transport=transport,
-                            allowed_users=allowed_users)
+                            allowed_users=allowed_users,
+                            notifier=notify.notify)
     if allowed_users:
         print(f'[feishu] user allowlist active: {", ".join(sorted(allowed_users))}')
     else:

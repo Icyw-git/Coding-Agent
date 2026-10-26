@@ -4832,3 +4832,81 @@ SHA1 `1fb660f8…`）、exec policy、审批文案、定时只读、子代理排
   的应用上按验收单确认（本机测试用 fake Lark client 验证请求结构）。
 
 未做：锁屏/UAC 安全桌面截图受系统限制，工具返回明确失败原因。
+
+## P2a 落地：本地通知与空闲感知
+
+常驻 personal agent 的第一块地基：飞书之外要有本地提醒，主动性任务要能判断用户是否空闲。
+
+- **Toast 编码**：Windows PowerShell 5.1 在 GBK 控制台下读 UTF-8 脚本里的中文会解析失败，
+  因此命令走 `-EncodedCommand`（UTF-16LE + base64），Toast XML 再单独 base64 后嵌进脚本；
+  标题/正文先转义 XML 并剔控制字符与孤立代理项。AUMID 借用已真机验证的
+  `{1AC14E77-…}\WindowsPowerShell\v1.0\powershell.exe`，无包身份也能弹。
+- **限频与降级**：`notify()` 10 秒内最多一次，失败尝试也占名额（避免网关批量失败刷屏）；
+  子进程超时/非零退出/`OSError` 都收敛成 `{sent: false, reason, error?}`，调用方无需 try。
+  默认在 `win32` 开启，`HARNESS_NOTIFY=0` 关闭。
+- **空闲/锁屏**：`GetLastInputInfo` 给出空闲秒数；`OpenInputDesktop` 拿不到输入桌面句柄即判锁屏。
+  这是启发式——RDP 断开、UAC 安全桌面也会命中，但对「锁屏暂停截屏」足够。结果缓存 2 秒，
+  失败也缓存，`HARNESS_IDLE=0` 关闭。
+- **路由**：新增 `src/api_system.py` 的 `GET /v1/system/state`，返回 `{"idle": {...}}`，
+  复用统一 Bearer 鉴权、限流和 access log。
+- **测试**：新增 `tests/test_notify.py`、`tests/test_idle.py`、`tests/test_system_state_api.py`，
+  覆盖命令编码与 XML 转义、限频/重置、环境开关、非 Windows、超时/非零退出/`OSError`、
+  JSON 解析（BOM、null、非法 locked）、缓存与强制刷新、路由鉴权与快照透传。
+  真机：`idle.state(force=True)` 返回 `idle_seconds=33, locked=false`；`notify()` 返回
+  `sent=True` 且通知中心出现。全量 **1788 passed / 2 skipped**，ruff 通过。
+
+未做：网关发送失败时自动调用本地通知（P2c）、按空闲触发主动性任务。
+
+## P2b 落地：登录自启与监督进程
+
+目标是把「两个终端 + 手动拉起」变成登录后自动常驻，并且启动失败能自己喊一声。
+
+- **自启安装器** `scripts/install_autostart.py`：只做 `schtasks` 的 install/remove/status
+  和 dry-run。任务名 `HarnessAgent`，`/SC ONLOGON /RL LIMITED /F`，当前用户、不提权；
+  运行动作是 `"<pythonw.exe>" "<repo>/src/agent_service.py"`（没有 pythonw 时回退 python）。
+  dry-run 用 `subprocess.list2cmdline()` 打印真实命令行，不碰系统；非 Windows 拒绝执行。
+- **监督进程** `src/agent_service.py`：先起 `python -m uvicorn api:create_app --factory`，
+  用 `/openapi.json` 探活（30 秒）；再起飞书网关（缺 `FEISHU_*` 时跳过）。子进程强制
+  `PYTHONIOENCODING=utf-8` + `PYTHONUNBUFFERED=1`，日志分别写 `.cache/logs/api.log` /
+  `feishu.log`，单个超过 10MB 时下次启动轮转为 `.1.log`。
+- **失败路径**：缺 token、端口占用、API 未就绪、网关启动后退出都会发 error Toast 并结束；
+  运行期任一子进程退出也会通知并返回码 4。默认**不自动重启**，避免坏配置下无限拉起。
+  API + 网关都健康时发一条“Harness Agent 已就绪”（info，静音）。
+- **pythonw 兼容**：计划任务用 pythonw 时 `sys.stdout/stderr` 可能是 `None`，入口先重定向到
+  `.cache/logs/service.log` 再解析参数，避免第一条 print 就把进程炸掉。
+- **测试**：`tests/test_install_autostart.py`（9）覆盖命令/quoting、dry-run 不执行、
+  非 Windows 拒绝、pythonw 选择、status 已装/未装；`tests/test_agent_service.py`（13）
+  覆盖启动顺序、网关 env、缺 token、端口占用、API/网关启动失败、子进程退出通知、
+  Ctrl-C 返回 0、日志轮转与端口探测（全部用 fake Popen/probe，不启动真实服务）。
+  真机只读验证：dry-run 输出含 `ONLOGON` 与 `pythonw.exe`；`status` 正确返回“未安装”。
+  全量 **1810 passed / 2 skipped**，ruff 通过。
+
+未做：`--restart-on-crash`；Task Scheduler `/End` 强制结束监督进程时的子进程清理
+（普通退出/Ctrl+C 会 terminate，超时用 `kill_process_tree`；强制杀监督进程可能留下
+API/网关孤儿，后续可用 Job Object 的 `KILL_ON_JOB_CLOSE` 补上）。
+
+## P2c 落地：飞书失败降级本地通知
+
+目标是飞书不可达时（断网、凭证失效、机器人被移出会话）人仍能在机器旁知道「有事没送出去」。
+
+- **注入而非全局开关**：`FeishuGateway` 新增 `notifier` 参数，默认 `None`。只有入口
+  `_run_gateway` 传 `notify.notify`；测试与库内直接构造网关不会弹真通知。
+  `FEISHU_LOCAL_ALERTS=0` 可再关一层。
+- **事件键去重**：`_local_alert(key, title, body)` 用 `time.monotonic()` 记录每个 key
+  的最近弹出时间，120 秒窗口内同键只弹一次。远端故障通常是持续的，心跳 60 秒一轮、
+  定时结果 15 秒一轮，不做去重会变成刷屏。不同 key（reply/watch/heartbeat/cron）互不影响。
+- **四路覆盖**：`_reply` 在卡片失败回退文本后仍失败时告警并继续向上抛；`_watch_notify`
+  告警后继续抛，让 `TurnWatcher` 按异常判定未送达并重试；`poll_heartbeat` /
+  `poll_cron_results` 告警后继续 `continue`，不 ack、保留 pending 下一轮补发。
+- **失败隔离**：notifier 自身抛错只打印一行日志并返回 False，不覆盖原始发送异常；
+  告警正文截到 400 字符，避免把整段命令/摘要塞进 Toast。
+- **测试**：新增 `tests/test_feishu_local_alerts.py`（13），覆盖四路失败告警、
+  成功不告警、同键去重、不同键各一次、环境开关、无 notifier 保持旧行为、
+  notifier 抛错隔离、正文截断；`test_main_allows_explicit_any_user_escape_hatch`
+  同步断言入口注入 `notify.notify`。定向 139 passed；全量 **1823 passed / 2 skipped**，
+  ruff 通过。
+
+未做：Toast 点击后跳回飞书（目前只是系统通知）；网关自身掉线时没有常驻状态指示
+（靠 API 监督进程的退出通知）。
+
+

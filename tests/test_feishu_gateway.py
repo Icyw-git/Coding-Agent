@@ -583,8 +583,9 @@ def test_main_allows_explicit_any_user_escape_hatch(monkeypatch, tmp_path):
             seen['closed'] = True
 
     class FakeGateway:
-        def __init__(self, api, transport=None, allowed_users=None):
+        def __init__(self, api, transport=None, allowed_users=None, notifier=None):
             seen['allowed'] = allowed_users
+            seen['notifier'] = notifier
 
         def run(self, app_id, app_secret):
             seen['ran'] = True
@@ -596,8 +597,9 @@ def test_main_allows_explicit_any_user_escape_hatch(monkeypatch, tmp_path):
     monkeypatch.setattr(feishu_gateway, 'LarkTransport', lambda *a, **k: None)
     monkeypatch.setattr(feishu_gateway, 'FeishuGateway', FakeGateway)
     assert feishu_gateway.main() == 0
+    # 入口必须把本地兜底通知接上（P2c）；其余是既有逃生阀行为
     assert seen == {'allowed': None, 'ran': True, 'stopped': True,
-                    'closed': True}
+                    'closed': True, 'notifier': feishu_gateway.notify.notify}
 
 
 def test_lark_transport_sends_text(monkeypatch):

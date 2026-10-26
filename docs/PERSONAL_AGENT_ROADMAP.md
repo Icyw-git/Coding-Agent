@@ -31,8 +31,8 @@
 | A4 | 鼠标键盘控制 | 无 | 缺能力（高风险，最后做） |
 | A5 | 窗口/进程管理 | 只能 `bash` 间接 tasklist/taskkill | 缺封装 |
 | B1 | 开机自启 / 守护 | 无，重启后要手动拉 API + 网关 | 缺能力（决定“常驻”是否成立） |
-| B2 | 本地通知 | 只有飞书；飞书断/未配则无提醒 | 缺能力 |
-| B3 | 空闲/锁屏感知 | 无 | 缺能力 |
+| B2 | 本地通知 | 能力层 `src/notify.py` + 网关失败降级（2026-10-26） | 主动按空闲触发任务尚未做 |
+| B3 | 空闲/锁屏感知 | 已支持：`src/idle.py` + `GET /v1/system/state`（2026-10-26） | 缺主动性任务接线 |
 | C1 | 凭据存储 | `.env` 明文 | 缺安全边界 |
 | C2 | 浏览器登录态 | `web_fetch` 无 cookie | 缺能力 |
 | D1 | 目录级持久授权 | 只能改 `HARNESS_WORKSPACE_ROOTS` 重启 | 缺策略能力 |
@@ -205,7 +205,53 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 **风险与缓解**：截图含敏感信息 → 只存 `.cache/screenshots`、7 天清理、逐次审批、后台拒绝、
 `/status` 可见；多屏 DPI 错位 → 返回里记录每屏 rect 与虚拟桌面范围。
 
-### P2：常驻（自启 + 本地通知 + 空闲感知）— 1 个迭代
+### P2：常驻（自启 + 本地通知 + 空闲感知）— 进行中
+
+**P2a 本地通知与空闲感知（2026-10-26，已完成）**
+
+- `src/notify.py`：Windows Toast。PowerShell `-EncodedCommand`（UTF-16LE）里嵌 base64
+  XML，标题/正文先转义并剔除控制字符与孤立代理项；借用 Windows PowerShell 的 AUMID，
+  10 秒全局限频（失败尝试也计数），`HARNESS_NOTIFY=0` 关闭。所有失败收敛为
+  `{sent, reason}`，不抛给回合或网关。
+- `src/idle.py`：`GetLastInputInfo` 读空闲秒数，`OpenInputDesktop` 打不开输入桌面即视为
+  锁屏（启发式，RDP 断开/UAC 安全桌面也会命中）；结果缓存 2 秒，`HARNESS_IDLE=0` 关闭。
+  返回 `{available, idle_seconds, locked, checked_at[, error]}`，失败同样进缓存。
+- `GET /v1/system/state`：`{"idle": {...}}`，走统一 Bearer 鉴权与限流。
+- 测试：`tests/test_notify.py`（11）、`tests/test_idle.py`（12）、
+  `tests/test_system_state_api.py`（3）。真机验证：空闲 `idle_seconds=33, locked=false`；
+  实际 Toast 返回 `sent=True` 并出现在通知中心。
+- 后续批次：网关发送失败降级已由 P2c 完成；主动性任务按空闲触发仍未做。
+
+**P2b 自启与守护（2026-10-26，已完成）**
+
+- `scripts/install_autostart.py`：`install/remove/status` + `--dry-run`。任务名
+  `HarnessAgent`，`/SC ONLOGON /RL LIMITED /F`，运行 `src/agent_service.py`；
+  优先用同目录 `pythonw.exe`，登录时不闪控制台。安装器只构造并执行 `schtasks`，
+  不会自动安装，也不提供模型工具入口；dry-run 只打印命令。
+- `src/agent_service.py`：一个监督进程启动 API（`python -m uvicorn api:create_app`）
+  与可选飞书网关；日志写 `.cache/logs/{api,feishu}.log`（10MB 轮转，子进程强制 UTF-8）。
+  API 用 `/openapi.json` 探活（30 秒），端口占用/缺 token/API 未就绪/网关启动后退出
+  都会发本地失败 Toast；成功后发“Harness Agent 已就绪”。网关缺 `FEISHU_*` 时只跑 API。
+  运行期任一子进程退出 → 通知 + 结束监督进程；**默认不自动重启**。
+- 测试：`tests/test_install_autostart.py`（9）、`tests/test_agent_service.py`（13），
+  覆盖命令构造/quoting、dry-run 不执行、非 Windows 拒绝、启动顺序、网关 env、
+  缺 token/端口占用/启动失败、子进程退出通知、日志轮转。真机只读验证：dry-run
+  输出包含 `ONLOGON` 与 `pythonw.exe`，`status` 正确报告“未安装”。
+- 未做：`--restart-on-crash`；Task Scheduler `/End` 强制结束监督进程时，子进程
+  清理未用 Job Object 保证（普通退出/Ctrl+C 会 terminate，超时再 kill 进程树）。
+
+**P2c 飞书失败降级本地通知（2026-10-26，已完成）**
+
+- `FeishuGateway` 新增 `notifier` 注入（默认 `None`）与按事件键的 120 秒去重窗口。
+  覆盖四处发送失败：`_reply` 文字回复、`_watch_notify` 回合终态/审批超时、`poll_heartbeat`
+  心跳摘要、`poll_cron_results` 定时结果。
+- 语义保持：回复与回合通知**仍向上抛**（调用方/`TurnWatcher` 依赖异常重试）；心跳与定时
+  结果仍不 ack，保留 pending 下一轮补发。本地通知只做兜底，失败不影响发送路径。
+- 启用条件：只有入口 `_run_gateway` 显式注入 `notify.notify` 才生效，
+  `FEISHU_LOCAL_ALERTS=0` 关闭；测试直接构造网关不会弹真通知。
+- 测试：`tests/test_feishu_local_alerts.py`（13），覆盖四路失败告警、成功不发、
+  同键去重、不同键各一次、环境开关、无 notifier、notifier 自身抛错隔离、正文截断。
+- 未做：本地通知点击后跳回飞书（仅系统 Toast）；网关断线期间没有 UI 常驻状态指示。
 
 **目标**：重启机器后无需人工，agent 起来并能在飞书断线时用系统通知兜底。
 
@@ -213,10 +259,10 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 
 | 项 | 方案 | 备注 |
 |---|---|---|
-| 自启 | `scripts/install_autostart.py`：写计划任务（`schtasks /SC ONLOGON /RL LIMITED /TN HarnessAgent`），启动 `entrypoint.py --daemon`（API + 网关），日志到 `.cache/logs/` | 卸载命令 `--remove`；计划任务用当前用户权限，不提权 |
-| 守护 | 进程内 watchdog：`api` 起不来/端口占用 → 通知；可选 `--restart-on-crash`（父进程守护子进程） | 先做“起不来要吼一声”，不做自愈重启 |
-| 本地通知 | `src/notify.py`：Windows toast（WinRT），`notify(title, body, url?)`；飞书发送失败时降级 | 触发点：回合失败、审批超时、心跳、cron 结果 |
-| 空闲/锁屏 | `src/idle.py`：`GetLastInputInfo` 读空闲秒数 + `SessionSwitch` 事件；暴露 `/v1/system/state` | 用途：空闲才跑主动性任务；锁屏时暂停截屏类工具 |
+| 自启 | `scripts/install_autostart.py`：写计划任务（`schtasks /SC ONLOGON /RL LIMITED /TN HarnessAgent`），启动 `src/agent_service.py`（API + 网关），日志到 `.cache/logs/` | 已完成（P2b）；当前用户权限，不提权 |
+| 守护 | 进程内 watchdog：`api` 起不来/端口占用 → 通知；可选 `--restart-on-crash`（父进程守护子进程） | 已完成“起不来要吼一声”（P2b）；不做自愈重启 |
+| 本地通知 | `src/notify.py`：Windows toast（WinRT），`notify(title, body, url?)`；飞书发送失败时降级 | 能力层（P2a）+ 网关降级（P2c）均已完成；`FEISHU_LOCAL_ALERTS=0` 可关 |
+| 空闲/锁屏 | `src/idle.py`：`GetLastInputInfo` 读空闲秒数 + 锁屏判断；暴露 `/v1/system/state` | 已完成（P2a）；锁屏用输入桌面句柄启发式，未订阅 `SessionSwitch` 事件 |
 
 **权限**：`notify` 属“输出”，无需审批但限频（每 10 秒最多 1 条）；自启安装属**安装期操作**，
 必须命令行显式执行，不给模型工具入口。
