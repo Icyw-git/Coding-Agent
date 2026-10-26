@@ -92,6 +92,14 @@ WORKSPACE_VIEW_TTL = 600.0   # 工作区卡片/序号的有效期：过期必须
 # 最小间隔，避免飞书卡片 PATCH 接口被高频调用触发频控
 MIN_CARD_PATCH_INTERVAL = 0.45
 
+# 流式延迟诊断：FEISHU_STREAM_TRACE=1 时每个回合打印一行时间戳，
+# 用来区分「模型慢」「SSE 慢」「卡片 PATCH 慢」。默认关闭，不刷屏。
+STREAM_TRACE_ENV = 'FEISHU_STREAM_TRACE'
+
+
+def stream_trace_enabled() -> bool:
+    return (os.getenv(STREAM_TRACE_ENV) or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
 # 截图回传：飞书图片上传上限 10MB，单回合最多回传 4 张；可用环境变量关闭。
 SCREENSHOT_REPLY_LIMIT = 4
 SCREENSHOT_REPLY_ENV = 'FEISHU_SEND_SCREENSHOTS'
@@ -848,6 +856,24 @@ class FeishuGateway:
         last_sent = None
         stream_failed = False
         progress: dict = {'status': {}}
+        # 流式延迟诊断：只在开启时累加，不影响既有行为。
+        trace = {'card_sends': 0, 'card_patches': 0, 'patch_ms': 0.0,
+                 'deltas': 0, 'progress': 0, 'sses': 0}
+
+        def _trace_out(error: str = '') -> None:
+            if not stream_trace_enabled():
+                return
+            total = time.perf_counter() - _t_entry
+            first = trace.get('first_ms')
+            first_text = '-' if first is None else f'{first / 1000:.2f}s'
+            patches = trace['card_patches']
+            patch_avg = '-' if not patches else f"{trace['patch_ms'] / patches:.0f}ms"
+            print('[feishu][stream] '
+                  f'total={total:.2f}s first_delta={first_text} '
+                  f'deltas={trace["deltas"]} progress={trace["progress"]} '
+                  f'cards={trace["card_sends"]} patches={patches} '
+                  f'patch_avg={patch_avg} failed={stream_failed}'
+                  + (f' error={error}' if error else ''))
 
         def _note(status: dict | None = None) -> str:
             status = status or progress['status'] or {}
@@ -889,6 +915,7 @@ class FeishuGateway:
             if now - last_update < 0.6:
                 return
             try:
+                _t_card = time.perf_counter()
                 if message_id is None:
                     # 首建卡片用本次内容（进度路径下 parts 可能为空）
                     if step_mode:
@@ -897,9 +924,12 @@ class FeishuGateway:
                         message_id = sender(chat_id, payload or '生成中…',
                                             **reply_kwargs)
                     perf_record('gw.first_card', time.perf_counter() - _t_entry)
+                    trace['card_sends'] += 1
                 elif self._card_patch_gate():
                     updater(message_id, payload)
                     last_update = now
+                    trace['card_patches'] += 1
+                    trace['patch_ms'] += (time.perf_counter() - _t_card) * 1000
                 last_sent = payload
             except Exception as exc:
                 stream_failed = True
@@ -907,6 +937,9 @@ class FeishuGateway:
 
         def on_delta(part: str) -> None:
             parts.append(part)
+            trace['deltas'] += 1
+            if 'first_ms' not in trace:
+                trace['first_ms'] = (time.perf_counter() - _t_entry) * 1000
             answer = ''.join(parts)
             if step_mode:
                 update_partial(answer, answer_text=answer, running=True, note=_note())
@@ -915,6 +948,7 @@ class FeishuGateway:
 
         def on_progress(status: dict) -> None:
             progress['status'] = status
+            trace['progress'] += 1
             answer = ''.join(parts)
             if step_mode:
                 update_partial(answer, answer_text=answer, running=True,
@@ -952,6 +986,7 @@ class FeishuGateway:
                 reply = _invoke(session_id)
         except Exception as exc:
             print(f'[feishu] agent reply failed: {exc}')
+            _trace_out(str(exc)[:80])
             hint = friendly_error(exc)
             failed = ('处理未完成：' + (hint or str(exc)) + chr(10)
                       + ('技术细节：' + str(exc) + chr(10) if hint else '')
@@ -992,6 +1027,7 @@ class FeishuGateway:
             return
 
         reply = reply or '本轮已结束，未生成文本回复。'
+        _trace_out()
         self._send_turn_screenshots(chat_id, session_id, screenshots,
                                     reply_to=reply_to)
         duration = getattr(self.api, 'last_duration', None)
