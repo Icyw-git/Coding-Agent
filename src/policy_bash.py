@@ -571,6 +571,8 @@ def approval_class(tool: str, args) -> str:
     文件工具返回空串：一次「写 a.txt」的批准不该免审同会话的任意路径写入，
     尤其是越界写。按目录的范围授权需要先解析 cwd/工作区，留到路径范围化那一轮。
     """
+    if tool in ('desktop_snapshot', 'desktop_action'):
+        return ''
     if tool in ('read', 'write', 'edit', 'apply_patch'):
         return ''
     if tool == 'web_fetch':

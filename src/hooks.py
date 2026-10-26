@@ -45,6 +45,7 @@ from approval_judge import (
 from exec_policy import (
     CLIPBOARD_TOOLS,
     DENY,
+    DESKTOP_TOOLS,
     PATH_INVALID,
     PATH_OUTSIDE,
     PATH_SECRET,
@@ -347,6 +348,7 @@ SCHEDULED_FORBIDDEN_TOOLS = frozenset({
     'kill_background', 'rename_session', 'revoke_permissions',
     'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
+    'desktop_snapshot', 'desktop_action',
 })
 # 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
 # 整批就按该分区判定，避免被同批的工作区内文件稀释。
@@ -441,11 +443,14 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         return _screen_background_error(tool)
     if tool in CLIPBOARD_TOOLS and not interactive:
         return _clipboard_background_error(tool)
+    if tool in DESKTOP_TOOLS and not interactive:
+        return _desktop_background_error(tool)
     # untrusted 档的语义是「每条都问」，而会话白名单是一种预授权：命中它就等于
     # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单，
     # 屏幕/剪贴板工具同理：每次都应按当下的屏幕/剪贴板重新审批。
     if (policy.approval_policy != 'untrusted'
             and tool not in SCREEN_TOOLS and tool not in CLIPBOARD_TOOLS
+            and tool not in DESKTOP_TOOLS
             and GATE.session_allows(tool, args)):
         print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
         issue_grant(tool, args)   # 白名单命中同样是一次「本调用已批准」
@@ -507,6 +512,11 @@ def _screen_background_error(tool: str) -> str:
 def _clipboard_background_error(tool: str) -> str:
     return (f'Error: {tool} requires an interactive turn; background and '
             'scheduled tasks cannot access the local clipboard.')
+
+
+def _desktop_background_error(tool: str) -> str:
+    return (f'Error: {tool} requires an interactive turn; background and '
+            'scheduled tasks cannot control the local desktop.')
 
 
 def deny_message(decision) -> str:

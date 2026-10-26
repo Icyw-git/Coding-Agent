@@ -5018,3 +5018,23 @@ API/网关孤儿，后续可用 Job Object 的 `KILL_ON_JOB_CLOSE` 补上）。
 
 未做：域名与工具级授权（账本里预留 `scope` 概念但只实现 `write`）；卡片上直接输入路径
 （飞书回调不带表单值，新增仍走命令）；授权变更的全局审计检索（P6 再做）。
+
+
+## P3b 落地：显式审批的桌面键鼠控制
+
+修复全量测试时发现 `tests/conftest.py` 有两个同名 `_isolate_cron_state` fixture：Python 只保留后定义者，
+导致负责重定向 `DURABLE_PATH` 的 fixture 被覆盖，cron 测试写进真实 `.cache/crons.json` 并在 Windows 上偶发
+`PermissionError`。已分别改名为 `_isolate_cron_durable_path` / `_isolate_cron_jobs`；`tests/test_cron_idle.py`
+定向回归 **22 passed**，测试不再指向真实持久文件。
+
+P3b 增加 `src/desktop_control_windows.py` 能力层与 `src/tool_desktop.py` 工具层：
+- `desktop_snapshot` 读前台窗口标题、进程/PID/HWND、窗口矩形与 UIA 焦点控件；不截屏，屏幕图像仍走单独审批的 `screen_capture`。
+- `desktop_action` 一次执行一个 `move/click/type/key/scroll`；PowerShell 5.1 + user32 `SendInput`，文本以 UTF-8/base64 参数传输并逐 UTF-16 字符发送。
+- 输入动作绑定先前 snapshot 的 PID + HWND，运行时重新读取 foreground；切窗即拒绝。鼠标坐标还必须落在 snapshot 窗口矩形和虚拟桌面内。参数限制：输入 ≤1000 字符，滚轮 ±20 格，键名采用白名单。
+- 所有调用默认关闭，需 `HARNESS_DESKTOP_CONTROL=1`；开后每项都走人工审批，不接受“同类”会话预授权；`approval_policy=never` 仍拒绝。后台/定时与子代理拒绝；Recovery 将动作列为 destructive，不自动重试。
+- UIA `IsPassword` 与标题/进程/焦点上的敏感词只作为启发式防误操作；它不是可靠的支付页检测或 OS 安全边界。桌面共享会话存在输入竞争窗口，不用于登录、支付、改密码、2FA 或无人值守流程。
+- 审计记录成功/失败的动作类型、PID/HWND、标题哈希、耗时/短错误，不落键入文本。`/status` 显示控制开关。
+
+新增测试覆盖后端 payload、键鼠参数边界、窗口身份契约、默认关闭/never 档、逐次审批、后台拒绝、审计脱敏和 cron 隔离。定向 **70 passed**；全量 **1921 passed / 2 skipped**，ruff 通过。
+
+**未做真机桌面输入**：当前进程运行环境不能由自动化用例安全验证键鼠副作用。实际启用前需用户在自己的飞书/CLI交互会话中显式配置环境变量，第一次仅对记事本测试，且逐步核对审批卡和目标窗口。敏感窗口拦截不可当作保证。

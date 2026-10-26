@@ -9,6 +9,8 @@ from typing import Optional
 from exec_policy import resolve_tool_path
 from tool_clipboard import read as _clipboard_read_tool
 from tool_clipboard import write as _clipboard_write_tool
+from tool_desktop import action as _desktop_action_tool
+from tool_desktop import snapshot as _desktop_snapshot_tool
 from tool_documents import (
     ImageResult,  # noqa: F401
     read_document,
@@ -161,6 +163,20 @@ def run_clipboard_write(text: str) -> str:
     return _clipboard_write_tool(text, audit=_screen_audit)
 
 
+def run_desktop_snapshot() -> str:
+    return _desktop_snapshot_tool(audit=_screen_audit)
+
+
+def run_desktop_action(action: str, x: int = None, y: int = None,
+                       text: str = None, key: str = None,
+                       amount: int = None, expected_pid: int = None,
+                       expected_window_id: str = None) -> str:
+    return _desktop_action_tool(
+        action, x=x, y=y, text=text, key=key, amount=amount,
+        expected_pid=expected_pid, expected_window_id=expected_window_id,
+        audit=_screen_audit)
+
+
 def run_view_image(path: str, cwd: str = None):
     return view_image(path, cwd, gate=_gate_file, resolve=safe_path,
                       max_bytes=_IMAGE_MAX_BYTES,
@@ -273,6 +289,8 @@ tool_registry = {
     'screen_ocr': run_screen_ocr,
     'clipboard_read': run_clipboard_read,
     'clipboard_write': run_clipboard_write,
+    'desktop_snapshot': run_desktop_snapshot,
+    'desktop_action': run_desktop_action,
     'read_document': run_read_document,
     'render_document': run_render_document,
     'apply_patch': run_apply_patch,

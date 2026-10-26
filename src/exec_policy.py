@@ -57,6 +57,8 @@ __all__ = [
     'ASK',
     'CLIPBOARD_ENV',
     'CLIPBOARD_TOOLS',
+    'DESKTOP_ENV',
+    'DESKTOP_TOOLS',
     'DEFAULT_APPROVAL_POLICY',
     'DEFAULT_SANDBOX_MODE',
     'DENY',
@@ -142,6 +144,15 @@ SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
 # 剪贴板：读可能含密码/私信，写会覆盖用户刚复制的内容；两者都逐次询问。
 CLIPBOARD_TOOLS = ('clipboard_read', 'clipboard_write')
 CLIPBOARD_ENV = 'HARNESS_CLIPBOARD_TOOLS'
+# Desktop input is opt-in and each action requires a human decision.
+DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_action')
+DESKTOP_ENV = 'HARNESS_DESKTOP_CONTROL'
+
+
+def desktop_control_enabled(environ=None) -> bool:
+    """Disabled unless explicitly enabled with HARNESS_DESKTOP_CONTROL=1."""
+    raw = (environ if environ is not None else os.environ).get(DESKTOP_ENV, '')
+    return str(raw).strip().casefold() in ('1', 'true', 'yes', 'on', 'enabled')
 
 
 def screen_tools_enabled(environ=None) -> bool:
@@ -253,6 +264,20 @@ class Policy:
                 decision = Decision(
                     DENY, 'clipboard_tools_disabled',
                     f'{tool} is disabled ({CLIPBOARD_ENV}=0)')
+        elif tool in DESKTOP_TOOLS:
+            if not desktop_control_enabled():
+                decision = Decision(
+                    DENY, 'desktop_control_disabled',
+                    f'{tool} is disabled ({DESKTOP_ENV}=1 is required)')
+            elif self.approval_policy == 'never':
+                decision = Decision(
+                    DENY, 'desktop_control_approval_required',
+                    'desktop control always requires explicit per-action approval')
+            else:
+                decision = Decision(
+                    ASK, 'desktop_control',
+                    f'{tool} inspects or controls the local foreground desktop; '
+                    'each operation requires explicit approval')
         elif tool in external_tools:
             decision = Decision(
                 ASK, 'external_tool',

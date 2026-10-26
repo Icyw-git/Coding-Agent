@@ -21,9 +21,10 @@ ORDER = [
     'request_shutdown', 'request_plan', 'review_plan', 'create_worktree',
     'remove_worktree', 'keep_worktree', 'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
+    'desktop_snapshot', 'desktop_action',
 ]
 
-SCHEMA_SHA1 = 'cc00ce9f1b7191bd76a7e96bc093e016b2065d0e'
+SCHEMA_SHA1 = '21c026beb25e799ba7275097c6b4cfbddff7943a'
 
 
 def test_tool_order_is_stable():

@@ -109,6 +109,29 @@ def _clipboard_detail(tool: str, args: dict) -> str:
     return f'replace the local clipboard with {chars} chars{suffix}'
 
 
+def _desktop_detail(tool: str, args: dict) -> str:
+    if tool == 'desktop_snapshot':
+        return 'inspect foreground window metadata and focused UI control'
+    action = args.get('action') or 'unknown'
+    fields = [f'action={action}']
+    if args.get('expected_pid') is not None:
+        fields.append(f"foreground pid={args['expected_pid']}")
+    if args.get('expected_window_id'):
+        fields.append(f"window id={args['expected_window_id']}")
+    if action in ('move', 'click'):
+        fields.append(f"coordinates=({args.get('x')},{args.get('y')})")
+    elif action == 'type':
+        text = args.get('text') if isinstance(args.get('text'), str) else ''
+        fields.append(f'text length={len(text)}')
+        if text:
+            fields.append('text=' + ' '.join(text[:80].split()))
+    elif action == 'key':
+        fields.append(f"key={args.get('key', '')}")
+    elif action == 'scroll':
+        fields.append(f"amount={args.get('amount', '')}")
+    return 'desktop input: ' + ', '.join(fields)
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -120,6 +143,8 @@ def detail(tool: str, args) -> str:
         return safe_text(_screen_detail(tool, args))
     if tool in ('clipboard_read', 'clipboard_write'):
         return safe_text(_clipboard_detail(tool, args))
+    if tool in ('desktop_snapshot', 'desktop_action'):
+        return safe_text(_desktop_detail(tool, args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

@@ -209,6 +209,14 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   fail-closed 直接拒绝，`danger-full-access` + `never` 沿用既有语义放行）；后台与定时回合
   直接拒绝，子代理也拿不到这两个工具。`HARNESS_CLIPBOARD_TOOLS=0` 可整体关闭。审计事件只记
   字节数/字符数/是否截断/耗时，不记录剪贴板内容或哈希。
+- 桌面输入工具默认**关闭**。显式设置 `HARNESS_DESKTOP_CONTROL=1` 后，`desktop_snapshot` 返回
+  前台窗口标题、进程/PID、窗口句柄与 UI Automation 当前焦点；`desktop_action` 支持单次
+  `move`/`click`/`type`/`key`/`scroll`。每项操作都逐次审批、不接受会话白名单；`never` 档位
+  一律拒绝；后台任务、定时任务和子代理不可调用。动作必须携带 snapshot 的 PID + HWND，若
+  前台窗口改变则拒绝；坐标限制在虚拟桌面内，文本最多 1000 字符。密码输入控件和标题/进程/
+  焦点名称命中敏感词时拒绝，但这是启发式防误操作，**不是可靠的支付页面识别或 OS 隔离**。
+  先使用 `screen_capture` 观察画面（它有独立审批），再取 `desktop_snapshot` 并执行单步动作；
+  每次动作完成后应重新观察。审计记录动作类型、目标 PID/HWND、标题哈希与耗时，不记录输入文本。
 - 本地通知与空闲感知：`src/notify.py` 通过 Windows Toast 弹系统通知（PowerShell
   `-EncodedCommand` + base64 XML，绕开 GBK 控制台的引号/中文解析问题），10 秒内最多一条，
   失败只返回原因、不抛异常，`HARNESS_NOTIFY=0` 关闭；`src/idle.py` 用 `GetLastInputInfo`

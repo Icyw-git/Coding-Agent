@@ -609,4 +609,37 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'properties': {'text': {'type': 'string',
                                                       'description': 'Text to put on the '
                                                                      'local clipboard'}},
-                              'required': ['text']}}}]
+                              'required': ['text']}}},
+ {'type': 'function',
+  'function': {'name': 'desktop_snapshot',
+               'description': 'Inspect the foreground window and focused UI control. '
+                              'Requires HARNESS_DESKTOP_CONTROL=1 and explicit approval '
+                              'each time. Use pid and window_id for a following action.',
+               'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'desktop_action',
+               'description': 'Perform one approved mouse or keyboard action in the '
+                              'foreground desktop. Requires HARNESS_DESKTOP_CONTROL=1 '
+                              'and explicit approval every time. First call '
+                              'desktop_snapshot; expected_pid and expected_window_id '
+                              'must match that window. Sensitive windows are blocked.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'action': {'type': 'string',
+                                             'enum': ['move', 'click', 'type', 'key', 'scroll']},
+                                  'expected_pid': {'type': 'integer',
+                                                   'description': 'PID from desktop_snapshot'},
+                                  'expected_window_id': {'type': 'string',
+                                                         'description': 'Hexadecimal window id'},
+                                  'x': {'type': 'integer',
+                                        'description': 'Pixel coordinate inside the target window'},
+                                  'y': {'type': 'integer',
+                                        'description': 'Pixel coordinate inside the target window'},
+                                  'text': {'type': 'string',
+                                           'description': 'Text to type, max 1000 characters'},
+                                  'key': {'type': 'string',
+                                          'description': 'Key name such as enter, tab, escape, or F1'},
+                                  'amount': {'type': 'integer',
+                                             'description': 'Scroll notches from -20 to 20, excluding 0'}},
+                              'required': ['action', 'expected_pid',
+                                           'expected_window_id']}}}]

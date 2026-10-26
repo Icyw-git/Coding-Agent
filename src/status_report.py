@@ -14,7 +14,16 @@ import sandbox
 import screen_capture
 import tool_cache
 import workspace_diff
-from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, clipboard_tools_enabled, load_policy, screen_tools_enabled, set_tier
+from exec_policy import (
+    CLIPBOARD_ENV,
+    DESKTOP_ENV,
+    SCREEN_ENV,
+    clipboard_tools_enabled,
+    desktop_control_enabled,
+    load_policy,
+    screen_tools_enabled,
+    set_tier,
+)
 
 SANDBOX_MODE_HELP = (
     ('read-only', '只放公认只读的命令，写改与其余命令都要审批'),
@@ -105,6 +114,10 @@ def format_status(session_store) -> str:
         '\n  剪贴板工具：开（读写都需审批）'
         if clipboard_tools_enabled()
         else f'\n  剪贴板工具：关（{CLIPBOARD_ENV}=0）')
+    desktop_line = (
+        '\n  桌面控制：开（每步需审批）'
+        if desktop_control_enabled()
+        else f'\n  桌面控制：关（设置 {DESKTOP_ENV}=1 启用）')
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -122,6 +135,7 @@ def format_status(session_store) -> str:
         f'{grants_line}'
         f'{screen_line}'
         f'{clipboard_line}'
+        f'{desktop_line}'
         f'{usage_line}'
     )
 

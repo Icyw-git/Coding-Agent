@@ -18,6 +18,7 @@ _ENV_KEYS = ('HARNESS_MEMORY_RECALL', 'HARNESS_LOAD_MEMORIES',
              'HARNESS_APPROVAL_ALL',
              # 屏幕工具默认开；本机 .env 若配了 0，不能把默认档测试前提改掉。
              'HARNESS_SCREEN_TOOLS', 'HARNESS_CLIPBOARD_TOOLS',
+             'HARNESS_DESKTOP_CONTROL',
              # LLM 审查官默认关：开着会让审批类测试偷偷打真实 LLM API
              # （test_approval_scope 曾因此慢 12s 且卡片断言落空）。专测文件自己
              # delenv 打开。
@@ -27,7 +28,7 @@ _TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cron_state(tmp_path, monkeypatch):
+def _isolate_cron_durable_path(tmp_path, monkeypatch):
     """cron 是进程级单例：用例之间清空任务/队列，并把 crons.json 指到临时目录。"""
     import cron_scheduler
 
@@ -126,7 +127,7 @@ def _isolate_grant_ledger(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cron_state():
+def _isolate_cron_jobs():
     """cron 表是进程级全局：用例之间泄漏会让稳定 ID / 触发断言随执行顺序变化。
 
     默认心跳按稳定 ID 注册（服务启动路径），如果它从某个用例泄漏到下一个
@@ -184,6 +185,7 @@ def _restore_permission_backend(tmp_path):
         os.environ.pop(key, None)   # 用例默认跑默认档，需要别的档位自己 setenv
     os.environ.pop('HARNESS_SCREEN_TOOLS', None)
     os.environ.pop('HARNESS_CLIPBOARD_TOOLS', None)
+    os.environ.pop('HARNESS_DESKTOP_CONTROL', None)
     previous = permission_gate.backend
     previous_timeout = permission_gate.timeout
     permission_gate.timeout = 3   # GATE 在导入时已读走 timeout，setenv 来不及
