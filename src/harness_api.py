@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import secrets
 import threading
@@ -35,6 +36,36 @@ def _scheduler_enabled() -> bool:
     """HARNESS_SCHEDULER=0 关闭；默认在拥有 runtime 的 server 进程里启动。"""
     raw = (os.getenv('HARNESS_SCHEDULER') or '').strip().casefold()
     return raw not in ('0', 'false', 'no', 'off')
+
+
+ACCESS_LOG_MAX_BYTES_ENV = 'HARNESS_API_LOG_MAX_BYTES'
+ACCESS_LOG_BACKUPS_ENV = 'HARNESS_API_LOG_BACKUPS'
+DEFAULT_ACCESS_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_ACCESS_LOG_BACKUPS = 3
+
+
+def access_log_max_bytes() -> int:
+    """单个访问日志文件上限；非法值回落默认，不阻止启动。"""
+    raw = (os.getenv(ACCESS_LOG_MAX_BYTES_ENV) or '').strip()
+    if not raw:
+        return DEFAULT_ACCESS_LOG_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_ACCESS_LOG_MAX_BYTES
+    return max(64 * 1024, value)      # 太小的轮转只会把磁盘刷成碎片
+
+
+def access_log_backups() -> int:
+    """保留几份历史；0 表示不保留（只留当前文件）。"""
+    raw = (os.getenv(ACCESS_LOG_BACKUPS_ENV) or '').strip()
+    if not raw:
+        return DEFAULT_ACCESS_LOG_BACKUPS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_ACCESS_LOG_BACKUPS
+    return max(0, min(value, 20))
 
 
 def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 60,
@@ -97,7 +128,12 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
             if access_log_path:
                 log_path = Path(access_log_path)
                 log_path.parent.mkdir(parents=True, exist_ok=True)
-                handler = logging.FileHandler(log_path, encoding="utf-8")
+                # 轮转而不是无限增长：访问日志每请求一行，长跑时不轮转会一直涨
+                # （实测单机三个月 17.8MB / 14 万行，且全是重复的轮询请求）。
+                # 保留 3 份 × 10MB：够查最近的问题，不会占满磁盘。
+                handler = logging.handlers.RotatingFileHandler(
+                    log_path, maxBytes=access_log_max_bytes(),
+                    backupCount=access_log_backups(), encoding='utf-8')
                 handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
                 logger.addHandler(handler)
             if owns_runtime:

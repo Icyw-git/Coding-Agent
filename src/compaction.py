@@ -39,6 +39,14 @@ def _is_tool_result_message(msg):  # 判断是否工具结果
     return msg.get('role') == 'tool'
 
 
+# 截断标记的文本必须**跨轮逐字稳定**：它落在前缀中间，一旦文本变化（旧版写
+# `[snipped N messages]`，N 是每次截掉的消息数），marker 之后整段尾部全部失配。
+# 实测：45 次 snip 后的调用加权命中率只有 45%（其余 95%），吃掉 58% 的未命中
+# token。代价是模型看不到「截掉了多少条」——判定「有没有丢上下文」靠的是标记
+# 存在与否，不是那个数字，而这个数字每轮都在变，本来也读不出来。
+SNIP_MARKER = '[earlier messages were trimmed]'
+
+
 def snip_compact(messages, max_messages=None, info=None):
     """保留头 3 条 + marker + 尾部，中间按 tool_calls 分组裁剪。
 
@@ -67,7 +75,7 @@ def snip_compact(messages, max_messages=None, info=None):
         info.update(head_end=head_end, tail_start=tail_start,
                     snipped=tail_start - head_end)
     return (messages[:head_end]
-            + [{'role': 'user', 'content': f"[snipped {tail_start - head_end} messages]"}]
+            + [{'role': 'user', 'content': SNIP_MARKER}]
             + messages[tail_start:])
 
 

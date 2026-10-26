@@ -250,6 +250,7 @@ def test_replay_repairs_historical_snip_cutting_tool_group(tmp_path):
     history = store.rebuild_openai_history()
 
     assert history[0]['content'] == 'start'
-    assert any(str(m.get('content', '')).startswith('[snipped') for m in history)
+    from compaction import SNIP_MARKER
+    assert any(m.get('content') == SNIP_MARKER for m in history)
     assert history[-1]['content'] == 'continue'
     SessionEventStore.validate_openai_history(history)

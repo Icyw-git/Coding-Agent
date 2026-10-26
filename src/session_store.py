@@ -672,9 +672,9 @@ class SessionEventStore:
                     he, ts = normalize_snip_bounds(
                         messages, int(event['head_end']),
                         int(event['tail_start']))
+                    from compaction import SNIP_MARKER
                     messages = (messages[:he]
-                                + [{"role": "user",
-                                    "content": f"[snipped {max(0, ts - he)} messages]"}]
+                                + [{"role": "user", "content": SNIP_MARKER}]
                                 + messages[ts:])
                 else:
                     # 旧版 head/tail 全量副本事件：逐字还原 head + marker + 保留段
@@ -682,8 +682,8 @@ class SessionEventStore:
                     tail = event.get("tail") or []
                     messages = [json.loads(json.dumps(m)) for m in head
                                 if isinstance(m, dict) and m.get('role')]
-                    messages.append({"role": "user",
-                                     "content": f"[snipped {int(event.get('snipped') or 0)} messages]"})
+                    from compaction import SNIP_MARKER
+                    messages.append({"role": "user", "content": SNIP_MARKER})
                     messages.extend(json.loads(json.dumps(m)) for m in tail
                                     if isinstance(m, dict) and m.get('role'))
                 for entry in messages:

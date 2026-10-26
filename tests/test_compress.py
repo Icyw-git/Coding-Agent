@@ -5,6 +5,8 @@
 import sys
 from pathlib import Path
 
+from compaction import SNIP_MARKER
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 from session_store import SessionEventStore
@@ -74,8 +76,8 @@ def test_snip_compact(monkeypatch):
     assert len(msgs) > 50
     out = harness.snip_compact(msgs)
     assert len(out) <= 50, f"snip 后仍有 {len(out)} 条"
-    assert any(m.get("role") == "user" and str(m.get("content", "")).startswith("[snipped")
-               for m in out), "缺少 [snipped N messages] 标记"
+    assert any(m.get("role") == "user" and m.get("content") == SNIP_MARKER
+               for m in out), "缺少截断标记"
     validate_pairs(out, "snip")
 
 
@@ -330,7 +332,7 @@ def test_snip_persisted_and_replayed(tmp_path, monkeypatch):
         store.append_message(m)
     out, _ = harness.pre_compact_messages(store.rebuild_openai_history(),
                                           session_store=store)
-    assert any(str(m.get('content', '')).startswith('[snipped ') for m in out)
+    assert any(m.get('content') == SNIP_MARKER for m in out)
     events = [e for e in store.read_events() if e['type'] == 'history_snipped']
     assert len(events) == 1
     ev = events[0]
@@ -362,7 +364,7 @@ def test_snip_legacy_copy_event_compat(tmp_path):
     store.append('history_snipped', head=head, tail=tail, snipped=5)
     history = store.rebuild_openai_history()
     assert [m['content'] for m in history] == ['开头', '回复',
-                                               '[snipped 5 messages]',
+                                               SNIP_MARKER,
                                                '最近的问题', '最近的回答']
 
 
@@ -544,3 +546,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_snip_marker_is_byte_stable_across_rounds(monkeypatch):
+    """截断标记必须跨轮逐字一致：它在前缀中间，文本一变尾部整段失配。
+
+    旧实现把 `[snipped N messages]` 的 N 写进 marker，N 每轮不同，导致 snip 之后
+    的调用缓存加权命中率只有 45%（其余 95%），吃掉 58% 的未命中 token。
+    这里锁住「不同截断量 → 同一段文本」这个不变量。
+    """
+    import compaction
+
+    class FakeHarness:
+        CONTEXT_LIMIT = 100
+
+        @staticmethod
+        def get_workdir():
+            return None
+
+    monkeypatch.setattr(compaction, '_h', lambda: FakeHarness)
+
+    def marker_for(total):
+        messages = [{'role': 'user', 'content': f'm{index}'}
+                    for index in range(total)]
+        info = {}
+        out = compaction.snip_compact(messages, max_messages=10, info=info)
+        markers = [m for m in out if m.get('content') == compaction.SNIP_MARKER]
+        assert markers, f'no marker for {total} messages'
+        return markers[0]['content']
+
+    assert marker_for(30) == marker_for(40) == compaction.SNIP_MARKER
