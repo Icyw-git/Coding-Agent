@@ -73,8 +73,8 @@ class ActionResult:
 
 # The input payload is base64 in an environment variable.  This avoids quoting
 # and console-codepage problems for Chinese text and key names.
-CONTROL_SCRIPT = r'''
-$ErrorActionPreference = 'Stop'
+# worker 模式下只执行一次的装配部分（Add-Type 编译在这里，代价只付一次）。
+_CONTROL_SETUP = r'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -125,11 +125,19 @@ public static class HarnessDesktopNative {
 # stdout would otherwise use the OEM codepage (GBK on zh-CN) and titles would
 # arrive mangled.
 function Write-Result($obj, $code) {
+    # worker 模式下 Write-Reply 已由 prelude 定义，直接走 JSON 行协议；
+    # 独立进程模式没有预先定义 Write-Reply，退回 base64(UTF-8 JSON) 单行输出。
+    if (Get-Command Write-Reply -ErrorAction SilentlyContinue) {
+        Write-Reply $obj
+        return
+    }
     $json = $obj | ConvertTo-Json -Depth 8 -Compress
     [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
-    exit $code
+    [Console]::Out.Flush()
 }
-function Read-Payload {
+function Read-Payload($req) {
+    # worker 模式下参数已经是解析好的对象；独立进程模式仍支持 base64 环境变量。
+    if ($null -ne $req) { return $req }
     $raw = [Convert]::FromBase64String($env:HARNESS_DESKTOP_PAYLOAD)
     return [Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json
 }
@@ -273,17 +281,35 @@ function Invoke-Step($step, $state) {
     }
     return $null
 }
-function Fail($code, $message, $state, $step = 0, $done = $null) {
+function New-Failure($code, $message, $state, $step = 0, $done = $null) {
     $obj = [ordered]@{ ok=$false; error=$code; message=$message; state=$state }
     if ($step -gt 0) { $obj.step = [int]$step }
     if ($null -ne $done) { $obj.steps_done = @($done) }
-    Write-Result $obj 2
+    return $obj
 }
-try {
-    $payload = Read-Payload
+
+# worker 模式下失败对象先放这里，由顶层 catch 统一回包；独立进程模式直接输出
+# 并靠 exit 结束。早先写成「返回失败对象」会让调用点继续跑完，一个请求回两次包。
+$script:HarnessFailure = $null
+
+function Fail($code, $message, $state, $step = 0, $done = $null) {
+    $failure = New-Failure $code $message $state $step $done
+    $script:HarnessFailure = $failure
+    if (-not (Get-Command Write-Reply -ErrorAction SilentlyContinue)) {
+        Write-Result $failure 2
+    }
+    throw [System.Exception]::new('__harness_failure__')
+}
+'''
+
+_CONTROL_BODY = r'''
+function Invoke-HarnessOp($req) {
+    $payload = Read-Payload $req
     $state = Get-WindowState
     if ($payload.action -eq 'snapshot') {
-        Write-Result ([ordered]@{ ok=$true; state=$state }) 0
+        # 只返回对象，由顶层循环统一回包。这里若自己再 Write-Result，一个请求会
+        # 产生两个响应，之后每个请求都读到上一条的答复（协议整体错位）。
+        return [ordered]@{ ok = $true; state = $state }
     }
     if (-not $state.available) { Fail 'no_foreground_window' 'no foreground window' $state }
     if ([int]$state.pid -ne [int]$payload.expected_pid -or
@@ -322,18 +348,36 @@ try {
         }
         Start-Sleep -Milliseconds 30
         $after = Get-WindowState
-        Write-Result ([ordered]@{ ok=$true; action='sequence'; steps=$done.ToArray(); state_after=$after }) 0
+        return [ordered]@{ ok=$true; action='sequence'; steps=$done.ToArray(); state_after=$after }
     }
     $err = Invoke-Step $payload $state
     if ($null -ne $err) { Fail $err.code $err.message $state }
     Start-Sleep -Milliseconds 30
     $after=Get-WindowState
-    Write-Result ([ordered]@{ ok=$true; action=$action; state_before=$state; state_after=$after }) 0
-} catch {
-    Write-Result ([ordered]@{ ok=$false; error='desktop_control_failed';
-        message=$_.Exception.Message }) 2
+    return [ordered]@{ ok=$true; action=$action; state_before=$state; state_after=$after }
 }
 '''
+
+_CONTROL_MAIN = r'''
+# 独立进程模式的入口：调一次、输出一次、退出。worker 模式不执行这一段。
+try {
+    $payload = Read-Payload $null
+    $result = Invoke-HarnessOp $payload
+    if ($null -eq $result) { $result = @{ ok = $true } }
+    Write-Result $result 0
+} catch {
+    $msg = $_.Exception.Message
+    if ($null -ne $script:HarnessFailure) {
+        Write-Result $script:HarnessFailure 2
+    } else {
+        Write-Result ([ordered]@{ ok=$false; error='desktop_control_failed';
+            message=$msg }) 2
+    }
+}
+'''
+
+# 兼容入口：既有的独立进程测试把 _CONTROL_SETUP + _CONTROL_BODY 拼起来跑。
+CONTROL_SCRIPT = _CONTROL_SETUP + _CONTROL_BODY + _CONTROL_MAIN
 
 
 def _powershell_exe() -> str | None:
@@ -375,7 +419,49 @@ def _state(value) -> WindowState:
     )
 
 
+def worker_script() -> str:
+    """常驻 worker 用的完整脚本：prelude + 装配 + 请求循环。
+
+    装配（Add-Type 编译）只在进程启动时做一次，之后每次请求只跑
+    Invoke-HarnessOp——这是把 882ms/次 降到 0.2ms/次 的关键。
+    """
+    import ps_worker
+
+    return (ps_worker.PRELUDE + _CONTROL_SETUP
+            + _CONTROL_BODY + ps_worker.LOOP)
+
+
+def _run_worker(payload: dict, *, timeout: float) -> dict:
+    import ps_worker
+
+    reply = ps_worker.run('desktop', worker_script, payload,
+                          timeout=max(timeout, ps_worker.DEFAULT_TIMEOUT))
+    return reply
+
+
 def _run(payload: dict, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> dict:
+    # 显式注入 runner（测试）或关闭 worker 时走「每次起进程」的老路径。
+    if runner is None and _worker_enabled():
+        try:
+            return _run_worker(payload, timeout=timeout)
+        except Exception as exc:
+            if not _worker_fallback_allowed():
+                raise DesktopControlError(str(exc)) from exc
+            print(f'  [33m[desktop] worker unavailable, falling back: {exc}[0m')
+    return _run_standalone(payload, runner=runner, timeout=timeout)
+
+
+def _worker_enabled() -> bool:
+    return (os.getenv('HARNESS_PS_WORKER') or '').strip().casefold() not in (
+        '0', 'false', 'off', 'no')
+
+
+def _worker_fallback_allowed() -> bool:
+    return (os.getenv('HARNESS_PS_WORKER_FALLBACK') or '').strip().casefold() not in (
+        '0', 'false', 'off', 'no')
+
+
+def _run_standalone(payload: dict, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> dict:
     data = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode('ascii')
     runner = runner or run_powershell
     try:

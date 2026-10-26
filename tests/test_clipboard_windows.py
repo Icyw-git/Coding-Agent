@@ -87,6 +87,8 @@ def test_read_timeout_is_a_clipboard_error():
 
 
 def test_missing_powershell_is_reported(monkeypatch):
+    # 关掉常驻 worker，验证独立进程路径的失败文案（worker 有自己的报错）。
+    monkeypatch.setenv('HARNESS_PS_WORKER', '0')
     monkeypatch.setattr(clipboard_windows, '_powershell_exe', lambda: None)
     with pytest.raises(clipboard_windows.ClipboardError, match='Windows PowerShell'):
         clipboard_windows.read()
