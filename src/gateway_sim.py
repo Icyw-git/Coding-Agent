@@ -481,6 +481,17 @@ class GatewayClient:
         return self._json(self.http.post('/v1/net-grants/remove', json=payload),
                           'remove domain')['removed']
 
+    # ---------- 审计 ----------
+
+    def list_audit(self, *, limit: int = 50, types=None,
+                   since: str | None = None) -> dict:
+        params: dict = {'limit': limit}
+        if types:
+            params['types'] = ','.join(types) if not isinstance(types, str) else types
+        if since:
+            params['since'] = since
+        return self._json(self.http.get('/v1/audit', params=params), 'list audit')
+
     # ---------- 执行档位 ----------
 
     def get_policy(self) -> dict:

@@ -62,6 +62,7 @@ import tool_cache
 import turn_screenshots
 from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, approval_class, clipboard_tools_enabled, screen_tools_enabled
 from feishu_approval_card import approval_card, approval_text
+from feishu_audit_card import audit_card, audit_text
 from feishu_cron_card import cron_card, cron_delete_card, cron_text
 from feishu_domain_card import domain_card, domain_text
 from feishu_grant_card import grant_card, grant_text
@@ -705,6 +706,7 @@ class FeishuGateway:
         # chat_id → (token, created_at)：目录授权卡片按钮同理
         self._grant_views: dict[str, tuple[str, float]] = {}
         self._domain_views: dict[str, tuple[str, float]] = {}
+        self._audit_views: dict[str, tuple[str, float]] = {}
         self._session_confirmation: dict[str, tuple] = {}
         # WS 事件解耦：长 turn 的 send 会阻塞回调线程数分钟，必须丢进队列由
         # worker 池消费；同一聊天的消息用锁保序，不同聊天并行。
@@ -1996,6 +1998,83 @@ class FeishuGateway:
                              f"{record.get('host')}（{expiry}）\n{effect}")
         self._show_domains(chat_id)
 
+    # ---------- 审计 ----------
+
+    def _audit_view_ok(self, chat_id: str, value: dict) -> bool:
+        view = self._audit_views.get(chat_id)
+        return bool(view and value.get('audit_view') == view[0]
+                    and time.monotonic() - view[1] <= 600)
+
+    def _show_audit(self, chat_id: str, *, page: int = 0, intro: str = '',
+                    message_id: str | None = None,
+                    types: list[str] | None = None) -> None:
+        """审计卡片：跨会话列最近的安全相关事件。"""
+        try:
+            payload = self.api.list_audit(limit=100, types=types)
+        except Exception as exc:
+            self._reply(chat_id, f'[audit] {exc}')
+            return
+        rows = payload.get('events') or []
+        token = secrets.token_hex(4)
+        self._audit_views[chat_id] = (token, time.monotonic())
+        card = audit_card(rows, token=token, intro=intro, page=page,
+                          counts=payload.get('counts'))
+        patcher = getattr(self.transport, 'update_step_card', None)
+        if message_id and patcher is not None:
+            try:
+                patcher(message_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] audit card patch failed, sending new: {exc}')
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, card)
+                return
+            except Exception as exc:
+                print(f'[feishu] audit card failed, fallback to text: {exc}')
+        self._reply(chat_id, (intro + chr(10) if intro else '')
+                    + audit_text(rows))
+
+    def _handle_audit_action(self, chat_id: str, value: dict,
+                             sender_id: str | None = None,
+                             message_id: str | None = None) -> None:
+        action = str(value.get('audit_action') or '')
+        if not self._audit_view_ok(chat_id, value):
+            self._reply(chat_id, '这张审计卡片已过期，请重新发送 /audit 打开。')
+            return
+        if action != 'page':
+            self._reply(chat_id, '未知的审计操作，请重新发送 /audit。')
+            return
+        target = value.get('page')
+        if type(target) is not int or target < 0:
+            self._reply(chat_id, '无效的页码，请重新打开 /audit。')
+            return
+        self._show_audit(chat_id, page=target, message_id=message_id)
+
+    def _handle_audit_command(self, chat_id: str, argument: str) -> None:
+        """/audit [类型过滤]：查看最近的安全相关事件。"""
+        import audit
+
+        usage = ('用法:' + chr(10)
+                 + '/audit                 最近 100 条（卡片翻页）' + chr(10)
+                 + '/audit <类型>         只看某类，例如 screen_captured' + chr(10)
+                 + '/audit all             完整类型列表')
+        argument = (argument or '').strip()
+        if not argument:
+            self._show_audit(chat_id)
+            return
+        if argument.casefold() == 'all':
+            names = sorted(audit.AUDIT_EVENTS)
+            self._reply(chat_id,
+                        '可过滤的审计类型:' + chr(10) + chr(10).join(names))
+            return
+        if argument not in audit.AUDIT_EVENTS:
+            self._reply(chat_id, usage)
+            return
+        self._show_audit(chat_id, types=[argument],
+                         intro=f'只看 {argument}')
+
     def _send_help(self, chat_id: str) -> None:
         """帮助卡：常用入口按钮 + 折叠命令清单；无 2.0 卡片能力时回退纯文本。"""
         sender = getattr(self.transport, 'send_step_card', None)
@@ -2412,6 +2491,8 @@ class FeishuGateway:
                 self._handle_grant_command(chat_id, argument, sender_id)
             elif command in ('/domains', '/domain'):
                 self._handle_domain_command(chat_id, argument, sender_id)
+            elif command == '/audit':
+                self._handle_audit_command(chat_id, argument)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
@@ -2654,6 +2735,15 @@ class FeishuGateway:
         if (value or {}).get('domain_action'):
             if not self._domain_view_ok(chat_id, value):
                 return '域名卡片已过期，请重新打开', False
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return '正在处理…', True
+        if (value or {}).get('audit_action'):
+            if not self._audit_view_ok(chat_id, value):
+                return '审计卡片已过期，请重新打开', False
             try:
                 self._events.put_nowait((chat_id, value, open_id, None,
                                          message_id))
@@ -3119,6 +3209,9 @@ class FeishuGateway:
                                 elif text.get('domain_action'):
                                     self._handle_domain_action(chat_id, text, sender_id,
                                                                message_id)
+                                elif text.get('audit_action'):
+                                    self._handle_audit_action(chat_id, text, sender_id,
+                                                              message_id)
                                 elif text.get('task_action'):
                                     self._handle_task_action(chat_id, text, sender_id,
                                                              message_id)
