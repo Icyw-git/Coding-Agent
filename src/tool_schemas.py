@@ -315,7 +315,17 @@ TOOL_SCHEMAS = [{'type': 'function',
                                              'durable': {'type': 'boolean',
                                                          'description': 'Whether the job survives '
                                                                         'restarts (default '
-                                                                        'true)'}},
+                                                                        'true)'},
+                                             'idle_after_minutes': {
+                                                 'type': 'integer',
+                                                 'minimum': 0,
+                                                 'maximum': 1440,
+                                                 'description': 'Only run once the machine has '
+                                                                'been idle for this many minutes '
+                                                                '(0 = run at the scheduled time). '
+                                                                'If the trigger time is busy, it '
+                                                                'waits up to 12 hours, then skips '
+                                                                'that occurrence.'}},
                               'required': ['cron', 'prompt']}}},
  {'type': 'function',
   'function': {'name': 'list_crons',

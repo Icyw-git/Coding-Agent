@@ -31,8 +31,8 @@
 | A4 | 鼠标键盘控制 | 无 | 缺能力（高风险，最后做） |
 | A5 | 窗口/进程管理 | 只能 `bash` 间接 tasklist/taskkill | 缺封装 |
 | B1 | 开机自启 / 守护 | 无，重启后要手动拉 API + 网关 | 缺能力（决定“常驻”是否成立） |
-| B2 | 本地通知 | 能力层 `src/notify.py` + 网关失败降级（2026-10-26） | 主动按空闲触发任务尚未做 |
-| B3 | 空闲/锁屏感知 | 已支持：`src/idle.py` + `GET /v1/system/state`（2026-10-26） | 缺主动性任务接线 |
+| B2 | 本地通知 | 能力层 `src/notify.py` + 网关失败降级（2026-10-26） | 已补齐（含空闲门控定时任务） |
+| B3 | 空闲/锁屏感知 | 已支持：`src/idle.py` + `GET /v1/system/state` + 定时任务空闲门控（2026-10-26） | 已补齐（P2d 接线） |
 | C1 | 凭据存储 | `.env` 明文 | 缺安全边界 |
 | C2 | 浏览器登录态 | `web_fetch` 无 cookie | 缺能力 |
 | D1 | 目录级持久授权 | 只能改 `HARNESS_WORKSPACE_ROOTS` 重启 | 缺策略能力 |
@@ -205,7 +205,7 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 **风险与缓解**：截图含敏感信息 → 只存 `.cache/screenshots`、7 天清理、逐次审批、后台拒绝、
 `/status` 可见；多屏 DPI 错位 → 返回里记录每屏 rect 与虚拟桌面范围。
 
-### P2：常驻（自启 + 本地通知 + 空闲感知）— 进行中
+### P2：常驻（自启 + 本地通知 + 空闲感知）— 已完成（2026-10-26）
 
 **P2a 本地通知与空闲感知（2026-10-26，已完成）**
 
@@ -220,7 +220,7 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 - 测试：`tests/test_notify.py`（11）、`tests/test_idle.py`（12）、
   `tests/test_system_state_api.py`（3）。真机验证：空闲 `idle_seconds=33, locked=false`；
   实际 Toast 返回 `sent=True` 并出现在通知中心。
-- 后续批次：网关发送失败降级已由 P2c 完成；主动性任务按空闲触发仍未做。
+- 后续批次：网关发送失败降级由 P2c 完成；主动性任务按空闲触发由 P2d 完成。
 
 **P2b 自启与守护（2026-10-26，已完成）**
 
@@ -253,6 +253,26 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
   同键去重、不同键各一次、环境开关、无 notifier、notifier 自身抛错隔离、正文截断。
 - 未做：本地通知点击后跳回飞书（仅系统 Toast）；网关断线期间没有 UI 常驻状态指示。
 
+**P2d 定时任务空闲门控（2026-10-26，已完成）**
+
+- `CronJob` 新增 `idle_after_s`（0 表示不门控）与 `deferred_since`（持久化到
+  `.cache/crons.json`）。`tick()` 到点时先看门控：机器不空闲就记 `deferred_since`
+  并延后；等机器空闲（锁屏视为空闲）后**补跑一次**，即使 cron 分钟已过去。
+  等待超过 12 小时丢弃这次 occurrence（一次性任务直接移除），避免隔夜任务第二天
+  突然执行。
+- 探测成本：空闲快照 30 秒缓存，且只有“门控任务已到期或处于延后状态”时才探测；
+  普通任务不触碰 `idle.py`。探测异常一律按“不空闲”处理，调度线程不受影响。
+- 语义保持：未门控任务行为不变；`last_fired` 仍防同分钟重复触发；延后任务补跑后
+  清空 `deferred_since`，不会重复补。
+- 暴露面：API `idle_after_minutes`（0–1440，创建/更新可设）；模型工具
+  `schedule_cron(idle_after_minutes=...)`、`list_crons` 显示 `[空闲 ≥N 分钟]`；
+  gateway 客户端创建/更新透传；飞书任务卡片显示 `空闲≥N分`。
+- 测试：`tests/test_cron_idle.py`（22），覆盖即时执行、忙碌延后、跨分钟补跑、
+  一次性任务移除、锁屏视为空闲、探测不可用、12 小时丢弃、非门控不探测、
+  缓存与显式探测、参数校验、更新清除延后、API/gateway/工具/卡片契约。
+- 未做：门控只在派发前判断，入队后用户立刻回来仍可能执行（毫秒级窗口，可接受）；
+  没有“只在接通电源时执行”“只在特定时间段执行”等更细条件。
+
 **目标**：重启机器后无需人工，agent 起来并能在飞书断线时用系统通知兜底。
 
 **能力**
@@ -263,11 +283,13 @@ Windows 侧可参考：Copilot Actions 用**独立 Windows 会话 + 独立 agent
 | 守护 | 进程内 watchdog：`api` 起不来/端口占用 → 通知；可选 `--restart-on-crash`（父进程守护子进程） | 已完成“起不来要吼一声”（P2b）；不做自愈重启 |
 | 本地通知 | `src/notify.py`：Windows toast（WinRT），`notify(title, body, url?)`；飞书发送失败时降级 | 能力层（P2a）+ 网关降级（P2c）均已完成；`FEISHU_LOCAL_ALERTS=0` 可关 |
 | 空闲/锁屏 | `src/idle.py`：`GetLastInputInfo` 读空闲秒数 + 锁屏判断；暴露 `/v1/system/state` | 已完成（P2a）；锁屏用输入桌面句柄启发式，未订阅 `SessionSwitch` 事件 |
+| 空闲触发 | 定时任务带 `idle_after_s`：到点不空闲则延后，空闲/锁屏后补跑一次，超过 12 小时丢弃 | 已完成（P2d）；30 秒探测缓存，只在门控任务到期时探测 |
 
 **权限**：`notify` 属“输出”，无需审批但限频（每 10 秒最多 1 条）；自启安装属**安装期操作**，
 必须命令行显式执行，不给模型工具入口。
 
-**测试**：计划任务命令构造（不真装）；notify 限频与降级；idle 解析；`/v1/system/state` 契约。
+**测试**：计划任务命令构造（不真装）；notify 限频与降级；idle 解析；`/v1/system/state` 契约；
+空闲门控的延后/补跑/过期与探测缓存（`tests/test_cron_idle.py`）。
 
 **验收**：重启机器 → 飞书自动收到“服务已就绪”；关掉飞书网关 → 失败通知出现在 Windows 通知中心。
 

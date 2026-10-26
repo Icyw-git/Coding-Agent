@@ -22,7 +22,7 @@ ORDER = [
     'remove_worktree', 'keep_worktree', 'screen_capture', 'screen_ocr',
 ]
 
-SCHEMA_SHA1 = '1fb660f82b16d779fdd357a097a8481a8e42b319'
+SCHEMA_SHA1 = 'dea2cca8a68c935161e2045bbff136b956c4aca1'
 
 
 def test_tool_order_is_stable():

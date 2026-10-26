@@ -34,11 +34,14 @@ if BaseModel is not None:
         allow_side_effects: bool = False
         # 结果推送到哪个聊天（飞书 chat_id）；空 = 只写会话日志，不推送。
         deliver_to: str | None = Field(default=None, max_length=200)
+        # 空闲门控：>0 时到点不空闲就延后，等机器空闲这么多分钟后补跑一次。
+        idle_after_minutes: int | None = Field(default=None, ge=0, le=1440)
 
     class UpdateCronRequest(BaseModel):
         # None = 不改。授权只由人显式给出（按钮/命令/API），模型工具不暴露。
         allow_side_effects: bool | None = None
         deliver_to: str | None = Field(default=None, max_length=200)
+        idle_after_minutes: int | None = Field(default=None, ge=0, le=1440)
 
     class SteerRequest(BaseModel):
         content: str = Field(min_length=1)

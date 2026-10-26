@@ -4909,4 +4909,37 @@ API/网关孤儿，后续可用 Job Object 的 `KILL_ON_JOB_CLOSE` 补上）。
 未做：Toast 点击后跳回飞书（目前只是系统通知）；网关自身掉线时没有常驻状态指示
 （靠 API 监督进程的退出通知）。
 
+## P2d 落地：定时任务的空闲门控
+
+目标是让“主动性任务”等到人离开电脑再跑（整理记录、扫描文件、生成日报），
+而不是到点就在用户正打字时抢回合。
+
+- **数据模型**：`CronJob` 新增 `idle_after_s`（0 表示不门控）与
+  `deferred_since`。两者都随 durable job 写入 `.cache/crons.json`，重启后
+  仍知道“这次 occurrence 已经延后过”。
+- **tick 语义**：到期且门控时先取空闲快照；`idle_ready()` 在
+  `idle_seconds >= idle_after_s` 或锁屏时放行，探测不可用按“不空闲”处理。
+  不满足就记 `deferred_since` 并跳过，等空闲后**补跑一次**（即使 cron 分钟已过）。
+  延后超过 12 小时丢弃这次 occurrence，一次性任务直接移除，避免隔夜任务第二天
+  突然执行。
+- **探测成本**：`_has_due_idle_job()` 先在锁外判断“是否有门控任务到期或已延后”，
+  没有就完全不探测；快照 30 秒缓存（测试可显式传 probe 绕过）。这样每秒一次的
+  `tick()` 不会把 PowerShell 空闲探测打成热点。
+- **锁粒度**：探测在拿 `cron_lock` 之前完成，避免持锁跑外部命令阻塞
+  `schedule_job` / `cancel_job` / API 线程。
+- **兼容性**：未门控任务走原分支，行为不变；`last_fired` 仍防同分钟重复；
+  补跑后清空 `deferred_since`，不会重复补。延后/丢弃也只在涉及 durable job 时落盘。
+- **暴露面**：API `idle_after_minutes`（0–1440，创建/更新可设，更新时清空延后）；
+  模型工具 `schedule_cron(idle_after_minutes=...)` 与 `list_crons` 的
+  `[空闲 ≥N 分钟]`；`GatewayClient.create_cron/update_cron` 透传；飞书任务卡片显示
+  `空闲≥N分`；`_as_dict` 返回 `idle_after_s` 与 `deferred_since` 便于排障。
+- **测试**：新增 `tests/test_cron_idle.py`（22），覆盖立即执行、忙碌延后、
+  跨分钟补跑、一次性任务移除、锁屏视为空闲、探测异常/显式不可用、12 小时丢弃、
+  非门控不探测、缓存与显式 probe、参数校验、更新清除延后，以及 API/gateway/
+  工具/卡片/schema 契约。定向 cron/gateway/API 回归 137 + 75 通过；
+  全量 **1845 passed / 2 skipped**，ruff 通过。
+
+未做：门控只在派发前判断，入队后用户立刻回来仍可能执行（毫秒级窗口，可接受）；
+没有“仅接通电源时执行”“仅工作日执行”等更细条件。
+
 

@@ -50,14 +50,24 @@ def _push_label(job: dict, chat_id: str) -> str:
     return f'推送→{target[:8]}'
 
 
+def _idle_label(job: dict) -> str:
+    seconds = int(job.get('idle_after_s') or 0)
+    if seconds <= 0:
+        return ''
+    return f'空闲≥{max(1, seconds // 60)}分'
+
+
 def _job_lines(job: dict, chat_id: str) -> list[str]:
     kind = 'recurring' if job.get('recurring') else '一次性'
     mode = '可写（副作用仍审批）' if job.get('allow_side_effects') else '只读'
+    idle = _idle_label(job)
+    gate = f' · {idle}' if idle else ''
     prompt = ' '.join(str(job.get('prompt') or '').split())
     if len(prompt) > 80:
         prompt = prompt[:80] + '…'
     return [f"{job.get('id', '')}",
-            f"{job.get('cron', '')} · {kind} · {mode} · {_push_label(job, chat_id)}",
+            f"{job.get('cron', '')} · {kind} · {mode}{gate} · "
+            f"{_push_label(job, chat_id)}",
             prompt]
 
 
@@ -140,7 +150,9 @@ def cron_text(jobs: list[dict], *, chat_id: str = '') -> str:
     for job in jobs:
         kind = 'recurring' if job.get('recurring') else '一次性'
         mode = '可写' if job.get('allow_side_effects') else '只读'
+        idle = _idle_label(job)
+        gate = f' · {idle}' if idle else ''
         prompt = ' '.join(str(job.get('prompt') or '').split())[:40]
         lines.append(f"  {job.get('id')}: '{job.get('cron')}' → {prompt} "
-                     f"[{kind} · {mode} · {_push_label(job, chat_id)}]")
+                     f"[{kind} · {mode}{gate} · {_push_label(job, chat_id)}]")
     return chr(10).join(lines)

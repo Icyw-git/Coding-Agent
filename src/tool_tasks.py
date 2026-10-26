@@ -51,17 +51,23 @@ def run_complete_task(task_id: str) -> str:
 
 
 def run_schedule_cron(cron: str, prompt: str,
-                      recurring: bool = True, durable: bool = True) -> str:
+                      recurring: bool = True, durable: bool = True,
+                      idle_after_minutes: int = 0) -> str:
     # 模型不能给自己授权副作用：schedule_job 的默认值就是只读；需要写操作
     # 由用户在 /cron add --writes 里显式开启。来源聊天只在飞书回合里有值：
     # 任务结束后结果推回同一处，而不是留在一个没人看的后台会话里。
     deliver_to = hooks.current_origin_chat()
+    try:
+        idle_after_s = max(0, int(idle_after_minutes or 0)) * 60
+    except (TypeError, ValueError):
+        return 'Error: idle_after_minutes must be a whole number'
     result = schedule_job(cron, prompt, recurring, durable,
-                          deliver_to=deliver_to)
+                          deliver_to=deliver_to, idle_after_s=idle_after_s)
     if isinstance(result, str):
         return f"Error: {result}"
     push = ' → 结果推送到当前聊天' if deliver_to else ''
-    return f"Scheduled {result.id}: '{cron}' → {prompt} (read-only){push}"
+    idle = (f'（空闲 ≥{idle_after_s // 60} 分钟才执行）' if idle_after_s else '')
+    return f"Scheduled {result.id}: '{cron}' → {prompt} (read-only){idle}{push}"
 
 
 def run_list_crons() -> str:
@@ -75,8 +81,10 @@ def run_list_crons() -> str:
         dur = "durable" if j.durable else "session"
         mode = "" if getattr(j, 'allow_side_effects', False) else " (read-only)"
         push = ' → 推送' if getattr(j, 'deliver_to', '') else ''
+        idle = (' [空闲 ≥%d 分钟]' % (int(j.idle_after_s) // 60)
+                if int(getattr(j, 'idle_after_s', 0) or 0) else '')
         lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
-                     f"[{tag}, {dur}]{mode}{push}")
+                     f"[{tag}, {dur}]{mode}{idle}{push}")
     return "\n".join(lines)
 
 

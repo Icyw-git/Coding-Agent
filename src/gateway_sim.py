@@ -122,7 +122,8 @@ class GatewayClient:
                     recurring: bool = True, durable: bool = True,
                     job_id: str | None = None,
                     allow_side_effects: bool = False,
-                    deliver_to: str = '') -> dict:
+                    deliver_to: str = '',
+                    idle_after_minutes: int = 0) -> dict:
         payload = {'cron': cron, 'prompt': prompt,
                    'recurring': recurring, 'durable': durable,
                    'allow_side_effects': allow_side_effects}
@@ -130,15 +131,20 @@ class GatewayClient:
             payload['id'] = job_id
         if deliver_to:
             payload['deliver_to'] = deliver_to
+        if idle_after_minutes:
+            payload['idle_after_minutes'] = idle_after_minutes
         return self._json(self.http.post('/v1/crons', json=payload), 'create cron')
 
     def update_cron(self, job_id: str, *, allow_side_effects: bool | None = None,
-                    deliver_to: str | None = None) -> dict:
+                    deliver_to: str | None = None,
+                    idle_after_minutes: int | None = None) -> dict:
         payload = {}
         if allow_side_effects is not None:
             payload['allow_side_effects'] = allow_side_effects
         if deliver_to is not None:
             payload['deliver_to'] = deliver_to
+        if idle_after_minutes is not None:
+            payload['idle_after_minutes'] = idle_after_minutes
         return self._json(self.http.patch(f'/v1/crons/{job_id}', json=payload),
                           'update cron')
 
