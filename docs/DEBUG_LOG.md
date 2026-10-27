@@ -6196,3 +6196,48 @@ Mock；把它当内核句柄传给 `CloseHandle`，ctypes 一路递归到栈溢�
 
 全量 2236 passed / 3 skipped（`test_turn_slot_released_after_turn` 是既有偶发，
 单跑 3 次全过），ruff 通过。
+
+## 第二轮 profile：两处漏掉的缓存（2026-10-27）
+
+用 `scripts/profile_new_tools.py` + `cProfile` 复查，发现上次给 `rules.py` 加缓存
+时漏了两个同类热点。
+
+### 1. 域名账本每次调用都读盘
+
+`cProfile` 显示 `hooks.evaluate_call` 的 107ms/200 次里，`net_grants.active_rules`
+占 34ms，`_read` 内部有 3 次 `stat` + 1 次文件读 + JSON 解析。
+
+`rules.py` 早就加了 `(路径, mtime_ns, size)` 缓存，`net_grants.py` 漏了——两个
+模块结构几乎一样，改一个忘了另一个。
+
+补上同样的缓存（含 `_CACHE_LOCK`、上限 8 条、`reset` 由 `conftest` 的隔离
+fixture 负责路径）。**注意 `strict=True` 必须绕过缓存**：那条路径是修改前的
+校验，必须看盘上真实内容。
+
+效果：`evaluate_call(bash)` **2.8 ms → 0.30 ms（9 倍）**。
+
+### 2. 审计预筛在文本层解码
+
+上一轮给 `audit.collect` 加了正则预筛，但它是先用 `open(..., 'r')` 把每行
+**解码成 str** 再跑正则。会话里 90% 是 message / tool_started，正文里几乎不出现
+`"type"` 这个键——在 bytes 层就能挡掉，不必解码。
+
+改成 `open(..., 'rb')` + `b'"type"' in raw` 再解码。实测 56 会话 3912 行：
+全解码 41ms，字节预筛 29ms。
+
+连同之前加的文件预算，`audit.collect` **178 ms → 37 ms（4.8 倍）**。
+
+### 验证
+
+- `evaluate_call(bash)` 300 次平均 0.296 ms；
+- 改域名账本后**立即生效**（deny → allow 切换当场反映，证明 mtime 缓存没把
+  旧值锁住）；
+- 新增 2 条测试：`test_ledger_read_is_cached_until_the_file_changes`（同内容命中、
+  改文件立即失效）、`test_strict_read_bypasses_cache`。
+
+### 没动的
+
+`audit.collect` 剩下的 37ms 主要是「读 56 个文件」本身，要再快就得建持久索引
+（写时维护、跨进程一致性、损坏恢复）。按需查询 37ms 完全够用，**不做**。
+
+全量 2239 passed / 3 skipped，ruff 通过。

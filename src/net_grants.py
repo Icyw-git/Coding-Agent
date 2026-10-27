@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
@@ -84,9 +85,45 @@ def _clean_record(item) -> dict | None:
     }
 
 
+# 每次工具调用都会读一次域名账本。缓存键是 (路径, mtime_ns, size)：改了文件
+# 立刻失效，不会出现「改了规则不生效」。与 rules.load 同一手法。
+# 只缓存非 strict 读（strict 是修改前的校验，必须看最新盘上内容）。
+_CACHE: dict[tuple[str, int, int], list[dict]] = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_MAX = 8
+
+
+def _cache_key() -> tuple[str, int, int] | None:
+    try:
+        stat = Path(DURABLE_PATH).stat()
+    except OSError:
+        return None
+    return (str(DURABLE_PATH), stat.st_mtime_ns, stat.st_size)
+
+
 def _read(strict: bool = False) -> list[dict]:
     if not DURABLE_PATH.exists():
         return []
+    cached = None
+    if not strict:
+        key = _cache_key()
+        if key is not None:
+            with _CACHE_LOCK:
+                cached = _CACHE.get(key)
+            if cached is not None:
+                return [dict(record) for record in cached]
+    records = _read_uncached(strict)
+    if not strict:
+        key = _cache_key()
+        if key is not None:
+            with _CACHE_LOCK:
+                if len(_CACHE) >= _CACHE_MAX:
+                    _CACHE.clear()
+                _CACHE[key] = [dict(record) for record in records]
+    return records
+
+
+def _read_uncached(strict: bool = False) -> list[dict]:
     try:
         data = json.loads(_read_text(DURABLE_PATH))
     except Exception as exc:

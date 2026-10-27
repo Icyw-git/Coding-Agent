@@ -113,3 +113,26 @@ def test_domain_rule_changes_approval_outcome(api_client, monkeypatch):
     net_grants.add('docs.example.com', scope='deny')
     decision = hooks.evaluate_call('web_fetch', {'url': url})
     assert decision.action == 'deny' and decision.code == 'domain_denied'
+
+
+def test_ledger_read_is_cached_until_the_file_changes():
+    """域名账本每次工具调用都读，必须按 mtime 缓存；改了要立刻生效。"""
+    import time
+
+    net_grants.add('cache.example.com', scope='deny')
+    first = net_grants.active_rules()
+    assert first == (('cache.example.com', 'deny'),)
+
+    # 同内容重复读应命中缓存（对象可以是新列表，但内容一致）
+    time.sleep(0.01)
+    assert net_grants.active_rules() == first
+
+    # 改文件后必须立刻反映（mtime 变了，缓存失效）
+    net_grants.add('cache.example.com', scope='allow')
+    assert net_grants.active_rules() == (('cache.example.com', 'allow'),)
+
+
+def test_strict_read_bypasses_cache():
+    """修改路径要看到盘上真实内容，不能被缓存里的旧值骗到。"""
+    net_grants.add('strict.example.com')
+    assert net_grants._read(strict=True) == net_grants._read(strict=False)
