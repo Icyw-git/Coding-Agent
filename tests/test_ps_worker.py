@@ -69,6 +69,7 @@ def test_structured_failure_payload_is_preserved(worker):
     assert reply['detail'] == 'x'
 
 
+@pytest.mark.slow   # real PowerShell restart (~5s)
 def test_timeout_stops_the_worker(worker):
     with pytest.raises(ps_worker.WorkerError, match='timed out'):
         worker.call({'op': 'slow', 'ms': 2000}, timeout=0.2)

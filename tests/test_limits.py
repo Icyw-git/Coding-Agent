@@ -85,6 +85,7 @@ def test_small_allocation_passes_under_the_same_limit():
     assert b'ok' in out
 
 
+@pytest.mark.slow   # spawns real child processes
 def test_process_count_limit_blocks_fork_bomb():
     """进程数 5 时，起 20 个子进程必须中途失败。"""
     code = textwrap.dedent('''
@@ -110,6 +111,7 @@ def test_process_count_limit_blocks_fork_bomb():
     assert b'blocked at' in out, out
 
 
+@pytest.mark.slow   # real CPU burn to the limit
 def test_cpu_time_limit_terminates_busy_loop():
     """CPU 1s 限额下死循环必须被终止（不是靠墙钟超时）。"""
     proc = _spawn('x = 0\nwhile True:\n    x += 1')

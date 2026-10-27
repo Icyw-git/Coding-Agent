@@ -6602,3 +6602,37 @@ ping 超时把正在启动的 worker 杀了，报「exited during startup」—�
 这几轮反复出现「超时中断」，实际原因是**全量耗时从 5 分钟涨到 7.5 分钟**
 （用例数 1690 → 2302），而我的超时阈值没跟上。改用后台运行 + 落盘日志后
 一次跑通，无失败。后续跑全量建议 `nohup ... &` 或给足 900s 以上。
+
+## 测试分组：`-m "not slow"` 快速回归（2026-10-27）
+
+全量 2302 条要跑 3–7 分钟（取决于机器负载），每次改动都等这么久不现实。加
+`slow` marker，把「因为重导入或真实 OS 往返而必然慢」的用例标出来：
+
+| 用例 | 耗时 | 原因 |
+|---|---|---|
+| `test_lark_transport_sends_text` | 13–19s | `import lark_oapi` 本身 13.19s |
+| `test_timeout_stops_the_worker` | 5.5s | 真实 PowerShell 重启 |
+| `test_cpu_time_limit_terminates_busy_loop` | 4.8s | 真烧 CPU 到限额 |
+| `test_poll_does_not_rerender_when_nothing_changed` | 4.1s | 真实网关轮询 |
+| `test_process_count_limit_blocks_fork_bomb` | 2.2s | 真 spawn 子进程 |
+| `test_sendinput_struct_is_64bit_sized` | 2.0s | 真实 PowerShell 往返 |
+
+效果：
+
+- `pytest -m "not slow"` → **2295 passed，160s**（跳过 7 条）
+- `pytest` → **2302 passed，183–335s**（跑全部）
+
+### 一次失败的重构尝试（已回滚）
+
+想顺手把 `test_harness_app.py` 里 26 处 `for _ in range(80): pause; sleep(0.02)`
+换成按墙钟等待（固定轮数 = 固定 1.6s 预算，机器繁忙时偶发失败）。
+
+用正则批量替换，结果：6 处替换把循环体里的变量赋值丢了，直接 `NameError`；
+另有 2 处谓词太弱（原来等「行数非零」，实际要等「最后一条已渲染」）。
+改到自己都数不清改了几处，**整体回滚**。
+
+教训：**正则批量改测试文件的风险高于收益**。那几条偶发失败本来就少（4 轮里
+1–2 次），而一次改坏 6 条是确定性的损失。真要修应该手工逐条改，或者干脆
+接受偶发、靠重跑兜底。
+
+全量 2302 passed / 3 skipped，ruff 通过。

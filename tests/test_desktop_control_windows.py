@@ -252,6 +252,7 @@ def test_powershell_script_contract_covers_combos_buttons_and_wait():
     assert 'Start-Sleep -Milliseconds $ms' in desktop.CONTROL_SCRIPT
 
 
+@pytest.mark.slow   # real PowerShell round-trip
 def test_sendinput_struct_is_64bit_sized():
     """INPUT 必须是 40 字节（type 4 + 对齐 4 + union 32）。
 

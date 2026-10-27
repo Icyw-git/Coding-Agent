@@ -602,6 +602,7 @@ def test_main_allows_explicit_any_user_escape_hatch(monkeypatch, tmp_path):
                     'closed': True, 'notifier': feishu_gateway.notify.notify}
 
 
+@pytest.mark.slow   # heavy lark_oapi import (~13s)
 def test_lark_transport_sends_text(monkeypatch):
     """LarkTransport：成功发送不抛错；失败时带错误码抛 RuntimeError。"""
     import lark_oapi as lark

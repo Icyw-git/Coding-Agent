@@ -121,6 +121,7 @@ def _pending_two(gw, results):
     return threads
 
 
+@pytest.mark.slow   # real gateway poll
 def test_two_requests_share_one_card_and_patch_on_resolve(approval_gateway):
     gw, fake = approval_gateway
     patches = []
@@ -186,6 +187,7 @@ def test_bulk_button_from_another_chat_is_rejected(approval_gateway):
     assert len(permission_gate.pending()) == 2
 
 
+@pytest.mark.slow   # real gateway poll
 def test_poll_does_not_rerender_when_nothing_changed(approval_gateway):
     gw, fake = approval_gateway
     results = {}
