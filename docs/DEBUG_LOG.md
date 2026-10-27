@@ -7408,3 +7408,87 @@ tools.run_web_fetch(...) 期望 'Permission denied by user'
 ### 验证
 
 全量 **2539 passed / 3 skipped**（291s），ruff 通过。
+
+## 调研 + 实现：越用越懂人（D1/D2/D4）（2026-10-28）
+
+调研了 Codex/dots/Muse 加上 PAHF 论文与 RSI 领域综述，写成
+`docs/AGENT_LEARNING_AND_RSI.md`。核心区分：**「越用越懂人」是学习，
+「RSI」是改变系统**，两者常被混为一谈。
+
+### 最重要的发现：我们缺 post-action 反馈通道
+
+PAHF（arXiv 2602.16173）的结论：
+
+> The final and most critical step is Post-Action Feedback Integration. This
+> reactive loop is the essential mechanism for correcting miscalibrated beliefs
+> and adapting to non-stationarity, **which pre-action queries alone cannot solve**.
+
+论文的例子：Day 1 记「Kate 喜欢可乐」；Day 2 她困了、送可乐、她说「我困的时候
+更想喝茶」。**只有第三条能纠正记忆**——只记「喜欢可乐」会永久错。
+
+查我们的 `extract_memories`：只拼对话文本（`f'{role}: {content}'`），工具结果
+虽在 messages 里但**没有和"用户随后说了什么"配对**。三个缺口：
+
+- A 没有 post-action 通道（不看工具做了什么、用户反应如何）
+- B `correction` 没有覆盖语义（会和旧记忆并存，召回可能取到错的）
+- C 条件性偏好没有表达（「困了喝茶」只能写成一句话，靠关键词碰）
+
+### D1 新增 memory_feedback.py
+
+纯本地、零模型调用的信号提炼，产出提示拼进抽取提示词（不直接写记忆——避免两处
+都在判断"什么值得记"）。
+
+五类信号：`correction`（明确否定）、`refine`（补充条件）、`rewrite`（用户改了模型
+刚写的文件）、`failure`（工具报错）、`approval`（认可，低权重）。
+
+**两个必须记的坑**（都是写完自测才发现的）：
+
+1. **PAHF 的核心例子没识别出来**。第一版只匹配否定词，「我困的时候更想喝茶」
+   不含任何否定词 → 漏掉。加 `REFINE_PATTERNS`（的时候/的话/更想/还是用/下次…）
+   和独立的 `refine` 类型，专门处理"不是否定而是收窄"。
+
+2. **正反馈用前缀匹配造成误判**。「好主意」「可以吗」「好的话说回来…」全被判成
+   approval。改成**整句匹配**（去掉末尾标点/语气词后整体比对，或逗号分句全在名单
+   内）。前缀匹配在这里是错的：中文的「好」可以是评价、疑问、转折的开头。
+
+### D2 合并规则补两条
+
+- `correction` 永远赢：与旧的 `user` 记忆冲突时**删旧留新**，不能并存——一条错误
+  假设和它的修正在一起，召回可能取到错的那个。
+- 条件性偏好不算矛盾：「困了喝茶」和「喜欢可乐」可以共存，但**永远不许丢掉条件**。
+
+### D4 记忆来源（防黑箱）
+
+TIME 那篇调查批评 Muse 每小时建用户档案且不告知。我们的对策：写下时存
+`source_session` + `source_quote`（用户原话，同样过脱敏 + 单行 + 限长 200 字），
+`/memories why <名字>` 回答「为什么记这个」。查不到来源的旧记忆会明说
+「早期写入或自动抽取，没有留下原话」，而不是假装有。
+
+### 关于 RSI：明确只做第二层
+
+Phil Schmid 的三层定义：
+- **Iteration**：改代码跑测试，系统不变
+- **Self-improvement**：加工具/记技能，系统变了、尺子不变
+- **Recursive**：连尺子一起抬高，且仍改不动那个尺子
+
+> A rising score proves self-improvement. Recursion is a claim about whether the
+> next round faces a harder, still-honest bar.
+
+**公开系统没有做到第三层**，而且：
+
+> The moment the system owns the ruler, it will get very good at looking improved.
+> RSI without taste is a faster way to optimize the wrong thing.
+
+实测我们的位置：技能只读（有 scan/load，无 write 工具）、无 Python 扩展动态加载、
+`SKILLS_DIR` 在工作区内（技术上 agent 能写）、**评估器是 2575 条 pytest，agent
+改不到**——这恰好是 RSI 公认唯一能安全改进的前提。
+
+因此设计上只做第二层（S1 技能自建需审批、S2 自改进需验证、S3 审计+回滚、
+S4 不自动提交 git），明确不做第三层（agent 改策略/审批代码、改 tests、自动加载
+可执行插件、自己抬高标准）。**S 系列整体后置**：自改进的价值取决于"能判断改得
+对不对"，而我们现在只有一个粗糙的评估器，先积累"什么记忆真的有帮助"的数据。
+
+### 验证
+
+新增 `test_memory_feedback.py` (36)。全量 **2575 passed / 3 skipped**（167s），
+ruff 通过。

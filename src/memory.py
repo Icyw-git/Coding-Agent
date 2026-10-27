@@ -20,6 +20,7 @@ import yaml
 
 import llm_route
 import memory_aging
+import memory_feedback
 import memory_redact
 import memory_scope
 from file_lock import FileLockTimeout, exclusive_file_lock
@@ -124,23 +125,34 @@ def _atomic_write(path, text: str) -> None:
         raise
 
 
-def _render_memory(name: str, mem_type: str, description: str, body: str) -> str:
+def _render_memory(name: str, mem_type: str, description: str, body: str,
+                   *, source: str = '', quote: str = '') -> str:
     """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。
 
     写盘前对 description/body 做凭据脱敏：记忆是长期状态，一条 .env 内容被
     记下来之后每次会话都会被召回，泄露面比会话本身大得多（会话能删，记忆
     会一直跟着）。
+
+    ``source`` / ``quote`` 记「这条记忆从哪来」：用户原话片段 + 会话 id。
+    没有它就只能猜——TIME 那篇调查批评的正是不可观察的长期档案。
     """
     def one_line(value) -> str:
         return ' '.join(str(value or '').split())
 
     safe_desc, desc_hits = memory_redact.redact(str(description or ''))
     safe_body, body_hits = memory_redact.redact(str(body or ''))
-    hits = sorted(set(desc_hits) | set(body_hits))
+    safe_quote, quote_hits = memory_redact.redact(str(quote or ''))
+    hits = sorted(set(desc_hits) | set(body_hits) | set(quote_hits))
     if hits:
         _record_redaction(hits)
-    return (f"---\nname: {one_line(name)}\ndescription: {one_line(safe_desc)}\n"
-            f"type: {one_line(mem_type)}\n---\n\n{safe_body}\n")
+    lines = [f"---\nname: {one_line(name)}\ndescription: {one_line(safe_desc)}",
+             f"type: {one_line(mem_type)}"]
+    if source:
+        lines.append(f"source_session: {one_line(source)}")
+    if safe_quote:
+        # 单行 + 限长：原话只作证据，不是正文。
+        lines.append(f"source_quote: {one_line(safe_quote)[:200]}")
+    return '\n'.join(lines) + f"\n---\n\n{safe_body}\n"
 
 
 def _audit(event: str, payload: dict) -> None:
@@ -165,19 +177,24 @@ def _record_redaction(kinds: list[str]) -> None:
     })
 
 
-def write_memory_file(name: str, mem_type: str, description: str, body: str):  # 保存记忆文件
+def write_memory_file(name: str, mem_type: str, description: str, body: str,  # 保存记忆文件
+                      *, source: str = '', quote: str = ''):
     with _write_guard():
-        written = _write_memory_file_unlocked(name, mem_type, description, body)
+        written = _write_memory_file_unlocked(name, mem_type, description, body,
+                                              source=source, quote=quote)
     _audit('memory_written', {'name': str(name), 'type': str(mem_type),
                               'chars': len(str(body or ''))})
     return written
 
 
-def _write_memory_file_unlocked(name: str, mem_type: str, description: str, body: str):
+def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
+                               body: str, *, source: str = '',
+                               quote: str = ''):
     h = _h()
     h.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     filepath = h.MEMORY_DIR / f'{_slug(name)}.md'
-    _atomic_write(filepath, _render_memory(name, mem_type, description, body))
+    _atomic_write(filepath, _render_memory(name, mem_type, description, body,
+                                           source=source, quote=quote))
     _cache_drop(filepath)
     _rebuild_index_unlocked()  # 重建记忆索引
     return filepath
@@ -447,6 +464,17 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
         print("[Memory: extract skipped - no text content in recent messages]")
         return
 
+    # post-action 反馈：从「模型做了什么 → 用户怎么反应」里学。
+    # PAHF 的结论是这一步才是纠错的核心（pre-action 询问无法解决偏好漂移）。
+    # 只产出提示文本，不直接写记忆——避免两处都在判断“什么值得记”。
+    try:
+        feedback_block = memory_feedback.as_prompt_block(
+            memory_feedback.collect(messages))
+    except Exception as exc:
+        print(f'  \033[33m[memory] feedback signals skipped: '
+              f'{type(exc).__name__}: {exc}\033[0m')
+        feedback_block = ''
+
     existing = list_memory_files()
     existing_desc = '\n'.join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
 
@@ -463,7 +491,8 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
         "Do NOT think out loud, do NOT explain, do NOT wrap it in markdown code "
         "fences (```json), do NOT add any text before or after the array.\n\n"
         f"Existing memories:\n{existing_desc}\n\n"
-        f"Dialogue:\n{dialogue[:4000]}"
+        + (f"{feedback_block}\n\n" if feedback_block else '')
+        + f"Dialogue:\n{dialogue[:4000]}"
     )
 
     try:
@@ -649,6 +678,13 @@ def consolidate_memories():
         "2. Remove outdated/contradicted memories\n"
         "3. Keep the total under 30 memories\n"
         "4. Preserve important user preferences above all\n"
+        "5. A correction ALWAYS wins: if a 'correction' memory contradicts an "
+        "earlier 'user' memory, delete the old one instead of keeping both. "
+        "A wrong assumption and its fix coexisting means recall may pick the "
+        "wrong one.\n"
+        "6. Conditional preferences are not contradictions: 'when X: prefer A' "
+        "and 'prefer B' can coexist only if B is true outside condition X. "
+        "Never drop the condition.\n"
         "Output ONLY the JSON array - no explanations, no markdown fences, no commentary. "
         "The first character of your reply must be '[' and the last must be ']'. "
         "Each item: {name, type, description, body}.\n\n"

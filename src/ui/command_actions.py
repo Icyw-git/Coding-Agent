@@ -273,6 +273,9 @@ class CommandActionsMixin:
         import memory_scope
 
         arg = (argument or '').strip().lower()
+        if arg.startswith('why'):
+            self.handle_why((argument or '').strip()[len('why'):].strip())
+            return
         if arg.startswith('restore'):
             import llm_route
             import memory_aging
@@ -335,6 +338,49 @@ class CommandActionsMixin:
         lines.append('切换：/memories on|off|readonly|writeonly')
         lines.append('  readonly  = 用已有记忆，不产生新的')
         lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
+        self._notice(chr(10).join(lines))
+
+    def handle_why(self, name: str) -> None:
+        """`/memories why <名字>`：这条记忆从哪来。
+
+        TIME 那篇调查的教训：不可观察的长期记忆会变成黑箱。每条记忆要能回答
+        「为什么记这个」——所以写盘时存 source_session + source_quote。
+        """
+        import memory
+
+        target = ' '.join(str(name or '').split())
+        if not target:
+            self._notice('用法：/memories why <记忆名>（先 /memories 看列表）')
+            return
+        entries = memory.list_memory_files()
+        needle = target.casefold()
+        hit = next((item for item in entries
+                    if needle in str(item.get('name') or '').casefold()
+                    or needle in str(item.get('filename') or '').casefold()), None)
+        if hit is None:
+            self._notice(f'没有叫 {target} 的记忆。')
+            return
+        filename = hit.get('filename') or ''
+        raw = ''
+        try:
+            import llm_route
+            path = llm_route.harness().MEMORY_DIR / filename
+            raw = path.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+        meta, _body = memory._parse_frontmatter(raw) if raw else ({}, '')
+        lines = [f"记忆：{hit.get('name')}（{hit.get('type')}）",
+                 f"描述：{hit.get('description') or '（无）'}"]
+        quote = str(meta.get('source_quote') or '').strip()
+        session_id = str(meta.get('source_session') or '').strip()
+        if quote:
+            lines.append(f'原话：「{quote}」')
+        if session_id:
+            lines.append(f'来源会话：{session_id}')
+        if not quote and not session_id:
+            lines.append('来源：未记录（早期写入或自动抽取，没有留下原话）')
+        lines.append('')
+        lines.append('不满意就 /memories 查看后告诉我忘掉它（用 forget 工具）。')
         self._notice(chr(10).join(lines))
 
     def handle_rules(self) -> None:

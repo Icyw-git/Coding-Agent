@@ -53,7 +53,16 @@ def remember(text: str, *, mem_type: str = 'preference', name: str = '',
     desc = ' '.join(str(description or '').split()) or body[:80]
 
     try:
-        path = memory.write_memory_file(label, kind, desc, body)
+        # 来源：会话 id + 用户原话。没有它就只能猜「为什么记这个」——
+        # `/why` 靠这两个字段回答。取不到会话时留空，不影响写入。
+        session_id = ''
+        try:
+            import hooks
+            session_id = hooks.current_session_id() or ''
+        except Exception:
+            pass
+        path = memory.write_memory_file(label, kind, desc, body,
+                                        source=session_id, quote=body[:200])
     except Exception as exc:
         return f'Error: could not save memory: {type(exc).__name__}: {exc}'
     return (f'Saved memory "{label}" (type={kind}) as {path.name}. '
