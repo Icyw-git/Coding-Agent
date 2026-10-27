@@ -6145,3 +6145,54 @@ Mock；把它当内核句柄传给 `CloseHandle`，ctypes 一路递归到栈溢�
   按时间），而且个人单机上「磁盘满」通常由别的原因先暴露；
 - 没有按命令类型给不同限额（比如给 `npm install` 更高的内存）——那需要先有
   真实的使用数据，现在硬编规则等于猜。
+
+## 补齐 policy_denied 审计：被拒绝的调用现在能查到
+
+`policy_denied` 在审计白名单（`audit.AUDIT_EVENTS`）里登记了很久，图标也配了，
+但代码里**从来没有写入方**。结果是 `/audit` 能回答「放行了什么」，却答不了
+「什么被挡住了」——而后者才是安全审计的主要用途：用户想知道有没有人（或模型）
+试图做危险的事。
+
+### 接入的六条拒绝路径
+
+| 路径 | blocked_by | 例子 |
+|---|---|---|
+| 策略层硬拒 | `policy` | 黑名单 `shutdown`、秘密文件 `.env`、域名 deny |
+| 定时回合禁用工具 | `background` | `delete_paths` 在只读定时任务里 |
+| 定时回合只读复核 | `background` | 写文件被 read-only + never 折成 DENY |
+| 后台读屏幕 | `background` | `screen_capture` 在非交互线程 |
+| 后台读剪贴板 | `background` | `clipboard_read` |
+| 后台控桌面 | `background` | `desktop_action` |
+
+**`blocked_by` 是刻意区分的**：`policy` 是「你的规则拦了它」，`background` 是
+「这条路径没法问人」。两者混在一起，用户会误以为自己的策略拦下了一条本来允许
+的操作。
+
+### 两个实现细节
+
+1. **抽出 `_append_audit` 共用写入逻辑**。原本 `_record_auto_approval` 里有一份
+   完整的「取会话 → 找文件 → append → 失败只打印」，现在两条审计事件共用它。
+   少一份复制，也少一处忘记同步的机会。
+2. **白名单要一并补齐**。第一次只写了事件，`/audit` 里却看不到 `blocked_by` 和
+   `reason`——因为 `AUDIT_EVENTS['policy_denied']` 还只有 `('tool', 'code', 'zone')`。
+   投影层按白名单裁字段，登记不全等于白写。补成
+   `('tool', 'code', 'zone', 'reason', 'blocked_by', 'command')`。
+
+### 真机验证
+
+    bash        code=deny_pattern   by=policy      ← shutdown /s
+    read        code=secret_path    by=policy      ← .env
+    web_fetch   code=domain_denied  by=policy      ← 域名 deny
+    screen_capture code=screen_access by=background ← 非交互回合
+    delete_paths   code=delete_paths  by=background ← 定时任务
+
+卡片渲染也分了两种措辞：策略拒绝显示 `工具 · 策略码 · 原因`，后台拒绝显示
+`工具 · 策略码 · 后台/定时回合不可用`。
+
+### 测试
+
+`tests/test_policy_denied_audit.py` 9 条：三类策略硬拒、后台屏幕、定时删除、
+放行不写事件、无会话静默、审计投影带出 `blocked_by`、卡片区分两种来源。
+
+全量 2236 passed / 3 skipped（`test_turn_slot_released_after_turn` 是既有偶发，
+单跑 3 次全过），ruff 通过。

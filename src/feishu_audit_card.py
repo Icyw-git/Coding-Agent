@@ -102,7 +102,17 @@ def _detail(event: dict) -> str:
     if kind == 'approval_timeout':
         return f"{event.get('tool', '')} · 等待 {event.get('timeout_s', '')}s"
     if kind == 'policy_denied':
-        return f"{event.get('tool', '')} · {event.get('code', '')}"
+        # 被挡住的调用：先说工具与策略码，再给一句原因。
+        # blocked_by=background 不是策略拒绝，而是「这条路径没法问人」，
+        # 两者用同一个事件型但必须区分，否则用户会以为自己的策略拦了它。
+        tool = event.get('tool') or 'tool'
+        code = event.get('code') or ''
+        if event.get('blocked_by') == 'background':
+            return f'{tool} · {code} · 后台/定时回合不可用'
+        reason = str(event.get('reason') or '')
+        reason = reason[6:] if reason.startswith('Error: ') else reason
+        head = f'{tool} · {code}' if code else tool
+        return f'{head} · {reason[:80]}' if reason else head
     return ''
 
 

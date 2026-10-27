@@ -307,6 +307,57 @@ def _record_approval_timeout(req: PermissionRequest) -> None:
               f'{type(exc).__name__}: {exc}\033[0m')
 
 
+def _append_audit(event: str, payload: dict) -> bool:
+    """把一条审计事件写进当前会话事件流；没有活动会话返回 False。
+
+    审计是观察层：任何失败都只打印，绝不反过来改变一次已经做出的判定。
+    """
+    session_id = current_session_id()
+    if not session_id:
+        return False
+    try:
+        h = _h()
+        sessions_dir = getattr(h, 'SESSIONS_DIR', None)
+        store_cls = getattr(h, 'SessionEventStore', None)
+        if sessions_dir is None or store_cls is None:
+            return False
+        path = sessions_dir / f'session_{session_id}.jsonl'
+        if not path.is_file():
+            return False
+        store_cls.open(path).append(event, session_id=session_id, **payload)
+        return True
+    except Exception as exc:
+        print(f'  \033[33m[permission] failed to record {event}: '
+              f'{type(exc).__name__}: {exc}\033[0m')
+        return False
+
+
+def _record_policy_denied(tool: str, args: dict, decision, *,
+                          reason: str = '', blocked_by: str = 'policy') -> None:
+    """被拒绝的调用写审计事件。
+
+    `policy_denied` 在审计白名单里登记了很久，但一直没有写入方——于是
+    `/audit` 能回答「放行了什么」，却答不了「什么被挡住了」。而后者才是
+    安全审计的主要用途。
+
+    ``blocked_by`` 区分拒绝来源：
+      - ``policy``     策略层硬拒（黑名单、秘密文件、系统路径、域名 deny…）
+      - ``background`` 需要交互但当前是后台/定时回合
+    """
+    args = args if isinstance(args, dict) else {}
+    summary = approval_view.summarize(tool, args)
+    command = summary.get('command')
+    _append_audit('policy_denied', {
+        'tool': tool,
+        'code': getattr(decision, 'code', '') or '',
+        'zone': getattr(decision, 'pattern', '') or '',
+        'reason': str(reason or getattr(decision, 'reason', '') or '')[:200],
+        'blocked_by': blocked_by,
+        'command': str(command)[:400] if command else '',
+        'args_keys': sorted(str(key) for key in args)[:20],
+    })
+
+
 def _record_auto_approval(tool: str, args: dict, decision, *,
                           by: str, reason: str) -> None:
     """自动放行写审计事件（观察性，不改变流程）。
@@ -319,33 +370,17 @@ def _record_auto_approval(tool: str, args: dict, decision, *,
     没有活动会话、或会话文件不存在时静默跳过；写失败只打印：审计不能反过来
     让一次已经放行的调用失败。
     """
-    session_id = current_session_id()
-    if not session_id:
-        return
-    try:
-        h = _h()
-        sessions_dir = getattr(h, 'SESSIONS_DIR', None)
-        store_cls = getattr(h, 'SessionEventStore', None)
-        if sessions_dir is None or store_cls is None:
-            return
-        path = sessions_dir / f'session_{session_id}.jsonl'
-        if not path.is_file():
-            return
-        summary = approval_view.summarize(tool, args or {})
-        command = summary.get('command')
-        store_cls.open(path).append(
-            'approval_auto',
-            tool=tool,
-            by=by,
-            code=getattr(decision, 'code', '') or '',
-            reason=str(reason or '')[:200],
-            command=str(command)[:400] if command else '',
-            args_keys=sorted(str(key) for key in (args or {}))[:20],
-            session_id=session_id,
-        )
-    except Exception as exc:
-        print(f'  \033[33m[permission] failed to record auto approval: '
-              f'{type(exc).__name__}: {exc}\033[0m')
+    args = args if isinstance(args, dict) else {}
+    summary = approval_view.summarize(tool, args)
+    command = summary.get('command')
+    _append_audit('approval_auto', {
+        'tool': tool,
+        'by': by,
+        'code': getattr(decision, 'code', '') or '',
+        'reason': str(reason or '')[:200],
+        'command': str(command)[:400] if command else '',
+        'args_keys': sorted(str(key) for key in args)[:20],
+    })
 
 GATE = PermissionGate(
     session_id_provider=current_session_id,
@@ -475,8 +510,12 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     decision = evaluate_call(tool, args, policy=policy)
     if scheduled_read_only():
         if tool in SCHEDULED_FORBIDDEN_TOOLS:
+            _record_policy_denied(tool, args, decision,
+                                  reason=_scheduled_readonly_error(tool),
+                                  blocked_by='background')
             return _scheduled_readonly_error(tool)
         if decision.denied:
+            _record_policy_denied(tool, args, decision)
             return deny_message(decision)
         # 用 read-only + never 复核：工作区写改在默认档是 ALLOW，只读档才会
         # 变成 ASK，never 再把它折成 DENY。硬拒（秘密路径/黑名单）保持原文案。
@@ -484,6 +523,9 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             tool, args, policy=Policy(sandbox_mode='read-only',
                                       approval_policy='never'))
         if readonly.denied:
+            _record_policy_denied(tool, args, readonly,
+                                  reason=_scheduled_readonly_error(tool),
+                                  blocked_by='background')
             return _scheduled_readonly_error(tool)
         return None
     if decision.allowed:
@@ -494,14 +536,24 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         return None
     if decision.denied:
         print(f'\n\033[31m[blocked] {decision.pattern or decision.reason}\033[0m')
+        _record_policy_denied(tool, args, decision)
         return deny_message(decision)
     # 屏幕内容可能包含锁屏后的私密信息，且没人能确认「现在屏幕上是用户想让我看
     # 的那一屏」：后台/定时回合不进入审批队列，直接拒绝。
     if tool in SCREEN_TOOLS and not interactive:
+        _record_policy_denied(tool, args, decision,
+                              reason=_screen_background_error(tool),
+                              blocked_by='background')
         return _screen_background_error(tool)
     if tool in CLIPBOARD_TOOLS and not interactive:
+        _record_policy_denied(tool, args, decision,
+                              reason=_clipboard_background_error(tool),
+                              blocked_by='background')
         return _clipboard_background_error(tool)
     if tool in DESKTOP_TOOLS and not interactive:
+        _record_policy_denied(tool, args, decision,
+                              reason=_desktop_background_error(tool),
+                              blocked_by='background')
         return _desktop_background_error(tool)
     # untrusted 档的语义是「每条都问」，而会话白名单是一种预授权：命中它就等于
     # 用一次「本次会话允许同类」把档位悄悄改回 on-request。所以这一档不走白名单，

@@ -42,7 +42,8 @@ AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
     'grant_removed': ('path', 'scope', 'expires', 'by', 'note'),
     'domain_added': ('host', 'scope', 'expires', 'by', 'note'),
     'domain_removed': ('host', 'scope', 'expires', 'by', 'note'),
-    'policy_denied': ('tool', 'code', 'zone'),
+    'policy_denied': ('tool', 'code', 'zone', 'reason', 'blocked_by',
+                      'command'),
     'permission_revoked': ('count', 'by'),
 }
 
