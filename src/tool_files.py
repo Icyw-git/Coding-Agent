@@ -13,6 +13,28 @@ DOCUMENT_SUFFIXES = frozenset({'.pdf', '.docx', '.pptx', '.xlsx',
                                '.doc', '.ppt', '.xls'})
 
 
+def _fs_error(exc: Exception, *, action: str, path: str) -> str:
+    """把文件系统异常转成「能照着做」的一句话。
+
+    原始文案 `[Errno 2] No such file or directory: 'D:\\\\a\\\\b'` 信息没错，
+    但不告诉用户下一步。这几类是文件工具最常见、也最容易让模型反复重试的
+    错误，统一补一句后续动作。
+    """
+    if isinstance(exc, FileNotFoundError):
+        return (f'Error: file not found: {path} '
+                '(check the path, or use ls/glob to locate it)')
+    if isinstance(exc, IsADirectoryError):
+        return f'Error: {path} is a directory; use ls to list it'
+    if isinstance(exc, NotADirectoryError):
+        return f'Error: part of {path} is not a directory; check the path'
+    if isinstance(exc, PermissionError):
+        return (f'Error: permission denied {action} {path} '
+                '(it may be locked by another process, or read-only)')
+    if isinstance(exc, OSError) and getattr(exc, 'errno', None) == 28:
+        return f'Error: no space left on device while {action} {path}'
+    return f'Error: {exc}'
+
+
 def read_file(path: str, *, resolve, gate, limit: Optional[int] = None,
               offset: int = 0, cwd: str = None) -> str:
     # 读默认放行，但秘密路径是硬拒；teammate 等无头路径不走 PreToolUse，
@@ -53,7 +75,7 @@ def read_file(path: str, *, resolve, gate, limit: Optional[int] = None,
     except BinaryFileError as exc:
         return f'Error: {exc}'
     except Exception as e:
-        return f"Error: {e}"
+        return _fs_error(e, action='reading', path=path)
 
 
 def write_file(path: str, content: str, *, resolve, gate, capture,
@@ -76,7 +98,7 @@ def write_file(path: str, content: str, *, resolve, gate, capture,
         file_path.write_bytes(encode_text(content, encoding, newline))
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return _fs_error(e, action='writing', path=path)
 
 
 def edit_file(path: str, old_text: str, new_text: str, *, resolve, gate,
@@ -103,4 +125,4 @@ def edit_file(path: str, old_text: str, new_text: str, *, resolve, gate,
     except BinaryFileError as exc:
         return f'Error: {exc}'
     except Exception as e:
-        return f"Error: {e}"
+        return _fs_error(e, action='editing', path=path)

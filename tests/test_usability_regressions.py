@@ -130,3 +130,46 @@ def test_reading_a_document_suffix_redirects(tmp_path):
     pdf.write_bytes(b'%PDF-1.4')
     message = tools.run_read(str(pdf))
     assert 'read_document' in message
+
+
+# ---------- 文件系统错误：给下一步动作 ----------
+
+def test_missing_file_says_how_to_locate_it(tmp_path):
+    """裸 errno 只说「找不到」，不说「那你该用什么找」。"""
+    import tools
+
+    message = tools.run_read(str(tmp_path / 'nope.txt'))
+    assert 'file not found' in message
+    assert 'ls' in message or 'glob' in message
+
+
+def test_edit_on_missing_file_uses_the_same_wording(tmp_path):
+    """直接测底层函数：run_edit 会先过策略闸，越界路径要弹审批，测不到这条分支。"""
+    import tool_files
+
+    message = tool_files.edit_file(
+        'nope.txt', 'a', 'b',
+        resolve=lambda p, c: tmp_path / p, gate=lambda *a: None,
+        capture=lambda p: None)
+    assert 'file not found' in message
+
+
+def test_directory_read_points_at_ls(tmp_path):
+    import tools
+
+    message = tools.run_read(str(tmp_path))
+    assert 'is a directory' in message
+    assert 'ls' in message
+
+
+def test_unknown_oserror_still_shows_the_original(tmp_path, monkeypatch):
+    """认不出的异常不要吞掉原文——排障时那行才是关键。"""
+    import tool_files
+
+    def boom(*args, **kwargs):
+        raise OSError('something very specific went wrong')
+
+    monkeypatch.setattr(tool_files, 'read_text_file', boom)
+    message = tool_files.read_file(
+        'x', resolve=lambda p, c: tmp_path / 'x', gate=lambda *a: None)
+    assert 'something very specific went wrong' in message

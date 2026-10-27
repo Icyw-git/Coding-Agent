@@ -182,8 +182,12 @@ class Worker:
         last = ''
         while time.monotonic() < deadline:
             try:
-                reply = self._roundtrip({'op': '__ping__'}, timeout=min(
-                    2.0, max(0.2, deadline - time.monotonic())))
+                # 每轮给足剩余预算，但至少 1s：机器繁忙时编译会更久，
+                # 固定 2s 会让本来能起来的 worker 被误判失败。
+                reply = self._roundtrip(
+                    {'op': '__ping__'},
+                    timeout=min(8.0, max(1.0, deadline - time.monotonic())),
+                    kill_on_timeout=False)
             except WorkerError as exc:
                 last = str(exc)
                 if self._proc is None or self._proc.poll() is not None:
@@ -209,7 +213,8 @@ class Worker:
 
     # ---------- 请求 ----------
 
-    def _roundtrip(self, request: dict, *, timeout: float) -> dict:
+    def _roundtrip(self, request: dict, *, timeout: float,
+                   kill_on_timeout: bool = True) -> dict:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.stdout is None:
             raise WorkerError(f'{self.name} worker is not running')
@@ -234,8 +239,14 @@ class Worker:
         reader.join(timeout)
         if reader.is_alive():
             # 卡住的 worker 不能留：下次请求会读到上一条的响应。
-            self._stop()
-            raise WorkerError(f'{self.name} worker timed out after {timeout:g}s')
+            # 但**启动期间**的 ping 超时不能杀进程——那时 PowerShell 还在编译
+            # 脚本头，杀掉的正是它要等的东西。启动阶段由调用方决定不杀。
+            if kill_on_timeout:
+                self._stop()
+                raise WorkerError(
+                    f'{self.name} worker timed out after {timeout:g}s')
+            raise WorkerError(
+                f'{self.name} worker still starting after {timeout:g}s')
         line = result.get('line') or ''
         if not line.strip():
             self._stop()

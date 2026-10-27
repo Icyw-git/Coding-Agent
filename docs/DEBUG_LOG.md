@@ -6551,3 +6551,54 @@ are off limits); ask the user to handle it.`
 `test_feishu_approval_batch`：`'#1 · bash'` → `'#1 · 执行命令 (bash)'`。
 
 全量 2298 passed / 3 skipped（291s），ruff 通过。
+
+## 文件错误提示统一 + worker 启动超时修复（2026-10-27）
+
+### 1. 文件系统错误给下一步动作
+
+`read`/`write`/`edit` 原本对 `FileNotFoundError` 等一律 `return f'Error: {e}'`，
+用户看到的是 `[Errno 2] No such file or directory: 'D:\a\b'`——信息没错，但不说
+下一步。抽出 `_fs_error(exc, action, path)` 统一转：
+
+| 异常 | 输出 |
+|---|---|
+| `FileNotFoundError` | `file not found: <path> (check the path, or use ls/glob to locate it)` |
+| `IsADirectoryError` | `<path> is a directory; use ls to list it` |
+| `NotADirectoryError` | `part of <path> is not a directory` |
+| `PermissionError` | `permission denied reading <path> (locked or read-only)` |
+| 磁盘满（errno 28） | `no space left on device while <action> <path>` |
+| 其它 | 保留原文（排障时那行才是关键） |
+
+### 2. worker 启动超时会把自己杀掉（真实 bug）
+
+`test_ps_worker::test_timeout_stops_the_worker` 在全量跑时偶发失败，单跑 3 次
+都过——但它每次要 7.9 秒，说明对时序敏感。查下去发现是**真 bug**：
+
+`_wait_ready()` 用 `_roundtrip(ping, timeout=2.0)` 等启动，而 `_roundtrip` 在超时时
+会 `self._stop()` **杀掉进程**。于是机器繁忙、PowerShell 编译脚本头超过 2 秒时，
+ping 超时把正在启动的 worker 杀了，报「exited during startup」——而它其实只是慢。
+
+修法两处：
+
+- `_roundtrip(..., kill_on_timeout=False)`：启动阶段的 ping 超时**不杀进程**，
+  只让外层循环继续等（真正的卡死由 `_wait_ready` 的总预算兜底）；
+- ping 超时从固定 2s 改成 `min(8, max(1, 剩余预算))`：给繁忙机器留余量。
+
+修复后连续 3 次冷启动稳定在 1.66–1.76s 成功。
+
+### 3. 顺带确认没问题的
+
+- **路径特殊字符**：空格、中文、分号、美元符、反斜杠、UNC 风格都正确；
+  `~` 会展开成用户目录（不存在时报 file not found 是对的）；
+- **glob**：`*.py` 只匹配当前目录（标准语义）、`**/*.py` 递归、
+  `*.PY` 在 Windows 上大小写不敏感——都符合预期，我一开始误判成 bug；
+- **grep**：正则转义、非法模式（`*`、`[`、`(unclosed`）都给出明确错误；
+- **22 个真实会话**的历史重建全部自洽，无孤儿 tool 消息。
+
+全量 2302 passed / 3 skipped（447s），ruff 通过。
+
+### 关于「测试卡住」
+
+这几轮反复出现「超时中断」，实际原因是**全量耗时从 5 分钟涨到 7.5 分钟**
+（用例数 1690 → 2302），而我的超时阈值没跟上。改用后台运行 + 落盘日志后
+一次跑通，无失败。后续跑全量建议 `nohup ... &` 或给足 900s 以上。
