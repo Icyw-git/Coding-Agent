@@ -17,6 +17,7 @@ import rules as user_rules
 import sandbox
 import screen_capture
 import tool_cache
+import trash
 import workspace_diff
 from exec_policy import (
     CLIPBOARD_ENV,
@@ -125,6 +126,7 @@ def format_status(session_store) -> str:
     rules_line = ('\n  ' + user_rules.load().describe()
                   + f'（{user_rules.path_for_display()}）')
     credentials_line = '\n  ' + credentials.describe()
+    trash_line = '\n  ' + trash.describe_status()
     browser_line = '\n  ' + browser_profile.describe()
     allow_domains, deny_domains = net_grants.counts()
     domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
@@ -151,6 +153,7 @@ def format_status(session_store) -> str:
         f'{domains_line}'
         f'{rules_line}'
         f'{credentials_line}'
+        f'{trash_line}'
         f'{browser_line}'
         f'{usage_line}'
     )

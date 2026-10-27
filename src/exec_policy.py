@@ -57,6 +57,7 @@ __all__ = [
     'ASK',
     'CLIPBOARD_ENV',
     'CLIPBOARD_TOOLS',
+    'DELETE_TOOLS',
     'DESKTOP_ENV',
     'DESKTOP_TOOLS',
     'DEFAULT_APPROVAL_POLICY',
@@ -146,6 +147,8 @@ CLIPBOARD_TOOLS = ('clipboard_read', 'clipboard_write')
 CLIPBOARD_ENV = 'HARNESS_CLIPBOARD_TOOLS'
 # Desktop input is opt-in and each action requires a human decision.
 DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_windows', 'desktop_action')
+# 删除：可撤销，但仍是一次破坏性动作，逐次审批。
+DELETE_TOOLS = ('delete_paths',)
 DESKTOP_ENV = 'HARNESS_DESKTOP_CONTROL'
 
 
@@ -264,6 +267,13 @@ class Policy:
                 decision = Decision(
                     DENY, 'clipboard_tools_disabled',
                     f'{tool} is disabled ({CLIPBOARD_ENV}=0)')
+        elif tool in DELETE_TOOLS:
+            # 走回收站所以可撤销，但删除本身仍要人点头：路径可能展开成多个文件，
+            # 「看起来删一个」和「实际删了 20 个」只差一个 glob。
+            decision = Decision(
+                ASK, 'delete_paths',
+                f'{tool} moves files to the recycle bin (restorable, but still a '
+                'destructive action)')
         elif tool in DESKTOP_TOOLS:
             if not desktop_control_enabled():
                 decision = Decision(

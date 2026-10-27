@@ -9,6 +9,7 @@ from typing import Optional
 from exec_policy import resolve_tool_path
 from tool_clipboard import read as _clipboard_read_tool
 from tool_clipboard import write as _clipboard_write_tool
+from tool_delete import delete as _delete_tool
 from tool_desktop import action as _desktop_action_tool
 from tool_desktop import list_windows as _desktop_list_tool
 from tool_desktop import snapshot as _desktop_snapshot_tool
@@ -164,6 +165,10 @@ def run_clipboard_write(text: str) -> str:
     return _clipboard_write_tool(text, audit=_screen_audit)
 
 
+def run_delete_paths(paths: list) -> str:
+    return _delete_tool(paths, audit=_screen_audit)
+
+
 def run_desktop_snapshot() -> str:
     return _desktop_snapshot_tool(audit=_screen_audit)
 
@@ -297,6 +302,7 @@ tool_registry = {
     'screen_ocr': run_screen_ocr,
     'clipboard_read': run_clipboard_read,
     'clipboard_write': run_clipboard_write,
+    'delete_paths': run_delete_paths,
     'desktop_snapshot': run_desktop_snapshot,
     'desktop_windows': run_desktop_windows,
     'desktop_action': run_desktop_action,

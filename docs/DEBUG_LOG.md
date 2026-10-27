@@ -5759,3 +5759,69 @@ powershell / pwsh / conhost / mintty / WSL / ConEmu），并对 **type / key**
 
 测试：`test_desktop_control_windows` 50（+4 终端防护）、`test_audit` 13（+2）。
 全量 2187 passed / 3 skipped，ruff 通过。
+## D2 落地：可撤销删除（回收站）
+
+路线图里「D2 删除不进回收站」是剩下的缺口里**唯一会造成真实数据损失**的一项：
+模型看错目标、路径拼错、glob 多匹配一个文件，用户就没有第二次机会。回收站是
+操作系统本来就有的安全网，没理由不用。
+
+### 设计
+
+**`src/trash.py`（能力层）**
+
+- Windows：`SHFileOperationW` + `FOF_ALLOWUNDO`，走系统回收站。`ctypes` 直调
+  shell32，零依赖。带 `FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI`——
+  否则每个文件弹一个确认框会把非交互会话卡住。
+- 其他平台：`trash-put` / `trash` / `gio trash`。**找不到就明确失败**，不退回
+  `unlink`——静默降级等于把安全网换成陷阱。
+- 多个路径一次调用（Windows 支持列表），让「部分成功」这种中间态没机会出现。
+- 拒绝文件系统根与盘符根：它们进不了回收站，也不该被删。
+- `SHFileOperationW` 的错误码翻成人话（`0x20` → "file in use"、
+  `0x2E` → "in use by another process"），比裸 errno 好查得多。
+
+**`src/tool_delete.py` + `delete_paths` 工具**
+
+- 只负责格式化与审计（`delete_trashed{count, method, paths}` /
+  `delete_failed{count, reason}`）。
+- 结果里明确告诉模型「已进回收站、可恢复」，让它能如实转告用户。
+
+**策略层**
+
+- `delete_paths` 归入 `DELETE_TOOLS`，三档下都 `ASK`——可撤销不等于不用问：
+  一个 glob 展开可能就是 20 个文件。
+- 加入 `SCHEDULED_FORBIDDEN_TOOLS`（定时任务不能删）、子代理排除、恢复分类
+  `DESTRUCTIVE`（不自动重试）。
+- 审批面逐条列出**每个**目标（超过 20 条折叠），而不是只写「删 1 个文件」。
+
+### 与 bash 的关系
+
+**没有**试图把 `bash` 里的 `del` / `rm` 改写进回收站。bash 是自由文本执行，
+可靠改写需要完整 shell 解析器——那是另一个量级的工程，而且解析失败时会静默
+退化成真实删除，比现在更危险。
+
+替代做法：工具描述里明确写「优先用 `delete_paths` 而不是 `del`/`rm`，后者不可
+恢复」。这是引导而非强制，但比假装能拦截诚实。
+
+### 真实验证
+
+- 删除文件与目录 → 都进了回收站（用 `Shell.Application` 查回收站确认，
+  原路径正确、可恢复）；
+- 文件被占用 → `SHFileOperation failed (code 0x20): a sharing violation occurred`；
+- 不存在的路径 → `path does not exist`；
+- 端到端：策略 `ASK` → 审批文案列出目标 → 工具输出「Moved 2 item(s) to the
+  Recycle Bin (restorable)」；
+- `/status` 显示「可撤销删除：可用（Windows 回收站）」。
+
+测试：`tests/test_trash.py` 19 条，覆盖能力层（真实删除文件/目录、缺失路径、
+根目录拒绝、单字符串输入）、工具层（格式化、失败不抛、空列表、审计失败隔离）、
+策略边界（三档都 ASK、定时禁止、子代理排除、恢复分类）、审批面（逐条列出、
+超长折叠）。
+
+全量 2206 passed / 3 skipped，ruff 通过。
+
+### 未做
+
+- `bash` 的 `del`/`rm` 没有接管（理由见上）；
+- 没有「列出回收站 / 从回收站恢复」的入口——`delete_paths` 只负责删，
+  恢复仍由用户在系统里操作。真要补，恢复需要记下每个文件的回收站路径。
+- `remove_worktree` 仍是破坏性删除（git 的 worktree 语义不同，没动）。

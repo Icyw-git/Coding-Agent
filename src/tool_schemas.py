@@ -693,4 +693,17 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                                  'description': 'wait step: '
                                                                                 '50-3000 ms'}}}}},
                               'required': ['action', 'expected_pid',
-                                           'expected_window_id']}}}]
+                                           'expected_window_id']}}},
+ {'type': 'function',
+  'function': {'name': 'delete_paths',
+               'description': 'Move files or directories to the Recycle Bin so they '
+                              'can be restored. Prefer this over `del`/`rm` in bash: '
+                              'those are unrecoverable. Paths must already exist.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'paths': {'type': 'array',
+                                            'items': {'type': 'string'},
+                                            'maxItems': 50,
+                                            'description': '1-50 existing paths to move to '
+                                                           'the recycle bin'}},
+                              'required': ['paths']}}}]

@@ -22,9 +22,10 @@ ORDER = [
     'remove_worktree', 'keep_worktree', 'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
     'desktop_snapshot', 'desktop_windows', 'desktop_action',
+    'delete_paths',
 ]
 
-SCHEMA_SHA1 = 'a96d3f0f00f542095a3208db240b4c98f917d568'
+SCHEMA_SHA1 = '0c6e8a99d1c2e17e6ed179e6b101e01955020b3a'
 
 
 def test_tool_order_is_stable():

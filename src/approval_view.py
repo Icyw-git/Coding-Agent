@@ -171,6 +171,22 @@ def _desktop_detail(tool: str, args: dict) -> str:
     return 'desktop input: ' + ', '.join(fields)
 
 
+def _delete_detail(args: dict) -> str:
+    """删除审批要让人看到**每一条**目标：路径可能展开成多个文件。"""
+    paths = args.get('paths')
+    if isinstance(paths, str):
+        paths = [paths]
+    items = [str(item) for item in (paths or []) if str(item).strip()]
+    if not items:
+        return 'move nothing to the recycle bin (no paths)'
+    head = (f'move {len(items)} item(s) to the recycle bin (restorable):'
+            if len(items) > 1 else 'move to the recycle bin (restorable):')
+    lines = [head] + [f'  {item}' for item in items[:20]]
+    if len(items) > 20:
+        lines.append(f'  … {len(items) - 20} more')
+    return chr(10).join(lines)
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -184,6 +200,8 @@ def detail(tool: str, args) -> str:
         return safe_text(_clipboard_detail(tool, args))
     if tool in ('desktop_snapshot', 'desktop_windows', 'desktop_action'):
         return safe_text(_desktop_detail(tool, args))
+    if tool == 'delete_paths':
+        return safe_text(_delete_detail(args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

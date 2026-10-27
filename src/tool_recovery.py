@@ -42,7 +42,7 @@ DESTRUCTIVE_TOOLS = frozenset({
     'edit', 'apply_patch', 'create_task', 'schedule_cron',
     'spawn_teammate', 'send_message', 'check_inbox', 'request_shutdown',
     'request_plan', 'review_plan', 'create_worktree', 'remove_worktree',
-    'screen_capture', 'desktop_action',
+    'screen_capture', 'desktop_action', 'delete_paths',
 })
 
 # Category order is the order used in recovery text: least to most careful.

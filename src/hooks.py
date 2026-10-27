@@ -392,6 +392,7 @@ SCHEDULED_FORBIDDEN_TOOLS = frozenset({
     'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
     'desktop_snapshot', 'desktop_windows', 'desktop_action',
+    'delete_paths',
 })
 # 多文件补丁取最严分区：一个补丁里只要有一个秘密/系统/越界路径，
 # 整批就按该分区判定，避免被同批的工作区内文件稀释。
