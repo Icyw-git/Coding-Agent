@@ -84,6 +84,23 @@ def normalize_snip_bounds(messages: list[dict], head_end: int,
     return head, tail
 
 
+# 历史重建真正关心的事件类型。大文件流式路径用它挑出「非 message」的那几类，
+# 再与 message 事件按 seq 归并——顺序必须与原始事件流一致，否则 compaction /
+# history_snipped 这类「作用于当前 messages 的操作」会落到错误位置。
+_HISTORY_EVENT_TYPES = frozenset({
+    'compaction', 'history_snipped', 'rewind', 'tool_recovery',
+})
+
+
+def _merged_history_events(messages: list[dict], others: list[dict]) -> list[dict]:
+    """把「message 事件」与「其它历史事件」按 seq 归并回原始顺序。"""
+    if not others:
+        return messages
+    merged = messages + others
+    merged.sort(key=lambda event: event.get('seq') or 0)
+    return merged
+
+
 class SessionEventStore:
     """The recovery source of truth; transcript snapshots remain separate exports."""
 
@@ -618,16 +635,31 @@ class SessionEventStore:
                 handle.seek(-1, os.SEEK_END)
                 self._history_partial_tail = handle.read(1) != b'\n'
         if size > _event_cache_limit():
-            # 第一遍只收集 tool_compacted 占位，第二遍才构造 messages。
-            placeholders = {
-                e['tool_call_id']: e['placeholder']
-                for e in self.iter_events()
-                if e.get('type') == 'tool_compacted'
-                and e.get('tool_call_id') and e.get('placeholder')
-            }
-            events = self.iter_events()
+            # 大文件走流式单遍：工具结果占位（tool_compacted）绝大多数会话里
+            # 一条都没有，先扫一遍只为它等于白付一次全量解析。这里在一次遍历里
+            # 同时收集 message 与占位表，占位在**构建阶段结束后**统一回填——
+            # 回填顺序与事件顺序无关，因为占位是「按 tool_call_id 覆盖内容」。
+            placeholders = {}
+            raw_messages = []
+            others = []
+            for event in self.iter_events():
+                kind = event.get('type')
+                if kind == 'message':
+                    raw_messages.append(event)
+                elif kind == 'tool_compacted':
+                    if event.get('tool_call_id') and event.get('placeholder'):
+                        placeholders[event['tool_call_id']] = event['placeholder']
+                elif kind in _HISTORY_EVENT_TYPES:
+                    others.append(event)
+            events = _merged_history_events(raw_messages, others)
+            # 流式路径每条事件都是刚 json.loads 出来的新对象，且下一次调用会重新
+            # 解析——没有共享风险，构建时不必再整体复制一层。
+            events_are_fresh = True
+            events_are_fresh = False
         else:
             events = self.read_events()
+            # read_events 可能直接返回缓存里的对象，必须复制后才能改写。
+            events_are_fresh = False
             # tool_compacted 占位（micro_compact 的持久化决策）：两遍扫描 ——
             # 先收集 tool_call_id → 占位文本，再在构建时替换对应 tool 消息
             placeholders = {e['tool_call_id']: e['placeholder']
@@ -642,9 +674,9 @@ class SessionEventStore:
                 message = event.get("message")
                 if not isinstance(message, dict) or "role" not in message:
                     raise SessionReplayError(f"invalid message event at seq {event.get('seq')}")
-                # 事件 dict 全部源自 JSONL 解析（天然 JSON 安全）；json 往返比
-                # copy.deepcopy 快 2-3 倍，多轮长对话每回合都要整体重建历史
-                entry = json.loads(json.dumps(message))
+                # 流式路径的对象是本次独有，直接用；read_events 可能给缓存对象，
+                # 必须复制（复制后再改写 content 才不会污染缓存）。
+                entry = message if events_are_fresh else json.loads(json.dumps(message))
                 if (entry.get('role') == 'tool'
                         and entry.get('tool_call_id') in placeholders):
                     entry['content'] = placeholders[entry['tool_call_id']]

@@ -75,3 +75,45 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
         lines.append(_state_text(state))
         return '\n'.join(lines)
     return f'Completed desktop action {result.action}. {_state_text(state)}'
+
+
+def list_windows(*, limit: int = 20, runner=None, audit=None) -> str:
+    """列出可见窗口。只读，不需要先知道前台是谁。"""
+    try:
+        result = desktop_control_windows.list_windows(limit=limit, runner=runner)
+    except desktop_control_windows.DesktopControlError as exc:
+        return f'Error: listing windows failed: {exc}'
+    windows = result['windows']
+    _audit(audit, 'desktop_list_windows', count=len(windows),
+           total=result['total'])
+    if not windows:
+        return 'No visible top-level windows.'
+    lines = [f"Visible windows ({len(windows)} of {result['total']}):"]
+    for index, item in enumerate(windows, 1):
+        marks = []
+        if item['foreground']:
+            marks.append('foreground')
+        if item['minimized']:
+            marks.append('minimized')
+        suffix = f" [{', '.join(marks)}]" if marks else ''
+        lines.append(f"  {index}. pid={item['pid']} window_id={item['window_id']} "
+                     f"{item['process']}: {item['title']}{suffix}")
+    lines.append('To act on one, call desktop_snapshot after focusing it, or use '
+                 "desktop_action with action='focus' and that pid + window_id.")
+    return chr(10).join(lines)
+
+
+def focus(action_args: dict, *, runner=None, audit=None) -> str:
+    """把窗口切到前台；仍要 pid + window_id 双因子。"""
+    try:
+        state = desktop_control_windows.focus_window(
+            expected_pid=action_args.get('expected_pid'),
+            expected_window_id=action_args.get('expected_window_id'),
+            runner=runner)
+    except desktop_control_windows.DesktopControlError as exc:
+        _audit(audit, 'desktop_focus_failed', reason=str(exc)[:120])
+        return f'Error: focusing that window failed: {exc}'
+    _audit(audit, 'desktop_focus', process=state.process, pid=state.pid,
+           window_id=state.window_id,
+           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest())
+    return f'Focused that window. {_state_text(state)}'

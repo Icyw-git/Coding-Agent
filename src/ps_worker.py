@@ -341,3 +341,47 @@ def _failure_text(reply: dict) -> str:
     if message and code and code not in message:
         return f'{code}: {message}'
     return message or code or 'worker reported failure'
+
+
+# ---------- 预热 ----------
+
+_warm_started = threading.Event()
+
+
+def warm(name: str, script) -> None:
+    """后台把 worker 拉起来，让第一个真实调用不必等 2.7s 的启动。
+
+    Add-Type 编译 C# + 加载 UIAutomation 是固定成本（实测 2.7s），而它只
+    取决于程序集与脚本，和具体请求无关。进程启动后立刻在后台付掉，用户
+    第一次点「看看屏幕 / 列窗口」就不用等。
+    """
+    def run() -> None:
+        try:
+            worker = get_worker(name, script)
+            worker._ensure()
+        except Exception as exc:
+            print(f'  \033[33m[ps_worker] warm-up of {name} failed: {exc}\033[0m')
+
+    threading.Thread(target=run, name=f'ps-warm-{name}', daemon=True).start()
+
+
+def start_warmup() -> None:
+    """预热桌面与剪贴板 worker（进程级只做一次）。"""
+    if _warm_started.is_set():
+        return
+    _warm_started.set()
+    if (os.getenv('HARNESS_PS_WARMUP') or '').strip().casefold() in (
+            '0', 'false', 'off', 'no'):
+        return
+    try:
+        import desktop_control_windows as desktop
+
+        warm('desktop', desktop.worker_script)
+    except Exception:
+        pass
+    try:
+        import clipboard_windows as clipboard
+
+        warm('clipboard', clipboard.worker_script)
+    except Exception:
+        pass

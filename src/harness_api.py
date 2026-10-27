@@ -138,6 +138,14 @@ def create_app(runtime=None, *, api_token: str | None = None, rate_limit: int = 
                 logger.addHandler(handler)
             if owns_runtime:
                 await asyncio.to_thread(harness.initialize_mcp_tools)
+                # PowerShell worker 启动要 2.7s（Add-Type 编译）；趁用户还没发
+                # 第一条消息先付掉，第一次用桌面/剪贴板工具才不用等。
+                try:
+                    import ps_worker
+
+                    ps_worker.start_warmup()
+                except Exception:
+                    pass
                 # 后台预热 LLM 客户端（openai SDK import ~1.5s），首个请求不再等待
                 threading.Thread(target=harness.client.warmup, daemon=True).start()
                 if _scheduler_enabled():

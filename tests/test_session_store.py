@@ -254,3 +254,43 @@ def test_replay_repairs_historical_snip_cutting_tool_group(tmp_path):
     assert any(m.get('content') == SNIP_MARKER for m in history)
     assert history[-1]['content'] == 'continue'
     SessionEventStore.validate_openai_history(history)
+
+
+def test_streamed_rebuild_matches_cached_rebuild(tmp_path, monkeypatch):
+    """大文件走单遍流式，小文件走 read_events——两条路径产出的历史必须一致。
+
+    流式路径把 message 与 compaction/history_snipped 分开收集再按 seq 归并；
+    归并顺序错了会把「作用于当前 messages 的操作」落到错误位置，而这类错误在
+    只有 message 的会话里看不出来。这里特意造一个带 compaction 的会话。
+    """
+    import json
+
+    import session_store as store_mod
+
+    path = tmp_path / 'session_mix.jsonl'
+    store = store_mod.SessionEventStore.open(path)
+    n = 0
+
+    def add(kind, **payload):
+        nonlocal n
+        n += 1
+        store.append(kind, **payload)
+
+    add('message', message={'role': 'user', 'content': 'one'})
+    add('message', message={'role': 'assistant', 'content': 'two'})
+    add('tool_compacted', tool_call_id='c1', placeholder='[compacted c1]')
+    add('compaction', summary='sum', tail=[{'role': 'user', 'content': 'tail'}])
+    add('message', message={'role': 'user', 'content': 'after compaction'})
+    add('history_snipped', head_end=1, tail_start=2, snipped=1)
+    add('message', message={'role': 'assistant', 'content': 'final'})
+
+    store._history_cache = None
+    streamed = store.rebuild_openai_history()
+
+    # 强制走 read_events 分支（把上限抬到远超文件大小）
+    monkeypatch.setattr(store_mod, '_event_cache_limit', lambda: 10 ** 12)
+    store._history_cache = None
+    cached = store.rebuild_openai_history()
+
+    assert json.dumps(streamed, ensure_ascii=False) == json.dumps(
+        cached, ensure_ascii=False)

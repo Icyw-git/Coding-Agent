@@ -145,7 +145,7 @@ SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
 CLIPBOARD_TOOLS = ('clipboard_read', 'clipboard_write')
 CLIPBOARD_ENV = 'HARNESS_CLIPBOARD_TOOLS'
 # Desktop input is opt-in and each action requires a human decision.
-DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_action')
+DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_windows', 'desktop_action')
 DESKTOP_ENV = 'HARNESS_DESKTOP_CONTROL'
 
 

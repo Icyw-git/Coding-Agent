@@ -20,6 +20,7 @@ from dataclasses import dataclass
 DEFAULT_TIMEOUT = 10.0
 MAX_TYPE_CHARS = 1000
 MAX_SCROLL = 20
+MAX_WINDOWS = 100
 MAX_SEQUENCE_STEPS = 12
 SUPPORTED_KEYS = frozenset({
     'enter', 'return', 'tab', 'escape', 'esc', 'backspace', 'delete',
@@ -84,6 +85,18 @@ using System.Runtime.InteropServices;
 public static class HarnessDesktopNative {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(
+        uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
@@ -281,6 +294,53 @@ function Invoke-Step($step, $state) {
     }
     return $null
 }
+function Get-VisibleWindows {
+    # 枚举有标题的可见顶层窗口：模型据此选目标，而不是靠用户手动切。
+    # 进程名一次取全表：每个窗口单独 Get-Process 是 8ms 级开销，20 个窗口就是
+    # 160ms——实测占本操作耗时的 90% 以上。
+    $procNames = @{}
+    try {
+        foreach ($proc in [System.Diagnostics.Process]::GetProcesses()) {
+            try { $procNames[$proc.Id] = $proc.ProcessName } catch { }
+        }
+    } catch { }
+    $items = New-Object System.Collections.ArrayList
+    $foreground = [HarnessDesktopNative]::GetForegroundWindow()
+    $callback = {
+        param($hwnd, $lparam)
+        try {
+            if (-not [HarnessDesktopNative]::IsWindowVisible($hwnd)) { return $true }
+            $len = [HarnessDesktopNative]::GetWindowTextLength($hwnd)
+            if ($len -le 0) { return $true }
+            $sb = New-Object Text.StringBuilder ($len + 1)
+            [HarnessDesktopNative]::GetWindowText($hwnd, $sb, $sb.Capacity) | Out-Null
+            $title = $sb.ToString()
+            if (-not $title.Trim()) { return $true }
+            $procId = [uint32]0
+            [HarnessDesktopNative]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+            $process = ''
+            if ($procNames.ContainsKey([int]$procId)) { $process = $procNames[[int]$procId] }
+            elseif ($procNames.ContainsKey($procId)) { $process = $procNames[$procId] }
+            $rect = New-Object HarnessDesktopNative+RECT
+            $hasRect = [HarnessDesktopNative]::GetWindowRect($hwnd, [ref]$rect)
+            $items.Add([ordered]@{
+                title = $title
+                process = $process
+                pid = [int]$procId
+                window_id = $hwnd.ToInt64().ToString('X')
+                foreground = ($hwnd -eq $foreground)
+                minimized = [bool][HarnessDesktopNative]::IsIconic($hwnd)
+                rect = if ($hasRect) {
+                    @($rect.Left, $rect.Top, ($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+                } else { $null }
+            }) | Out-Null
+        } catch { }
+        return $true
+    }
+    [HarnessDesktopNative]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+    return $items.ToArray()
+}
+
 function New-Failure($code, $message, $state, $step = 0, $done = $null) {
     $obj = [ordered]@{ ok=$false; error=$code; message=$message; state=$state }
     if ($step -gt 0) { $obj.step = [int]$step }
@@ -310,6 +370,67 @@ function Invoke-HarnessOp($req) {
         # 只返回对象，由顶层循环统一回包。这里若自己再 Write-Result，一个请求会
         # 产生两个响应，之后每个请求都读到上一条的答复（协议整体错位）。
         return [ordered]@{ ok = $true; state = $state }
+    }
+    if ($payload.action -eq 'list') {
+        # 只读：列出可见窗口，不用先知道前台是谁。
+        $limit = [int]$payload.limit
+        if ($limit -le 0) { $limit = 20 }
+        $all = @(Get-VisibleWindows)
+        return [ordered]@{
+            ok = $true
+            total = $all.Count
+            windows = @($all | Select-Object -First $limit)
+        }
+    }
+    if ($payload.action -eq 'focus') {
+        # 切窗口改变的是「后续动作打在哪」，属于输入操作：要求显式 expected_*。
+        $target = [IntPtr][Convert]::ToInt64([string]$payload.expected_window_id, 16)
+        if ($target -eq [IntPtr]::Zero) {
+            return New-Failure 'invalid_window' 'expected_window_id must be a window id' $state
+        }
+        $procId = [uint32]0
+        [HarnessDesktopNative]::GetWindowThreadProcessId($target, [ref]$procId) | Out-Null
+        if ([int]$procId -ne [int]$payload.expected_pid) {
+            return New-Failure 'window_gone' 'that window no longer belongs to the expected process' $state
+        }
+        if ([HarnessDesktopNative]::IsIconic($target)) {
+            [HarnessDesktopNative]::ShowWindow($target, 9) | Out-Null   # SW_RESTORE
+        }
+        # Windows 的前台锁：后台进程抢焦点经常被拒（实测约一半会失败）。
+        # 用 AttachThreadInput 把本进程的输入队列临时接到当前前台线程上，
+        # 这是绕过该限制的常规做法；仍失败时如实说明，并建议用户手动点一下
+        # 目标窗口——这比静默失败或假装成功要好。
+        $placed = [HarnessDesktopNative]::SetForegroundWindow($target)
+        if (-not $placed) {
+            $fgPid = [uint32]0
+            $fgWindow = [HarnessDesktopNative]::GetForegroundWindow()
+            $fgThread = [HarnessDesktopNative]::GetWindowThreadProcessId(
+                $fgWindow, [ref]$fgPid)
+            $self = [HarnessDesktopNative]::GetCurrentThreadId()
+            $attached = $false
+            try {
+                $attached = [HarnessDesktopNative]::AttachThreadInput($self, $fgThread, $true)
+                [HarnessDesktopNative]::BringWindowToTop($target) | Out-Null
+                $placed = [HarnessDesktopNative]::SetForegroundWindow($target)
+            } catch { } finally {
+                if ($attached) {
+                    [HarnessDesktopNative]::AttachThreadInput($self, $fgThread, $false) | Out-Null
+                }
+            }
+        }
+        if (-not $placed) {
+            $why = 'Windows refused to raise that window. Click it once '
+            $why += 'yourself, then retry (foreground lock blocks background processes).'
+            return New-Failure 'focus_failed' $why $state
+        }
+        # 轮询而不是固定 sleep：多数切换 10-30ms 就到位，固定等 120ms 等于每次
+        # 白付 90ms。上限 300ms 兜住慢机器/动画长的窗口。
+        $deadline = [DateTime]::UtcNow.AddMilliseconds(300)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ([HarnessDesktopNative]::GetForegroundWindow() -eq $target) { break }
+            Start-Sleep -Milliseconds 10
+        }
+        return [ordered]@{ ok = $true; action = 'focus'; state_after = (Get-WindowState) }
     }
     if (-not $state.available) { Fail 'no_foreground_window' 'no foreground window' $state }
     if ([int]$state.pid -ne [int]$payload.expected_pid -or
@@ -520,6 +641,50 @@ def snapshot(*, runner=None, timeout: float = DEFAULT_TIMEOUT) -> WindowState:
     return _state(_run({'action': 'snapshot'}, runner=runner, timeout=timeout).get('state'))
 
 
+def list_windows(*, limit: int = 20, runner=None,
+                 timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """列出可见顶层窗口。返回 ``{'total': n, 'windows': [...]}``。
+
+    只读，不改变任何状态——给模型一个「先看看有哪些目标」的入口，而不是
+    必须靠用户手动切到某个窗口再猜。
+    """
+    try:
+        limit = max(1, min(int(limit), MAX_WINDOWS))
+    except (TypeError, ValueError) as exc:
+        raise DesktopControlError('limit must be an integer') from exc
+    reply = _run({'action': 'list', 'limit': limit}, runner=runner,
+                 timeout=timeout)
+    windows = []
+    for item in reply.get('windows') or []:
+        if not isinstance(item, dict):
+            continue
+        rect = item.get('rect')
+        try:
+            rect = tuple(int(v) for v in rect) if rect else None
+        except (TypeError, ValueError):
+            rect = None
+        windows.append({
+            'title': str(item.get('title') or ''),
+            'process': str(item.get('process') or ''),
+            'pid': int(item.get('pid') or 0),
+            'window_id': str(item.get('window_id') or ''),
+            'foreground': bool(item.get('foreground')),
+            'minimized': bool(item.get('minimized')),
+            'rect': rect,
+        })
+    return {'total': int(reply.get('total') or len(windows)),
+            'windows': windows}
+
+
+def focus_window(*, expected_pid=None, expected_window_id=None, runner=None,
+                 timeout: float = DEFAULT_TIMEOUT) -> WindowState:
+    """把指定窗口切到前台。仍需 expected_pid 双因子，避免打到刚被复用的窗口 ID。"""
+    payload = validate_action('focus', expected_pid=expected_pid,
+                              expected_window_id=expected_window_id)
+    reply = _run(payload, runner=runner, timeout=timeout)
+    return _state(reply.get('state_after'))
+
+
 def _validated_key(key) -> str:
     """Normalize one key or a modifier combo such as ``ctrl+shift+s``."""
     if not isinstance(key, str) or not key.strip() or len(key) > 30:
@@ -644,9 +809,13 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
                 'steps': [_validated_step(step) for step in steps]}
     if steps is not None:
         raise DesktopControlError("steps is only valid with action='sequence'")
+    if action == 'focus':
+        # 切窗口只需要双因子身份，没有坐标/文本参数。
+        return {'action': 'focus', 'expected_pid': expected_pid,
+                'expected_window_id': expected_window_id}
     if action not in SINGLE_ACTIONS:
         raise DesktopControlError(
-            'action must be move, click, type, key, scroll, or sequence')
+            'action must be move, click, type, key, scroll, sequence, or focus')
     if action != 'click' and (button is not None or count is not None):
         raise DesktopControlError('button and count are only valid with click')
     if action == 'move':

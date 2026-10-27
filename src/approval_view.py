@@ -137,6 +137,8 @@ def _desktop_step_summary(step) -> str:
 def _desktop_detail(tool: str, args: dict) -> str:
     if tool == 'desktop_snapshot':
         return 'inspect foreground window metadata and focused UI control'
+    if tool == 'desktop_windows':
+        return 'list visible top-level windows (read-only)'
     action = args.get('action') or 'unknown'
     fields = [f'action={action}']
     if args.get('expected_pid') is not None:
@@ -164,6 +166,8 @@ def _desktop_detail(tool: str, args: dict) -> str:
         fields.append(f"key={args.get('key', '')}")
     elif action == 'scroll':
         fields.append(f"amount={args.get('amount', '')}")
+    elif action == 'focus':
+        fields.append('bring that window to the foreground')
     return 'desktop input: ' + ', '.join(fields)
 
 
@@ -178,7 +182,7 @@ def detail(tool: str, args) -> str:
         return safe_text(_screen_detail(tool, args))
     if tool in ('clipboard_read', 'clipboard_write'):
         return safe_text(_clipboard_detail(tool, args))
-    if tool in ('desktop_snapshot', 'desktop_action'):
+    if tool in ('desktop_snapshot', 'desktop_windows', 'desktop_action'):
         return safe_text(_desktop_detail(tool, args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):

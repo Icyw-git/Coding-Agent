@@ -5549,3 +5549,70 @@ worker 回包是 `{ok:false, error:'out_of_window', message:'step 2/3 (click): c
 - `screen_capture` 仍未接 worker（1.6s 里主要是 PNG 编码，进程开销占小头）。
 - 审计没有建持久索引：62ms 对按需查询够用，建索引会引入一致性维护成本。
 - `desktop_snapshot` 每步仍查 UIA：这是「每步重新校验前台窗口」的安全要求。
+## 组合工作流验证：列窗口 → 切窗 → 快照 → 序列（2026-10-26）
+
+之前每个工具单独验过，但没验过串起来用。这轮按「模型真会怎么调」跑完整链路，
+重点看耗时与流畅度。
+
+### 修掉的三处真实瓶颈
+
+**1. 首次列窗口 3.7 秒——worker 冷启动**
+
+`desktop_windows` 第一次调用要 3.1–3.7 s。分解后确认不是 EnumWindows 慢，而是
+**PowerShell worker 启动本身 2.7 s**（`Add-Type -AssemblyName UIAutomation*` +
+C# 编译）。这笔成本只取决于程序集与脚本，和具体请求无关。
+
+修法：`ps_worker.start_warmup()`，在 API 启动时（与 MCP 初始化同处）后台把
+desktop / clipboard 两个 worker 拉起来。用户读完界面第一次点按钮时已经就绪。
+实测首次列窗口 **3077 ms → 300 ms**。`HARNESS_PS_WARMUP=0` 可关闭。
+
+**2. 列窗口 174ms——每个窗口查一次进程名**
+
+`GetProcesses()` 全表预取改成一次性，取代每窗口一次 `Get-Process -Id`。
+20 个窗口时那是 20 次跨进程查询。实测 **174 ms → 48 ms**。
+
+**3. 切窗 160ms——固定 sleep 120ms**
+
+原来切完固定 `Start-Sleep 120ms` 等窗口动画。改成轮询前台是否已经变了，
+上限 300ms。实测 **160 ms → 32 ms**（多数切换 10–30ms 就到位）。
+
+### 切窗的硬限制：Windows 前台锁
+
+`SetForegroundWindow` 对后台进程有前台锁，实测**约一半调用会被拒**。这是系统
+行为，不是 bug。补了 `AttachThreadInput` + `BringWindowToTop` 的常规绕过手段，
+成功率从 5/10 提升到 **8/12**；剩余失败如实返回：
+
+    focus_failed: Windows refused to raise that window. Click it once yourself,
+    then retry (foreground lock blocks background processes).
+
+不假装成功，也不算「工具坏了」——手工点一下目标窗口再重试即可。
+
+### 最终耗时
+
+| 步骤 | 耗时 |
+|---|---|
+| `desktop_windows`（热态） | 48 ms |
+| `focus` | 32 ms |
+| `desktop_snapshot` | 15–27 ms |
+| `sequence`（3×60ms wait） | 479 ms |
+| **4 次调用合计** | **627–983 ms** |
+
+序列的 479ms 里有 180ms 是显式 wait、150ms 是步间 50ms 间隔——逻辑开销约 150ms。
+
+### 过程中踩到的两个 PowerShell 坑
+
+- `[ref]([uint32]0)` 不是合法语法，必须先 `$var = [uint32]0` 再 `[ref]$var`；
+- 反引号续行 + 跨行括号在 `ParseInput` 下报「缺少 )」，改成先拼接变量再传参。
+
+两处都用 `Parser::ParseInput` 静态校验过（`PARSE_OK`）才继续。这类错误只在
+worker 启动时暴露成「process closed unexpectedly」，从 stderr 里看不到原因，
+所以静态解析比反复试跑更快。
+
+### 验证方式
+
+全部只做**只读**操作 + 切窗：列窗口、切窗口、快照、只含 `wait` 的序列。
+**没有注入任何真实键鼠输入**——点击、键盘、文本输入仍需人按验收表逐项确认
+（`docs/FEISHU_ACCEPTANCE.md` D1–D15）。
+
+测试：`test_desktop_windows_tool` 11、`test_desktop_control_windows` 44。
+全量 2178 passed / 3 skipped，ruff 通过。

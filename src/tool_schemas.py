@@ -617,6 +617,16 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'each time. Use pid and window_id for a following action.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
+  'function': {'name': 'desktop_windows',
+               'description': 'List visible top-level windows with pid, window_id and '
+                              'title. Read-only; use it to discover a target instead of '
+                              'asking the user to switch windows manually.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'limit': {'type': 'integer',
+                                            'description': 'Max windows to return (1-100, default 20)'}},
+                              'required': []}}},
+ {'type': 'function',
   'function': {'name': 'desktop_action',
                'description': 'Perform approved mouse or keyboard input in the '
                               'foreground desktop: either one action, or a '

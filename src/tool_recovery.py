@@ -24,6 +24,7 @@ READ_ONLY_TOOLS = frozenset({
     'glob', 'grep', 'ls', 'web_fetch', 'load_skill',
     'todo_read', 'list_tasks', 'get_task', 'list_crons', 'background_output',
     'find_sessions', 'screen_ocr', 'clipboard_read', 'desktop_snapshot',
+    'desktop_windows',
 })
 
 # Repeating converges to the same state or is refused by a status guard.
