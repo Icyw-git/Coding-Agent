@@ -6289,3 +6289,60 @@ TUI 缺它会让 `test_cli_commands_and_aliases_exist_in_tui` 失败。这条测
   损坏文件拒写、按 decision 过滤删除。
 
 全量 2261 passed / 3 skipped，ruff 通过。
+
+## 飞书失败兜底通知可点击跳回（2026-10-27）
+
+之前本地 Toast 只是一个「飞书发不出去」的静态提示——用户看到后第一件事就是想回飞书
+看看到底怎么回事，但点了没反应，得自己找窗口。
+
+### 实现
+
+`notify.notify(...)` 新增 `url` 参数，写进 Toast XML：
+
+```xml
+<toast activationType="protocol" launch="https://open.feishu.cn/messenger/">
+```
+
+`activationType="protocol"` 是必须的——没有它 Windows 会把 `launch` 当应用参数
+而不是链接。
+
+### 安全过滤（这条路径的输入不可信）
+
+Toast 内容是**错误信息**，可能包含远端返回的文本。允许任意 scheme 等于给了一个
+「打开本地程序」的入口。所以 `_safe_launch` 只放行：
+
+- `https://`
+- `http://localhost`、`http://127.0.0.1`（本机控制台）
+
+拒绝的：`file://`（打开任意本地文件/程序）、`ms-*`（系统设置页）、
+`javascript:`/`vbscript:`、以及含换行/空字符的 URL（注入）。
+
+另有**一个真实的坑**：`&` 在 XML 属性里必须转义，否则整条 Toast 失效。
+`https://x.com/a?p=1&q=2` 不转义就发不出去，而且失败是静默的。走 `escape()`。
+
+### 网关接线
+
+`_local_alert` 是四处失败（回复、回合通知、心跳、定时结果）的统一出口，在那里
+统一带上 `https://open.feishu.cn/messenger/`。
+
+刻意**不拼具体 chat_id**：`open_chat_id` 只在当前应用租户内有效，拼错会打开空白
+页，不如落到消息中心让用户自己选。
+
+旧 notifier 不接受 `url` 参数时（测试替身）捕获 `TypeError` 退回不带链接的调用
+——通知本身比链接重要。
+
+### 验证
+
+- 真实弹了两条 Toast（带链接与不带链接），都返回 `sent=True`；
+- XML 断言：`activationType="protocol"` 与 `launch` 同时出现，无 url 时两者都没有；
+- `&` 转义后 XML 合法；
+- 5 种危险 scheme 全部被丢弃，4 种合法目标原样通过；
+- 换行注入被拒。
+
+测试 +9（`test_notify` 11 → 25？实际新增 8 条断言组）。全量 2275 passed /
+3 skipped，ruff 通过。
+
+### 未做
+
+`--restart-on-crash`（常驻进程崩了要手动重启）与 `screen_capture` 接 PowerShell
+worker（1.6s 里主要是 PNG 编码，进程开销占小头）——两者收益都不足以抵消改动风险。

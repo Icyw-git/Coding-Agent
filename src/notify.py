@@ -67,9 +67,38 @@ def _clean(text, limit: int) -> str:
     return raw
 
 
-def _toast_xml(title: str, body: str, level: str) -> str:
+# 只接受这几类启动目标：飞书（https）、本机 http（控制台/本地页面）。
+# 刻意不做「任意 scheme」——file://、ms-* 或自定义协议都可能被滥用成打开
+# 本地程序，而这条路径的输入来自错误信息，不可信。
+_ALLOWED_PREFIXES = ('https://', 'http://localhost', 'http://127.0.0.1')
+_CONTROL_CHARS = frozenset(chr(code) for code in (0, 10, 13))
+
+
+def _safe_launch(url: str | None) -> str | None:
+    """校验并归一化 Toast 的启动目标；不合法返回 None（退化成不可点击）。
+
+    ``&`` 在 XML 属性里必须转义，否则整条 Toast 失效——这是最常见的坑，
+    所以这里走 ``escape()`` 而不是拼字符串。
+    """
+    text = str(url or '').strip()
+    if not text:
+        return None
+    if not any(text.casefold().startswith(prefix) for prefix in _ALLOWED_PREFIXES):
+        return None
+    if any(ch in _CONTROL_CHARS for ch in text):
+        return None
+    return text
+
+
+def _toast_xml(title: str, body: str, level: str,
+               launch: str | None = None) -> str:
+    target = _safe_launch(launch)
+    # activationType=protocol 让点击「打开链接」而不是「打开某个应用」。
+    # 没有合法目标时不写这两个属性，Toast 退化成纯提示。
+    head = (f'<toast activationType="protocol" launch="{escape(target)}">'
+            if target else '<toast>')
     parts = [
-        '<toast>',
+        head,
         '<visual><binding template="ToastGeneric">',
         f'<text>{escape(title)}</text>',
     ]
@@ -118,7 +147,8 @@ def _command(script: str) -> list[str]:
             '-EncodedCommand', _encode(script)]
 
 
-def notify(title, body='', *, level='info', runner=None) -> dict:
+def notify(title, body='', *, level='info', url=None,
+           runner=None) -> dict:
     """弹一条本地 Toast；返回结果字典，不抛异常。
 
     ``runner(command, timeout)`` 可注入，需返回带 ``returncode``/``stdout``/
@@ -142,7 +172,7 @@ def notify(title, body='', *, level='info', runner=None) -> dict:
                     'retry_in': round(MIN_INTERVAL - (now - _last_attempt), 1)}
         _last_attempt = now
 
-    command = _command(_build_script(_toast_xml(title, body, level)))
+    command = _command(_build_script(_toast_xml(title, body, level, url)))
     runner = runner or _run
     try:
         completed = runner(command, TIMEOUT)

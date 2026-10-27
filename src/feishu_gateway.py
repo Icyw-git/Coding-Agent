@@ -3288,11 +3288,32 @@ class FeishuGateway:
                 return False
             self._alerted[key] = now
         try:
-            self.notifier(title, body[:LOCAL_ALERT_BODY], level='error')
+            # 带上飞书链接：通知是「飞书发不出去」时弹的，用户看到后第一件事
+            # 就是想回到飞书看看到底怎么回事。点击直接打开聊天窗口。
+            self.notifier(title, body[:LOCAL_ALERT_BODY], level='error',
+                          url=self._feishu_chat_url())
+        except TypeError:
+            # 旧 notifier 不接受 url（测试替身）：退回不带链接的调用，
+            # 通知本身比链接重要。
+            try:
+                self.notifier(title, body[:LOCAL_ALERT_BODY], level='error')
+            except Exception as exc:
+                print(f'[feishu] local alert failed: {exc}')
+                return False
         except Exception as exc:
             print(f'[feishu] local alert failed: {exc}')
             return False
         return True
+
+    @staticmethod
+    def _feishu_chat_url() -> str:
+        """飞书客户端的聊天入口。
+
+        桌面端用 https 链接，点开会在客户端里打开消息页。刻意不拼具体
+        chat_id：open_chat_id 只在当前应用租户内有效，拼错会打开空白页，
+        不如直接落到消息中心让用户自己选。
+        """
+        return 'https://open.feishu.cn/messenger/'
 
     def _reply(self, chat_id: str, text: str):
         if self.transport is None or not text:

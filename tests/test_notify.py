@@ -146,3 +146,83 @@ def test_failed_attempt_also_counts_toward_rate_limit():
     assert notify.notify('a', runner=recorder)['reason'] == 'failed'
     assert notify.notify('b', runner=recorder)['reason'] == 'rate_limited'
     assert len(recorder.calls) == 1
+
+
+def test_toast_with_url_is_clickable():
+    """带 url 时 Toast 要能点击打开链接（activationType=protocol）。"""
+    xml = notify._toast_xml('t', 'b', 'error', 'https://open.feishu.cn/messenger/')
+    assert 'activationType="protocol"' in xml
+    assert 'launch="https://open.feishu.cn/messenger/"' in xml
+
+
+def test_toast_without_url_is_not_clickable():
+    xml = notify._toast_xml('t', 'b', 'info')
+    assert 'activationType' not in xml
+    assert 'launch=' not in xml
+
+
+def test_url_ampersand_is_escaped():
+    """`&` 不转义会让整条 Toast 失效——这是最常见的坑。"""
+    xml = notify._toast_xml('t', 'b', 'info', 'https://x.com/a?p=1&q=2')
+    assert '&amp;' in xml
+    assert 'p=1&q=2' not in xml
+
+
+@pytest.mark.parametrize('url', [
+    'file:///C:/Windows/notepad.exe',
+    'ms-settings:',
+    'javascript:alert(1)',
+    'vbscript:msgbox',
+    'ftp://example.com',
+])
+def test_unsafe_launch_targets_are_dropped(url):
+    """只允许 https 与本机 http：错误信息不可信，不能让它打开本地程序。"""
+    assert notify._safe_launch(url) is None
+    assert 'launch=' not in notify._toast_xml('t', 'b', 'error', url)
+
+
+@pytest.mark.parametrize('url', [
+    'https://open.feishu.cn/messenger/',
+    'https://example.com/x',
+    'http://localhost:8000/ui',
+    'http://127.0.0.1:8000/',
+])
+def test_safe_launch_targets_survive(url):
+    assert notify._safe_launch(url) == url
+
+
+def test_newline_in_url_is_rejected():
+    assert notify._safe_launch('https://x.com/a' + chr(10) + 'b') is None
+
+
+def test_notify_passes_url_through():
+    """url 要真的进到发给 PowerShell 的脚本里（整条命令是 -EncodedCommand）。"""
+    import base64
+
+    captured = {}
+
+    class Result:
+        returncode = 0
+        stdout = ''
+        stderr = ''
+
+    def runner(command, timeout):
+        captured['command'] = command
+        return Result()
+
+    notify.reset()
+    result = notify.notify('t', 'b', level='error',
+                           url='https://open.feishu.cn/x', runner=runner)
+
+    assert result['sent'] is True
+    # -EncodedCommand <base64(UTF-16LE 脚本)>
+    encoded = captured['command'][-1]
+    script = base64.b64decode(encoded).decode('utf-16-le')
+    # XML 在脚本里也是 base64 的：解两层才看得到 launch
+    import re
+
+    match = re.search(r"FromBase64String\('([A-Za-z0-9+/=]+)'\)", script)
+    assert match, script[:200]
+    xml = base64.b64decode(match.group(1)).decode('utf-8')
+    assert 'launch="https://open.feishu.cn/x"' in xml
+    assert 'activationType="protocol"' in xml
