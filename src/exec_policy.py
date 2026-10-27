@@ -138,7 +138,7 @@ _WARNED: frozenset = frozenset()
 READ_WRITE_TOOLS = ('write', 'edit', 'apply_patch')
 # 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
 READ_ONLY_FILE_TOOLS = ('read', 'view_image', 'read_document',
-                        'render_document', 'glob', 'grep', 'ls')
+                        'render_document', 'glob', 'grep', 'ls', 'recall')
 # 屏幕读取：内容可能含密码/私信，每次都问；定时/后台回合由 hooks 直接拒绝。
 SCREEN_TOOLS = ('screen_capture', 'screen_ocr')
 SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
@@ -274,6 +274,17 @@ class Policy:
                 ASK, 'delete_paths',
                 f'{tool} moves files to the recycle bin (restorable, but still a '
                 'destructive action)')
+        elif tool == 'forget':
+            # 删记忆不可逆（不像 delete_paths 有回收站），且删的是长期状态：
+            # 即使 approval_policy=never 也不该默默删掉用户的记忆。
+            decision = Decision(
+                ASK, 'forget_memory',
+                'forgetting a memory is permanent and affects every future session')
+        elif tool == 'remember':
+            # 写记忆是长期副作用：一次写入会影响之后每一个会话，值得看一眼。
+            decision = Decision(
+                ASK, 'remember_memory',
+                'saving a long-term memory affects every future session')
         elif tool in DESKTOP_TOOLS:
             if not desktop_control_enabled():
                 decision = Decision(

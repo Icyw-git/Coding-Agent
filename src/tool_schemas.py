@@ -706,4 +706,56 @@ TOOL_SCHEMAS = [{'type': 'function',
                                             'maxItems': 50,
                                             'description': '1-50 existing paths to move to '
                                                            'the recycle bin'}},
-                              'required': ['paths']}}}]
+                              'required': ['paths']}}},
+ {'type': 'function',
+  'function': {'name': 'remember',
+               'description': 'Save one long-term memory that will be recalled in later '
+                              'sessions. Use when the user says to remember something, '
+                              'corrects you, or states a stable preference. Do NOT use '
+                              'for secrets, passwords, or one-off details. Prefer this '
+                              'over writing files into the memories directory.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'text': {'type': 'string',
+                                           'description': 'The memory itself, in one or a '
+                                                          'few sentences'},
+                                  'type': {'type': 'string',
+                                           'enum': ['preference', 'correction', 'fact',
+                                                    'context'],
+                                           'description': 'preference = stable personal '
+                                                          'preference; correction = a '
+                                                          'correction the user made; fact = '
+                                                          'something that took effort to '
+                                                          'establish; context = background '
+                                                          'about a project or environment'},
+                                  'name': {'type': 'string',
+                                           'description': 'Short stable name; derived from '
+                                                          'text when omitted'},
+                                  'description': {'type': 'string',
+                                                  'description': 'One-line summary used '
+                                                                 'in the memory index'}},
+                              'required': ['text']}}},
+ {'type': 'function',
+  'function': {'name': 'forget',
+               'description': 'Delete one saved memory permanently. Requires user '
+                              'approval. Use recall first to find the exact name.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'name': {'type': 'string',
+                                           'description': 'Name or file name of the memory '
+                                                          'to delete'}},
+                              'required': ['name']}}},
+ {'type': 'function',
+  'function': {'name': 'recall',
+               'description': 'Search saved memories by keyword. An empty query lists '
+                              'every memory with its type and description.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'query': {'type': 'string',
+                                            'description': 'Keyword to look for; empty lists '
+                                                           'all memories'},
+                                  'limit': {'type': 'integer',
+                                            'minimum': 1,
+                                            'maximum': 50,
+                                            'description': 'Maximum results (default 10)'}},
+                              'required': []}}}]

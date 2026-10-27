@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import yaml
 
 import llm_route
+import memory_redact
 from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
 
@@ -122,12 +123,39 @@ def _atomic_write(path, text: str) -> None:
 
 
 def _render_memory(name: str, mem_type: str, description: str, body: str) -> str:
-    """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。"""
+    """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。
+
+    写盘前对 description/body 做凭据脱敏：记忆是长期状态，一条 .env 内容被
+    记下来之后每次会话都会被召回，泄露面比会话本身大得多（会话能删，记忆
+    会一直跟着）。
+    """
     def one_line(value) -> str:
         return ' '.join(str(value or '').split())
 
-    return (f"---\nname: {one_line(name)}\ndescription: {one_line(description)}\n"
-            f"type: {one_line(mem_type)}\n---\n\n{body}\n")
+    safe_desc, desc_hits = memory_redact.redact(str(description or ''))
+    safe_body, body_hits = memory_redact.redact(str(body or ''))
+    hits = sorted(set(desc_hits) | set(body_hits))
+    if hits:
+        _record_redaction(hits)
+    return (f"---\nname: {one_line(name)}\ndescription: {one_line(safe_desc)}\n"
+            f"type: {one_line(mem_type)}\n---\n\n{safe_body}\n")
+
+
+def _record_redaction(kinds: list[str]) -> None:
+    """脱敏是静默篡改用户要记的东西：必须留痕，否则“我明明让它记住了”无解。
+
+    惰性导入 hooks：memory 是更底层的模块，顶层 import 会形成环。失败也只
+    打印——审计是观察层，不能反过来影响一次写入。
+    """
+    print(f'  \033[33m[memory] redacted {len(kinds)} secret(s): {", ".join(kinds)}\033[0m')
+    try:
+        import hooks
+        hooks._append_audit('memory_redacted', {
+            'kinds': ','.join(kinds),
+            'reason': 'credential-shaped content in memory body',
+        })
+    except Exception:
+        pass
 
 
 def write_memory_file(name: str, mem_type: str, description: str, body: str):  # 保存记忆文件
@@ -181,6 +209,30 @@ def read_memory_file(filename: str):  # 读取记忆文件
         return None
     entry = _cached_entry(path)
     return entry[2] if entry is not None else None
+
+
+def delete_memory_file(name: str) -> bool:
+    """删除一条记忆。找不到返回 False（调用方据此给模型列出现有名字）。
+
+    ``name`` 既可以是记忆名也可以是文件名：模型手里通常只有 ``remember`` 返回的
+    文件名，而用户在界面上看到的是 name（两者经 ``_slug`` 后一致，但用户可能
+    只记得原文）。
+
+    删除后必须重建索引：``MEMORY.md`` 是召回入口，留着已删条目会让模型去读一个
+    已经不存在的文件。
+    """
+    target = _slug(name)
+    if not target:
+        return False
+    # _memory_path 会做目录穿越检查；这里复用它而不是自己拼路径。
+    resolved = _memory_path(f'{target}.md')
+    if resolved is None or not resolved.is_file():
+        return False
+    with _write_guard():
+        resolved.unlink(missing_ok=True)
+        _cache_drop(resolved)
+        _rebuild_index_unlocked()
+    return True
 
 
 def list_memory_files() -> list:  # 列出所有记忆文件

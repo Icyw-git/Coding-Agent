@@ -169,6 +169,24 @@ def run_delete_paths(paths: list) -> str:
     return _delete_tool(paths, audit=_screen_audit)
 
 
+def run_remember(text: str, type: str = 'preference', name: str = '',
+                 description: str = '') -> str:
+    # 惰性导入：tool_memory → memory → llm_route → harness，放到顶层会把
+    # hooks/tools 的导入顺序搅成环。
+    from tool_memory import remember
+    return remember(text, mem_type=type, name=name, description=description)
+
+
+def run_forget(name: str) -> str:
+    from tool_memory import forget
+    return forget(name)
+
+
+def run_recall(query: str = '', limit: int = 10) -> str:
+    from tool_memory import recall
+    return recall(query, limit=limit)
+
+
 def run_desktop_snapshot() -> str:
     return _desktop_snapshot_tool(audit=_screen_audit)
 
@@ -303,6 +321,9 @@ tool_registry = {
     'clipboard_read': run_clipboard_read,
     'clipboard_write': run_clipboard_write,
     'delete_paths': run_delete_paths,
+    'remember': run_remember,
+    'forget': run_forget,
+    'recall': run_recall,
     'desktop_snapshot': run_desktop_snapshot,
     'desktop_windows': run_desktop_windows,
     'desktop_action': run_desktop_action,
