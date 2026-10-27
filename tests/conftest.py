@@ -112,11 +112,6 @@ def _reset_turn_slot_state():
 
 @pytest.fixture(autouse=True)
 def _reset_turn_control_state():
-    """回合取消位/活动 token 是进程级状态：用例之间必须清零。
-
-    生产语义保留“启动前按下的 Esc 会取消即将开始的回合”，所以不在 begin_turn
-    里无条件清位；测试需要自己保证不把上一个用例的取消位带进下一个。
-    """
     import turn_control
 
     turn_control.reset()
@@ -124,6 +119,29 @@ def _reset_turn_control_state():
         yield
     finally:
         turn_control.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_third_round_state():
+    """污点与记忆作用域是 ContextVar：同一测试会话里会跨用例残留。
+
+    与 turn_coordinator 那次「单跑必过、连跑偶发」同类问题：_taint 记的是
+    “本回合读过什么”，上一个用例留下的污点会让下一个用例的普通出网无故升级；
+    memory_scope 留着 readonly/off，会让别的用例的抽取测试静默不跑。
+
+    两者都是 ContextVar，比全局变量好一点（线程间不串），但同一线程的用例
+    之间照样残留，所以这里前后都清。
+    """
+    import memory_scope
+    import taint
+
+    taint.reset()
+    memory_scope.reset()
+    try:
+        yield
+    finally:
+        taint.reset()
+        memory_scope.reset()
 
 
 @pytest.fixture(autouse=True)

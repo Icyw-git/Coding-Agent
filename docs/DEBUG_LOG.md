@@ -7234,3 +7234,22 @@ ruff 通过。
 - 文档内链检查：本轮新增的引用无失效（既有的 75 条 `[x](y.py)` 是把代码名
   当行内代码用的历史风格，不是这一轮引入的）
 - 全量 **2497 passed / 3 skipped**（188s），ruff 通过
+
+### 收尾第二件事：补 conftest 的状态隔离
+
+本轮新增模块里有模块级可变状态的两个：`taint`（本回合读过什么）和
+`memory_scope`（本会话记忆模式）。两者都是 `ContextVar`——比全局变量好（线程间
+不串），但**同一测试线程里的用例之间照样残留**。
+
+这正是之前 `turn_coordinator._DEPTH/_OWNER/_UNLOCK` 那次「单跑必过、连跑偶发」
+失败的同一类问题：上一个用例留下的污点会让下一个用例的普通出网无故升级；
+`memory_scope` 留着 readonly/off，会让别的用例的抽取测试静默不跑（断言"没调用
+模型"的用例会假通过）。
+
+加了 `_reset_third_round_state` autouse fixture，前后都清。
+
+**验证方式**（不是"看着对"，是实际构造残留）：临时写一个两用例的探针文件，
+第一个故意 `taint.mark()` + `set_mode('off')`，第二个断言自己是干净的。没有
+fixture 时第二个会失败；加完之后 2 passed。探针用完即删。
+
+全量 **2497 passed / 3 skipped**（170s），ruff 通过。
