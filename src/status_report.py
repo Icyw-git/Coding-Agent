@@ -154,6 +154,27 @@ def format_status(session_store) -> str:
         capability_lines += '\n    外部内容标记：开（web/MCP 结果标注不可信）'
     if taint.enabled():
         capability_lines += '\n    污点出网：开（读过敏感内容后出网强制审批）'
+    # 审批粒度：用户应该知道“批准一次”到底管多久。
+    try:
+        import approval_scope
+        capability_lines += (f'\n    审批作用域：{approval_scope.describe(approval_scope.default_scope())}'
+                            '（/sandbox 外的独立开关 HARNESS_APPROVAL_SCOPE）')
+    except Exception:
+        pass
+    # 记忆：自动抽取与显式工具都在，但两半的状态不一样。
+    try:
+        import memory_scope
+        capability_lines += f'\n    记忆：{memory_scope.describe()}'
+    except Exception:
+        pass
+    try:
+        import session_continue
+        if session_continue.enabled():
+            hours = session_continue.window_seconds() / 3600
+            capability_lines += (f'\n    跨渠道接续：开'
+                                f'（{hours:g} 小时内的会话自动接上）')
+    except Exception:
+        pass
     # 规则文件坏了必须**无条件**显示：那意味着所有规则一夜之间失效，
     # 而用户还以为自己的 allow 规则在生效。
     if ruleset.error:

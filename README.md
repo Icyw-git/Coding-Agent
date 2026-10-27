@@ -259,6 +259,37 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   子代理暴露，屏幕与剪贴板工具（`screen_capture`/`screen_ocr`/`clipboard_read`/
   `clipboard_write`）同样排除，bash 也不提供
   `run_in_background`。
+- 记忆有三个显式工具：`remember`（存一条长期记忆，type 限
+  `preference`/`correction`/`fact`/`context`）、`forget`（永久删除一条，需审批）、
+  `recall`（按关键词查，空查询列全部）。它们与自动抽取互补：自动那一半每回合
+  结束时在后台跑，这三个是用户/模型点名的入口。
+
+## 记忆
+
+记忆分两半，缺一半都不好用：
+
+**自动一半**（默认开）——每回合结束后台线程抽取本轮值得记的内容，超过阈值时
+合并去重。召回默认走本地关键词筛选（`HARNESS_MEMORY_RECALL=local`，零网络往返），
+作为请求末尾的独立 system 消息注入，**不进 system prompt**——否则每轮召回变化都会
+作废整个请求前缀的供应商缓存。
+
+**显式一半**——`remember` / `forget` / `recall` 三个工具。用户说「记住我周三下午不
+看代码」时不该指望自动抽取碰巧抓到；想删掉一条记错的，也不用去 `memories/` 手动
+翻文件。
+
+三个额外的保障：
+
+- **落盘脱敏**：写入前把凭据形态的内容替换成 `[redacted:kind]`（私钥块、
+  `sk-`/`ghp_`/`AKIA`/JWT/Bearer、`password:`、中文「密码是」…）。记忆是长期状态，
+  一条 `.env` 内容被记下来会跟着每次召回，泄露面比会话本身大得多。自然语言不误伤
+  （「token 预算是 8000」保持原样），命中会打印并记审计事件。
+- **老化归档**：超过 `HARNESS_MEMORY_MAX_AGE_DAYS`（默认 90 天）未用到、且类型是
+  `fact`/`context` 的记忆移到 `memories/.archive/`，**不删除**。
+  `preference`/`correction` 不过期——偏好不会因为三个月没提就失效。
+  `/memories restore <文件名>` 可以找回。
+- **逐会话开关**：`/memories on|off|readonly|writeonly`。`readonly` 用已有记忆但不产生
+  新的，`writeonly` 不受旧记忆影响但会被学习。会话级选择**不改全局设置**，且随会话
+  事件流持久化，重启后仍生效。
 
 ## 执行安全与审批
 
@@ -364,8 +395,8 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
 档位名写错不会静默回落到默认档：`/sandbox` 报用法，环境变量按默认档并在 stderr 提示一次，
 `/status` 和 `--doctor` 始终显示实际生效的档位。
 
-审批有三条通道：CLI 主循环读 stdin（`y` 允许 / `n` 拒绝 / `a` 允许并把同类操作加入本会话白名单，
-与审批卡片的三个按钮一致，TUI 卡片同样是 `y`/`n`/`a`）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
+审批有三条通道：CLI 主循环读 stdin（`y` 仅这一次 / `n` 拒绝 / `a` 允许并把同类操作加入本会话白名单 /
+`t` 允许同类 N 次，与审批卡片的按钮一致，TUI 卡片同样是 `y`/`n`/`a`）；HTTP 服务模式（`create_app`）把请求登记到 `/v1/permissions`
 队列，由飞书卡片或 `/approvals` 决议；Teammate、后台 worker、任务 runner 这些不能抢控制台的线程
 只排队等远程决议。没有同类键的命令（解释器、外发请求等）不显示 `a`，服务端也会丢弃这类请求伪造的
 `scope=session`。超时（`HARNESS_APPROVAL_TIMEOUT`，默认 300 秒）未决议一律拒绝；值写成非数字或
@@ -383,6 +414,54 @@ PreToolUse 钩子、工具边界（`run_bash` / `run_read` / `run_view_image` / 
 否则批准一条 `del` 时带上 `klass=rm`，就等于给后续的 `rm` 开门。命令名会解一层包装器
 （`cmd /c "del x"`、`bash -c 'rm x'` 归到 `del` / `rm`，而不是宽泛到能覆盖 `cmd /c rd /s /q` 的
 `cmd` / `bash`），绝对路径与 `.exe` 归一到同一个键；解释器载荷（`python -c`）不解，按它自身归类。
+
+### 授权的作用域与时限
+
+批准一次不等于永久放开。授权带作用域，默认是 `once`（只这一次）：
+
+| 作用域 | 含义 |
+| --- | --- |
+| `once`（默认） | 只这一次，不写白名单 |
+| `times` | 同类还能用 N 次，每次命中递减 |
+| `until` | 到指定时间戳为止 |
+| `session` | 本会话内同类（同样有 12 小时上限） |
+
+默认取 `once` 是因为点「同意」时心里想的是眼前这一条，不是「以后同类都免了」。
+`HARNESS_APPROVAL_SCOPE=session` 可恢复旧的默认行为。`/revoke` 与档位切换会收回**所有作用域**
+的授权，不只 `session` 档。
+
+### 不可代做的事（第四档）
+
+除 allow / ask / deny 之外还有一档 `MUST_DO_SELF`：改密码、提权、改 sudoers、生成 2FA 码、
+支付转账、往密码框打字、把凭据复制到剪贴板。这些**不进审批**：
+
+- 不看档位（`danger-full-access` + `never` 也拒）
+- 不看用户规则文件（allow 规则也改不动）
+- 不看会话白名单（预授权不是代做理由）
+- 不进审批队列（排队等来的「是」同样是错的）
+
+理由：`ask` 的根本问题是它会被说服——模型换个说法就能把审批人说动，而这类事无论模型说什么
+都只能用户自己动手。拒绝语会明确说「只能你做」，避免模型换个工具重试。清单在
+`src/never_do.py`，`HARNESS_NEVER_DO=0` 仅供排查误伤。
+
+### 外部内容与污点出网
+
+`web_fetch` 和 MCP 工具返回的内容会包进 `<untrusted source=… kind=…>` 围栏：网页、issue、
+邮件都可能夹带「ignore previous instructions」，围栏让「这是数据」在上下文里显式可辨。
+正文逐字保留（转义会破坏代码块和 diff），系统提示会说明只有围栏外的文字才算指令。
+`HARNESS_UNTRUSTED_MARK=0` 可关。
+
+污点出网补的是**跨命令**的因果关系：`bash cat .env` 是放行的（`grep .env docs` 这类正常用法
+误伤面比文件工具大），而配套的秘密外发规则只在同一条命令里同时出现两者时才升级。所以
+「先读密钥、再联网」在审批面上原本是两件不相干的事。现在每回合维护敏感读取来源，出网时
+强制升级审批并在卡片上说明「本回合已读过什么」。三个设计约束：
+
+- **只升级不禁止**：读过记忆之后要联网是合理的，缺的是让审批人看到因果
+- **回合级而非全局**：跨回合累积会让每轮都变红，用户就会无脑通过，比不做更糟
+- **优先级高于会话白名单与 LLM 审查官**：一次域名预授权不是读过密钥后的放行依据；
+  审查官看不到本回合前面读过什么，也就无权放行外发
+
+`HARNESS_TAINT_EGRESS=0` 可关。
 
 审批面显示的就是要批准的内容：bash 命令按「留头尾、中间省略」完整呈现，CLI 提示、`/approvals`、
 `/perms`、审批卡片共用同一份渲染（`src/approval_view.py`）；其余工具的参数仍限长，`write` 的整份
@@ -501,8 +580,24 @@ HARNESS_EVENT_CACHE_MAX_BYTES=2097152
 HARNESS_HISTORY_INITIAL_MESSAGES=200
 HARNESS_HISTORY_PAGE_MESSAGES=200
 
-# 可选：记忆召回 llm（默认）、local（本地筛选，无网络请求）、off
+# 可选：记忆召回 llm、local（默认，本地筛选无网络请求）、off
 HARNESS_MEMORY_RECALL=local
+
+# 可选：记忆老化（太久没用到就归档，不删除）
+HARNESS_MEMORY_AGING=1
+HARNESS_MEMORY_MAX_AGE_DAYS=90
+
+# 可选：逐会话记忆开关用命令（不改全局）
+#   /memories on | off | readonly | writeonly
+
+# 可选：主动建议（默认关；只读工具面，建议不是行动）
+HARNESS_PROACTIVE=0
+
+# 可选：新会话时接续最近活跃会话（跨 TUI/飞书/API）
+HARNESS_CONTINUE_SESSION=1
+HARNESS_CONTINUE_WINDOW_S=28800
+
+# 全部环境变量见 docs/ENVIRONMENT.md
 
 # 可选：工作区 AGENTS.md / CLAUDE.md 注入（on 默认 / off 关闭）
 HARNESS_PROJECT_CONTEXT=on
@@ -767,7 +862,8 @@ python scripts/install_autostart.py install             # 当前用户，不提�
 [飞书验收](docs/FEISHU_ACCEPTANCE.md)；下一阶段能力规划（桌面/系统/账号）见
 [Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)；
 记忆/主动性/委托边界的第三轮规划见
-[Round 3](docs/PERSONAL_AGENT_ROUND3.md)。
+[Round 3](docs/PERSONAL_AGENT_ROUND3.md)；
+全部环境变量开关见 [环境变量参考](docs/ENVIRONMENT.md)。
 
 验收辅助（本地预检 + 卡片结构校验 + 可选真机发卡）：
 
