@@ -48,6 +48,65 @@ def _format_grants() -> str:
     return '\n'.join(lines)
 
 
+def _handle_rules(argument: str) -> None:
+    """/rules [add|remove ...]：查看或维护用户规则文件。"""
+    import rules as user_rules
+
+    parts = (argument or '').split(maxsplit=1)
+    action = parts[0].casefold() if parts and parts[0] else ''
+    rest = parts[1] if len(parts) > 1 else ''
+    if not action:
+        print(_format_rules())
+        return
+    usage = chr(10).join([
+        '  用法：/rules                                       查看',
+        '        /rules add allow "<前缀>" [note 备注]',
+        '        /rules add deny  "<前缀>" [note 备注]',
+        '        /rules add ask   "<前缀>" [note 备注]',
+        '        /rules remove "<前缀>"',
+        '  规则只作用于 destructive / opaque_command / external_tool 三类询问，'
+        '改不动硬拒与档位。',
+    ])
+    if action not in ('add', 'remove'):
+        print(usage)
+        return
+    if not rest.strip():
+        print(usage)
+        return
+    try:
+        if action == 'remove':
+            prefix, extra = grants.split_path_argument(rest)
+            if extra:
+                print(usage)
+                return
+            removed = user_rules.remove_rule(prefix)
+            if not removed:
+                print(f'  没有以 {prefix!r} 开头的规则')
+                return
+            for rule in removed:
+                print(f'  已删除：{rule.decision} {", ".join(rule.prefixes)}')
+            return
+        words = rest.split(maxsplit=2)
+        if len(words) < 2:
+            print(usage)
+            return
+        decision = words[0].casefold()
+        prefix, tail = grants.split_path_argument(' '.join(words[1:]))
+        note = ''
+        if tail:
+            try:
+                _, note = grants.parse_options(tail)
+            except ValueError as exc:
+                print(f'  [rules] {exc}')
+                return
+        rule = user_rules.add_rule(decision, [prefix], note=note)
+    except Exception as exc:
+        print(f'  [rules] {exc}')
+        return
+    print(f'  已保存：{rule.decision} {", ".join(rule.prefixes)}')
+    print('  ' + user_rules.RuleSet(rules=[rule]).describe())
+
+
 def _format_rules() -> str:
     ruleset = user_rules.load()
     if ruleset.error:
@@ -165,8 +224,18 @@ def handle_command(line: str, messages: list, session_store) -> None:
         extra = f'，{len(removed)} 条目录写授权' if removed else ''
         print(f'  已撤销 {count} 条当前会话预授权{extra}。')
 
+    elif command == '/domains':
+        import terminal_views
+
+        print(terminal_views.domains(argument))
+
+    elif command == '/audit':
+        import terminal_views
+
+        print(terminal_views.audit(argument))
+
     elif command == '/rules':
-        print(_format_rules())
+        _handle_rules(argument)
 
     elif command == '/grants':
         parts = argument.split(maxsplit=1)

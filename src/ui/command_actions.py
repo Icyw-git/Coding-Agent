@@ -171,6 +171,14 @@ class CommandActionsMixin:
                 self._audit_grant('grant_removed', record)
             extra = (f'，以及 {len(removed)} 条目录写授权' if removed else '')
             self._notice(f'已撤销 {count} 条当前会话预授权{extra}。')
+        elif verb == 'domains':
+            import terminal_views
+
+            self._notice(terminal_views.domains(argument))
+        elif verb == 'audit':
+            import terminal_views
+
+            self._notice(terminal_views.audit(argument))
         elif verb == 'rules':
             self.handle_rules()
         elif verb == 'grants':

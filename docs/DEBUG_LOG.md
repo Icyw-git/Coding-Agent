@@ -6241,3 +6241,51 @@ fixture 负责路径）。**注意 `strict=True` 必须绕过缓存**：那条�
 （写时维护、跨进程一致性、损坏恢复）。按需查询 37ms 完全够用，**不做**。
 
 全量 2239 passed / 3 skipped，ruff 通过。
+
+## 功能完整性：终端侧补齐 /domains、/audit，规则可增删（2026-10-27）
+
+飞书早就有 `/domains` 和 `/audit`，但 **CLI 与 TUI 都没有**——同样一台机器，
+换个界面就找不到入口。另外 `/rules` 只能看，改规则得手编辑 YAML。
+
+### 1. 抽出 `src/terminal_views.py`
+
+CLI 和 TUI 都需要「域名策略」「最近审计」的纯文本渲染。一开始各写一份，很快
+发现字段顺序和有效期措辞已经开始分叉（`有效至` vs `已过期`）。改成共享模块：
+
+- `domains(argument) -> str`：解析 + 落盘 + 渲染，一次调用返回要显示的文本；
+- `audit(argument, limit=50) -> str`：同上。
+
+前端只负责把字符串 print / notice 出去，不再各写一份逻辑。飞书有自己的卡片
+（`feishu_domain_card` / `feishu_audit_card`），不走这条路径——那是刻意的：
+卡片要按钮和翻页，纯文本要一行一条，两者形态不同。
+
+### 2. `/rules` 支持增删
+
+`rules.add_rule` / `rules.remove_rule`：
+
+- 同决策 + 同前缀 + 同工具 + 同作用域视为同一条，**替换而不是追加**（否则反复
+  改一次 note 就多一条规则）；
+- **文件损坏时拒绝写入**：直接覆盖等于丢掉用户写的全部规则，这比「改不进去」
+  糟糕得多，所以显式报 `rules file is unusable`；
+- `remove_rule` 支持按 `decision` 过滤（同一前缀可以同时有 allow 和 deny）。
+
+CLI 侧 `/rules add allow "npm test" note 只读测试`、`/rules remove "npm test"`。
+
+### 3. 顺带修的注册问题
+
+`/rules` 原本在 `cli_commands` 里声明 `arguments=()`（不接受参数），所以带参数
+调用会被 `command_error` 直接拦掉，连 handler 都没进。改成声明参数后才生效。
+
+TUI 侧补了 `CommandSpec('domains', ..., ('domain',))` —— CLI 的 `/domain` 是别名，
+TUI 缺它会让 `test_cli_commands_and_aliases_exist_in_tui` 失败。这条测试正是
+为了让「两边命令面一致」这件事不会悄悄漂移。
+
+### 验证
+
+- `/domains allow *.example.com note docs` → 列表显示 `允许 *.example.com [永久]`；
+- `/audit` 在真实 56 个会话上返回 6 条，带 `tool` / `blocked_by` / `reason`；
+- `/rules add` → `/rules` 显示 → `/rules remove` → 空态，闭环；
+- 22 条测试覆盖空态、增删、deny 硬拒措辞、坏输入、`*.com` 被拒、规则替换语义、
+  损坏文件拒写、按 decision 过滤删除。
+
+全量 2261 passed / 3 skipped，ruff 通过。

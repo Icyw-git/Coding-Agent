@@ -382,5 +382,65 @@ def write(rules: list[Rule], path=None) -> None:
         tmp.replace(target)
 
 
+def add_rule(decision: str, prefixes, *, tools=None, note: str = '',
+             scope: str = SCOPE_GLOBAL, path=None) -> Rule:
+    """新增或替换一条规则；同决策+同前缀集合视为同一条（覆盖而不是重复）。
+    """
+    decision = str(decision or '').strip().casefold()
+    if decision not in DECISIONS:
+        raise RuleError(f'decision must be one of {", ".join(DECISIONS)}')
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    cleaned = tuple(_clean_prefix(item) for item in prefixes or ())
+    if not cleaned:
+        raise RuleError('at least one prefix is required')
+    tool_list = _clean_tools(tools)
+    rule = Rule(decision=decision, tools=tool_list, prefixes=cleaned,
+                note=str(note or '')[:MAX_NOTE_CHARS], scope=scope)
+    ruleset = load(path)
+    if ruleset.error:
+        # 文件坏了不能直接覆盖：那等于丢掉用户写的全部规则。
+        raise RuleError(
+            f'rules file is unusable ({ruleset.error}); fix or remove it first')
+    updated = list(ruleset.rules)
+    for index, existing in enumerate(updated):
+        if (existing.decision == rule.decision
+                and existing.prefixes == rule.prefixes
+                and existing.tools == rule.tools
+                and existing.scope == rule.scope):
+            updated[index] = rule
+            break
+    else:
+        if len(updated) >= MAX_RULES:
+            raise RuleError(f'refusing more than {MAX_RULES} rules')
+        updated.append(rule)
+    write(updated, path)
+    return rule
+
+
+def remove_rule(prefix: str, *, decision: str = '', path=None) -> list[Rule]:
+    """按前缀删除规则（可限定 decision）；返回被删掉的规则。"""
+    target = str(prefix or '').strip()
+    if not target:
+        raise RuleError('prefix must not be empty')
+    wanted = str(decision or '').strip().casefold()
+    ruleset = load(path)
+    if ruleset.error:
+        raise RuleError(
+            f'rules file is unusable ({ruleset.error}); fix or remove it first')
+    kept, removed = [], []
+    for rule in ruleset.rules:
+        hit = (target in rule.prefixes
+               and (not wanted or rule.decision == wanted))
+        if hit:
+            removed.append(rule)
+        else:
+            kept.append(rule)
+    if not removed:
+        return []
+    write(kept, path)
+    return removed
+
+
 def path_for_display() -> Path:
     return Path(os.fspath(DURABLE_PATH))
