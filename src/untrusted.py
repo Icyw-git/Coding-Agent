@@ -24,7 +24,7 @@ Muse 的做法是「外部数据进入模型上下文时一律标注为不可信
 """
 from __future__ import annotations
 
-import os
+import settings
 
 #: 围栏标签名。提示词侧会引用它，改这里要同步改 ``untrusted_notice()``。
 TAG = 'untrusted'
@@ -35,7 +35,7 @@ ENV = 'HARNESS_UNTRUSTED_MARK'
 
 def enabled() -> bool:
     """是否给外部内容加不可信围栏。默认开。"""
-    return os.getenv(ENV, '1').strip().lower() not in ('0', 'off', 'false', 'no')
+    return settings.flag(ENV, True)
 
 
 def _attr(value: str) -> str:

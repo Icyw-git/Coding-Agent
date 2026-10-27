@@ -7253,3 +7253,86 @@ ruff 通过。
 fixture 时第二个会失败；加完之后 2 passed。探针用完即删。
 
 全量 **2497 passed / 3 skipped**（170s），ruff 通过。
+
+## 架构复查：分层与配置（2026-10-27）
+
+用户提出两个问题：分层做好了吗？参数该不该统一到 config/yaml？
+
+### 分层：设计对，但没有用目录表达
+
+`src/` 下 151 个 `.py` 平铺，只有 `ui/` 一个包。靠文件名前缀（`tool_` 20 个、
+`feishu_` 11、`api_` 11、`session_` 7、`turn_` 6）暗示归属。
+
+写脚本解析了 151 个文件的 import 图，算依赖深度：
+
+| 底层（被依赖） | 次数 | | 顶层（依赖多） | 出边 |
+|---|---|---|---|---|
+| `paths` | 16 | | `feishu_gateway` | 32 |
+| `exec_policy` | 16 | | `status_report` | 22 |
+| `turn_progress` | 11 | | `harness_api` | 19 |
+| `hooks` | 11 | | `tools` | 18 |
+
+底层是路径/策略/存储这类纯原语，顶层是网关/UI/入口——**语义分层是对的**，缺的
+只是物理表达。
+
+但有 7 对循环依赖，其中 **`hooks <-> tools` 是真实痛点**：这轮加记忆工具时踩到了
+（`tools` → `tool_tasks` → `hooks` → `from tools import tool_registry` → 还没执行到
+赋值 → ImportError）。这种"靠 import 顺序碰巧能跑"的结构，每次新增工具都可能再踩。
+
+另外 `docs/coding-standards.md` 明文写"`src/` 模块不 import harness"，实际 26 个
+文件经 `llm_route.harness()` 这个"合法后门"反向读入口全局。**规范与实际不一致**比
+规范宽松更糟——新代码会照抄后门。
+
+### 配置：不建议做统一 yaml，三条硬约束
+
+1. **安全档位必须只认进程启动环境**：项目根的 `.env` 就在工作区里，`write` 在默认档
+   免审，Agent 改一行就能把下次启动的权限降到 `never`。`harness.py` 开头的
+   `_TRUSTED_POLICY_ENV` 快照就是防这个。档位写进工作区 yaml = 提权路径。
+2. **换档必须即时生效**：`/sandbox` 靠 `set_tier()` 写 `os.environ`、`load_policy()`
+   即读即用。任何"启动加载一次配置对象"都会破坏它。
+3. **参数在调用时读取**：实测 138 处 `os.getenv`，**只有 2 处**是模块级常量
+   （`api_streams.STREAM_PROGRESS_INTERVAL`、`feishu_gateway.BINDINGS_PATH`），
+   其余全在函数体内。缓存则破坏约束 2，不缓存则没省什么。
+
+结论：现在做统一配置是负收益。真正的痛点不是"参数散"，而是"没有地方问这个参数
+是什么、默认多少"——那个已经有了（`docs/ENVIRONMENT.md`）。
+
+### 做了的事：`src/settings.py` 收敛读取点
+
+不改机制，只改读取方式：
+
+```python
+settings.flag(name, default)        # 布尔，非法值回落到 default
+settings.number(name, default, minimum=…, maximum=…)  # 越界收敛到边界
+settings.text(name, default)        # 空串等于未设
+settings.csv(name)                  # 逗号/分号，去重保序
+settings.policy_env(name)           # 只读，且只接受三个档位键
+```
+
+三个设计决定：
+
+- **不缓存**：每次调用都读环境。比 dict 查找慢几微秒，但保住"改完下一条调用就生效"。
+- **非法值回落而不报错**：配置写错不该让一次已批准的操作失败。
+- **`policy_env` 只读且只收三个键**：刻意没有 setter——绕过 `set_tier` 或启动环境
+  改档位等于提权。有测试断言 `dir(settings)` 里不存在 `set_policy`/`set_tier`。
+
+迁移了 7 个本轮新模块（`never_do`/`untrusted`/`taint`/`memory_redact`/`proactive`/
+`session_continue`/`memory_aging`），它们原本各自重复 `not in ('0','off','false','no')`。
+行为完全不变（156 条相关测试全过）。
+
+**没做**：没有一次性改完 138 处调用点。按"新参数一律走 settings、旧参数动到时顺手改"
+渐进迁移，避免大规模回归风险。
+
+### 没做的：src/ 分子包
+
+按前缀分 `core/policy/storage/tools/transport` 会把 151 个文件的 import 路径全改掉，
+`tests/` 里大量 `monkeypatch.setattr('src.xxx')` 失效。按之前"正则批量改测试文件一次
+改坏 6 处"的教训，这个动作需要机械可验证的做法。**收益主要是观感，代价是高风险
+回归**，判定现在不值得。
+
+### 验证
+
+- 新增 `test_settings.py` (34)，含一条契约测试：`settings.flag` 与各模块自己的
+  `enabled()` 必须给出同一个答案（防止两层漂移）
+- 全量 **2531 passed / 3 skipped**（165s），ruff 通过
+- 新增 `docs/ARCHITECTURE_REVIEW.md` 记录完整诊断与建议

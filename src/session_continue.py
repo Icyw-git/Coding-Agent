@@ -24,6 +24,8 @@ from __future__ import annotations
 import os
 import time
 
+import settings
+
 #: 默认接续时间窗（秒）。8 小时：够一次工作时段，又不会跨夜。
 DEFAULT_WINDOW_S = 8 * 3600
 
@@ -31,8 +33,7 @@ ENV_WINDOW = 'HARNESS_CONTINUE_WINDOW_S'
 
 
 def enabled() -> bool:
-    return os.getenv('HARNESS_CONTINUE_SESSION', '1').strip().lower() not in (
-        '0', 'off', 'false', 'no')
+    return settings.flag('HARNESS_CONTINUE_SESSION', True)
 
 
 def window_seconds() -> int:

@@ -30,6 +30,8 @@ import os
 import time
 from pathlib import Path
 
+import settings
+
 #: 默认保留天数。Codex 用 30 天；我们放宽到 90 天——单人本地记忆条数本来就少，
 #: 太激进会让人觉得"它把我说的忘了"。
 DEFAULT_DAYS = 90
@@ -55,8 +57,7 @@ def threshold_days() -> int:
 
 
 def enabled() -> bool:
-    return os.getenv('HARNESS_MEMORY_AGING', '1').strip().lower() not in (
-        '0', 'off', 'false', 'no')
+    return settings.flag('HARNESS_MEMORY_AGING', True)
 
 
 def _log_path(memory_dir: Path) -> Path:

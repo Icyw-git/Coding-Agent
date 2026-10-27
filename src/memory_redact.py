@@ -19,8 +19,9 @@
 """
 from __future__ import annotations
 
-import os
 import re
+
+import settings
 
 #: 关闭开关（不建议：关掉等于把密钥写进长期记忆）。
 ENV = 'HARNESS_REDACT_MEMORY_SECRETS'
@@ -55,7 +56,7 @@ _REDACTION = '[redacted:{}]'
 
 
 def enabled() -> bool:
-    return os.getenv(ENV, '1').strip().lower() not in ('0', 'off', 'false', 'no')
+    return settings.flag(ENV, True)
 
 
 def redact(text: str, *, extra_values=()) -> tuple[str, list[str]]:

@@ -26,6 +26,8 @@ import os
 import time
 from pathlib import Path
 
+import settings
+
 #: 只读白名单：主动回合能用的**全部**工具。
 #: 刻意不含 write/edit/apply_patch/delete_paths/web_fetch 与一切写操作。
 #: bash 整个排除：它既能 ls 也能 curl，裁不出安全的子集。
@@ -50,8 +52,7 @@ NORMAL_INTERVAL_S = 86400
 
 def enabled() -> bool:
     """默认关。只有显式设 ``HARNESS_PROACTIVE=1`` 才启用。"""
-    return os.getenv('HARNESS_PROACTIVE', '0').strip().lower() in (
-        '1', 'true', 'yes', 'on')
+    return settings.flag('HARNESS_PROACTIVE', False)
 
 
 def max_suggestions() -> int:

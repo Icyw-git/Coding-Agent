@@ -30,8 +30,9 @@ tainted，tainted 的进程失去自动放行）。我们不需要 eBPF —— �
 """
 from __future__ import annotations
 
-import os
 from contextvars import ContextVar
+
+import settings
 
 #: 关闭开关（0/off/false 时不追踪、不升级）。
 ENV = 'HARNESS_TAINT_EGRESS'
@@ -45,7 +46,7 @@ MAX_SOURCES = 8
 
 
 def enabled() -> bool:
-    return os.getenv(ENV, '1').strip().lower() not in ('0', 'off', 'false', 'no')
+    return settings.flag(ENV, True)
 
 
 def reset() -> None:

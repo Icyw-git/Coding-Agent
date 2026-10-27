@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import re
 
+import settings
+
 #: 第四档的动作码。``Decision.action`` 仍然只有三态（结构不变），
 #: 「不可覆盖」由 ``enforce`` 在规则应用之后单独检查这个码来保证。
 MUST_DO_SELF = 'must_do_self'
@@ -119,8 +121,7 @@ def enabled() -> bool:
     注意它**不是**一个普通配置项：只有设成 ``HARNESS_NEVER_DO=0`` 才关闭，
     且不提供用户规则文件、审批、会话白名单等任何模型可触达的绕过路径。
     """
-    import os
-    return os.getenv('HARNESS_NEVER_DO', '1').strip().lower() not in ('0', 'off', 'false', 'no')
+    return settings.flag('HARNESS_NEVER_DO', True)
 
 
 def actions() -> list[str]:
