@@ -39,3 +39,6 @@ _harness_lines.txt
 _tmp_analyze.py
 _tmp_struct.txt
 text.txt
+
+# 误跑 npm 产生的空 lock 文件
+package-lock.json

@@ -12,6 +12,7 @@ import approval_view
 import browser_profile
 import credentials
 import grants
+import limits
 import net_grants
 import rules as user_rules
 import sandbox
@@ -127,6 +128,7 @@ def format_status(session_store) -> str:
                   + f'（{user_rules.path_for_display()}）')
     credentials_line = '\n  ' + credentials.describe()
     trash_line = '\n  ' + trash.describe_status()
+    limits_line = '\n  ' + limits.status_line()
     browser_line = '\n  ' + browser_profile.describe()
     allow_domains, deny_domains = net_grants.counts()
     domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
@@ -154,6 +156,7 @@ def format_status(session_store) -> str:
         f'{rules_line}'
         f'{credentials_line}'
         f'{trash_line}'
+        f'{limits_line}'
         f'{browser_line}'
         f'{usage_line}'
     )

@@ -284,9 +284,28 @@ def reset_cache() -> None:
 
 
 def _popen_shell(command: str, cwd, stdout):
-    return subprocess.Popen(command, shell=True, cwd=cwd, stdout=stdout,
+    """默认路径：普通 Popen + 资源限额（不依赖 Low IL 沙箱）。
+
+    限额是护栏不是安全边界，套不上就照常跑（``apply_to_process`` 失败返回
+    None）。进程结束后关句柄，避免每个命令漏一个内核对象。
+    """
+    proc = subprocess.Popen(command, shell=True, cwd=cwd, stdout=stdout,
                             stderr=subprocess.STDOUT,
                             start_new_session=os.name != 'nt')
+    try:
+        import limits
+
+        # proc 必须是真进程才能套限额：测试常用 Mock 替换 Popen，而 Mock 的
+        # 任意属性都会自动生成，`getattr(proc, 'pid')` 拿到的是 Mock 而不是
+        # 整数，assign 会失败或死循环。显式检查类型，不做猜测。
+        if (isinstance(proc, subprocess.Popen)
+                and limits.available() and limits.from_env().enabled):
+            job = limits.apply_to_process(proc)
+            if job is not None:
+                proc._harness_job = job
+    except Exception as exc:
+        _warn_once(f'资源限额未能应用（{exc}），命令未受限额约束')
+    return proc
 
 
 def _warn_once(message: str) -> None:

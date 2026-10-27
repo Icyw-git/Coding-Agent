@@ -6053,3 +6053,95 @@ Low」。新目录继承 Low 之后，`icacls` 自己（以 Low 运行）就再�
 注释。
 
 全量 2211 passed / 3 skipped，ruff 通过。
+## H1 落地：进程资源限额（Job Object，不依赖沙箱）（2026-10-27）
+
+`bash` 原本只有超时——管得住「卡住不动」，管不住「慢慢把内存吃光」。一个失控的
+`npm install` 或递归脚本足以让桌面卡死，而超时到点前机器已经不能用了。
+
+### 为什么不复用 sandbox 的 Job Object
+
+`sandbox.py` 里已经有一个 Job Object，但它只设了 `KILL_ON_JOB_CLOSE`（防遗留
+进程），语义不同；而且它只在 Low IL 沙箱路径创建，而沙箱默认 `off`。
+
+上一轮试过把沙箱默认打开，实测后回退（见上一节）。所以这里做**独立的限额层**：
+
+    sandbox（能不能写工作区外）  ─┐
+                                  ├→ 各自独立开关，互不依赖
+    limits （能用多少资源）      ─┘
+
+### 能力层 `src/limits.py`
+
+三类限额，都通过 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 设置：
+
+| 项 | LimitFlags | 默认 |
+|---|---|---|
+| 单进程内存 | `PROCESS_MEMORY` (0x100) | 2048 MB |
+| 整组内存 | `JOB_MEMORY` (0x200) | 4096 MB |
+| 进程数 | `ACTIVE_PROCESS` (0x008) | 64 |
+| CPU 累计时间 | `JOB_TIME` (0x004) | 不限 |
+
+默认值依据：2 GiB 过得去 `npm install` / 大型编译的单进程峰值，又能挡住「一次
+分配几十 G」的失控；64 个进程给正常并发留余量，挡住 fork 炸弹。
+
+**刻意不设 `KILL_ON_JOB_CLOSE`**：限额是护栏，不是生命周期管理。关句柄不该杀进程。
+
+### 真实验证（不是看代码，是跑）
+
+| 场景 | 结果 |
+|---|---|
+| 10 MB @ 256 MB 限额 | exit 0，成功 |
+| 1 GB @ 256 MB 限额 | exit 1，`MemoryError` |
+| 1 GB @ 不限额 | **exit 0，成功** |
+| 起 20 进程 @ 5 进程限额 | 第 5 个 `OSError`，命令自己捕获 |
+| 死循环 @ CPU 1s 限额 | exit `0xC0000044`（超时终止） |
+
+第三行是关键对照：同一段代码在不限额时成功，说明确实是限额在起作用，不是巧合。
+
+### 接入默认路径
+
+限额挂在 `_popen_shell`（沙箱 `off` 时走的那条），所以**不依赖 Low IL 也能生效**。
+句柄塞进 `proc.__dict__['_harness_job']`，由 `process_utils.close_process` 统一
+关闭——那里是所有执行路径的收敛点。
+
+失败一律降级：`CreateJobObject` 失败、`AssignProcessToJobObject` 失败、进程已经
+退出，都只是「不限额，照常跑」。个人单机上「命令能跑」比「限额一定生效」重要；
+限额本身是护栏，不是安全边界。
+
+### 过程中踩到的栈溢出（真实事故）
+
+接入后全量测试直接崩在 `Windows fatal exception: stack overflow`，报错栈指向
+`threading.py` 和 `asyncio`，完全看不出跟限额有关。
+
+根因：测试用 `Mock()` 替换 `subprocess.Popen`。Mock 对**任意属性**都返回一个新
+Mock（不会 `AttributeError`），所以 `getattr(proc, '_harness_job', None)` 拿到一个
+Mock；把它当内核句柄传给 `CloseHandle`，ctypes 一路递归到栈溢出。
+
+修法两条，都在 `close_process` 里：
+
+1. 用 `getattr(proc, '__dict__', {}).get(...)` 而不是 `getattr(proc, ...)`——
+   Mock 的 `__dict__` 里没有就不返回；
+2. 校验 `isinstance(job, int) and job`——内核句柄在 Python 里是整数。
+
+`_popen_shell` 里也加了 `isinstance(proc, subprocess.Popen)` 守卫，避免对假进程
+调 `limits.apply_to_process`。
+
+补了两条回归测试：`test_close_process_tolerates_mock_process`（不崩、幂等）和
+`test_close_process_closes_real_job_handle`（真句柄被关且从 proc 上摘掉）。
+
+### 可观测与开关
+
+- `/status` 与 `/status_line()` 显示当前限额；
+- `HARNESS_LIMIT_MEMORY_MB` / `HARNESS_LIMIT_PROCESSES` / `HARNESS_LIMIT_CPU_SECONDS`
+  调整，设 `0` 关闭对应项；非法值静默回落默认（护栏不该阻止启动）。
+
+测试：`tests/test_limits.py` 17 条，覆盖环境解析、三类限额的真实约束、
+失败降级、以及上面那个 Mock 事故。
+
+全量 2226 passed / 3 skipped，ruff 通过。
+
+### 未做
+
+- 磁盘配额（`JOB_OBJECT_LIMIT_PROCESS_DISK` 等）没有接：语义复杂（按字节/
+  按时间），而且个人单机上「磁盘满」通常由别的原因先暴露；
+- 没有按命令类型给不同限额（比如给 `npm install` 更高的内存）——那需要先有
+  真实的使用数据，现在硬编规则等于猜。
