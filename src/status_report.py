@@ -14,11 +14,14 @@ import credentials
 import grants
 import limits
 import net_grants
+import never_do
 import rules as user_rules
 import sandbox
 import screen_capture
+import taint
 import tool_cache
 import trash
+import untrusted
 import workspace_diff
 from exec_policy import (
     CLIPBOARD_ENV,
@@ -135,6 +138,8 @@ def format_status(session_store) -> str:
     _cap('资源限额', limits_snapshot.enabled,
          limits_snapshot.describe().replace('资源限额：', ''))
     _cap('浏览器 profile', browser_profile.exists(), '已创建')
+    _cap('不可代做', never_do.enabled(),
+         f'{len(never_do.actions())} 类（改密码/支付/2FA 等，不可绕过）')
 
     capability_lines = ''
     if active:
@@ -145,6 +150,10 @@ def format_status(session_store) -> str:
     if path_grants:
         capability_lines += (f'\n    目录写授权：{len(path_grants)} 个'
                             '（/grants 查看）')
+    if untrusted.enabled():
+        capability_lines += '\n    外部内容标记：开（web/MCP 结果标注不可信）'
+    if taint.enabled():
+        capability_lines += '\n    污点出网：开（读过敏感内容后出网强制审批）'
     # 规则文件坏了必须**无条件**显示：那意味着所有规则一夜之间失效，
     # 而用户还以为自己的 allow 规则在生效。
     if ruleset.error:

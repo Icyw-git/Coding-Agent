@@ -20,6 +20,7 @@ import approval_view
 import checkpoints
 import grants
 import net_grants
+import never_do
 import policy_bash
 import rules as user_rules
 import taint
@@ -573,6 +574,19 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     定时任务默认按 read-only 档重判：写文件、联网、第三方工具、子代理直接拒绝，
     不进入审批 —— 没人授权过这个任务的副作用，不能让它借当前会话的档位执行。
     """
+    # 第四档必须在一切判定之前：它不看档位、不看规则文件、不看会话白名单、
+    # 不进审批队列。一旦落到 ask，模型就有机会把审批人说动 —— 而这类事
+    # （改密码、转账、验证码）无论模型说什么都只能用户自己动手。
+    refusal = never_do.check(tool, args)
+    if refusal:
+        print(f'\n\033[31m[refused] {tool}: must be done by the user\033[0m')
+        _append_audit('policy_denied', {
+            'tool': tool,
+            'code': never_do.MUST_DO_SELF,
+            'reason': 'operation must be performed by the user personally',
+            'blocked_by': 'never_do',
+        })
+        return refusal
     policy = load_policy()
     decision = evaluate_call(tool, args, policy=policy)
     # 先记污点再判决策：无论这次调用最后是放行、被拒还是用户拒，只要它"读过"

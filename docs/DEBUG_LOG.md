@@ -6936,3 +6936,57 @@ hooks/tools 的导入顺序（`tools` ↔ `hooks` 本来就是环，靠 harness 
 - 全量 **2355 passed / 3 skipped / 7 deselected**（270s），ruff 通过
 - 端到端手验：密钥不落盘（`sk-` 未出现在磁盘）、污点链路（读 .env → 出网需
   升级 → 重置后清空）、围栏格式正确
+
+## 第三轮实施：M3 第四档 MUST_DO_SELF（2026-10-27）
+
+### 为什么是「第四档」而不是「再加一类审批」
+
+现有三档是 allow / ask / deny。`ask` 的根本问题是**它会被说服**：模型换一种说法
+（"用户已经同意了"、"这是测试环境"）就能把审批人说动。而改密码、转账、输入验证码
+这类事根本不该进入讨论。
+
+dots 把它写在产品里：
+
+> Certain sensitive tasks, such as changing a password, **always stay with you**.
+> **Built-in safety requirements always apply**（Custom Rules 不能覆盖）
+
+Muse 的对应思路是 assume breach：不问模型会不会被说服，只问它被说服了能造成什么。
+
+### 实现（src/never_do.py）
+
+- `check(tool, args)` 纯文本/参数匹配，**不读环境、不读规则**——这一档的定义就是
+  无条件。
+- 挂在 `enforce` 的**最前面**，在 `evaluate_call` 之前。这样它天然绕过档位、规则
+  文件、会话白名单、LLM 审查官，也**不进审批队列**（排队等来的"是"同样是错的）。
+- `Decision.action` 仍只有三态（结构不变），「不可覆盖」由 `enforce` 提前返回保证。
+
+### 清单
+
+改密码（passwd/chpasswd/net user/Set-ADAccountPassword）、提权
+（net localgroup administrators）、改 sudoers、2FA 生成（oathtool）、支付转账
+（stripe/paypal/alipay/venmo + pay/charge/transfer/refund/send）、
+`desktop_action` 往密码框打字、`clipboard_write` 复制凭据。
+
+**故意没做**：同意法律条款/签合同。原因是纯文本匹配误报太高（"同意"两字在日常
+对话里到处都是），需要结构化表单识别才有意义。代码里用空的 `_FORM_RULES` 显式
+记录了这个取舍，不是遗漏。
+
+### 误伤控制
+
+有 8 条「不该拒」的测试守住边界：
+`grep password docs/`、`echo "my password is in the vault"`、
+`git log --grep=payment`、`npm install` 等都要放行。关键是**讨论密码 ≠ 改密码**，
+所以规则只认命令动词和参数位置，不做全文关键词匹配。
+
+### 核心验证
+
+`test_enforce_refuses_even_with_danger_full_access_and_never` 构造了最宽松组合：
+`danger-full-access` + `approval_policy=never` + 会话白名单命中 + 审批都返回同意，
+断言 ① 仍然被拒 ② **审批函数被调用 0 次**。这是第四档存在的意义所在。
+
+### 可观察性
+
+`/status` 的「已启用」新增一行「不可代做：10 类（改密码/支付/2FA 等，不可绕过）」，
+并补上 N5/N6 的状态行——用户应该能一眼看到自己受哪些保护。
+
+新增 test_never_do.py (33)。全量 **2388 passed / 3 skipped**（184s），ruff 通过。
