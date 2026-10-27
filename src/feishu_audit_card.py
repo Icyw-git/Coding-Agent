@@ -20,6 +20,9 @@ _ICONS = {
     'clipboard_read': '📋',
     'clipboard_written': '📋',
     'desktop_snapshot': '🪟',
+    'desktop_list_windows': '🗂️',
+    'desktop_focus': '🎯',
+    'desktop_focus_failed': '⚠️',
     'desktop_snapshot_failed': '⚠️',
     'desktop_action': '🖱️',
     'desktop_action_failed': '⚠️',
@@ -78,6 +81,8 @@ def _detail(event: dict) -> str:
             if event.get('width') else '',
         ) if value]
         return ' · '.join(bits)
+    if kind == 'desktop_list_windows':
+        return f"{event.get('count', '?')} 个窗口（共 {event.get('total', '?')}）"
     if kind.startswith('desktop_'):
         bits = [str(value) for value in (
             event.get('action'), event.get('process'),

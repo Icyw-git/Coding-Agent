@@ -101,3 +101,9 @@ def test_truncated_card_says_there_is_more():
     assert '已达显示上限' not in plain
     assert '已达显示上限' in truncated
     assert '共 20 条' in truncated
+
+
+def test_list_windows_line_shows_counts():
+    line = card.event_line({'type': 'desktop_list_windows', 'ts': 0,
+                            'count': 5, 'total': 23})
+    assert '5 个窗口' in line and '23' in line

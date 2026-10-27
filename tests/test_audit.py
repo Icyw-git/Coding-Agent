@@ -153,3 +153,18 @@ def test_api_rejects_unknown_type_and_bad_since(client):
 
 def test_api_requires_token(client):
     assert client.get('/v1/audit').status_code == 401
+
+
+def test_desktop_list_and_focus_are_audited():
+    """新增的桌面事件必须登记进白名单，否则审计里看不到「它列过哪些窗口」。"""
+    for kind in ('desktop_list_windows', 'desktop_focus',
+                 'desktop_focus_failed'):
+        assert kind in audit.AUDIT_EVENTS, kind
+
+
+def test_desktop_list_projection_keeps_only_counts():
+    event = audit.project({'type': 'desktop_list_windows', 'seq': 1, 'ts': 1.0,
+                           'count': 5, 'total': 23,
+                           'windows': [{'title': 'secret document'}]})
+    assert event.fields == {'count': 5, 'total': 23}
+    assert 'windows' not in event.fields      # 窗口标题不进审计流

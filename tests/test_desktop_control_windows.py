@@ -290,3 +290,42 @@ def test_control_script_declares_explicit_union_size():
     """脚本层面也断言：漏了 Size 就等于漏了 8 字节。"""
     assert 'StructLayout(LayoutKind.Explicit, Size = 32)' in         desktop.CONTROL_SCRIPT
     assert 'public struct MOUSEINPUT' in desktop.CONTROL_SCRIPT
+
+
+def test_terminal_input_is_blocked_by_default():
+    """终端窗口默认拒绝键入：敲进去的任何字符都会被当命令执行。
+
+    这一条来自一次真实事故——验证审计时把 type 打进了正在用的终端。
+    终端标题通常不含「密码」之类敏感词，敏感词匹配抓不到它，必须单列。
+    """
+    script = desktop.CONTROL_SCRIPT
+    assert 'terminal_input' in script
+    assert 'allow_terminal' in script
+    assert 'is_terminal' in script
+
+
+def test_allow_terminal_is_part_of_the_payload():
+    payload = desktop.validate_action('type', expected_pid=1,
+                                      expected_window_id='AB',
+                                      text='echo hi')
+    assert payload['allow_terminal'] is False
+    payload = desktop.validate_action('type', expected_pid=1,
+                                      expected_window_id='AB',
+                                      text='echo hi', allow_terminal=True)
+    assert payload['allow_terminal'] is True
+
+
+def test_terminal_flag_does_not_affect_move():
+    """点一下终端选中文字是正常需求：只有 type/key 受终端保护影响。"""
+    script = desktop.CONTROL_SCRIPT
+    assert "@('type', 'key')" in script
+    payload = desktop.validate_action('move', expected_pid=1,
+                                      expected_window_id='AB', x=1, y=2)
+    assert payload['allow_terminal'] is False
+
+
+def test_window_state_reports_terminal_flag():
+    state = desktop._state({'available': True, 'process': 'WindowsTerminal',
+                            'is_terminal': True})
+    assert state.is_terminal is True
+    assert desktop.state_dict(state)['is_terminal'] is True

@@ -61,6 +61,7 @@ class WindowState:
     focused_control_type: str = ''
     focused_is_password: bool = False
     sensitive_target: bool = False
+    is_terminal: bool = False
     error: str = ''
 
 
@@ -195,6 +196,12 @@ function Get-WindowState {
     $sensitivePattern = '(?i)password|passwd|payment|checkout|bank|wallet|2fa|verification|credit.?card|'
     $sensitivePattern += '银行卡|支付|付款|密码|验证码'
     $sensitive = $password -or ($all -match $sensitivePattern)
+    # 终端类窗口单列：往里键入的任何字符都会被当作命令执行，风险高于普通窗口，
+    # 而它的标题通常不含敏感词（就是 'PowerShell' / 'cmd'），敏感词匹配抓不到。
+    $terminalPattern = '(?i)WindowsTerminal|^cmd$|^powershell|^pwsh|^conhost|'
+    $terminalPattern += '^mintty|^wt$|^bash$|^wsl$|^ConEmu|^Terminal$'
+    $isTerminal = (($process -match $terminalPattern) -or
+                   ($classBuffer.ToString() -match '(?i)ConsoleWindowClass|CASCADIA|VirtualConsole'))
     return [ordered]@{
         available=$true; title=$titleBuffer.ToString(); process=$process; pid=[int]$procId
         window_id=$hwnd.ToInt64().ToString('X')
@@ -202,6 +209,7 @@ function Get-WindowState {
         rect=if ($hasRect) { @($rect.Left,$rect.Top,($rect.Right-$rect.Left),($rect.Bottom-$rect.Top)) } else { $null }
         focused_name=$focusedName; focused_control_type=$focusedType
         focused_is_password=$password; sensitive_target=$sensitive
+        is_terminal=$isTerminal
     }
 }
 function Invoke-Step($step, $state) {
@@ -455,6 +463,19 @@ function Invoke-HarnessOp($req) {
     if ($state.sensitive_target) {
         Fail 'sensitive_target' 'desktop input is blocked on a password or sensitive window' $state
     }
+    # 终端窗口：只有 type/key（会变成命令）需要拦；move/click/scroll 和纯 wait
+    # 序列不受影响——点一下终端去选中文字是正常需求。
+    $inputAction = ($payload.action -in @('type', 'key'))
+    if ($payload.action -eq 'sequence') {
+        foreach ($st in @($payload.steps)) {
+            if ([string]$st.action -in @('type', 'key')) { $inputAction = $true; break }
+        }
+    }
+    if ($state.is_terminal -and $inputAction -and -not [bool]$payload.allow_terminal) {
+        $why = 'typing into a terminal window would run commands; re-send with '
+        $why += 'allow_terminal=true after confirming the window'
+        Fail 'terminal_input' $why $state
+    }
     $action = [string]$payload.action
     if ($action -eq 'sequence') {
         $steps = @($payload.steps)
@@ -551,6 +572,7 @@ def _state(value) -> WindowState:
         focused_control_type=str(value.get('focused_control_type') or ''),
         focused_is_password=bool(value.get('focused_is_password')),
         sensitive_target=bool(value.get('sensitive_target')),
+        is_terminal=bool(value.get('is_terminal')),
         error=str(value.get('error') or ''),
     )
 
@@ -797,7 +819,8 @@ def _validated_step(step) -> dict:
 
 def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
                     x=None, y=None, text=None, key=None, amount=None,
-                    button=None, count=None, steps=None) -> dict:
+                    button=None, count=None, steps=None,
+                    allow_terminal=None) -> dict:
     action = str(action or '').strip().casefold()
     try:
         expected_pid = int(expected_pid)
@@ -831,6 +854,8 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
     if action not in SINGLE_ACTIONS:
         raise DesktopControlError(
             'action must be move, click, type, key, scroll, sequence, or focus')
+    # 显式放行终端输入必须由调用方逐次声明，不能隐式带上。
+    terminal_ok = bool(allow_terminal)
     if action != 'click' and (button is not None or count is not None):
         raise DesktopControlError('button and count are only valid with click')
     if action == 'move':
@@ -839,7 +864,8 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
         except (TypeError, ValueError) as exc:
             raise DesktopControlError('move requires integer x and y') from exc
         return {'action': action, 'expected_pid': expected_pid,
-                'expected_window_id': expected_window_id, **coords}
+                'expected_window_id': expected_window_id,
+                'allow_terminal': terminal_ok, **coords}
     if action == 'click':
         return {'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
@@ -848,7 +874,8 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
         if not isinstance(text, str) or len(text) > MAX_TYPE_CHARS:
             raise DesktopControlError(f'type text must be a string of at most {MAX_TYPE_CHARS} characters')
         return {'action': action, 'expected_pid': expected_pid,
-                'expected_window_id': expected_window_id, 'text': text}
+                'expected_window_id': expected_window_id,
+                'allow_terminal': terminal_ok, 'text': text}
     if action == 'key':
         return {'action': action, 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
@@ -860,16 +887,19 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
     if amount == 0 or abs(amount) > MAX_SCROLL:
         raise DesktopControlError(f'scroll amount must be between -{MAX_SCROLL} and {MAX_SCROLL}, excluding 0')
     return {'action': action, 'expected_pid': expected_pid,
-            'expected_window_id': expected_window_id, 'amount': amount}
+            'expected_window_id': expected_window_id,
+            'allow_terminal': terminal_ok, 'amount': amount}
 
 
 def action(action: str, *, expected_pid=None, expected_window_id=None, x=None,
            y=None, text=None, key=None, amount=None, button=None, count=None,
-           steps=None, runner=None, timeout: float = DEFAULT_TIMEOUT) -> ActionResult:
+           steps=None, allow_terminal=None, runner=None,
+           timeout: float = DEFAULT_TIMEOUT) -> ActionResult:
     payload = validate_action(action, expected_pid=expected_pid,
                               expected_window_id=expected_window_id, x=x, y=y,
                               text=text, key=key, amount=amount,
-                              button=button, count=count, steps=steps)
+                              button=button, count=count, steps=steps,
+                              allow_terminal=allow_terminal)
     if payload['action'] == 'sequence':
         wait_s = sum(step.get('ms', 0) for step in payload['steps']) / 1000.0
         timeout = min(60.0, max(
@@ -895,5 +925,6 @@ def state_dict(state: WindowState) -> dict:
         'focused_control_type': state.focused_control_type,
         'focused_is_password': state.focused_is_password,
         'sensitive_target': state.sensitive_target,
+        'is_terminal': state.is_terminal,
         **({'error': state.error} if state.error else {}),
     }

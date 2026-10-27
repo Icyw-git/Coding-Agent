@@ -5689,3 +5689,73 @@ notepad 是 Store 应用，外壳进程与窗口进程不同）。验收时用 `
 | `type` / `key` | 81–154 ms |
 | `sequence`（2 步） | 299 ms |
 | 剪贴板读/写往返 | 12–224 ms |
+## 安全防护真机验证 + 一次真实事故（2026-10-26）
+
+### 先说事故
+
+验证审计留痕时，我直接调 `tool_desktop.action('type', ...)` 往「当前前台窗口」输入了
+一个 `x`。当时前台**是用户正在用的终端**——等于往他的 shell 里敲了个字符。
+
+没造成损害（单个 `x`，shell 忽略），但这是明确的操作失误：**测试输入不该打在无法
+确认目标的窗口上**。对比之下，之前所有键鼠测试都先在自建窗口
+（`cmd /k title HARNESS-XXXX`）里跑，那才是正确做法。
+
+由此补了一个缺失的防护——见下面第 3 条。
+
+### 三项防护的真机验证结果
+
+**1. 序列中途切窗 → 正确中止（验证通过）**
+
+这个验证一开始「失败」了三次，原因都在**测试方法**而不是产品：
+
+- 干扰线程调 `focus_window` 时，它和序列**共用同一个 worker**，请求串行排队，
+  等序列跑完才执行——所以干扰永远迟到；
+- 用独立 PowerShell 进程 `AppActivate` 才真正插进去。
+
+正确验证结果（干扰在 687ms 插入，序列第 2 步的 2500ms wait 期间）：
+
+    ok=False  error=foreground_changed  step=3  已完成=2/3
+    message=step 3/3 (wait): foreground window changed; re-snapshot
+
+**报告准确的步号与已完成步数**，第 3 步没有执行。防护是对的。
+
+**2. 敏感窗口拦截（验证通过）**
+
+建了一个标题含 `Password Login` 的窗口：
+
+    sensitive_target=True
+    type -> ok=False  error=sensitive_target
+    message=desktop input is blocked on a password or sensitive window
+
+**3. 终端窗口防护（新增，验证通过）**
+
+终端是最危险的目标：敲进去的任何字符都会被当命令执行，而它的标题通常**不含**
+「密码」这类敏感词，原来的敏感词匹配抓不到。这正好是我踩到那个坑的原因。
+
+新增 `is_terminal` 判定（进程名 + 窗口类名，覆盖 WindowsTerminal / cmd /
+powershell / pwsh / conhost / mintty / WSL / ConEmu），并对 **type / key**
+（含序列里含这两类的）默认拒绝：
+
+    terminal_input: typing into a terminal window would run commands;
+    re-send with allow_terminal=true after confirming the window
+
+`move`/`click`/`scroll` 不受影响——点一下终端去选中文字是正常需求。
+显式 `allow_terminal=true` 才放行，且必须由调用方逐次传入。
+
+### 审计留痕的一个缺口
+
+验证时发现 `desktop_list_windows` 与 `desktop_focus` **没有登记进
+`AUDIT_EVENTS` 白名单**，所以审计里查不到「它列过哪些窗口、切过哪个窗口」——
+新功能加了，审计没跟上。已补齐三个事件（含 `desktop_focus_failed`），
+并按既有口径裁剪字段：窗口标题**不进**审计流，只记 count/total/pid/window_id。
+
+### 验证方式与边界
+
+- 键鼠只打在自建临时窗口（`cmd /k title HARNESS-*`）上，输入的是 `echo` 类命令；
+- 唯一一次例外就是开头那件事，已记录并补了防护；
+- 临时窗口全部关闭，当前窗口列表里没有残留；
+- 仍**没有**在真实业务窗口（浏览器/编辑器/聊天工具）验证输入——那要人按
+  `docs/FEISHU_ACCEPTANCE.md` D1–D15 逐项确认。
+
+测试：`test_desktop_control_windows` 50（+4 终端防护）、`test_audit` 13（+2）。
+全量 2187 passed / 3 skipped，ruff 通过。
