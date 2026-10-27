@@ -19,7 +19,6 @@ import memory_aging
 
 def _entry(memory_dir, name, mem_type, *, age_days=0, body='body'):
     """造一条记忆并把它（连同 mtime）设为指定年龄。"""
-    import memory
     path = memory_dir / f'{name}.md'
     path.write_text(
         f'---\nname: {name}\ndescription: d\ntype: {mem_type}\n---\n\n{body}\n',
@@ -168,8 +167,8 @@ def test_record_recall_with_no_names_is_noop(tmp_path):
 # ---------------------------------------------------------------- 接入 memory.age_memories
 
 def test_age_memories_archives_and_reindexes(tmp_path, monkeypatch):
-    import memory
     import llm_route
+    import memory
     home = llm_route.harness()
     memories = tmp_path / 'memories'
     memories.mkdir()
@@ -191,8 +190,8 @@ def test_age_memories_archives_and_reindexes(tmp_path, monkeypatch):
 
 
 def test_age_memories_keeps_preferences(tmp_path, monkeypatch):
-    import memory
     import llm_route
+    import memory
     home = llm_route.harness()
     memories = tmp_path / 'memories'
     memories.mkdir()
