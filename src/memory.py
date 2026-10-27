@@ -32,6 +32,15 @@ _WRITE_LOCK_NAME = '.memory-write.lock'
 _SLUG_RE = re.compile(r'[^a-z0-9._-]+')
 _MAX_MEMORY_ITEMS = 50   # 提示词要求 <30；留出余量但仍给删除范围设上界
 
+#: 召回块的优先级声明。必须在第一行：回忆块追加在用户消息之后（保前缀缓存），
+#: 而模型对末尾内容权重高——不声明就会被旧偏好盖过当前指令。
+#: PAHF 的 injection eval 专门测这一项（over-influence）。
+MEMORY_PRECEDENCE = (
+    'Priority: the user\'s latest message always overrides these notes when '
+    'they conflict. Treat them as background preferences to apply only when the '
+    'current request is silent or ambiguous.'
+)
+
 # 记忆文件解析缓存：key 是路径，value 是 ((size, mtime_ns), meta, body, raw)。
 # 每轮 load_memories 都要扫全部记忆；21 个文件时 YAML 解析约 7 ms，直接缓存
 # 解析结果能把固定开销降到读 stat。写入路径主动失效，外部修改靠 size/mtime 兜底。
@@ -428,6 +437,10 @@ def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
     except Exception:
         pass
     parts = ["<relevant_memories>"]
+    # 优先级声明必须在第一行。回忆块追加在**用户消息之后**（为保住前缀缓存），
+    # 而模型对末尾内容权重高——不声明就会被旧偏好盖过当前指令。
+    # PAHF 的 injection eval 专门测这一项（over-influence）。
+    parts.append(MEMORY_PRECEDENCE)
     for f in selected_files:
         content = read_memory_file(f)
         if content:

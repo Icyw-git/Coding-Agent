@@ -7492,3 +7492,112 @@ S4 不自动提交 git），明确不做第三层（agent 改策略/审批代码
 
 新增 `test_memory_feedback.py` (36)。全量 **2575 passed / 3 skipped**（167s），
 ruff 通过。
+
+## 偏好学习与 RSI：完整设计方案（2026-10-28）
+
+深挖 PAHF 原文、EvoMemBench（FAMA）、RSI 研究地图与本机 autoresearch skill，
+写成 `docs/PERSONAL_AGENT_LEARNING_RSI_DESIGN.md`（架构 + 实现方法 + 阶段计划）。
+
+### 一手材料里的关键结论
+
+**PAHF（arXiv 2602.16173）** —— 记忆条目是 `{text, last_update_date, keywords}`
++ embedding；API 只有 add / retrieve top-k / **near-duplicate 检测决定 update vs add**；
+**两层**（session notes 合并后清除 → global 只留 durable）；合并时**冲突按
+last_update_date 取最新**。它给的例子很关键：一趟旅行说"这次不想托运"被
+**故意丢弃**，因为 explicitly scoped to that specific trip。
+
+另一条直击我们的痛处：
+
+> Without careful pruning, memory stores will accumulate redundant and outdated
+> information, **degrading agent quality over time**.
+
+**EvoMemBench（arXiv 2605.18421）** —— FAMA 指标：
+`max(0, MPA − λ·(1−FAA))`，λ = N_forget/(N_presence+N_forget)。
+「Failure to Forget」是主要问题，agent 必须 "forgetting-aware"。
+只测"记住没有"会奖励"什么都记"。
+
+**PAHF 的 injection eval** 里有一项 `over-influence`：记忆是否错误覆盖了当前
+用户意图。**我们正好踩中**（见下）。
+
+### 对照出的 8 个缺口
+
+| 维度 | 我们 | PAHF |
+|---|---|---|
+| 条目字段 | name/description/type/source_* | + last_update_date / keywords / embedding |
+| 检索依据 | 只对 name+description 打分 | 全文 dense retrieval |
+| 作用域 | session 与 global 混在一起 | 两段，中间有 durability 判定 |
+| 写入策略 | 同名覆盖 | near-duplicate → update vs add |
+| 冲突 | LLM 自行决定 | 按 last_update_date 取最新 |
+| 剪枝 | 50 条上限 + 90 天 | stale / overwritten / low-signal |
+| 注入位置 | **请求末尾（用户消息之后）** | — |
+| 评估 | 无 | precision / recall / safety / recency / over-influence |
+
+实测我们 20 条记忆：project 13、user 5、feedback 1、reference 1。
+**65% 是 project 类**——按 durability 原则这正是最容易过时的一类，而它们都没有
+时间戳。
+
+### RSI：三层定义与我们的位置
+
+| 层 | 系统 | 尺子 |
+|---|---|---|
+| Iteration | 不变 | 不变 |
+| Self-improvement | 变 | 不变 |
+| Recursive | 变 | **也抬高，且仍改不动** |
+
+> The moment the system owns the ruler, it will get very good at **looking** improved.
+
+公开系统无第三层。我们定位第二层，因为**评估器（2615 条 pytest）诚实且
+agent 改不到**——这恰是 RSI 公认唯一能安全改进的前提；但**没有 taste**，
+而抬标准需要 taste。
+
+### 设计要点：三环分离
+
+- **Ring 0 不可变**：exec_policy / 审批链 / never_do / POLICY_KEYS / **tests/**
+- **Ring 1 需审批**：skills/*.md、AGENTS.md
+- **Ring 2 自由**：记忆、会话、任务、工作区文件
+
+核心原则：**谁都能改，唯独改尺子的那条路必须是死路。**
+
+### 已实现两项（优先级最高、风险最低）
+
+**A1 召回优先级声明**（一句话，修真实风险）
+`inject_memories` 把记忆块追加在用户消息**之后**（为保前缀缓存），而模型对末尾
+内容权重高 → 旧偏好可能压过当轮指令。加首行声明：
+
+> Priority: the user's latest message always overrides these notes when they
+> conflict.
+
+不动位置（移走会作废整个前缀缓存），只降优先级。
+
+**B1 verifier_guard（评估器保护）**
+把 tests / CI / lint 配置归入第四档（MUST_DO_SELF）：改测试、改 `.github/workflows`、
+改 `conftest.py`/`pytest.ini`/`ruff.toml` 一律硬拒，不看档位、不问人、不进队列。
+
+理由不是"别乱动用户文件"，而是：**一旦 agent 能改测试，"pytest 全绿"就不再是
+证据**——它可以删失败用例、放宽断言，然后"证明"自己变好了。这是奖励作弊的教科书
+路径，也是 RSI 的第一条红线。
+
+**一处刻意的精度取舍**：`test_*.py` 文件名模式只在测试目录内或仓库根生效。本仓
+`testpaths = tests`，全仓型号会把 `src/test_helpers.py` 这类非测试文件也硬拒，
+反而阻碍正常工作。有测试守住这条边界。
+
+### 评估缺失是最大的短板
+
+按 PAHF 的 eval 框架，记忆质量要测：Precision（只存 durable）、Recall、
+Safety、Recency correctness、Over-influence、Token efficiency。我们一条都没有。
+
+**因此文档里写死一个判断：Part A 的评估集没建起来之前，Part B（自改进）不该启动。**
+否则 RSI 会优化一个我们自己都测不准的东西。
+
+### 阶段顺序
+
+A1（注入声明）→ **B1（verifier_guard）** → A2（schema v2）→ **B4（评估集）** →
+A4（写入策略）→ A3（检索改进）→ A5（两层作用域）→ A6（低信号剪枝）→
+B2（改动台账+回滚）→ B3（self_improve 循环）
+
+B2/B3 放最后：没有 A 的数据，自改进就是无源之水。
+
+### 验证
+
+新增 `test_verifier_guard.py` (40) + `test_memory_injection.py` (2)。
+全量 **2615 passed / 3 skipped**（200s），ruff 通过。

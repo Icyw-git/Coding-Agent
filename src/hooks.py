@@ -24,6 +24,7 @@ import never_do
 import policy_bash
 import rules as user_rules
 import taint
+import verifier_guard
 from agent_core import register_hook
 from approval import (
     DEFAULT_APPROVAL_TIMEOUT,
@@ -613,6 +614,18 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             'blocked_by': 'never_do',
         })
         return refusal
+    # 评估器保护：改 tests/CI/lint 配置会让「全绿」不再成证据。
+    # 与第四档同一位置和性质：不可审批、不看档位、不进队列。
+    guard = verifier_guard.check(tool, args)
+    if guard:
+        print(f'\n\033[31m[refused] {tool}: evaluation surface is read-only\033[0m')
+        _append_audit('policy_denied', {
+            'tool': tool,
+            'code': 'verifier_protected',
+            'reason': 'evaluation surface (tests/CI/lint) must be changed by the user',
+            'blocked_by': 'verifier_guard',
+        })
+        return guard
     # 主动回合白名单：不是审批，是「没有这条路径」。§1 里的理由：主动回合没人
     # 坐等点“同意”，把一个写操作变成一次被打断的询问不叫安全。
     if proactive_turn():
