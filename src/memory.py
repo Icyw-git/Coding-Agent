@@ -19,7 +19,9 @@ from contextlib import contextmanager
 import yaml
 
 import llm_route
+import memory_aging
 import memory_redact
+import memory_scope
 from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
 
@@ -372,6 +374,10 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list:
 
 
 def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
+    # 会话级开关优先：`/memories off|writeonly` 在本会话内不读记忆。
+    # 进程级 HARNESS_LOAD_MEMORIES / HARNESS_MEMORY_RECALL 仍作为全局默认。
+    if not memory_scope.use_enabled():
+        return ''
     # 召回策略 HARNESS_MEMORY_RECALL：
     #   local 默认——本地中文关键词筛选，零网络往返（省 ~2s/轮，见 perf 分段 mem.load）；
     #          召回质量与 llm 模式不同（关键词匹配 vs 语义筛选）
@@ -389,6 +395,12 @@ def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
         selected_files = select_relevant_memories(messages)
     if not selected_files:
         return ''
+    # 记一笔召回时刻：老化用「最后一次有用」而不是「最后一次写入」，否则
+    # 一条被反复用到的旧偏好会因为写得早而被误淘汰。失败不影响对话。
+    try:
+        memory_aging.record_recall(_h().MEMORY_DIR, selected_files)
+    except Exception:
+        pass
     parts = ["<relevant_memories>"]
     for f in selected_files:
         content = read_memory_file(f)
@@ -399,6 +411,10 @@ def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
 
 
 def extract_memories(messages: list):  # 提取用户偏好、约束、项目事实等记忆
+    # `/memories readonly|off` 时本会话不产生新记忆（Codex 的 chat-level
+    # contribute 开关）。放在最前面：后面要调一次模型，能省就省。
+    if not memory_scope.contribute_enabled():
+        return
     # 记忆窗口：会话开头前 10 条（用户偏好通常最先说）+ 结尾最后 10 条
     if len(messages) <= 20:
         window = messages
@@ -568,9 +584,44 @@ def _replace_memory_files(prepared: list[dict]) -> None:
         _rebuild_index_unlocked()
 
 
+def age_memories(days: int | None = None) -> list[dict]:
+    """把长期未用的记忆移到 .archive/。返回被归档的条目。
+
+    **不删除**：归档目录里的文件可以随时放回。我们有一条既有约束是不删除
+    用户数据，淘汰也必须遵守。
+
+    跳过 preference / correction：人的偏好不会因为三个月没提就失效，教训
+    更是要一直记得。
+    """
+    h = _h()
+    stale = memory_aging.stale_entries(h.MEMORY_DIR, list_memory_files(), days=days)
+    if not stale:
+        return []
+    moved = []
+    with _write_guard():
+        for entry in stale:
+            target = memory_aging.archive(h.MEMORY_DIR, entry)
+            if target is not None:
+                moved.append({**entry, 'archived_as': target.name})
+        if moved:
+            _cache_clear()
+            _rebuild_index_unlocked()
+    if moved:
+        names = ', '.join(item['name'] for item in moved[:3])
+        more = f' 等{len(moved)} 条' if len(moved) > 3 else ''
+        print(f'  \033[90m[memory] archived {names}{more} '
+              f'(太久没用到；可用 /memories archived 找回)\033[0m')
+    return moved
+
+
 def consolidate_memories():
     """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
     h = _h()
+    # 先老化再合并：归档后可能已经低于阈值，那就省一次模型调用。
+    try:
+        age_memories()
+    except Exception as exc:
+        print(f'  \033[33m[memory] aging skipped: {type(exc).__name__}: {exc}\033[0m')
     files = list_memory_files()
     if len(files) < h.CONSOLIDATE_THRESHOLD:
         return

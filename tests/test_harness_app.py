@@ -830,8 +830,13 @@ def test_command_palette_filters_dispatches_and_prefills_arguments():
             search = modal.query_one('#command-palette-search')
             search.value = 'mdl'
             await pilot.pause()
-            assert options.option_count == 2
-            assert options.get_option_at_index(1).id == 'model'
+            # 不写死条数：``memories`` 的描述里含 readonly，模糊匹配也会命中它。
+            # 这里只关心「分组头 + 至少一个命中的命令」且第 0 项是禁止选中的分组。
+            assert options.option_count >= 2
+            ids = [options.get_option_at_index(i).id
+                   for i in range(options.option_count)]
+            assert ids[0] == 'group:commands'
+            assert 'model' in ids
 
             search.value = 'find'
             await pilot.pause()

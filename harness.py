@@ -52,6 +52,7 @@ import heartbeat
 import hooks  # 副作用：注册 6 个 hook 回调（权限/日志/上下文/总结）
 import llm_config
 import llm_route
+import memory_scope
 import paths
 import recovery
 import sandbox
@@ -1442,6 +1443,8 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     checkpoint_manager = get_checkpoint_manager(session_store)
     _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
     restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
+    # 记忆开关也随会话恢复：ContextVar 不跨进程，重启后要继续生效
+    memory_scope.restore_from_session(session_store)
     def combined_steer():
         texts = []
         if steer_provider is not None:

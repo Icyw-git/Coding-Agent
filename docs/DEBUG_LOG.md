@@ -6990,3 +6990,77 @@ Muse 的对应思路是 assume breach：不问模型会不会被说服，只问�
 并补上 N5/N6 的状态行——用户应该能一眼看到自己受哪些保护。
 
 新增 test_never_do.py (33)。全量 **2388 passed / 3 skipped**（184s），ruff 通过。
+
+## 第三轮实施：N3 逐会话记忆开关 + N2 记忆老化（2026-10-27）
+
+### N3 逐会话开关（src/memory_scope.py）
+
+`HARNESS_LOAD_MEMORIES` / `HARNESS_MEMORY_RECALL` 都是进程级，没有「这次聊天别
+记我」。Codex 的 chat-level `/memories` 明确说了 **不改全局设置**，这里照做。
+
+四个模式两两控制读/写：
+
+| 模式 | 用已有记忆 | 产生新记忆 |
+|---|---|---|
+| on（默认） | ✓ | ✓ |
+| off | ✗ | ✗ |
+| readonly | ✓ | ✗ |
+| writeonly | ✗ | ✓ |
+
+分开的理由：调试记忆功能时常需要"只读"（用已有但不污染它）或"只写"（一次性
+引导会话，让它学习但不受旧记忆影响）。
+
+**一个语义坑**：`HARNESS_MEMORY_RECALL=off` 历史上只关"读"、没关"写"，直接映射
+会得到 `writeonly`（能学不读）——这显然不是用户想表达的。所以在 `_globals()` 里
+把它归一成 `off`（读写都停），需要真正的只写请显式 `/memories writeonly`。
+这个 bug 是被测试 `test_global_env_still_drives_default` 抓到的。
+
+存储：ContextVar（热路径，每轮召回都读）+ 会话事件流（持久源，重启后仍生效）。
+恢复走 `restore_from_session`，与 `tool_todos.restore` 同一套"取最后一次"语义；
+恢复失败一律跟随全局默认——**不动状态比静默切成"不记"安全**。
+
+命令：`/memories [on|off|readonly|writeonly]`，不带参数显示模式 + 记忆概况 +
+归档情况。TUI 补 `CommandSpec('memories', ...)`。
+
+### N2 老化与归档（src/memory_aging.py）
+
+之前只有 `_MAX_MEMORY_ITEMS = 50` 的数量上界（超了**报错**，而报错的是用户、
+模型只看到写入失败）。用一年后 50 条全是早期闲聊。
+
+三个不照抄 Codex 的地方：
+
+1. **不静默删除**——移到 `memories/.archive/`。我们有「不删除用户数据」的既有
+   约束，淘汰也必须遵守。`/memories restore <文件名>` 可以找回。
+2. **preference / correction 永不过期**——偏好不会因为三个月没提就失效，教训
+   更是要一直记得。只淘汰 `fact` / `context`（这两类有时效性："部署走 X"改版
+   后就错了）。
+3. **不写回记忆文件**——记录"最后一次被召回"需要频繁写入，直接改 md 会不停
+   扰动 mtime（而 mtime 正是老化依据）和前缀缓存。改用独立的
+   `.recall-log.json`。
+
+「多久没用」取 mtime 与召回记录的**较大者**：刚写过也算用过。召回记录损坏时
+降级为「当作刚用过」——记录坏了不该导致删掉任何东西。
+
+执行时机：`consolidate_memories()` 里**先老化再合并**，归档后可能已经低于阈值，
+那就省一次模型调用。默认 90 天（Codex 是 30 天，我们放宽——单人记忆条数本来就
+少，太激进会让人觉得"它把我说的忘了"）。
+
+### 一个偶发失败的真正原因（不是 UI 时序）
+
+全量跑到 47% 出现 1 个失败：`test_command_palette_filters_dispatches...`
+断言搜 `mdl` 得到 2 项，实际 3 项。单独跑这几个文件全过——是因为**只有全量里
+`memories` 命令才存在**（它是我这轮新加的）。
+
+真正的匹配逻辑：`fuzzy_filter` 同时搜 name 和 description，而 `memories` 的描述
+含 `readonly`，`mdl` 是 m→d→l 的子序列 → **合理匹配**，不是 bug。
+
+修的是测试而不是代码：把 `assert options.option_count == 2` 改成"第 0 项是分组头
+且 `model` 在列表里"，不再依赖具体命令集。
+
+教训：硬编码「结果条数」的断言会在新增同类条目时必然失败，而失败原因与被测
+功能无关。
+
+### 验证
+
+新增 `test_memory_scope.py` (21) + `test_memory_aging.py` (21)。
+全量 **2429 passed / 3 skipped**（329s），ruff 通过。

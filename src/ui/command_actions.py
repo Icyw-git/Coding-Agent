@@ -181,6 +181,8 @@ class CommandActionsMixin:
             self._notice(terminal_views.audit(argument))
         elif verb == 'rules':
             self.handle_rules()
+        elif verb == 'memories':
+            self.handle_memories(argument)
         elif verb == 'grants':
             self.handle_grants(argument)
         elif verb == 'workspaces':
@@ -260,6 +262,74 @@ class CommandActionsMixin:
                          session_id=store.session_id)
         except Exception as exc:
             self._notice(f'[grants] 审计写入失败: {exc}', level='error')
+
+    def handle_memories(self, argument: str) -> None:
+        """逐会话的记忆开关（对齐 Codex 的 chat-level /memories）。
+
+        只改本会话，不动全局环境变量：那是一个显式的进程级选择，被一条会话
+        命令悄悄改掉会让人下次启动时莫名其妙。
+        """
+        import memory
+        import memory_scope
+
+        arg = (argument or '').strip().lower()
+        if arg.startswith('restore'):
+            import llm_route
+            import memory_aging
+            filename = (argument or '').strip()[len('restore'):].strip()
+            if not filename:
+                self._notice('用法：/memories restore <文件名>')
+                return
+            if memory_aging.restore_archived(llm_route.harness().MEMORY_DIR,
+                                             filename):
+                memory._rebuild_index()
+                self._notice(f'已恢复：{filename}')
+            else:
+                self._notice(f'恢复失败：找不到归档条目 {filename}')
+            return
+        if arg:
+            try:
+                memory_scope.set_mode(arg)
+            except ValueError as exc:
+                self._notice(str(exc))
+                return
+            # 持久化到会话事件流：重启 / 重新打开还要生效（ContextVar 不跨进程）。
+            store = getattr(self, '_session_store', None)
+            if store is not None:
+                try:
+                    store.append(memory_scope.EVENT, mode=arg)
+                except Exception:
+                    pass
+            self._notice(f'本会话记忆：{memory_scope.describe()}')
+            return
+        # 不带参数：显示当前模式 + 记忆概况。
+        entries = memory.list_memory_files()
+        lines = [f'本会话记忆：{memory_scope.describe()}',
+                 f'已存记忆：{len(entries)} 条']
+        if entries:
+            for item in entries[:8]:
+                lines.append(f"  · {item.get('name')} ({item.get('type')})")
+            if len(entries) > 8:
+                lines.append(f'  … 还有 {len(entries) - 8} 条（用 recall 查全部）')
+        # 归档目录：淘汰不删除，用户要能看到并找回。
+        try:
+            import llm_route
+            import memory_aging
+            archived = memory_aging.archived_entries(
+                llm_route.harness().MEMORY_DIR)
+        except Exception:
+            archived = []
+        if archived:
+            lines.append(f'已归档：{len(archived)} 条（太久没用到）')
+            for item in archived[:5]:
+                lines.append(
+                    f"  · {item['filename']}（{item['age_days']} 天前归档）")
+            lines.append('  恢复：/memories restore <文件名>')
+        lines.append('')
+        lines.append('切换：/memories on|off|readonly|writeonly')
+        lines.append('  readonly  = 用已有记忆，不产生新的')
+        lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
+        self._notice(chr(10).join(lines))
 
     def handle_rules(self) -> None:
         import rules as user_rules
