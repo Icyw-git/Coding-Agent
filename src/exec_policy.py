@@ -663,6 +663,16 @@ def system_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
+# 版本库内部目录：读写都按秘密区处理。`.git` 之外还有几个常见的（子模块与
+# 工具链）。匹配的是路径**段**，所以 `/a/.git/b` 和 `/.git` 都能命中，
+# 而 `/a/git-notes` 不会。
+_VCS_DIRS = frozenset({'.git', '.hg', '.svn'})
+
+
+def _inside_vcs(resolved: Path) -> bool:
+    return any(part in _VCS_DIRS for part in resolved.parts)
+
+
 def classify_path(path: str, *, cwd=None, workspace, secrets) -> str:
     """返回 PATH_WORKSPACE / PATH_OUTSIDE / PATH_SECRET / PATH_SYSTEM / PATH_INVALID。
 
@@ -680,6 +690,14 @@ def classify_path(path: str, *, cwd=None, workspace, secrets) -> str:
     except (OSError, RuntimeError, ValueError):
         return PATH_INVALID
     if is_secret_path(resolved, secrets):
+        return PATH_SECRET
+    # 版本库内部目录当成秘密区（读写都硬拒）。
+    # 理由：`.git/config` 可以改 remote 把推送引到别处；`.git/hooks/*` 是
+    # 可执行脚本，会在下一次 git 操作时运行；`.git/index`、objects 被改会
+    # 直接破坏仓库。它们都在工作区内，按「工作区写改免审」处理等于把仓库
+    # 完整性交给模型自律——而这条路径的收益（让 agent 顺手改 git 内部状态）
+    # 远小于风险。
+    if _inside_vcs(resolved):
         return PATH_SECRET
     if any(resolved.is_relative_to(root) for root in system_roots()):
         return PATH_SYSTEM

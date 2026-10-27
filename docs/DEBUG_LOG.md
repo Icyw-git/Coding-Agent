@@ -6405,3 +6405,79 @@ worker（1.6s 里主要是 PNG 编码，进程开销占小头）——两者收�
 edit 的 diff 形状、`replace_all` 标注、`summarize` 也留头尾、短内容不动。
 
 全量 2281 passed / 3 skipped，ruff 通过。
+
+## 全面可用性检查：发现一个真实漏洞（2026-10-27）
+
+按「用户/模型实际会碰到什么」把所有交互面走了一遍：审批展示（24 个工具逐个）、
+错误提示、截断提示、路径类错误、飞书 friendly_error 覆盖度。
+
+### 最重要的发现：`.git/` 被当普通工作区
+
+逐个工具试错时撞到的：`write('.git/x', 'hi')` **成功了**。
+
+`classify_path` 原本只判秘密文件（`.env` / 私钥）与系统目录，`.git` 在
+工作区内，于是被归为 `PATH_WORKSPACE`，而默认档下工作区内写改**免审**。
+这意味着模型可以：
+
+- 改 `.git/config` 的 remote，把之后每次 push 引到别处；
+- 写 `.git/hooks/pre-commit`，在下一次 commit 时执行任意脚本；
+- 动 `.git/index` / objects，直接破坏仓库。
+
+它比 `.github/workflows`（要 push 才生效）、`setup.py`（要安装才执行）危险得多
+——**改完立即生效，不需要任何额外动作**。所以只拦 VCS 目录，不扩大其它构建配置。
+
+修法：`_inside_vcs()` 按**路径段**匹配 `.git` / `.hg` / `.svn`，命中归
+`PATH_SECRET`（读写都硬拒）。段匹配保证 `git-notes/` 这类只是名字像的目录不受
+影响——有测试盯着。
+
+写 `.git/config`、`.git/hooks/pre-commit` 现在都被硬拒，正常文件仍可写。
+
+### 顺带修的三个体验问题
+
+**1. 补丁审批看不到影响面**
+
+`apply_patch` 的 detail 原本把补丁原文摊上去（`summarize` 截到 215 字）。审阅
+补丁的人第一眼要看的是**动了几处、哪些新增哪些删除**，而不是补丁的开头两行。
+
+现在先给摘要：
+
+    patch touches 3 path(s):  (+3/-1 lines)
+      add a.txt
+      update b.py
+      delete c.md
+
+解析不出文件头时退回内容预览（不显示空白）。
+
+统计 `+/-` 行数时踩了个小坑：`+++`/`---` 在 `startswith('+')/('-')` 下会被
+算成增删，要先排除。另外我最初把预期写成 `+2/-1`，实际 `+3/-1` 才对
+（`+hello`、`+world`、`+x = 2` 三行）——**是测试预期错了，不是代码错了**。
+
+**2. 读目录给出原始 errno**
+
+`read('.')` 返回 `[Errno 13] Permission denied: 'D:\harness-agent'`。用户看不出
+「这是目录」。改成 `is a directory; use ls to list it, or glob/grep to search inside`。
+
+**3. `secret_path` 的提示只提「读」**
+
+`.git/config` 被拒时提示是 "ask the user instead of reading it"，但这次是**写**。
+改成不区分方向的措辞：`Protected path (secret files and version-control internals
+are off limits); ask the user to handle it.`
+
+### 检查过、确认没问题的
+
+| 面 | 结论 |
+|---|---|
+| 24 个工具的审批展示 | 桌面/删除/剪贴板/域名/写文件的措辞都能读懂 |
+| 未知命令拼错 | 有编辑距离建议 |
+| 参数缺漏 | 打印完整用法 |
+| 大输出截断 | 给出 `offset=` 续读提示 |
+| 飞书 friendly_error | 402/401/429/超时/turn_busy 都有可执行建议，未知错误原样透出（不编造） |
+| 空状态 | 说明默认行为，不是空白 |
+
+### 测试
+
+`tests/test_usability_regressions.py` 14 条：补丁摘要（含 move、无法解析时回退、
+增删统计）、VCS 目录归秘密区（5 个路径）、形近目录仍属工作区（3 个）、
+真实工具拒绝写 `.git`、读目录/读文档后缀的下一步提示。
+
+全量 2295 passed / 3 skipped，ruff 通过。

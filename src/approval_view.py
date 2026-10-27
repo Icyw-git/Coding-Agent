@@ -256,6 +256,52 @@ def _edit_detail(args: dict) -> str:
             + f'+++ 新内容 ({len(new)} chars)' + chr(10) + added)
 
 
+def _patch_summary(patch: str) -> tuple[list[str], str]:
+    """从补丁文本里提取「改了什么文件」，返回 (摘要行, 其余内容)。
+
+    审批补丁的人第一眼要看的是**影响面**：动了几处、哪些是新增哪些是删除。
+    直接甩一份 20KB 的 diff 上去，既看不到影响面，也超出卡片长度。
+    """
+    actions = {
+        '*** Add File:': 'add',
+        '*** Update File:': 'update',
+        '*** Delete File:': 'delete',
+        '*** Move to:': 'move',
+    }
+    summary = []
+    total_add = total_del = 0
+    for line in str(patch or '').splitlines():
+        for marker, verb in actions.items():
+            if line.startswith(marker):
+                path = line[len(marker):].strip()
+                if verb == 'move':
+                    summary.append(f'  → rename to {path}')
+                else:
+                    summary.append(f'  {verb} {path}')
+                break
+        else:
+            # 先排除 diff 头：`+++`/`---` 在 startswith('+')/('-') 下会算成增删。
+            if line.startswith(('+++', '---')):
+                continue
+            if line.startswith('+'):
+                total_add += 1
+            elif line.startswith('-'):
+                total_del += 1
+    stats = f'  (+{total_add}/-{total_del} lines)' if (total_add or total_del) else ''
+    return summary, stats
+
+
+def _apply_patch_detail(args: dict) -> str:
+    patch = args.get('patch')
+    if not isinstance(patch, str) or not patch.strip():
+        return 'no patch content'
+    summary, stats = _patch_summary(patch)
+    if not summary:
+        return _content_preview(patch, limit=400)
+    head = f'patch touches {len(summary)} path(s):' + stats
+    return head + chr(10) + chr(10).join(summary)
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -275,6 +321,8 @@ def detail(tool: str, args) -> str:
         return safe_text(_write_detail(tool, args))
     if tool == 'edit':
         return safe_text(_edit_detail(args))
+    if tool == 'apply_patch':
+        return safe_text(_apply_patch_detail(args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

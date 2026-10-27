@@ -637,7 +637,8 @@ _DENY_HINTS = {
     'deny_pattern': 'This command is on the deny list; use another tool or ask '
                     'the user to run it.',
     'deny_root_delete': 'Refusing to delete a filesystem root.',
-    'secret_path': 'Protected secret file; ask the user instead of reading it.',
+    'secret_path': 'Protected path (secret files and version-control '
+                   'internals are off limits); ask the user to handle it.',
     'secret_egress': 'This would send a protected file outbound; confirm with '
                      'the user first.',
     'system_path': 'Writes to system directories are blocked; choose a path '

@@ -29,6 +29,11 @@ def read_file(path: str, *, resolve, gate, limit: Optional[int] = None,
         if offset < 0 or (limit is not None and limit < 0):
             return 'Error: offset and limit must be non-negative'
         file_path = resolve(path, cwd)
+        if file_path.is_dir():
+            # 原始 OSError 会是 `[Errno 13] Permission denied: 'D:\harness-agent'`，
+            # 用户看不出「这是目录」。直接给下一步动作。
+            return (f'Error: {file_path} is a directory; use ls to list it, '
+                    'or glob/grep to search inside it')
         if file_path.suffix.lower() in DOCUMENT_SUFFIXES:
             return (f'Error: {file_path.suffix} is a document; use read_document '
                     'to extract its text')
