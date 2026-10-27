@@ -218,3 +218,54 @@ def test_task_manager_uses_the_sandbox(sandbox_ws, tmp_path):
         assert not outside.exists()
     finally:
         manager.close()
+
+
+def test_environment_block_is_cached(tmp_path):
+    """环境块重复构建占每次 spawn Python 侧开销的 90%，必须缓存。"""
+    import sandbox
+
+    sandbox.reset_cache()
+    first = sandbox._environment_block(tmp_path)
+    second = sandbox._environment_block(tmp_path)
+    assert first is second        # 同一对象 = 命中缓存
+
+
+def test_environment_block_cache_invalidates_on_env_change(tmp_path, monkeypatch):
+    """改了环境变量必须重建：否则沙箱里看不到新值。"""
+    import sandbox
+
+    sandbox.reset_cache()
+    first = sandbox._environment_block(tmp_path)
+    monkeypatch.setenv('HARNESS_CACHE_PROBE', 'yes')
+    second = sandbox._environment_block(tmp_path)
+    assert first is not second
+    assert 'HARNESS_CACHE_PROBE=yes' in second[:]
+
+
+def test_environment_block_overrides_temp(tmp_path):
+    """TEMP/TMP/TMPDIR 必须指向沙箱临时目录，否则命令写临时文件会失败。"""
+    import sandbox
+
+    sandbox.reset_cache()
+    block = sandbox._environment_block(tmp_path)[:]
+    for name in ('TEMP', 'TMP', 'TMPDIR'):
+        assert f'{name}={tmp_path}' in block
+
+
+def test_environment_block_is_sorted_case_insensitively(tmp_path):
+    """Windows 要求环境块按大小写不敏感排序，否则 CreateProcess 行为未定义。"""
+    import sandbox
+
+    sandbox.reset_cache()
+    block = sandbox._environment_block(tmp_path)[:]
+    names = [entry.split('=', 1)[0] for entry in block.split(chr(0)) if '=' in entry]
+    assert names == sorted(names, key=str.upper)
+
+
+def test_reset_cache_clears_environment_block_cache(tmp_path):
+    import sandbox
+
+    sandbox._environment_block(tmp_path)
+    assert sandbox._ENV_BLOCK_CACHE
+    sandbox.reset_cache()
+    assert not sandbox._ENV_BLOCK_CACHE

@@ -5915,3 +5915,85 @@ H1（资源限额）想落地就得先决定「要不要把 `HARNESS_OS_SANDBOX`
 - `/status` 与 `--doctor` 已经显示沙箱状态，保持；
 - 在 `docs/FEISHU_SETUP.md` 写清「沙箱管写入，不管读取与网络」；
 - 给不支持完整性标签的文件系统加一条显式提示（现在只有一行 warn）。
+## 沙箱性能优化：环境块缓存（2026-10-26）
+
+上一轮测量结论是「沙箱开销在噪声内」，但那次只看端到端。这轮 profile 到函数级，
+发现一处 38 倍的重复劳动。
+
+### 定位过程
+
+`cProfile` 按累计时间排序，每次 `spawn_shell` 的 Python 侧耗时分布：
+
+| 环节 | 耗时 | 说明 |
+|---|---|---|
+| `wait()` | 18.5 ms | 命令本身的执行时间，不是沙箱开销 |
+| `_create_process` | 4.2 ms | 沙箱真正的开销（CreateProcessAsUser + 令牌） |
+| `_environment_block` | **1.4 ms** | 环境块重建 |
+
+单独测 `_environment_block`：**435 µs**，而 `_low_token` 只有 17 µs。也就是
+环境块比令牌贵 25 倍——它在遍历 `os.environ`、做大小写归一、构造排序字典、
+拼一个大字符串、再拷进 `create_unicode_buffer`。这些在一个进程内**永远不会变**。
+
+### 修法：按 (TEMP 目录, 环境指纹) 缓存
+
+```python
+_ENV_BLOCK_CACHE: dict[tuple[str, int], object] = {}
+cache_key = (str(temp_dir), _environment_fingerprint())
+```
+
+- 缓存键带 `hash(frozenset(os.environ))`：进程内改了环境变量（测试 `setenv`、
+  运行时切换配置）会自动失效，不会出现「沙箱里看不到新变量」。
+- `reset_cache()` 一并清空，与既有的工作区状态缓存同生命周期。
+- 上限 4 条：正常只有一两个工作区，超了整表清掉。
+
+**435 µs → 11.3 µs（38 倍）。**
+
+### 优化后对比（n=20，稳态）
+
+| 命令 | off p50 | auto p50 | 差值 |
+|---|---|---|---|
+| `echo x` | 21.8 ms | 20.1 ms | −1.6 ms |
+| `python -c` | 70.6 ms | 74.8 ms | +4.2 ms |
+| `echo hi`（bench 脚本） | 23.5 ms | 23.6 ms | **+0.0 ms** |
+| `dir /b` | 22.5 ms | 24.5 ms | +2.0 ms |
+
+差值稳定落在 **−10% ~ +9%** 且正负都有，**沙箱开销已经不可测**。
+
+隔离效果不变：off 写工作区外成功、auto 被内核拒绝（"拒绝访问。"）。
+
+### 过程中自己引入又修掉的一个 bug
+
+第一次加缓存后测了 200 次，`cProfile` 显示仍在重建。原因很蠢但值得记：
+
+```python
+key = (str(temp_dir), _environment_fingerprint())   # 缓存键
+values = {key.upper(): ... }                        # ← 这里的推导变量也叫 key
+for key in ('TEMP', 'TMP', 'TMPDIR'):               # ← 又把 key 冲掉了
+    values[key] = ...
+...
+_ENV_BLOCK_CACHE[key] = block                       # ← 存成了 'TMPDIR'
+```
+
+缓存里实际躺着 `{'TMPDIR': block}`，每次查 `(path, fp)` 都未命中。变量改名
+`cache_key` 后正常。**这种「缓存看着有但从不命中」的 bug，如果只看代码是看不
+出来的，必须测「第二次调用是否同一对象」。** 新增的测试正是这么写的：
+
+```python
+assert sandbox._environment_block(tmp_path) is sandbox._environment_block(tmp_path)
+```
+
+### 测试
+
+`tests/test_sandbox.py` 14 → 19 条，新增：
+环境块缓存命中（同一对象）、改环境变量后失效、TEMP/TMP/TMPDIR 覆盖正确、
+大小写不敏感排序、`reset_cache` 清空缓存。
+
+全量 2211 passed / 3 skipped，ruff 通过。
+
+### 还能优化吗
+
+看了剩下的大头：`_create_process` 的 4.2 ms 是 `CreateProcessAsUserW` 系统调用
+本身，绕不开（要沙箱就必须用它）；`_low_token` 17 µs，可以缓存令牌句柄，
+但收益 0.07%，而且令牌跨进程复用要处理关闭时序，风险大于收益——**不做**。
+
+真正的结论：**沙箱现在没有可测量的性能代价，开不开只取决于安全取舍**。
