@@ -5616,3 +5616,76 @@ worker 启动时暴露成「process closed unexpectedly」，从 stderr 里看�
 
 测试：`test_desktop_windows_tool` 11、`test_desktop_control_windows` 44。
 全量 2178 passed / 3 skipped，ruff 通过。
+## 真实键鼠验收：发现并修掉 SendInput 结构大小缺陷（2026-10-26）
+
+之前所有桌面测试都注入 fake runner，**真实键鼠一次都没跑过**。这轮在真实窗口上
+验证，立刻暴露一个「测试全绿但功能全废」的缺陷。
+
+### 关键缺陷：INPUT 结构少 8 字节，SendInput 全部失败
+
+第一次真实 `type` 就报：
+
+    Unicode(...) 异常：SendInput failed
+
+用独立探针测结构大小：
+
+    sizeof=32  sent=0  err=87   ← ERROR_INVALID_PARAMETER
+
+64 位下 `INPUT` 应该是 **40 字节**：`type`(4) + 对齐填充(4) + union(32)。而
+`INPUTUNION` 只声明了一个 24 字节的 `KEYBDINPUT`，union 于是只有 24 字节，
+整个 `INPUT` 变成 32 —— `SendInput` 认为结构不对，直接返回 0。
+
+**为什么之前没发现**：`tests/test_desktop_control_windows.py` 的 44 条测试全部
+注入 fake runner，脚本只做字符串断言。真实的 `SendInput` 调用一次都没执行过。
+
+修法：`INPUTUNION` 显式 `Size = 32`，并补上 `MOUSEINPUT` / `HARDWAREINPUT`
+（union 成员必须覆盖最大的那个）。修后探针 `size=40 sent=1`。
+
+补了两条测试锁住：一条用真实 PowerShell 断言 `Marshal.SizeOf == 40`，
+一条断言脚本里有 `Size = 32` 与 `MOUSEINPUT` 声明。
+
+### 真实验证结果
+
+全部在真实窗口上执行，用截图 + OCR 自证：
+
+| 操作 | 耗时 | 结果 |
+|---|---|---|
+| `type` 输入 `echo HARNESS_KEYBOARD_OK` | 154 ms | ✅ |
+| `key=enter` 执行 | 93 ms | ✅ 命令输出可见 |
+| `sequence`（type + enter，一次审批） | 299 ms | ✅ |
+| `key=ctrl+a` 组合键 | 81 ms | ✅ |
+| `move` 鼠标移动 | 110 ms | ✅ |
+| 截屏 + OCR 验证回显 | ~1.5 s | ✅ 文本匹配 |
+
+中文、emoji、引号、PowerShell 元字符（`$(...)`、反引号、`|`、`>`）在**剪贴板**
+往返里 7/7 全部一致（原值备份后已恢复）。
+
+### 顺带确认的两个限制
+
+**Windows 前台锁**：后台进程 `SetForegroundWindow` 约一半会被拒。补了
+`AttachThreadInput` + `BringWindowToTop`，成功率 5/10 → 8/12；剩余失败返回明确
+指引（让用户手动点一下窗口再重试），不假装成功。这轮真实验证时也确实遇到过
+一次：`focus` 报告成功但快照显示前台仍是原窗口，靠「切完再快照核对」才确认。
+
+**Store 版记事本**：`Start-Process notepad` 后进程立刻消失（Windows 11 的
+notepad 是 Store 应用，外壳进程与窗口进程不同）。验收时用 `cmd /k title ...`
+或独立 PowerShell 窗口更可靠。
+
+### 验证边界
+
+- 真实键鼠**只在自建的临时窗口**上执行（`cmd /k title HARNESS-TARGET`），
+  输入的是 `echo` 类无害命令，没有碰任何真实文档或账号。
+- 验证完的窗口已关闭，剪贴板原值已恢复。
+- 仍然**没有**在真实业务窗口（浏览器、编辑器、聊天工具）上验证过输入——
+  那需要按 `docs/FEISHU_ACCEPTANCE.md` D1–D15 由人逐项确认。
+
+### 当前真实延迟（热态）
+
+| 操作 | p50 |
+|---|---|
+| `desktop_windows` | 48 ms |
+| `desktop_snapshot` | 15–27 ms |
+| `focus` | 32 ms |
+| `type` / `key` | 81–154 ms |
+| `sequence`（2 步） | 299 ms |
+| 剪贴板读/写往返 | 12–224 ms |

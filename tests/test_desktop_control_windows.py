@@ -250,3 +250,43 @@ def test_powershell_script_contract_covers_combos_buttons_and_wait():
     assert '0x0008' in desktop.CONTROL_SCRIPT
     assert '0x0020' in desktop.CONTROL_SCRIPT
     assert 'Start-Sleep -Milliseconds $ms' in desktop.CONTROL_SCRIPT
+
+
+def test_sendinput_struct_is_64bit_sized():
+    """INPUT 必须是 40 字节（type 4 + 对齐 4 + union 32）。
+
+    少了 `Size = 32` 会得到 32 字节，SendInput 返回 0 且 GetLastError=87
+    （参数错误）——所有真实键鼠注入都会失败，但**单元测试全绿**，因为测试都
+    注入 fake runner。用真实 PowerShell 断言结构大小，把这个坑锁住。
+    """
+    probe = r'''
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class SizeProbe {
+    [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public U u; }
+    [StructLayout(LayoutKind.Explicit, Size = 32)] public struct U { [FieldOffset(0)] public K k; }
+    [StructLayout(LayoutKind.Sequential)] public struct K {
+        public ushort wVk; public ushort wScan; public uint dwFlags;
+        public uint time; public UIntPtr extra;
+    }
+    public static int Size() { return Marshal.SizeOf(typeof(INPUT)); }
+}
+'@
+[SizeProbe]::Size()
+'''
+    import shutil
+    import subprocess
+
+    exe = shutil.which('powershell') or shutil.which('pwsh')
+    if exe is None:
+        pytest.skip('PowerShell not available')
+    result = subprocess.run([exe, '-NoProfile', '-NonInteractive',
+                             '-Command', probe],
+                            capture_output=True, text=True, timeout=120)
+    assert result.stdout.strip() == '40', result.stderr[-300:]
+
+
+def test_control_script_declares_explicit_union_size():
+    """脚本层面也断言：漏了 Size 就等于漏了 8 字节。"""
+    assert 'StructLayout(LayoutKind.Explicit, Size = 32)' in         desktop.CONTROL_SCRIPT
+    assert 'public struct MOUSEINPUT' in desktop.CONTROL_SCRIPT

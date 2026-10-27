@@ -109,12 +109,27 @@ public static class HarnessDesktopNative {
         uint flags, uint dx, uint dy, int data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-    [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION u; }
-    [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
+    // 64 位下 INPUT 必须是 40 字节：type(4) + 4 字节对齐填充 + union(32)。
+    // 少了 Pack/Size 会得到 32 字节，SendInput 返回 0 且 GetLastError=87
+    // （参数错误）——所有真实键鼠注入都会静默失败。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT { public uint type; public INPUTUNION u; }
+    [StructLayout(LayoutKind.Explicit, Size = 32)]
+    public struct INPUTUNION {
+        [FieldOffset(0)] public MOUSEINPUT mouse;
         [FieldOffset(0)] public KEYBDINPUT keyboard;
+        [FieldOffset(0)] public HARDWAREINPUT hardware;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT {
+        public int dx; public int dy; public uint mouseData; public uint dwFlags;
+        public uint time; public UIntPtr dwExtraInfo;
     }
     [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
-        public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo;
+        public ushort wVk; public ushort wScan; public uint dwFlags;
+        public uint time; public UIntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct HARDWAREINPUT {
+        public uint uMsg; public ushort wParamL; public ushort wParamH;
     }
     public const uint MOUSE_LEFT_DOWN=0x0002, MOUSE_LEFT_UP=0x0004;
     public const uint KEY_UP=0x0002, KEY_UNICODE=0x0004;
