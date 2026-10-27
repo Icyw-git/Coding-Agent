@@ -103,6 +103,56 @@ def summarize(tool: str, args: dict) -> dict:
     return compacted
 
 
+# 工具的中文标签。审批卡片和 CLI 提示都显示「中文名 (原名)」：中文让人
+# 一眼知道在干什么，原名留着方便对照日志/文档排查。未登记的工具只显示原名。
+_TOOL_LABELS = {
+    'bash': '执行命令',
+    'read': '读文件',
+    'write': '写文件',
+    'edit': '改文件',
+    'apply_patch': '改多个文件',
+    'view_image': '看图',
+    'read_document': '读文档',
+    'render_document': '渲染文档页',
+    'glob': '找文件',
+    'grep': '搜内容',
+    'ls': '列目录',
+    'web_fetch': '访问网页',
+    'screen_capture': '截屏',
+    'screen_ocr': '识别截图文字',
+    'clipboard_read': '读剪贴板',
+    'clipboard_write': '写剪贴板',
+    'desktop_snapshot': '看前台窗口',
+    'desktop_windows': '列出窗口',
+    'desktop_action': '操作键鼠',
+    'delete_paths': '删除（进回收站）',
+    'schedule_cron': '建定时任务',
+    'cancel_cron': '删除定时任务',
+    'list_crons': '看定时任务',
+    'spawn_teammate': '派一个助手',
+    'send_message': '给助手发消息',
+    'check_inbox': '收助手消息',
+    'request_shutdown': '让助手收工',
+    'request_plan': '请助手出方案',
+    'review_plan': '审助手的方案',
+    'create_task': '建任务',
+    'todo_write': '更新待办',
+}
+
+
+def tool_label(tool: str) -> str:
+    """「中文名 (原名)」；没有中文名时只回原名。
+
+    卡片上写 `desktop_action` 对非技术用户等于没写，但完全不显示原名又不好
+    对照日志。两个都给。
+    """
+    name = str(tool or '').strip()
+    label = _TOOL_LABELS.get(name)
+    if label and label != name:
+        return f'{label} ({name})'
+    return name or '工具'
+
+
 def _pairs(args: dict) -> str:
     return ', '.join(f'{key}={value}' for key, value in args.items()
                      if value not in (None, ''))

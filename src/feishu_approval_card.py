@@ -39,7 +39,8 @@ def _clip(text: str, limit: int) -> str:
 
 def _request_block(req: dict, index: int, budget: int) -> tuple[str, list[dict]]:
     """单条请求的正文与按钮；预算用于控制整卡长度。"""
-    tool = approval_view.safe_text(req.get('tool') or '工具')
+    tool = approval_view.safe_text(
+        approval_view.tool_label(req.get('tool')))
     reason = _clip(approval_view.safe_text(req.get('reason') or ''), MAX_REASON_CHARS)
     detail = approval_view.detail(tool, req.get('args') or {})
     if detail and len(detail) > budget:

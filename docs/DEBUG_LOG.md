@@ -6526,3 +6526,28 @@ are off limits); ask the user to handle it.`
   `'允许 1'` → `'用户规则：2 条'`（详情移到 `/rules`）。
 
 全量 2295 passed / 3 skipped，ruff 通过。
+
+## 审批卡片显示工具中文名（2026-10-27）
+
+卡片上写 `**#1 · desktop_action**`，非技术用户看不出这是在动键鼠；但只写中文
+又不好对照日志/文档。改成两者都给：
+
+    **#1 · 操作键鼠 (desktop_action)**
+    **#2 · 删除（进回收站） (delete_paths)**
+
+`approval_view.tool_label()` 一处定义，审批卡片与 CLI 提示共用。没登记的工具
+原样显示（不编中文名）——MCP 工具名是用户自己配的，编一个反而误导。
+
+### 顺带确认过的，没问题
+
+- **并发写会话**：4 线程各写 20 条，81 条事件 seq 完全连续、零错误；
+- **内存**：60 次 spawn 后增量 0 MB，没有句柄泄漏；
+- **时间显示**：刚刚/分钟/小时/天/一周外日期、未来时间、None 都正确降级；
+- **会话损坏**：尾部截断容忍（读出 1 条），中间坏行报
+  `invalid JSONL event at line 2`，位置明确。
+
+### 更新 2 处断言
+
+`test_feishu_approval_batch`：`'#1 · bash'` → `'#1 · 执行命令 (bash)'`。
+
+全量 2298 passed / 3 skipped（291s），ruff 通过。

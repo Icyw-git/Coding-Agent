@@ -320,7 +320,8 @@ class PermissionGate:
             allowed, scope = _ask_ui(tool, args, reason)
             self.resolve(req.req_id, allowed, by='ui-modal', scope=scope)
             return self._conclude(req, quiet=True)
-        print(f'  \033[33m[permission] {approval_view.safe_text(tool)} 等待审批：'
+        print(f'  \033[33m[permission] '
+              f'{approval_view.safe_text(approval_view.tool_label(tool))} 等待审批：'
               f'{approval_view.safe_text(reason)}'
               f'（/approvals 或审批卡片处理，{int(self.timeout)}s 未决议则拒绝）\033[0m')
         self._await_remote(req)

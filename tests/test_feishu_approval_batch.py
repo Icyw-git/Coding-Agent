@@ -24,7 +24,8 @@ def test_card_lists_each_request_with_its_own_buttons():
     card = approval_card([_req('r1'), _req('r2', 'read', 'a.txt')])
     text = json.dumps(card, ensure_ascii=False)
     assert card['header']['title']['content'] == '⚠ 需要审批（2）'
-    assert '#1 · bash' in text and '#2 · read' in text
+    assert '#1 · 执行命令 (bash)' in text
+    assert '#2 · 读文件 (read)' in text
     buttons = [button for element in card['elements']
                if element.get('tag') == 'action'
                for button in element['actions']]
@@ -49,7 +50,8 @@ def test_card_bulk_buttons_only_when_several_requests():
 def test_card_collapses_beyond_four_items():
     card = approval_card([_req(f'r{i}') for i in range(7)])
     text = json.dumps(card, ensure_ascii=False)
-    assert '#4 · bash' in text and '#5 · bash' not in text
+    assert '#4 · 执行命令 (bash)' in text
+    assert '#5 ·' not in text
     assert '另有 **3** 条未展开' in text
     assert card['header']['title']['content'] == '⚠ 需要审批（7）'
 

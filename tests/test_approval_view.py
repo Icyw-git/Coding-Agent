@@ -5,7 +5,7 @@
 用例锁的是「同一份可读内容」，而不是某个 print 的字面排版。
 """
 
-from approval_view import detail, safe_text, summarize
+from approval_view import detail, safe_text, summarize, tool_label
 from exec_policy import approval_class
 from hooks import GATE as permission_gate
 
@@ -167,3 +167,25 @@ def test_summarize_keeps_both_ends_for_writes():
 def test_summarize_leaves_short_content_alone():
     summary = summarize('write', {'path': 'a.txt', 'content': 'short'})
     assert summary['content'] == 'short'
+
+
+def test_tool_label_pairs_chinese_with_the_raw_name():
+    """卡片写 `desktop_action` 对非技术用户等于没写；只写中文又不好对照日志。"""
+    assert tool_label('desktop_action') == '操作键鼠 (desktop_action)'
+    assert tool_label('delete_paths') == '删除（进回收站） (delete_paths)'
+    assert tool_label('bash') == '执行命令 (bash)'
+
+
+def test_tool_label_falls_back_to_the_raw_name():
+    """没登记的工具原样显示，不能编一个中文名。"""
+    assert tool_label('some_mcp_tool') == 'some_mcp_tool'
+    assert tool_label('') == '工具'
+    assert tool_label(None) == '工具'
+
+
+def test_approval_card_shows_the_chinese_label():
+    import feishu_approval_card as fc
+
+    card = fc.approval_card([{'req_id': 'r', 'tool': 'desktop_action',
+                              'args': {}, 'reason': 'why'}])
+    assert '操作键鼠' in card['elements'][0]['content']
