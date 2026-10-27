@@ -7124,3 +7124,71 @@ Muse 的对应思路是 assume breach：不问模型会不会被说服，只问�
 
 - 新增 `test_session_continue.py` (20) + `test_proactive.py` (25)
 - 全量 **2475 passed / 3 skipped**（194s），ruff 通过
+
+## 第三轮实施：N7 审批作用域（2026-10-27）
+
+### 问题
+
+会话白名单原来是一个 set：`session_id|tool:klass`。批准一次 `rm`，这个会话里
+所有同类 `rm` **永久免审**，直到手动 `/revoke`。没有时限、没有次数。
+
+Muse 的说法是审批必须是**能力而不是建议**：
+
+> Approvals ... are strict capabilities, not conversational suggestions. They're
+> bound to the particular connector/destination and use case. Muse has support for
+> obtaining one-time, session-scoped, task-scoped, time-bounded, or perpetual
+> permission.
+
+> If the recipient, amount, or affected resource changes afterward, require a new
+> decision.
+
+### 四个作用域
+
+| 作用域 | 语义 | 落盘 |
+|---|---|---|
+| `once`（默认） | 只这一次 | 不写白名单，靠 `take_grant` 凭据传递 |
+| `times` | 同类还能用 N 次 | 每次命中递减，归零即删 |
+| `until` | 到时间戳为止（上限 12h） | 到期即删 |
+| `session` | 本会话同类（旧的默认） | 同样 12h 硬上限 |
+
+### 最重要的一个改动：默认从 session 变 once
+
+用户点"同意"时心里想的是**眼前这一条**，不是"以后同类都免了"。把默认改成
+`once`，让"多批一次"成为默认代价，而不是"少批一次"。
+
+`HARNESS_APPROVAL_SCOPE=session` 可恢复旧行为。
+
+### 实现要点
+
+- `_session_allows` 从 `set[str]` 改成 `dict[str, dict]`，值是作用域记录。
+- **在 `session_allows()` 里消费**，不在 `enforce` 里：命中一次就是"用掉一次"，
+  次数型授权才能递减。过期/耗尽的记录当场 `pop`，不留死键位。
+- `once` **不写白名单**：存了反而会让下一次命中。单次授权靠既有的
+  `take_grant` 凭据传递机制。
+- 会话档也有 12h 硬上限：`perpetual` 是 Muse 产品级的信任积累，我们不做——
+  一个会话跑一整天已经很长，更长的授权应该重新确认。
+- **撤销必须能收回所有作用域**：`revoke_session` 清的是整个 dict，不只是
+  session 档。这是安全语义，不能因为作用域不同而漏。
+
+### CLI 多一个选项
+
+`y=仅这一次 / n=拒绝 / a=本会话允许同类 / t=允许 N 次`。`t` 的输入坏了就退回
+`y`（宁可多问一次，不可超发授权）。
+
+### 顺手修的两处测试腐烂
+
+`test_approval_scope.py` / `test_execution_paths.py` 里有 9 处直接
+`GATE._session_allows.add(...)` / `.update(...)`，数据结构变了之后全部 AttributeError。
+改成构造 `approval_scope.make(...)` 记录。
+
+**踩的坑**：用 heredoc 里的 `'\n'` 写替换文本时，字面反斜杠 + n 被写进了源码，
+产生 `= \n   approval_scope.make(...)` 的语法错误。连试三种字符串写法都没匹配上
+（因为 `'\n'` 在 Python 里是换行符，而文件里是两个字面字符）。最后落到
+`chr(92) + 'n'` 才修好。教训：**涉及反斜杠的批量替换，先 `repr()` 看清实际内容**。
+
+### 验证
+
+新增 `test_scope_capability.py` (22)。全量 **2497 passed / 3 skipped**（255s），
+ruff 通过。
+
+手验：连续三次 `rm a/b/c` 各问一次（默认 once），确认默认行为已收紧。

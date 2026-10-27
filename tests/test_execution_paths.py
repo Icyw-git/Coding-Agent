@@ -122,7 +122,8 @@ def test_denied_approval_leaves_no_grant(env, monkeypatch):
 def test_session_allowlist_also_carries_the_grant(env):
     """白名单命中同样算「本次调用已批准」，否则边界会把它当成无凭据的新调用。"""
     env.session_id = 'A'
-    GATE._session_allows.add(session_allow_key('bash', 'rm', 'A'))
+    import approval_scope
+    GATE._session_allows[session_allow_key('bash', 'rm', 'A')] = approval_scope.make('session')
     assert hooks.permission_hook('bash', {'command': 'rm x'}) is None
     assert hooks.enforce_headless('bash', {'command': 'rm x'}) is None
     assert not GATE.pending()
@@ -226,7 +227,8 @@ def test_untrusted_tier_does_not_honor_the_session_allowlist(env, monkeypatch):
     untrusted 下不参与短路，否则一个按钮就把档位悄悄改掉了。
     """
     monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'untrusted')
-    GATE._session_allows.add(session_allow_key('bash', 'rm', ''))
+    import approval_scope
+    GATE._session_allows[session_allow_key('bash', 'rm', '')] = approval_scope.make('session')
     assert hooks.permission_hook('bash', {'command': 'rm x'}) \
         == 'Permission denied: approval timed out after 0.2s with no response'
     assert GATE.history(), '白名单命中不该省掉这次审批'
@@ -432,7 +434,9 @@ def test_registered_external_tool_asks_at_the_gate(env, asks):
 def test_external_tool_allowlist_is_keyed_by_the_tool_name(env, asks):
     """免审的出路仍是既有的「本次会话允许同类」：第三方工具的同类键就是工具名。"""
     hooks.register_external_tools(['mcp_echo'])
-    GATE._session_allows.add(session_allow_key('mcp_echo', 'mcp_echo', ''))
+    import approval_scope
+    GATE._session_allows[session_allow_key('mcp_echo', 'mcp_echo', '')] = \
+        approval_scope.make('session')
     assert hooks.permission_hook('mcp_echo', {'text': 'y'}) is None
     assert asks == [], '白名单命中不该再问'
     assert hooks.current_grants(), '白名单命中同样把凭据带到工具边界'
@@ -505,14 +509,16 @@ def test_sandbox_command_switches_tiers(line, sandbox, approval, capsys):
 
 def test_tier_switch_drops_session_preauthorizations():
     """换档 = 一次安全状态变更：批过的「同类」不能跟着跨档活下来。"""
-    GATE._session_allows.add(session_allow_key('bash', 'rm', 'A'))
+    import approval_scope
+    GATE._session_allows[session_allow_key('bash', 'rm', 'A')] = approval_scope.make('session')
     harness.handle_command('/sandbox read-only', [], None)
     assert not GATE._session_allows
 
 
 def test_no_op_tier_switch_keeps_preauthorizations():
     """重复设同一档位不是状态变更，不该把人已经批过的免审清掉。"""
-    GATE._session_allows.add(session_allow_key('bash', 'rm', 'A'))
+    import approval_scope
+    GATE._session_allows[session_allow_key('bash', 'rm', 'A')] = approval_scope.make('session')
     harness.handle_command('/sandbox workspace-write', [], None)
     assert session_allow_key('bash', 'rm', 'A') in GATE._session_allows
 

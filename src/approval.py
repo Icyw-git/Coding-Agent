@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import approval_scope
 import approval_view
 from exec_policy import approval_class, session_allow_key
 
@@ -130,8 +131,9 @@ class PermissionGate:
         self._lock = threading.RLock()
         self._requests: dict[str, PermissionRequest] = {}
         # 会话级白名单（审批分级）：键 session_allow_key(tool, klass, session_id)，
-        # 命中后同会话的同类操作免审
-        self._session_allows: set[str] = set()
+        # 值是 approval_scope 记录（不再是无期限的 set）：批准一次默认只算
+        # 「这一次」（once），要同类免审得显式选作用域。
+        self._session_allows: dict[str, dict] = {}
         # LLM 审查官放行缓存：键 = 会话|grant_key（审查批过的精确命令）。
         # 归 Gate 持有：clear()/revoke_session() 连带清空（撤销必须能收回
         # 审查官批出去的免审），且与 _session_allows 同锁防竞态。
@@ -194,7 +196,8 @@ class PermissionGate:
                 self._judge_approved.clear()
             else:
                 self._session_allows = {
-                    key for key in self._session_allows if not key.startswith(prefix)
+                    key: record for key, record in self._session_allows.items()
+                    if not key.startswith(prefix)
                 }
                 self._judge_approved = {
                     key: None for key in self._judge_approved
@@ -252,7 +255,8 @@ class PermissionGate:
         return rows[:max(1, limit)]
 
     def resolve(self, req_id: str, allow: bool, by: str = 'remote',
-                scope: str | None = None) -> PermissionRequest:
+                scope: str | None = None,
+                times: int = 0, until: float = 0) -> PermissionRequest:
         """远程决议一个 pending 请求并唤醒等待方。未知 id / 已决议 → 异常。
 
         scope='session' 且 allow=True 时，把「该会话的同类操作」加入白名单
@@ -275,8 +279,22 @@ class PermissionGate:
             if allow and scope == 'session':
                 klass = approval_class(req.tool, req.args)
                 if klass:
-                    self._session_allows.add(
-                        session_allow_key(req.tool, klass, req.session_id))
+                    key = session_allow_key(req.tool, klass, req.session_id)
+                    with self._lock:
+                        self._session_allows[key] = approval_scope.make(
+                            scope, times=times, until=until)
+            elif allow:
+                # 非持久作用域（once / times / until）也要留一条记录：
+                # once 用完即失，times 递减，until 到期失效——都在 consume() 里。
+                klass = approval_class(req.tool, req.args)
+                if klass:
+                    key = session_allow_key(req.tool, klass, req.session_id)
+                    record = approval_scope.make(scope, times=times, until=until)
+                    # once 不存：它只对「刚刚批准的这一次」有效，存了反而会
+                    # 让下一次命中。单次授权靠 take_grant 凭据传递。
+                    if record['scope'] != approval_scope.ONCE:
+                        with self._lock:
+                            self._session_allows[key] = record
             req._event.set()
             return req
 
@@ -289,7 +307,20 @@ class PermissionGate:
             tool, approval_class(tool, args),
             self._session_id_provider() if session_id is None else session_id)
         with self._lock:
-            return key in self._session_allows
+            record = self._session_allows.get(key)
+            if record is None:
+                return False
+            if not approval_scope.is_active(record):
+                # 过期/耗尽即删除：不能让一条死记录一直占着键位。
+                self._session_allows.pop(key, None)
+                return False
+            # 在这里消费：命中一次就是「用掉一次」——次数型授权才能递减。
+            updated = approval_scope.consume(record)
+            if updated is None:
+                self._session_allows.pop(key, None)
+            else:
+                self._session_allows[key] = updated
+            return True
 
     # ---------- 决议入口（enforce 调用） ----------
 
@@ -383,15 +414,31 @@ class PermissionGate:
             print(f'     {line}')
         klass = approval_class(req.tool, req.args)
         try:
-            choice = input('Allow? (y=允许 / n=拒绝 / a=本会话允许同类) ' if klass
+            choice = input('Allow? (y=仅这一次 / n=拒绝 / a=本会话允许同类 / '
+                           't=允许特 N 次) ' if klass
                            else 'Allow? (y=允许 / n=拒绝) ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             print('  \033[31m[permission] stdin unavailable → denied\033[0m')
             self.resolve(req.req_id, False, by='console(EOF)')
             return False
+        if choice == 't' and klass:
+            try:
+                raw = input('  还能用几次？').strip()
+                times = max(1, int(raw))
+            except (EOFError, KeyboardInterrupt, ValueError):
+                # 输入坏了就当单次：宁可多问一次，不可超发授权。
+                print('  \033[33m[permission] 次数无效，按「仅这一次」处理\033[0m')
+                choice = 'y'
+                times = 0
+            else:
+                self.resolve(req.req_id, True, by='console',
+                             scope='times', times=times)
+                print(f'  \033[32m[permission] 同类还能用 {times} 次\033[0m')
+                return True
         allow = choice in ('y', 'yes', 'a')
         if choice == 'a' and not klass:
             print('  \033[33m[permission] 这类命令不记「同类」，本次只放行这一次\033[0m')
+        # y（默认）不传 scope：走 approval_scope.default_scope()，默认 once。
         self.resolve(req.req_id, allow, by='console',
                      scope='session' if choice == 'a' else None)
         return allow

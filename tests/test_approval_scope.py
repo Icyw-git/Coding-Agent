@@ -78,16 +78,25 @@ def test_session_allowlist_skips_second_ask(remote_gate, monkeypatch):
     assert not GATE.pending()           # 第二次：白名单命中，未再询问
 
 
+def _allow(key: str, scope: str = 'session') -> None:
+    """往会话白名单里放一条授权记录。
+
+    白名单不再是 set（N7 起带作用域与时限），所以测试要造记录而不只是键。
+    """
+    import approval_scope
+    GATE._session_allows[key] = approval_scope.make(scope)
+
+
 def test_deny_list_wins_over_session_allowlist(remote_gate, monkeypatch):
     _fake_hooks_config(monkeypatch)
-    GATE._session_allows.add('bash:sudo')
+    _allow('bash:sudo')
     result = hooks.permission_hook('bash', {'command': 'sudo rm x'})
     assert 'Dangerous command' in result   # 白名单不能越过黑名单
 
 
 def test_different_class_still_requires_approval(remote_gate, monkeypatch):
     _fake_hooks_config(monkeypatch)
-    GATE._session_allows.add('bash:rm')
+    _allow('bash:rm')
     assert hooks.permission_hook('bash', {'command': 'rm -rf x'}) is None
 
     called = []
@@ -142,9 +151,10 @@ def test_sensitive_commands_cannot_grant_session_wide_allow(remote_gate, monkeyp
 
 
 def test_revoke_session_only_removes_that_sessions_grants(remote_gate):
-    GATE._session_allows.update({'A|bash:rm', 'B|bash:rm'})
+    _allow('A|bash:rm')
+    _allow('B|bash:rm')
     assert GATE.revoke_session('A') == 1
-    assert GATE._session_allows == {'B|bash:rm'}
+    assert set(GATE._session_allows) == {'B|bash:rm'}
     assert GATE.revoke_session() == 1
     assert not GATE._session_allows
 
@@ -210,7 +220,7 @@ def test_composite_command_approval_does_not_grant_its_first_verb(remote_gate,
 
 
 def test_clear_wipes_session_allowlist(remote_gate):
-    GATE._session_allows.add('bash:rm')
+    _allow('bash:rm')
     GATE.clear()
     assert not GATE.session_allows('bash', {'command': 'rm x'})
 
