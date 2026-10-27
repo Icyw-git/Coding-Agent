@@ -28,16 +28,19 @@ def test_status_reports_screenshot_count_and_switch(tmp_path, monkeypatch):
     screen_capture.save_png(screen_capture.PNG_MAGIC + b'x', harness.SCREENSHOT_DIR)
 
     output = harness.format_status(store)
-    assert '屏幕工具：开' in output
+    # 能力分组展示：已启用的带状态，未启用的缩在“未启用”一行里。
+    assert '已启用：' in output
+    assert '屏幕：开' in output
     assert '截图 1 张' in output
+    assert '剪贴板：读写都需审批' in output
 
     monkeypatch.setenv('HARNESS_SCREEN_TOOLS', '0')
-    assert '屏幕工具：关（HARNESS_SCREEN_TOOLS=0）' in harness.format_status(store)
-    assert '剪贴板工具：开' in harness.format_status(store)
-
     monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '0')
-    assert '剪贴板工具：关（HARNESS_CLIPBOARD_TOOLS=0）' in harness.format_status(store)
-    assert '桌面控制：关（设置 HARNESS_DESKTOP_CONTROL=1 启用）' in harness.format_status(store)
+    off = harness.format_status(store)
+    assert '未启用：' in off
+    assert '屏幕' in off.split('未启用：', 1)[1]
+    assert '剪贴板' in off.split('未启用：', 1)[1]
+    assert '桌面控制' in off.split('未启用：', 1)[1]
 
 
 def test_checkpoint_listing_keeps_actionable_reference():

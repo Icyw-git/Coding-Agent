@@ -22,7 +22,6 @@ import trash
 import workspace_diff
 from exec_policy import (
     CLIPBOARD_ENV,
-    DESKTOP_ENV,
     SCREEN_ENV,
     clipboard_tools_enabled,
     desktop_control_enabled,
@@ -109,31 +108,52 @@ def format_status(session_store) -> str:
     policy = load_policy()
     shots = screen_capture.stats(h.SCREENSHOT_DIR)
     path_grants = grants.active_write_paths()
-    grants_line = (f'\n  目录写授权：{len(path_grants)} 个（/grants 查看）'
-                   if path_grants else '')
-    screen_line = (
-        f"\n  屏幕工具：开 · 截图 {shots['files']} 张"
-        f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）"
-        if screen_tools_enabled()
-        else f'\n  屏幕工具：关（{SCREEN_ENV}=0）')
-    clipboard_line = (
-        '\n  剪贴板工具：开（读写都需审批）'
-        if clipboard_tools_enabled()
-        else f'\n  剪贴板工具：关（{CLIPBOARD_ENV}=0）')
-    desktop_line = (
-        '\n  桌面控制：开（每步需审批）'
-        if desktop_control_enabled()
-        else f'\n  桌面控制：关（设置 {DESKTOP_ENV}=1 启用）')
-    rules_line = ('\n  ' + user_rules.load().describe()
-                  + f'（{user_rules.path_for_display()}）')
-    credentials_line = '\n  ' + credentials.describe()
-    trash_line = '\n  ' + trash.describe_status()
-    limits_line = '\n  ' + limits.status_line()
-    browser_line = '\n  ' + browser_profile.describe()
+    # 能力开关分两类：**已启用且带状态**的单独一行（用户要看数量/占用），
+    # **未启用**的压缩成一行。十几行平铺下来，核心状态（会话/工作区/档位）
+    # 会被埋在中间，看久了抓不到重点。
     allow_domains, deny_domains = net_grants.counts()
-    domains_line = (f'\n  域名策略：允许 {allow_domains} · 拒绝 {deny_domains}'
-                    if allow_domains or deny_domains
-                    else '\n  域名策略：无（未知域名逐个审批）')
+    ruleset = user_rules.load()
+    cred_state = credentials.status()
+    limits_snapshot = limits.from_env()
+    active: list[tuple[str, str]] = []
+    inactive: list[str] = []
+
+    def _cap(label: str, enabled: bool, detail: str) -> None:
+        (active if enabled else inactive).append((label, detail) if enabled else label)
+
+    _cap('屏幕', screen_tools_enabled(),
+         f"开 · 截图 {shots['files']} 张"
+         f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）")
+    _cap('剪贴板', clipboard_tools_enabled(), '读写都需审批')
+    _cap('桌面控制', desktop_control_enabled(), '每步需审批')
+    _cap('域名策略', bool(allow_domains or deny_domains),
+         f'允许 {allow_domains} · 拒绝 {deny_domains}')
+    _cap('用户规则', bool(ruleset.rules), f'{len(ruleset.rules)} 条')
+    _cap('凭据加密', bool(cred_state.get('keys')),
+         f"{len(cred_state['keys'])} 项")
+    _cap('回收站删除', trash.available()[0], '可用')
+    _cap('资源限额', limits_snapshot.enabled,
+         limits_snapshot.describe().replace('资源限额：', ''))
+    _cap('浏览器 profile', browser_profile.exists(), '已创建')
+
+    capability_lines = ''
+    if active:
+        capability_lines = '\n  已启用：' + ''.join(
+            f'\n    {label}：{detail}' for label, detail in active)
+    if inactive:
+        capability_lines += '\n  未启用：' + '、'.join(inactive)
+    if path_grants:
+        capability_lines += (f'\n    目录写授权：{len(path_grants)} 个'
+                            '（/grants 查看）')
+    # 规则文件坏了必须**无条件**显示：那意味着所有规则一夜之间失效，
+    # 而用户还以为自己的 allow 规则在生效。
+    if ruleset.error:
+        # YAML 解析错误带多行上下文，直接嵌进 /status 会把输出撑乱。
+        # 这里只留首句，完整错误看 /rules。
+        reason = ' '.join(str(ruleset.error).split())[:90]
+        capability_lines += (f'\n  ⚠ 用户规则加载失败（{reason}）'
+                            '—— 全部规则当前不生效，看 /rules'
+                            f'（文件 {user_rules.path_for_display()}）')
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -148,16 +168,7 @@ def format_status(session_store) -> str:
         f'{h.hooks.GATE.judge_summary() if h.hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
-        f'{grants_line}'
-        f'{screen_line}'
-        f'{clipboard_line}'
-        f'{desktop_line}'
-        f'{domains_line}'
-        f'{rules_line}'
-        f'{credentials_line}'
-        f'{trash_line}'
-        f'{limits_line}'
-        f'{browser_line}'
+        f'{capability_lines}'
         f'{usage_line}'
     )
 

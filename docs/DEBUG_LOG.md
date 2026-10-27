@@ -6481,3 +6481,48 @@ are off limits); ask the user to handle it.`
 真实工具拒绝写 `.git`、读目录/读文档后缀的下一步提示。
 
 全量 2295 passed / 3 skipped，ruff 通过。
+
+## 清理 .git 残留 + /status 分组（2026-10-27）
+
+### `.git/` 里有 23 个不该存在的文件
+
+`git fsck` 通过（只有 dangling commit，是 amend/rebase 的正常残留），但列目录时
+发现 `.git/` 里躺着：
+
+    cache1.txt cache2.txt d1..d8.txt dump.py imp.txt lg.txt lg2.txt log.txt
+    py2.txt py3.txt s1.txt s2.txt st.txt st2.txt tmp_pytest.txt tmp_tests_diff.txt
+
+内容分别是历史的 `git log` 输出、pytest 输出、脚本 dump——是过去调试时 shell
+重定向写错路径留下的（不是代码缺陷，代码里搜不到这些名字）。
+
+全部删除，`.git/` 恢复成标准内容。删除前后核对：HEAD 未变、`git status` 干净、
+`git fsck` 无 corruption。
+
+### `/status` 从 15 行平铺改成两组
+
+新加的能力（域名/规则/凭据/删除/限额/浏览器）都和核心状态（会话/工作区/档位）
+平铺在一起，15 行下来重点被埋掉了。改成：
+
+- **已启用**：带状态单独一行（屏幕截图几张多大、域名允许几个拒绝几个、
+  规则几条、凭据几项、限额多少）；
+- **未启用**：压成一行逗号分隔。
+
+现在一眼能看出「开了什么、没开什么」，而不是逐行读。
+
+### 顺手修的一个真问题
+
+分组过程中发现：**规则文件加载失败时，`/status` 完全看不到**——因为「用户规则」
+只在有规则时才进「已启用」。而规则坏了意味着所有 allow/deny 一夜失效，用户却
+以为它们在生效。
+
+改成无条件显示警告行，并把 YAML 的多行解析错误**压成单行首句**（完整错误看
+`/rules`）——直接嵌进 `/status` 会把输出撑乱。
+
+### 更新 4 处断言
+
+- `test_cli_output`：`'屏幕工具：开'` → 分组后的 `'屏幕：开'`；
+  关闭态改成断言出现在「未启用」那一行之后。
+- `test_rules_integration`：`'规则文件：无'` → 出现在「未启用」行；
+  `'允许 1'` → `'用户规则：2 条'`（详情移到 `/rules`）。
+
+全量 2295 passed / 3 skipped，ruff 通过。

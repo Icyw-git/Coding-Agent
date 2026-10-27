@@ -10,7 +10,8 @@ def _store(tmp_path):
 def test_status_reports_missing_rules_file(tmp_path, monkeypatch):
     store = _store(tmp_path)
     output = harness.format_status(store)
-    assert '规则文件：无' in output
+    # 没有规则时归到「未启用」那一行，不再单独占一行。
+    assert '用户规则' in output.split('未启用：', 1)[1]
 
 
 def test_status_reports_loaded_rule_counts(tmp_path, monkeypatch):
@@ -19,7 +20,8 @@ def test_status_reports_loaded_rule_counts(tmp_path, monkeypatch):
         {'decision': 'deny', 'prefixes': ['npm publish']},
     ]}))
     output = harness.format_status(_store(tmp_path))
-    assert '允许 1' in output and '拒绝 1' in output
+    # 有规则时在「已启用」里显示条数（详情见 /rules）。
+    assert '用户规则：2 条' in output
 
 
 def test_status_reports_broken_rules_file(tmp_path, tmp_path_factory):
