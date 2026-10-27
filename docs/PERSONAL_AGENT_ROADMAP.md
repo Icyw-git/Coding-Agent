@@ -517,6 +517,12 @@ P4.2b 用户规则文件与 P4.3 自动放行审计也已完成。P3b 键鼠控�
 
 ---
 
+## 8.1 下一轮（能力边界之后）
+
+P1–P6 解决的是「能做什么」。对照 Codex 2026-04、dots、Muse 的一手资料，下一轮的
+缺口在**关系层**：记忆没有工具入口、主动性只有摘要没有提议、委托边界缺硬编码清单。
+详见 [PERSONAL_AGENT_ROUND3.md](PERSONAL_AGENT_ROUND3.md)。
+
 ## 9. 参考
 
 - Codex App Server 架构与协议：<https://openai.com/index/unlocking-the-codex-harness/>

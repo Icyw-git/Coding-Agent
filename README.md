@@ -765,7 +765,9 @@ python scripts/install_autostart.py install             # 当前用户，不提�
 详见 [飞书接入](docs/FEISHU_SETUP.md) 的「凭据保护」一节。
 
 [飞书验收](docs/FEISHU_ACCEPTANCE.md)；下一阶段能力规划（桌面/系统/账号）见
-[Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)。
+[Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)；
+记忆/主动性/委托边界的第三轮规划见
+[Round 3](docs/PERSONAL_AGENT_ROUND3.md)。
 
 验收辅助（本地预检 + 卡片结构校验 + 可选真机发卡）：
 
