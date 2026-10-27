@@ -333,3 +333,13 @@ def test_textual_flag_runs_new_app(tmp_path, monkeypatch):
 
     assert calls and calls[0][1]['session_id'] == 'next-ui'
     assert calls[0][0][0]['content'] == 'hi'
+
+
+def test_status_does_not_depend_on_real_credentials_file(tmp_path):
+    """凭据状态不能读本机真实文件：否则同一测试在不同机器上结论不同。"""
+    import credentials
+
+    # 隔离 fixture 已把 store_path 指到用例自己的 tmp_path
+    assert str(tmp_path) in str(credentials.store_path())
+    # 未迁移状态下就是「没有加密文件」，不依赖本机是否迁移过
+    assert credentials.status()['exists'] is False

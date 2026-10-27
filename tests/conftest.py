@@ -64,6 +64,36 @@ def _block_unstubbed_llm_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_credentials(tmp_path, monkeypatch):
+    """凭据存储按用例隔离：本机真实的 credentials.bin 会让 /status 断言串味。
+
+    `/status` 里有一行「凭据加密：N 项」。不隔离的话，本机迁移过凭据的机器
+    显示 3 项、没迁移的机器显示明文 .env——同一个测试在两台机器上结论不同。
+    """
+    import credentials
+
+    monkeypatch.setattr(credentials, 'store_path',
+                        lambda: tmp_path / 'credentials.bin')
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_ps_workers():
+    """常驻 PowerShell worker 是进程级单例：上一个用例注册的 worker 会留着。
+
+    留着的代价是真实进程：`test_get_worker_is_singleton_per_name` 注册完不走
+    shutdown 的话，后面每个用例都带着一个常驻 PowerShell，既拖慢又可能因为
+    名字撞车拿到别人的 worker（状态串味）。
+    """
+    import ps_worker
+
+    ps_worker.shutdown()
+    try:
+        yield
+    finally:
+        ps_worker.shutdown()
+
+
+@pytest.fixture(autouse=True)
 def _reset_turn_slot_state():
     """回合槽是模块级全局：上一个用例残留的 _DEPTH>0 会让下一个用例误判重入。
 

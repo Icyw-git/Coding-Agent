@@ -6684,3 +6684,61 @@ with _STATE:
 而不是时序。批量改测试反而会引入确定性破坏（上一轮已经踩过）。
 
 全量 2304 passed / 3 skipped，ruff 通过。
+
+## 复查模块级全局状态的测试隔离（2026-10-27）
+
+上一轮发现回合槽状态跨用例残留（`_DEPTH`）导致偶发失败，顺着这条线把所有
+模块级可变全局过了一遍，找同类问题。
+
+### 方法
+
+先筛出模块级可变容器/计数器（排除常量、frozenset、编译后的正则）：
+
+    background_task._bg_counter      agent_runtime._summary_cache
+    cron_scheduler._idle_cache       line_repl._RENDERER_ATTACHED
+    llm_config._settings_cache       llm_config._clients
+    net_grants._CACHE                mcp_bridge._clients / _shutdown
+    project_context._cache           notify._last_attempt
+    memory._FRONTMATTER_CACHE        ps_worker._workers
+    idle._cache                      skill_system._last_signature
+    sandbox._STATE / _ENV_BLOCK_CACHE   turn_control._ACTIVE_TOKENS
+    tool_todos._TODOS                workspace_diff._REPO_ROOTS
+    rules._CACHE                     turn_coordinator._DEPTH
+    tool_dispatch._tool_output_seq
+
+再逐个核对 conftest 是否隔离。
+
+### 找到并修的两个缺口
+
+**1. `credentials` 没有隔离——测试结论依赖本机状态**
+
+`/status` 里有一行「凭据加密：N 项」。不隔离的话：
+
+- 本机迁移过凭据 → 测试看到「加密（3 项）」
+- 换个没迁移的机器 → 看到明文 `.env`
+
+**同一个测试在两台机器上结论不同**，这类问题最难查（CI 上过了、本地不过）。
+加 `_isolate_credentials` fixture 把 `store_path` 指到 `tmp_path`。
+
+**2. `ps_worker._workers` 没有隔离——真实进程泄漏**
+
+`get_worker` 是进程级单例注册表。`test_get_worker_is_singleton_per_name` 注册完
+不走 shutdown 的话，**后面每个用例都带着一个常驻 PowerShell**：既拖慢，也可能
+因为名字撞车拿到别人的 worker（`ECHO_SCRIPT` 里的 op 对不上，报「unknown」）。
+加 `_shutdown_ps_workers` fixture，前后各 shutdown 一次。
+
+### 评估后判定不用处理的
+
+| 状态 | 理由 |
+|---|---|
+| `workspace_diff._REPO_ROOTS` | 按路径分 key，不同用例的 tmp_path 天然隔离 |
+| `tool_todos._TODOS` | 现有测试已手动 clear（4 处），搬到 conftest 收益小于改动 |
+| `sandbox._STATE` / `_ENV_BLOCK_CACHE` | 只缓存「工作区能否打标」，按路径分 key |
+| `rules._CACHE` / `net_grants._CACHE` | 已按 (路径, mtime, size) 缓存，且有 conftest 隔离 |
+
+### 测试
+
+`test_cli_output` 新增 1 条：确认 `store_path` 在用例 tmp_path 里、且未迁移状态
+下 `exists is False`（不依赖本机是否迁移过）。
+
+全量 2305 passed / 3 skipped，ruff 通过。
