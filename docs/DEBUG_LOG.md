@@ -7336,3 +7336,75 @@ settings.policy_env(name)           # 只读，且只接受三个档位键
   `enabled()` 必须给出同一个答案（防止两层漂移）
 - 全量 **2531 passed / 3 skipped**（165s），ruff 通过
 - 新增 `docs/ARCHITECTURE_REVIEW.md` 记录完整诊断与建议
+
+## 架构整理：解开顶层循环依赖 + 规范对齐（2026-10-27）
+
+按 ARCHITECTURE_REVIEW.md 的优先级做前两项。
+
+### 1. 解开 `hooks <-> tools` 循环
+
+关键发现：`hooks` 从 `tools` 取 `PatchError`/`patch_paths`，而这两个**实际定义在
+`tool_patch.py`**，`tools` 只是 `# noqa: F401` 转发。绕这一道纯属历史遗留。
+
+改法两步：
+
+1. `hooks` 直连 `from tool_patch import PatchError, patch_paths` — 循环断一半。
+2. `tool_registry` 只剩 `is_tool_hook` 用一处，改成调用期惰性 `import tools`。
+
+结果：**模块顶层 import 的循环依赖为 0**（之前 7 对，其中 6 对是函数体内惰性导入、
+不影响顶层顺序）。更重要的一条：**`import tools` 现在能独立成功**——原来它是最容易
+炸的那一端（本轮加记忆工具时就炸在这里）。
+
+### 2. 规范与实现对齐
+
+`coding-standards.md` 原来写"`src/` 模块不 import harness"，实际 26 个模块经
+`llm_route.harness()` 反向取。选择**承认后门**而不是去掉它（去掉会破坏大量测试的
+monkeypatch 方式，收益不抵成本）。
+
+改写成一张明确的允许/禁止表：
+
+| 允许 | 禁止 |
+|---|---|
+| 函数体内 `llm_route.harness()` | 模块顶层 `import harness` |
+| 读可变配置（目录/client/黑名单） | 在 harness 里回调 src 私有函数 |
+| 测试 `monkeypatch.setattr(harness, ...)` | 新模块默认照抄后门 |
+| 入口适配层（`headless.py`）顶层 import | 原语层这么做 |
+
+并写清新代码优先级：**参数注入 → `llm_route.harness()` → 才考虑顶层 import**。
+
+唯一顶层例外是 `headless.py`：它是入口适配层（`entrypoint.py` 的
+`from headless import run` 调它），职责上属于入口，放 `src/` 只是为了跟其它传输层
+放一起。已在规范和测试里都标注。
+
+### 3. 新增架构守卫测试（tests/test_architecture.py, 8 条）
+
+- `test_no_module_level_import_cycles`：顶层 import 必须无环
+- `test_tools_and_hooks_import_independently`：两个模块各自都能先导入
+- `test_registry_check_does_not_need_top_level_tools`
+- `test_settings_is_a_leaf_module`：配置层必须零依赖
+- `test_low_level_utils_stay_low`：`paths`/`file_lock`/`console` 不能依赖策略层
+- `test_only_entry_adapters_import_harness_at_module_level`
+
+### 踩到的坑：守卫测试自己制造了跨用例污染
+
+第一版 `test_tools_and_hooks_import_independently` 用 `sys.modules.pop('hooks')`
+来测"先导入谁"。结果全量出现 **12 个失败**，全是别的文件的：
+
+```
+tools.run_web_fetch(...) 期望 'Permission denied by user'
+实际 'Permission denied: approval timed out after 3s'
+```
+
+原因：`sys.modules.pop` 把模块对象从字典里拿掉，别处（`monkeypatch.setattr(hooks,
+...)` 打桩、`tools._gate()` 返回的引用）持有的旧对象与新建的不是同一个 —— 打桩打到
+旧对象上，真实对象没被打桩，于是走了真审批并超时。
+
+**这正是本仓反复出现的"跨用例全局状态泄漏"**，只不过这次是我自己写的守卫测试造成的。
+修法：改用**子进程**测真实的"先导入谁"，主进程模块表不受影响。
+
+教训：**测试里不要 `sys.modules.pop` 已导入的项目模块**——`monkeypatch` 打桩、
+模块级缓存都持有对象引用，pop 之后它们指向的是孤儿。
+
+### 验证
+
+全量 **2539 passed / 3 skipped**（291s），ruff 通过。

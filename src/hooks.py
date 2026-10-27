@@ -69,7 +69,7 @@ from exec_policy import (
     secret_references,
     session_allow_key,
 )
-from tools import PatchError, patch_paths, tool_registry
+from tool_patch import PatchError, patch_paths
 
 # 拆分后保持既有导入点不变：审批门与审查官的公开名字继续从本模块可见。
 __all__ = [
@@ -416,7 +416,11 @@ GATE = PermissionGate(
 
 
 def is_tool_hook(tool:str,args:dict):
-    if tool not in tool_registry.keys():
+    # 惰性导入：tools → tool_tasks → hooks 是既有依赖方向，顶层 `from tools import
+    # tool_registry` 会形成环（本轮加记忆工具时踩到过：tools 还没执行到
+    # `tool_registry = {...}` 就被 hooks 反向 import）。这里只在调用期取一次。
+    import tools
+    if tool not in tools.tool_registry:
         return f'Error: unknown tool {tool}'
     return None
 

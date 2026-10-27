@@ -16,10 +16,38 @@
 （`_LazyLLMClient` 透明代理 + PEP 562 模块 `__getattr__`），预热只挂 CLI 启动与
 API lifespan 的后台线程。
 
-CLI 只适配输入输出，runtime 与工具不反向依赖入口和网关。`src/` 模块不 import
-harness：工作区、工具表、技能目录与 model client 由入口采集后注入（如
-`prompt_assembly.collect_context()`、`session_title.generate_session_title(messages, client)`），
-保证每个 `src` 模块都能脱离 CLI 单独导入与测试。路径一律 `Path`；
+CLI 只适配输入输出，runtime 与工具不反向依赖入口和网关。保证每个 `src` 模块都能
+脱离 CLI 单独导入与测试。
+
+### 与 harness 的关系（`llm_route.harness()` 后门）
+
+理想状态是 `src/` 完全不依赖根目录的 `harness.py`：工作区、工具表、技能目录与
+model client 由入口采集后注入（如 `prompt_assembly.collect_context()`、
+`session_title.generate_session_title(messages, client)`）。
+
+**实际有 26 个模块做不到**，它们经 `llm_route.harness()` 延迟取入口全局状态
+（配置目录、`SessionEventStore`、`DESTRUCTIVE` 黑名单等）。这是个已存在的妥协，
+与其写一条没人遵守的规定，不如把边界写清：
+
+| 允许 | 禁止 |
+|---|---|
+| 函数体内 `llm_route.harness()`（调用期取最新值） | 模块顶层 `import harness` |
+| 读可变配置（目录、模型 client、黑名单表） | 在 `harness` 里回调 `src` 的私有函数 |
+| 测试用 `monkeypatch.setattr(harness, ...)` 注入 | 新模块默认照抄这个后门 |
+| 入口适配层（`headless.py`）顶层 import | 原语层（路径/存储/策略）这么做 |
+
+新代码的优先级：**先把值作为参数注入**（首选）→ 其次 `llm_route.harness()` →
+最后才考虑新增 `import harness`。理由：前者可测、无导入顺序风险；后者把整个入口
+变成每个模块的隐式依赖，任何 `harness.py` 的重构都会波及全仓。
+
+顶层 `import harness` 会直接造成循环依赖，已被 `tests/test_architecture.py` 钉住
+（同类守卫也覆盖 `src/` 内部的顶层 import 环）。
+
+唯一的顶层例外是 `src/headless.py`：它是**入口适配层**（由 `entrypoint.py` 的
+`from headless import run` 调用，负责编排一次完整回合并输出 JSONL），职责上就属于
+入口而不是可复用原语，放在 `src/` 只是为了跟其它传输层放在一起。
+
+路径一律 `Path`；
 环境变量用 `HARNESS_` 前缀（`HARNESS_PROGRESS_INTERVAL`、`HARNESS_APPROVAL_TIMEOUT`），
 模型上下文窗口查 `MODEL_WINDOWS` 表再允许 `LLM_CONTEXT_WINDOW` 覆盖，未知模型
 打印告警并保守回落，不静默降级。

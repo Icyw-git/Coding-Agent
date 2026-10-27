@@ -80,6 +80,15 @@ from partially initialized module`。当时的解法是改成惰性导入 + 注�
 
 这种"靠 import 顺序碰巧能跑"的结构，**每次新增工具都可能再踩一次**。
 
+> **已修复（2026-10-27）**：`hooks` 原本从 `tools` 取 `PatchError`/`patch_paths`，
+> 而这两个实际定义在 `tool_patch.py`（`tools` 只是转发）——改成直连后循环断了一半；
+> 剩下 `tool_registry` 只在 `is_tool_hook` 里用，改成调用期惰性导入。
+> 现在 **模块顶层 import 的循环依赖为 0**，且 `import tools` 不再依赖导入顺序
+> （原来它是最容易炸的那一端）。已由 `tests/test_architecture.py` 钉住。
+>
+> 剩余 6 对都涉及函数体内的惰性导入或 `agent_teams` 内部协作，不影响顶层导入顺序，
+> 暂不处理。
+
 ### 1.4 问题二：规范与实际不一致
 
 `docs/coding-standards.md` 第 19 行明文规定：
@@ -100,6 +109,13 @@ def harness():
 `llm_route` 自己的 docstring 也承认这是为了测试（`monkeypatch.setattr(harness,
 'client', fake)`）。**这是个合理的妥协**，但它让"规范说不行、实际到处在用"成为常态，
 新代码会照抄后门而不是遵守规范。
+
+> **已处理（2026-10-27）**：选择"承认后门"而不是去掉它。`coding-standards.md` 改成
+> 一张明确的允许/禁止表：函数体内 `llm_route.harness()` 允许，模块顶层
+> `import harness` 禁止；唯一豁免是 `src/headless.py`（入口适配层，由
+> `entrypoint.py` 的 `from headless import run` 调用）。新代码优先级写清为
+> "参数注入 → `llm_route.harness()` → 才考虑顶层 import"。
+> 由 `test_only_entry_adapters_import_harness_at_module_level` 钉住。
 
 ---
 
@@ -167,7 +183,7 @@ def load_policy(environ=None) -> Policy:
 
 按性价比排序。都是增量，不推翻现有结构。
 
-### 建议 1（高性价比）：建 `src/settings.py` 作为唯一读取口
+### 建议 1（高性价比）：建 `src/settings.py` 作为唯一读取口 ✅ 已完成
 
 不改变"读环境变量"这个机制，只是**收敛读取点**：
 
@@ -190,7 +206,7 @@ def text(name: str, default: str = '') -> str:
 
 风险：低。纯新增模块，逐步替换而不是一次性重写。
 
-### 建议 2（中性价比）：把 `hooks <-> tools` 的环解开
+### 建议 2（中性价比）：把 `hooks <-> tools` 的环解开 ✅ 已完成
 
 只需要把 `hooks` 从 `tools` 拿的两样东西移走：
 
@@ -224,7 +240,7 @@ src/
 **我的判断：现在不值得。** 分层在语义上已经清楚（前缀命名 + 依赖深度健康），
 目录结构的收益主要是观感，而代价是几小时的机械工作和一次高风险回归。
 
-### 建议 4（低成本）：把规范改成与实现一致
+### 建议 4（低成本）：把规范改成与实现一致 ✅ 已完成
 
 `coding-standards.md` 说"`src/` 不 import harness"，实际 26 个文件在用
 `llm_route.harness()`。二者必须统一：
