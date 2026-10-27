@@ -111,3 +111,26 @@ def held() -> bool:
     """当前进程是否持有回合槽（诊断/测试用）。"""
     with _STATE:
         return _DEPTH > 0
+
+
+def reset_for_tests() -> None:
+    """清空进程级的回合槽状态（仅测试用）。
+
+    `_DEPTH` / `_OWNER` / `_UNLOCK` 是模块级全局：某个用例如果没走到 release
+    （异常、提前 return，或者只是被 Ctrl-C 打断），残留的 `_DEPTH > 0` 会让
+    **下一个用例**在 acquire 时命中「同线程重入」分支——它于是拿到一个空槽，
+    回合根本没跑，断言就随机失败。
+
+    conftest 里的 autouse fixture 会调用这里，把每个用例的起点拉回干净状态。
+    """
+    global _DEPTH, _OWNER, _UNLOCK
+    with _STATE:
+        manager = _UNLOCK
+        _DEPTH = 0
+        _OWNER = None
+        _UNLOCK = None
+    if manager is not None:
+        try:
+            manager.__exit__(None, None, None)
+        except Exception:
+            pass

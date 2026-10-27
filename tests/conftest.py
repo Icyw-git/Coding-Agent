@@ -64,6 +64,23 @@ def _block_unstubbed_llm_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_turn_slot_state():
+    """回合槽是模块级全局：上一个用例残留的 _DEPTH>0 会让下一个用例误判重入。
+
+    `turn_coordinator.acquire` 对「同线程重入」只增加嵌套计数、不再申请 OS 锁；
+    如果某个用例没 release（异常/提前返回），下一个用例会拿到一个空槽、回合根本
+    没跑，于是随机失败。这里每个用例前后都清零，把起点拉回干净状态。
+    """
+    import turn_coordinator
+
+    turn_coordinator.reset_for_tests()
+    try:
+        yield
+    finally:
+        turn_coordinator.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _reset_turn_control_state():
     """回合取消位/活动 token 是进程级状态：用例之间必须清零。
 

@@ -253,3 +253,35 @@ def test_cleanup_reports_busy_session_instead_of_moving_it(tmp_path):
     assert completed == 0
     assert failures and '执行任务' in failures[0][1]
     assert moved == []
+
+
+def test_reset_recovers_from_a_leaked_slot(tmp_path):
+    """上一个用例没收槽时，下一个用例必须能重新拿到，而不是误判重入。
+
+    这就是 test_harness_app 里那条偶发失败的根因：`_DEPTH` 是模块级全局，
+    残留 >0 会让 acquire 走「同线程重入」分支、拿回一个空槽，回合根本没跑。
+    """
+    import turn_coordinator
+
+    turn_coordinator.reset_for_tests()
+    turn_coordinator.acquire(tmp_path)      # 故意不释放：模拟用例异常退出的残局
+    try:
+        assert turn_coordinator._DEPTH == 1
+    finally:
+        turn_coordinator.reset_for_tests()
+
+    assert turn_coordinator._DEPTH == 0
+    # 重置后应能正常拿到槽并释放
+    again = turn_coordinator.acquire(tmp_path)
+    again.release()
+    turn_coordinator.reset_for_tests()
+
+
+def test_reset_is_idempotent(tmp_path):
+    import turn_coordinator
+
+    turn_coordinator.reset_for_tests()
+    turn_coordinator.reset_for_tests()      # 不该抛
+    slot = turn_coordinator.acquire(tmp_path)
+    slot.release()
+    turn_coordinator.reset_for_tests()

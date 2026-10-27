@@ -6636,3 +6636,51 @@ ping 超时把正在启动的 worker 杀了，报「exited during startup」—�
 接受偶发、靠重跑兜底。
 
 全量 2302 passed / 3 skipped，ruff 通过。
+
+## 找到两条偶发失败的共同根因：回合槽状态跨用例残留（2026-10-27）
+
+`test_turn_slot_released_after_turn` 与 `test_delete_requires_typed_confirmation`
+各约有 25% 概率随机失败，单跑必过。之前一直当作「Textual UI 时序敏感」处理，
+这次查到了真正的根因。
+
+### 根因
+
+`src/turn_coordinator.py` 的 `_DEPTH` / `_OWNER` / `_UNLOCK` 是**模块级全局**，
+`acquire()` 的逻辑是：
+
+```python
+with _STATE:
+    if _DEPTH:                 # ← 有人已经持槽
+        if _OWNER != ident: raise TurnBusy(...)
+        _DEPTH += 1            # 同线程 → 只加嵌套计数，不申请 OS 锁
+        return TurnSlot(release_nested)
+    manager = exclusive_file_lock(...)   # 真正的抢锁只在这里
+```
+
+如果某个用例没走到 `release()`（异常、提前 return、pytest 中途打断），
+`_DEPTH` 就留在 1。**下一个用例**在 acquire 时命中「同线程重入」分支——它拿到
+一个空槽、**回合根本没跑**，断言自然失败。
+
+这解释了为什么「单跑必过、连跑偶发」：失败取决于前一个用例有没有干净退出。
+
+### 修法
+
+- `turn_coordinator.reset_for_tests()`：清 `_DEPTH`/`_OWNER`/`_UNLOCK`，并关掉
+  残留的 OS 锁（不关会占着文件句柄）。
+- `conftest` 加 autouse fixture，每个用例前后都调它。
+
+### 效果
+
+`test_harness_app.py` 连跑 4 轮：**78 passed × 4，零失败**；而且耗时从 34s 降到
+**18s**——原来有 10s 是在等锁超时。
+
+补两条回归：`test_reset_recovers_from_a_leaked_slot`（故意不释放再 reset）、
+`test_reset_is_idempotent`。
+
+### 一条教训
+
+之前我把这两条当成「UI 时序问题」，还想用正则批量改固定轮询——那是**治错了病**。
+真正的信号是「单跑必过、连跑偶发」，这类模式优先怀疑**跨用例状态泄漏**，
+而不是时序。批量改测试反而会引入确定性破坏（上一轮已经踩过）。
+
+全量 2304 passed / 3 skipped，ruff 通过。
