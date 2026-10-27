@@ -56,6 +56,7 @@ import paths
 import recovery
 import sandbox
 import status_report
+import taint
 import tool_cache
 import turn_control
 import turn_files
@@ -1403,6 +1404,9 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
     memory LLM calls in daemon threads and die before they finish.
     """
     perf_reset()   # 分段计时清零（HARNESS_PERF=1 时生效）
+    # 污点是回合级状态：上回合读过密钥，不该让本回合每一次联网都变红（那样
+    # 几次之后用户就会无脑点通过，比不做更糟）。
+    taint.reset()
     if session_store is None:
         session_store = SessionEventStore(SESSIONS_DIR)
         for initial_message in messages:

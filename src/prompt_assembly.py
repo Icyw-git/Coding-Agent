@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from datetime import datetime
 
 import project_context
+import untrusted
 
 
 def project_prompt_section(workspace) -> str:
@@ -110,6 +111,8 @@ def assemble_system_prompt(context: dict) -> str:
     if skills:
         sections.append(PROMPT_SECTIONS['skills_usage'].format(catalog=skills))
     sections.append(PROMPT_SECTIONS['rules_main'])
+    # 外部内容的不可信围栏说明：常量字符串，不影响前缀稳定性。
+    sections.append(untrusted.untrusted_notice())
     project = context.get('project_instructions', '')
     if project:
         sections.append(project)

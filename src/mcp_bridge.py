@@ -152,6 +152,12 @@ def _make_sync_wrapper(client: MCPclient, tool_name: str):
                 if isinstance(result, str) and result.startswith('MCP error:'):
                     status = 'error'
                     error_type = _error_type(result)
+                elif isinstance(result, str):
+                    # MCP 工具返回的是第三方服务的内容（网页、issue、邮件…），
+                    # 同样可能夹带注入指令，加不可信围栏。错误串不包，保住前缀判断。
+                    import untrusted
+                    result = untrusted.wrap(
+                        result, getattr(client, 'name', 'mcp'), kind='mcp')
             return result
         finally:
             _emit_telemetry({

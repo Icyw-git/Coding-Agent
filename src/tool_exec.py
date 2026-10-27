@@ -144,6 +144,7 @@ def run_kill_background(bg_id: str) -> str:
 
 
 def fetch_url(url: str, max_chars: int = 20000, *, gate) -> str:
+    import untrusted
     from web_access import WebAccessError, check_url, fetch
 
     # 私网/本机地址在审批之前就拒掉：不给「批准一次 localhost 探测」的机会。
@@ -173,4 +174,5 @@ def fetch_url(url: str, max_chars: int = 20000, *, gate) -> str:
         text = text[:max_chars] + f'\n... (truncated; {omitted} chars omitted)'
     if result['truncated']:
         text += '\n... (response exceeded 2 MiB and was truncated)'
-    return header + text
+    # 网页内容由第三方控制：加不可信围栏，让模型把里面的「指令」当数据看。
+    return header + untrusted.wrap(text, result['final_url'], kind='web')
