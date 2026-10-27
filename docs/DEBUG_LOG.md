@@ -6742,3 +6742,38 @@ with _STATE:
 下 `exists is False`（不依赖本机是否迁移过）。
 
 全量 2305 passed / 3 skipped，ruff 通过。
+
+## MCP 桥的 shutdown 不可逆：写进文档而不是加 fake 兜底（2026-10-27）
+
+继续查全局状态时注意到 `mcp_bridge.shutdown_mcp()` 是个**不可逆**操作：
+`_shutdown=True` 之后 `register_mcp_tools` 永久返回 `[]`。
+
+### 试过加 conftest 兜底，撤掉了
+
+第一版加了 autouse fixture：用例结束后若发现 `_shutdown` 被置 True 就报错，
+指出是哪一层漏了保护。结果**误报了**——autouse fixture 的收尾早于
+`monkeypatch` 的恢复，正常用 monkeypatch 保护的写法也会被抓住。
+
+改成「只复原不复原告警」后又验证了一遍：**仅复位标志位不够**——
+事件循环已经 `stop`，`register_mcp_tools` 仍返回 `[]`，线程退出还需要时间。
+这条 fixture 修不干净，反而给人「已经兜底」的错觉，**直接删掉**。
+
+### 改成写进文档
+
+`shutdown_mcp` 的 docstring 现在明确写出：
+
+- 不可逆，一个进程只能关一次；
+- 仅复位 `_shutdown` 不够（loop 已停）；
+- 测试要验证这条路径，必须整段 monkeypatch（`_shutdown`/`_clients`/`_loop`/
+  `_run_async` 全替换），不能对真实的桥调用——那会让同进程后续所有 MCP 用例
+  拿到空工具表。
+
+现有的 `tests/test_mcp_lifecycle.py` 本来就是这么写的，所以这个坑一直没被踩到。
+文档化比加一个修不干净的 fake 兜底诚实。
+
+### 顺带确认
+
+`test_mcp_lifecycle` 与 `test_mcp_telemetry` 两种执行顺序都通过（前者用
+monkeypatch 保护了 `_shutdown`），当前没有实际泄漏。
+
+全量 2305 passed / 3 skipped，ruff 通过。

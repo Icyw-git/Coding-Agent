@@ -192,7 +192,16 @@ def register_mcp_tools(registry: dict) -> List[dict]:
 
 
 def shutdown_mcp() -> None:
-    """Close connected MCP sessions and stop the bridge event loop."""
+    """Close connected MCP sessions and stop the bridge event loop.
+
+    **不可逆**：`_shutdown=True` 之后 `register_mcp_tools` 永久返回 []，事件循环
+    也已经停下——仅把标志位复位**不够**，线程退出需要时间、loop 本身也不在运行
+    状态。所以一个进程里只能关一次。
+
+    测试如果要验证这条路径，必须整段用 monkeypatch 包住（`_shutdown`、`_clients`、
+    `_loop`、`_run_async` 全部替换），不能对真实的桥调用它：那会让同进程后续
+    所有 MCP 用例拿到空工具表。当前 `tests/test_mcp_lifecycle.py` 就是这么写的。
+    """
     global _shutdown
     if _shutdown:
         return
