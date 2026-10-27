@@ -2987,11 +2987,47 @@ class FeishuGateway:
                         chat_type=chat_type, message_id=message_id)
 
     def _rebind_new_session(self, chat_id: str) -> str:
+        session_id = self._continue_or_create(chat_id, missing=True)
+        return session_id
+
+    def _continue_or_create(self, chat_id: str, *, missing: bool = False) -> str:
+        """新建绑定时优先接续最近活跃的会话（跨渠道）。
+
+        只在「本来就要新建」的时机生效（绑定丢失 / 用户主动新建），**不改动已有
+        绑定**：硬改会让人在两头同时操作时莫名跳会话。
+
+        接续时必须明说接的是哪个会话——静默接续比不接续更糟，用户会以为自己
+        发错了地方。
+        """
+        import session_continue
+
+        # 会话目录从 harness 取：网关拿到的 api 对象不暴露目录，而 SESSIONS_DIR
+        # 本来就是全局配置的唯一来源（与 test 里 monkeypatch 的位置一致）。
+        try:
+            import llm_route
+            sessions_dir = llm_route.harness().SESSIONS_DIR
+        except Exception:
+            sessions_dir = None
+        picked = (session_continue.recent_session(sessions_dir)
+                  if sessions_dir is not None else None)
+        if picked is not None:
+            session_id = str(picked['id'])
+            with self._bindings_lock:
+                self.bindings[chat_id] = session_id
+                self._save_bindings()
+            what = session_continue.describe(picked)
+            prefix = '原会话已不存在，' if missing else ''
+            self._reply(chat_id,
+                        f'{prefix}已接续{what}，直接说下去就行。'
+                        '\n想开新话题请发 /new。')
+            return session_id
+
         session_id = self.api.create_session()
         with self._bindings_lock:
             self.bindings[chat_id] = session_id
             self._save_bindings()
-        self._reply(chat_id, '原会话已不存在，已新建会话继续。')
+        if missing:
+            self._reply(chat_id, '原会话已不存在，已新建会话继续。')
         return session_id
 
     def _watch_missing(self, session_id: str) -> None:

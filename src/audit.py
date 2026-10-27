@@ -45,6 +45,16 @@ AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
     'policy_denied': ('tool', 'code', 'zone', 'reason', 'blocked_by',
                       'command'),
     'permission_revoked': ('count', 'by'),
+    # 记忆是长期状态：写了一条会影响之后每一个会话，删了不可逆。
+    # 这三类事件让“它为什么记得这个”可追溯。
+    'memory_written': ('name', 'type', 'chars', 'by'),
+    'memory_forgotten': ('name', 'by'),
+    'memory_redacted': ('kinds', 'reason'),
+    'memory_archived': ('name', 'age_days'),
+    'memory_scope': ('mode', 'by'),
+    # 主动性：建议要能回看“提过什么、被采纳没有”。
+    'proactive_suggested': ('count', 'kind'),
+    'proactive_accepted': ('suggestion_id',),
 }
 
 MAX_LIMIT = 200

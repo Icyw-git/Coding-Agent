@@ -300,6 +300,12 @@ class CommandActionsMixin:
                     store.append(memory_scope.EVENT, mode=arg)
                 except Exception:
                     pass
+                try:
+                    import hooks
+                    hooks._append_audit(memory_scope.EVENT,
+                                        {'mode': arg, 'by': 'user'})
+                except Exception:
+                    pass
             self._notice(f'本会话记忆：{memory_scope.describe()}')
             return
         # 不带参数：显示当前模式 + 记忆概况。

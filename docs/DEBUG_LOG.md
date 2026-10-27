@@ -7064,3 +7064,63 @@ Muse 的对应思路是 assume breach：不问模型会不会被说服，只问�
 
 新增 `test_memory_scope.py` (21) + `test_memory_aging.py` (21)。
 全量 **2429 passed / 3 skipped**（329s），ruff 通过。
+
+## 第三轮实施：M4 可观察面 + M5 跨渠道接续 + M2 只读主动建议
+
+按优先级 M4 → M5 → M2 落地。
+
+### M4 记忆的审计事件
+
+`AUDIT_EVENTS` 新增 7 类：`memory_written` / `memory_forgotten` /
+`memory_redacted` / `memory_archived` / `memory_scope` / `proactive_suggested` /
+`proactive_accepted`。
+
+理由就是 TIME 那篇调查教的：**长期记忆不可观察会变成黑箱**。用户必须能回答
+"它为什么记得这个"。所以写入、删除、脱敏、归档、模式切换全部留痕。
+
+实现上统一走 `memory._audit()`（惰性导入 hooks），失败只静默——审计是观察层，
+不能反过来影响一次写入。
+
+### M5 跨渠道接续（src/session_continue.py）
+
+原来：在 TUI 聊到一半，手机上发消息会**新建**会话，上下文断掉。
+
+四个设计决定：
+
+1. **只提供"最近活跃"，不改已有绑定**——接续只在"本来就要新建"时生效（绑定
+   丢失 / 显式新建）。硬改会让人在两头同时操作时莫名跳会话。
+2. **8 小时时间窗**——隔夜再发消息应该开新话题，而不是闯进昨天的对话。
+3. **必须明说接的是哪个会话**：`已接续 3 小时前的会话「重构网关」`。
+   静默接续比不接续更糟，用户会以为自己发错了地方。
+4. **`/new` 不接续**——那是用户显式要求新会话。
+
+复用 `session_store.session_summary()` 的 `updated` 字段（"最后一条对话消息的
+时间戳，元数据和工具事件不推进它"），语义正好。
+
+### M2 只读主动建议（src/proactive.py）——默认关闭
+
+现在唯一的主动行为是 `heartbeat.py`，它明确写着**不跑模型**。所以"agent 自己
+想到该做什么"并不存在。这里做最小版本。
+
+**核心安全边界是白名单不是提示词**。`READ_ONLY_TOOLS` 12 个工具，明确排除：
+`write`/`edit`/`apply_patch`/`delete_paths`/`web_fetch`/`remember`/`forget`/
+`schedule_cron`/`spawn_teammate`/`desktop_action`/`clipboard_write`/
+`screen_capture`。
+
+**`bash` 整个排除**——它既能 `ls` 也能 `curl`，裁不出安全的子集。这是刻意的：
+宁可少给能力，不可给一个"看起来只读"的复合工具。
+
+为什么这一档不走审批：
+> 主动回合是 agent 自己发起的，没人坐在那里等着点"同意"。把一个写操作变成一次
+> 被打断的询问不叫安全，只是把代价转移给用户。
+
+防骚扰：默认关（`HARNESS_PROACTIVE=1` 才开）、每天最多一次、**连续忽略 3 次
+自动降频到每周一次**。降频是 `should_run` 的职责，不该让用户手动关。
+
+`parse_suggestions` 处理了模型的自作主张：`- ` / `* ` / `• ` / `1. ` / `1) `
+五种前缀都剥掉，`NONE`（大小写不敏感）返回空列表。
+
+### 验证
+
+- 新增 `test_session_continue.py` (20) + `test_proactive.py` (25)
+- 全量 **2475 passed / 3 skipped**（194s），ruff 通过

@@ -159,6 +159,28 @@ def scheduled_read_only() -> bool:
     return _SCHEDULED_READ_ONLY.get() is True
 
 
+# 主动建议回合：工具面裁到 proactive.READ_ONLY_TOOLS。与 scheduled_read_only
+# 不同——那一档是「先照常判、再按只读档复核」，这一档是**白名单**：不在名单里
+# 就直接拒，不给审批机会。理由：主动回合是 agent 自己发起的，没人坐在那里等着
+# 点“同意”；一个误点的代价应该由我们承担，而不是把选择推给被打断的用户。
+_PROACTIVE_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    'harness_proactive_turn', default=False)
+
+
+def proactive_turn() -> bool:
+    return _PROACTIVE_TURN.get() is True
+
+
+@contextlib.contextmanager
+def proactive_scope(enabled: bool = True):
+    """在主动建议回合里启用只读白名单。"""
+    token = _PROACTIVE_TURN.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _PROACTIVE_TURN.reset(token)
+
+
 # 来源聊天：模型在一个飞书回合里调用 schedule_cron 时，任务要记住「从哪个
 # 聊天来的」，回合结束后才能把结果推回同一处。API/CLI 回合没有这个上下文。
 _ORIGIN_CHAT: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -587,6 +609,20 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
             'blocked_by': 'never_do',
         })
         return refusal
+    # 主动回合白名单：不是审批，是「没有这条路径」。§1 里的理由：主动回合没人
+    # 坐等点“同意”，把一个写操作变成一次被打断的询问不叫安全。
+    if proactive_turn():
+        import proactive
+        if tool not in proactive.READ_ONLY_TOOLS:
+            _append_audit('policy_denied', {
+                'tool': tool,
+                'code': 'proactive_read_only',
+                'reason': 'proactive suggestions may only use read-only tools',
+                'blocked_by': 'proactive',
+            })
+            return (f'Error: {tool} is not available while generating proactive '
+                    'suggestions (read-only turn). Only report what you can see '
+                    'with read-only tools.')
     policy = load_policy()
     decision = evaluate_call(tool, args, policy=policy)
     # 先记污点再判决策：无论这次调用最后是放行、被拒还是用户拒，只要它"读过"

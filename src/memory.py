@@ -143,26 +143,34 @@ def _render_memory(name: str, mem_type: str, description: str, body: str) -> str
             f"type: {one_line(mem_type)}\n---\n\n{safe_body}\n")
 
 
-def _record_redaction(kinds: list[str]) -> None:
-    """脱敏是静默篡改用户要记的东西：必须留痕，否则“我明明让它记住了”无解。
+def _audit(event: str, payload: dict) -> None:
+    """把一条记忆相关事件写进会话流；没有活动会话就静默跳过。
 
-    惰性导入 hooks：memory 是更底层的模块，顶层 import 会形成环。失败也只
-    打印——审计是观察层，不能反过来影响一次写入。
+    惰性导入 hooks：memory 是更底层的模块，顶层 import 会形成环。
+    审计是观察层，任何失败都不能反过来影响一次写入。
     """
-    print(f'  \033[33m[memory] redacted {len(kinds)} secret(s): {", ".join(kinds)}\033[0m')
     try:
         import hooks
-        hooks._append_audit('memory_redacted', {
-            'kinds': ','.join(kinds),
-            'reason': 'credential-shaped content in memory body',
-        })
+        hooks._append_audit(event, payload)
     except Exception:
         pass
 
 
+def _record_redaction(kinds: list[str]) -> None:
+    """脱敏是静默篡改用户要记的东西：必须留痕，否则“我明明让它记住了”无解。"""
+    print(f'  \033[33m[memory] redacted {len(kinds)} secret(s): {", ".join(kinds)}\033[0m')
+    _audit('memory_redacted', {
+        'kinds': ','.join(kinds),
+        'reason': 'credential-shaped content in memory body',
+    })
+
+
 def write_memory_file(name: str, mem_type: str, description: str, body: str):  # 保存记忆文件
     with _write_guard():
-        return _write_memory_file_unlocked(name, mem_type, description, body)
+        written = _write_memory_file_unlocked(name, mem_type, description, body)
+    _audit('memory_written', {'name': str(name), 'type': str(mem_type),
+                              'chars': len(str(body or ''))})
+    return written
 
 
 def _write_memory_file_unlocked(name: str, mem_type: str, description: str, body: str):
@@ -234,6 +242,7 @@ def delete_memory_file(name: str) -> bool:
         resolved.unlink(missing_ok=True)
         _cache_drop(resolved)
         _rebuild_index_unlocked()
+    _audit('memory_forgotten', {'name': str(name)})
     return True
 
 
@@ -611,6 +620,9 @@ def age_memories(days: int | None = None) -> list[dict]:
         more = f' 等{len(moved)} 条' if len(moved) > 3 else ''
         print(f'  \033[90m[memory] archived {names}{more} '
               f'(太久没用到；可用 /memories archived 找回)\033[0m')
+        for item in moved:
+            _audit('memory_archived', {'name': item.get('name', ''),
+                                       'age_days': item.get('age_days', 0)})
     return moved
 
 
