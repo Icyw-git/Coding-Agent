@@ -6844,3 +6844,95 @@ M2 的前置（没有记忆的主动建议只能是泛泛而谈）。**M2 最后
 最容易做成品味灾难，先有真实使用数据再决定开不开。
 
 全量 2305 passed / 3 skipped，ruff 通过。
+
+## 第三轮实施：N6 + N5 + M1 + N1（2026-10-27）
+
+按「先堵实测确认的漏洞，再补关系层」的顺序落地四项。
+
+### N6 外部内容不可信围栏（src/untrusted.py）
+
+`web_fetch` 和 MCP 结果由第三方控制，模型无法区分「用户让我做的事」和「网页里
+一句 ignore previous instructions」。加 `<untrusted source="…" kind="…">` 围栏。
+
+三个设计取舍：
+- **不改内容本身**：正文逐字保留。转义会破坏代码块、正则和 diff。
+- **不转义正文**：正文里本来就有 `<untrusted>` 会出现假围栏，但转义的代价更大
+  （代码全失真）。靠提示词说明"只有最外层可信"。
+- **标签可关闭**：`HARNESS_UNTRUSTED_MARK=0` 退回旧行为。
+
+接入点：`tool_exec.fetch_url`（正文进围栏，URL/Content-Type 头留外面）、
+`mcp_bridge._make_sync_wrapper`（正常结果包，`MCP error:` 串不包——调用方靠
+前缀分类）。失败的是两个 MCP 遥测测试断言全等，改成断言正文在内。
+
+系统提示加一句说明（`prompt_assembly`），否则模型会把围栏当普通 XML 噪音。
+
+### N5 污点出网（src/taint.py）
+
+实测确认的缺口：`bash cat .env` 是放行的（exec_policy 里写明这是有意权衡，
+`grep .env docs` 误伤面大），配套的 `secret_egress` 只在**同一条命令**里同时
+出现秘密文件和出口命令时才升级。所以跨命令这条路是通的：
+
+    bash cat .env      -> allowed            # 内容进上下文
+    bash curl -d ...   -> opaque_command     # 不知道刚读过什么
+
+污点机制把因果补上。六个决定：
+
+1. **只升级不禁止**——读过记忆之后要联网是合理的，缺的是让审批人看到因果。
+2. **回合级而非全局**——跨回合累积会让每轮都变红，几次之后用户就无脑通过，
+   比不做更糟。`agent_loop` 开头 `taint.reset()`。
+3. **单向不可洗白**——命中即保持，不因为后面读了公开文件而清除（Muse 同语义）。
+4. **ContextVar 隔离**——父上下文污点不漏给线程池里的无关任务（有测试）。
+5. **记来源不只记布尔**——卡片要能写"读过 .env、读过 memories/"，否则用户看到
+   的只是一个莫名其妙的升级提示。
+6. **优先级高于会话白名单与 LLM 审查官**——一次域名预授权不是读过密钥后的放行
+   依据；审查官看的是"这条命令像不像常规开发操作"，它看不到本回合前面读过
+   什么，也就无权放行外发。
+
+打点挂在 `enforce` **入口**而不是各 return 点：读取路径分散在 read/bash/grep/
+read_document 和无头 worker 里，逐个改容易漏（包括以后的子代理），而漏一处
+等于整条链路失效。
+
+判定只靠文件名/路径，不靠内容：内容级检测（"看起来像密钥"）误报多，还会诱使
+后续代码去做正则猜测，反而不可靠。
+
+### M1 记忆的显式入口（src/tool_memory.py）
+
+工具数 48 → 51。`remember` / `forget` / `recall`。
+
+- type 收窄成四个语义枚举（preference/correction/fact/context）。
+- `forget` 同时接受记忆名与文件名：模型手里通常只有 remember 返回的文件名，
+  而用户在界面上看到的是 name。
+- `recall` 无命中时给下一步（换短关键词或空 query），而不是只说"没找到"。
+- 三者都要审批：写记忆影响之后每个会话；删记忆不可逆（不像 delete_paths 有
+  回收站），`approval_policy=never` 也不该默默删。
+- `recall` 登记进 `READ_ONLY_FILE_TOOLS`。
+
+**踩到的坑**：中文名经 `_SLUG_RE`（只留 `a-z0-9._-`）会被清空，退化成
+`memory-<时间戳>.md`。这是既有行为（自动抽取也这样），没改它——改 slug 规则会
+影响既有记忆文件名。工具层同时支持按 name 和文件名删，所以可用。
+
+**循环导入**：`tool_memory` → `memory` → `llm_route` → `harness` 会搅乱
+hooks/tools 的导入顺序（`tools` ↔ `hooks` 本来就是环，靠 harness 先导入解开）。
+`tools.py` 里改成惰性导入，并在注释里写明原因。
+
+### N1 落盘前秘密脱敏（src/memory_redact.py）
+
+`_render_memory` 之前对正文零处理。记忆是长期状态，一条 `.env` 内容被记下来后
+每次会话都会被召回——泄露面比会话本身大得多（会话能删，记忆会一直跟着）。
+
+- 已知形态：私钥块、`sk-`/`ghp_`/`AKIA`/`xox`/`AIza`/JWT/Bearer
+- 通用 kv：`api_key=`、`password:`、`password is`
+- 中文键名：密码是/密钥是/令牌为
+- 已知真实凭据值精确替换（比形态匹配可靠：值一定对）
+- 替换成 `[redacted:kind]`，保留位置信息——否则"数据库密码是 XXX"会变成
+  "数据库密码是"，读起来像记忆被截断了
+- **故意不碰自然语言**：「token 预算是 8000」不该被脱敏（有测试守住）
+- 命中写审计 `memory_redacted` + 打印：脱敏是静默篡改用户要记的东西
+
+### 验证
+
+- 新增 `test_untrusted.py` (10)、`test_taint.py` (16)、`test_memory_tools.py` (31)
+- 工具快照同步（ORDER + SHA1）：`9abdb4ef1756…`
+- 全量 **2355 passed / 3 skipped / 7 deselected**（270s），ruff 通过
+- 端到端手验：密钥不落盘（`sk-` 未出现在磁盘）、污点链路（读 .env → 出网需
+  升级 → 重置后清空）、围栏格式正确
