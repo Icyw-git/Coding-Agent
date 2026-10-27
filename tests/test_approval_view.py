@@ -27,9 +27,11 @@ def test_long_command_keeps_both_ends():
 def test_short_command_passes_through_and_other_fields_stay_bounded():
     assert summarize('bash', {'command': 'ls', 'cwd': None}) == {'command': 'ls',
                                                                  'cwd': None}
+    # 写入内容现在留头尾（而不是只留头 200 字）：审批人要能看出文件末尾
+    # 写了什么。上限放宽到 600 字，仍远小于飞书 30KB 卡片上限。
     content = summarize('write', {'path': 'a.txt', 'content': 'x' * 5000})['content']
-    assert content.endswith('… (5000 chars)')
-    assert len(content) < 250
+    assert '省略' in content
+    assert len(content) < 700
 
 
 def test_registered_request_carries_the_readable_command():
@@ -58,7 +60,7 @@ def test_command_is_shown_on_its_own_with_the_other_args_below():
 
 def test_non_bash_tools_render_as_pairs():
     assert detail('remove_worktree', {'name': 'feat'}) == 'name=feat'
-    assert detail('write', {'path': 'a.txt', 'content': None}) == 'path=a.txt'
+    assert detail('write', {'path': 'a.txt', 'content': None}) == 'a.txt（无内容摘要）'
     assert detail('bash', {}) == ''
 
 
@@ -118,3 +120,50 @@ def test_desktop_sequence_detail_lists_every_step():
     assert '4.right click(3,4)' in text
     assert '5.double click(5,6)' in text
     assert '6.wait 300ms' in text
+
+
+def test_write_detail_shows_content_preview():
+    """越界写的审批要能看出「写了什么」——只给路径没法判断。"""
+    text = detail('write', {'path': 'D:/out.txt', 'content': 'hello world'})
+    assert 'D:/out.txt' in text
+    assert 'hello world' in text
+    assert '11 chars' in text
+
+
+def test_write_detail_truncates_large_content_keeping_both_ends():
+    """长内容要留头尾：只看开头会把「文件末尾写了什么」整段切掉。"""
+    content = 'A' * 300 + 'B' * 3000 + 'C' * 300
+    text = detail('write', {'path': 'D:/big.txt', 'content': content})
+    assert '省略' in text
+    assert 'A' * 20 in text
+    assert 'C' * 20 in text
+    assert len(text) < 1000          # 不能把整段内容塞进卡片
+
+
+def test_edit_detail_shows_a_diff():
+    text = detail('edit', {'path': 'D:/a.py',
+                           'old_text': 'a = 1', 'new_text': 'a = 2'})
+    assert 'D:/a.py' in text
+    assert '- a = 1' in text
+    assert '+ a = 2' in text
+
+
+def test_edit_detail_marks_replace_all():
+    text = detail('edit', {'path': 'D:/a.py', 'old_text': 'x',
+                           'new_text': 'y', 'replace_all': True})
+    assert '全部替换' in text
+
+
+def test_summarize_keeps_both_ends_for_writes():
+    """登记时的摘要也不能只留头部——detail 收到的就是它。"""
+    summary = summarize('write', {'path': 'D:/o.txt',
+                                  'content': 'A' * 300 + 'B' * 3000 + 'C' * 300})
+    stored = summary['content']
+    assert '省略' in stored
+    assert stored.startswith('A')
+    assert stored.endswith('C')
+
+
+def test_summarize_leaves_short_content_alone():
+    summary = summarize('write', {'path': 'a.txt', 'content': 'short'})
+    assert summary['content'] == 'short'

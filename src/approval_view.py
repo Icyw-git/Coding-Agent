@@ -17,6 +17,9 @@ import re
 
 # 普通参数值：短摘要即可，write 的整份 content、MCP 的大参数不该进审批面。
 PREVIEW_CHARS = 200
+# 写入/编辑内容的上限：卡片要能看出「写了什么」，又要留在 30KB 卡片
+# 上限内。600 字够看清一段代码或配置的开头与结尾。
+WRITE_PREVIEW_CHARS = 600
 MAX_ITEMS = 20
 MAX_DEPTH = 2
 # 命令：200 字符不足以看清一条真实命令，按头 1200 / 尾 400 保留。
@@ -69,12 +72,32 @@ def _summarize_command(command: str) -> str:
             + command[-COMMAND_TAIL_CHARS:])
 
 
+def _summarize_content(text: str, limit: int = WRITE_PREVIEW_CHARS) -> str:
+    """写入/编辑内容在登记时的摘要：留头尾，标明总长度。
+
+    和 bash 的 command 同理：只留头部会把「写到文件末尾的东西」整段切掉，
+    而审批人恰恰要靠它判断这次写入是不是想干的事。
+    """
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    omitted = len(text) - limit
+    return (text[:head]
+            + chr(10) + f'… （省略 {omitted} 字）…' + chr(10)
+            + text[-tail:])
+
+
 def summarize(tool: str, args: dict) -> dict:
-    """登记用的参数摘要：命令留头尾，其余字段走通用上限。"""
+    """登记用的参数摘要：命令与写入内容留头尾，其余字段走通用上限。"""
     compacted = {}
     for key, value in args.items():
         if tool == 'bash' and key == 'command' and isinstance(value, str):
             compacted[key] = _summarize_command(value)
+        elif (tool in ('write', 'edit')
+              and key in ('content', 'old_text', 'new_text')
+              and isinstance(value, str) and len(value) > WRITE_PREVIEW_CHARS):
+            compacted[key] = _summarize_content(value)
         else:
             compacted[key] = _compact_value(value, MAX_DEPTH)
     return compacted
@@ -187,6 +210,52 @@ def _delete_detail(args: dict) -> str:
     return chr(10).join(lines)
 
 
+def _content_preview(text, limit: int = 300) -> str:
+    """写入内容的预览：保留头尾，中间省略。
+
+    审批越界写时，人需要判断的是「这台机器要把什么东西写到哪里」。只给路径
+    没法判断，给全文又会把卡片撑爆（飞书卡片有 30KB 上限，手机上也读不完）。
+    所以留头尾、标出总长度。
+    """
+    text = text if isinstance(text, str) else str(text or '')
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    omitted = len(text) - limit
+    return (text[:head]
+            + chr(10) + f'… （共 {len(text)} 字，省略 {omitted} 字）…' + chr(10)
+            + text[-tail:])
+
+
+def _write_detail(tool: str, args: dict) -> str:
+    path = args.get('path') or '(no path)'
+    content = args.get('content')
+    if not isinstance(content, str):
+        return f'{path}（无内容摘要）'
+    verb = 'append to' if args.get('append') else 'write'
+    preview = _content_preview(content)
+    fence = chr(10) + '```' + chr(10)
+    return (f'{verb} {path} ({len(content)} chars):'
+            + fence + preview + chr(10) + '```')
+
+
+def _edit_detail(args: dict) -> str:
+    path = args.get('path') or '(no path)'
+    old = args.get('old_text')
+    new = args.get('new_text')
+    if not isinstance(old, str) or not isinstance(new, str):
+        return path
+    replace_all = '（全部替换所有匹配）' if args.get('replace_all') else ''
+    old_lines = old.splitlines()[:8] or ['(空)']
+    new_lines = new.splitlines()[:8] or ['(空)']
+    removed = chr(10).join(f'- {line}' for line in old_lines)
+    added = chr(10).join(f'+ {line}' for line in new_lines)
+    return (f'{path}{replace_all}' + chr(10)
+            + f'--- 原内容 ({len(old)} chars)' + chr(10) + removed + chr(10)
+            + f'+++ 新内容 ({len(new)} chars)' + chr(10) + added)
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -202,6 +271,10 @@ def detail(tool: str, args) -> str:
         return safe_text(_desktop_detail(tool, args))
     if tool == 'delete_paths':
         return safe_text(_delete_detail(args))
+    if tool == 'write':
+        return safe_text(_write_detail(tool, args))
+    if tool == 'edit':
+        return safe_text(_edit_detail(args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
         return safe_text(_pairs(args))

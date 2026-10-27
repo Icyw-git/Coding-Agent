@@ -631,11 +631,38 @@ def _desktop_background_error(tool: str) -> str:
             'scheduled tasks cannot control the local desktop.')
 
 
+# 每类拒绝给一句「接下来可以怎么做」。模型收到一句干巴巴的拒绝，最常见的
+# 反应是换个写法再试一次；给出替代路径能让它停止试探、直接告诉用户。
+_DENY_HINTS = {
+    'deny_pattern': 'This command is on the deny list; use another tool or ask '
+                    'the user to run it.',
+    'deny_root_delete': 'Refusing to delete a filesystem root.',
+    'secret_path': 'Protected secret file; ask the user instead of reading it.',
+    'secret_egress': 'This would send a protected file outbound; confirm with '
+                     'the user first.',
+    'system_path': 'Writes to system directories are blocked; choose a path '
+                   'inside the workspace.',
+    'domain_denied': 'This domain is denied by policy; ask the user to remove '
+                     'the rule if it is needed.',
+    'outside_workspace_write': 'Write inside the workspace, or ask the user to '
+                               'grant this directory.',
+    'sandbox_read_only': 'The sandbox is read-only; ask the user to switch tiers.',
+    'invalid_url': 'Use a plain http(s) URL with a public host.',
+    'invalid_path': 'The path could not be resolved; check it and retry.',
+}
+
+
 def deny_message(decision) -> str:
-    """拒绝语文案是对外契约：提示词规则、审批测试、旧日志都在断言它。"""
+    """拒绝语文案是对外契约：提示词规则、审批测试、旧日志都在断言它。
+
+    在原文后追加一行可执行提示（``hint``），但不改变首句——首句是契约的一部分。
+    """
     if decision.pattern:
-        return f'Error: Dangerous command {decision.pattern}, please do not execute'
-    return f'Error: {decision.reason}'
+        head = f'Error: Dangerous command {decision.pattern}, please do not execute'
+    else:
+        head = f'Error: {decision.reason}'
+    hint = _DENY_HINTS.get(getattr(decision, 'code', '') or '')
+    return head + chr(10) + hint if hint else head
 
 
 def _path_zone(path: str, cwd: str | None = None) -> str:

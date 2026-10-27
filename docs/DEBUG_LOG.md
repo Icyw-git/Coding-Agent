@@ -6346,3 +6346,62 @@ Toast 内容是**错误信息**，可能包含远端返回的文本。允许任�
 
 `--restart-on-crash`（常驻进程崩了要手动重启）与 `screen_capture` 接 PowerShell
 worker（1.6s 里主要是 PNG 编码，进程开销占小头）——两者收益都不足以抵消改动风险。
+
+## 审批面与拒绝文案的可用性（2026-10-27）
+
+按「用户真的要点这个按钮」的角度走了一遍审批面，找到两个影响「敢不敢批」的问题。
+
+### 1. 越界写只看得到路径，看不到内容
+
+`detail('write', {'path': 'D:/out.txt', 'content': <5000 字>})` 原本输出：
+
+    path=D:/out.txt, content=xxxxxxx…（214 字后被 summarize 截断）
+
+两个问题叠加：
+
+- **`summarize` 只留头部 200 字**，而文件的改动常常在末尾（追加配置、补日志行），
+  审批人看到的是开头，判断不了这次写的是不是想干的事；
+- **`detail` 拿到的是已截断的值**，我的第一版给它加了 300 字预览，实际拿到的
+  最多 200 字，等于白写。
+
+修法分两层：
+
+- `summarize` 对 `write`/`edit` 的 `content`/`old_text`/`new_text` 保留**头尾**
+  （各 400/200，共 600 字，标出省略字数）；
+- `detail` 渲染成可读形态：`write D:/out.txt (5000 chars):` + 代码块预览；
+  `edit` 渲染成 mini diff（`--- 原内容` / `+++ 新内容`，各取前 8 行）。
+
+`edit` 之前只显示 `old_text=a=1, new_text=a=2`——没有文件路径、没有 diff 形状，
+现在能一眼看出改的是哪个文件的哪几行。
+
+### 2. 拒绝文案只说「不行」，不说「那怎么办」
+
+模型收到 `Error: Dangerous command shutdown, please do not execute` 之后，最常见的
+反应是换个写法再试一次。给每个拒绝码配一句可执行提示：
+
+    Error: Dangerous command shutdown, please do not execute
+    This command is on the deny list; use another tool or ask the user to run it.
+
+覆盖 `deny_pattern` / `secret_path` / `secret_egress` / `system_path` /
+`domain_denied` / `outside_workspace_write` / `sandbox_read_only` /
+`invalid_url` / `invalid_path` / `deny_root_delete`。未知 code 不加提示（不猜）。
+
+**首句一字不改**——它是对外契约，提示词规则、审批测试、旧日志都在断言它；新提示
+是追加的第二行。
+
+### 更新了 6 处既有断言
+
+这些断言写死了旧行为，属于「改动是对的、断言过时了」：
+
+- `content` 摘要上限 300 → 700（实际 600 字 + 省略标记）；
+- `'5000' in content` → `'省略' in content`（不再有 `… (5000 chars)` 尾巴）；
+- 四处 `== 'Error: access to protected path (...)'` → `.startswith(...)`
+  （现在后面跟着 hint 行）；
+- `write` 无 content 时的展示：`path=a.txt` → `a.txt（无内容摘要）`。
+
+### 测试
+
+`test_approval_view.py` 17 条（+6）：write 内容预览、长内容留头尾且总长受限、
+edit 的 diff 形状、`replace_all` 标注、`summarize` 也留头尾、短内容不动。
+
+全量 2281 passed / 3 skipped，ruff 通过。

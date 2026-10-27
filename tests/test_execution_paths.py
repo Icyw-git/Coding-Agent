@@ -133,8 +133,8 @@ def test_approval_request_compacts_large_arguments(env):
     req = GATE.request('write', {'path': 'notes.txt', 'content': 'x' * 5000},
                        'write file')
     assert req.args['path'] == 'notes.txt'
-    assert len(req.args['content']) < 300
-    assert '5000' in req.args['content']
+    assert len(req.args['content']) < 700     # 写入内容留头尾，上限 600
+    assert '省略' in req.args['content']      # 标明省略了多少字
 
 
 # ============================================================
@@ -178,7 +178,7 @@ def test_teammate_read_still_denies_secret_paths(env, tmp_path):
     """teammate 跳过 PreToolUse：秘密文件的拒绝要在 run_read 边界上生效。"""
     (tmp_path / 'ws' / '.env').write_text('TOKEN=1', encoding='utf-8')
     _tools, handlers = agent_teams._build_team_tools('worker')
-    assert handlers['read']('.env') == 'Error: access to protected path (.env)'
+    assert handlers['read']('.env') .startswith('Error: access to protected path (.env)')
     assert not GATE.history(), '硬拒不产生审批请求'
 
 
@@ -243,7 +243,7 @@ def test_run_bash_denies_without_spawning(env, monkeypatch):
     spawn = Mock(side_effect=AssertionError('被拒命令不得启动进程'))
     monkeypatch.setattr(SPAWN, spawn)
     assert tools.run_bash('sudo whoami') \
-        == 'Error: Dangerous command sudo, please do not execute'
+        .startswith('Error: Dangerous command sudo, please do not execute')
     spawn.assert_not_called()
 
 
@@ -290,11 +290,11 @@ def test_file_tools_hard_deny_secret_paths_without_asking(env, tmp_path):
     (tmp_path / 'ws' / '.env').write_text('TOKEN=1', encoding='utf-8')
     (tmp_path / 'id_rsa').write_text('PRIVATE', encoding='utf-8')
 
-    assert tools.run_read('.env') == 'Error: access to protected path (.env)'
+    assert tools.run_read('.env') .startswith('Error: access to protected path (.env)')
     assert tools.run_write('.env', 'TOKEN=2') \
-        == 'Error: access to protected path (.env)'
+        .startswith('Error: access to protected path (.env)')
     assert tools.run_read('../id_rsa') \
-        == 'Error: access to protected path (../id_rsa)'
+        .startswith('Error: access to protected path (../id_rsa)')
     assert not GATE.history(), '硬拒不产生审批请求'
 
 
@@ -303,7 +303,7 @@ def test_full_access_does_not_open_secret_paths(env, monkeypatch, tmp_path):
     monkeypatch.setenv('HARNESS_SANDBOX_MODE', 'danger-full-access')
     (tmp_path / 'id_rsa').write_text('PRIVATE', encoding='utf-8')
     assert tools.run_read('../id_rsa') \
-        == 'Error: access to protected path (../id_rsa)'
+        .startswith('Error: access to protected path (../id_rsa)')
 
 
 def test_danger_full_access_actually_opens_the_boundary(env, monkeypatch, tmp_path):
