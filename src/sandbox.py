@@ -33,6 +33,22 @@ from pathlib import Path
 
 ENV = 'HARNESS_OS_SANDBOX'
 MODES = ('off', 'auto', 'require')
+# 为什么没有默认开启（2026-10-27 实测后回退）
+#
+# 试过把默认值改成 auto，在本仓库实测后回退。三个真实问题：
+#
+# 1. **把仓库当工作区会自锁**。`_prepare_workspace` 先 mkdir 再对整棵树
+#    `/T` 打 Low；新目录继承 Low 之后，`icacls` 自己（以 Low 运行）就再也
+#    改不动 `.cache/sandbox-tmp`，于是每次都降级回普通执行，还刷一行警告。
+# 2. **打标持久且影响日常**。工作区根被打上 Low 后 `docs/` 也带了标签，
+#    要恢复得先补 WRITE_OWNER 再 `/setintegritylevel (OI)(CI)M`。用户不该为了
+#    试一个开关去修自己的目录权限。
+# 3. **收益与风险不匹配**。性能代价实测确实不可测（环境块缓存后 off/auto
+#    差值 −10% ~ +9%），但它只挡「工作区外写入」，不挡读取与网络。默认打开
+#    会让用户误以为「安全了」，实际秘密文件仍只靠策略层。
+#
+# 想用就显式设 HARNESS_OS_SANDBOX=auto（或 require 强制）。另外工作区最好
+# 指向专门的目录，而不是仓库根——那样第 1、2 条都不会发生。
 DEFAULT_MODE = 'off'
 
 _WINDOWS = os.name == 'nt'

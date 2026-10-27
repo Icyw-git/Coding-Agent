@@ -5997,3 +5997,59 @@ assert sandbox._environment_block(tmp_path) is sandbox._environment_block(tmp_pa
 但收益 0.07%，而且令牌跨进程复用要处理关闭时序，风险大于收益——**不做**。
 
 真正的结论：**沙箱现在没有可测量的性能代价，开不开只取决于安全取舍**。
+## 尝试默认开启 OS 沙箱，实测后回退（2026-10-27）
+
+按上一轮测量的建议把 `DEFAULT_MODE` 改成 `auto`，然后在**本仓库作为工作区**的真实
+场景下验证。结果发现三个问题，直接回退。
+
+### 问题 1：沙箱在仓库根上自锁
+
+`_prepare_workspace` 的顺序是「先 mkdir `.cache/sandbox-tmp`，再对整棵树 `/T` 打
+Low」。新目录继承 Low 之后，`icacls` 自己（以 Low 运行）就再也改不动它：
+
+    D:\harness-agent\.cache\sandbox-tmp: 拒绝访问。
+    icacls rc=0  "已成功处理 0 个文件; 处理 1 个文件时失败"
+
+于是 `_low_label(temp_dir)` 永远是 False，`_prepare_workspace` 每次都返回
+「无法把沙箱临时目录标记为 Low」，沙箱降级回普通执行，还刷一行警告。
+换句话说：**在仓库根上，auto 档等于永远不生效，但会一直吵**。
+
+### 问题 2：打标是持久的，会影响日常使用
+
+工作区根被打上 Low 后，`D:\harness-agent\docs` 也带了标签（实测 `low=True`）。
+恢复要两步：先补 `WRITE_OWNER`，再 `/setintegritylevel (OI)(CI)M`：
+
+    icacls docs /grant *<sid>:(OI)(CI)(WO)
+    icacls docs /setintegritylevel (OI)(CI)M /T /C /Q
+
+已执行并验证仓库全部恢复（`src`、`tests`、`docs`、`.cache`、`.git` 现在都是
+`low=False`）。但这个过程本身说明：**用户不该为了试一个开关去修自己的目录权限**。
+
+### 问题 3：收益与风险不匹配
+
+性能代价确实不可测（上一轮环境块缓存后 off/auto 差值 −10% ~ +9%），但它只挡
+「工作区外写入」，**不挡读取与网络**。默认打开会让用户误以为「安全了」，而秘密
+文件仍然只靠策略层的路径分区。
+
+### 回退内容
+
+- `DEFAULT_MODE` 改回 `'off'`，并把上面三条写进代码注释，避免以后有人再试一次。
+- 两个测试改回断言默认 `off`（`test_configured_mode_defaults_to_off`、
+  `test_unknown_mode_is_off_not_a_silent_upgrade`）。
+- 环境块缓存的优化**保留**（435µs → 11.3µs，那是纯粹的重复劳动，与档位无关）。
+
+### 顺带查清的一件事
+
+验证过程中 `echo data > out.txt` 在临时 cwd 里被判成 `outside_workspace_write`，
+一度以为是沙箱引入的。实际原因：`harness.get_workdir()` 是 `D:\harness-agent`，
+而我把 `cwd` 传成了临时目录——相对路径 `out.txt` 按 workdir 解析，自然判成越界。
+**这是既有语义（cwd 与 workspace 不一致时的正确行为），不是回归。** 用真实工作区
+重测后一切正常。
+
+### 结论
+
+沙箱保持默认 `off`。需要时显式 `HARNESS_OS_SANDBOX=auto`，且**工作区最好指向专门
+的目录而不是仓库根**——那样问题 1、2 都不会发生。这一点已写进 `sandbox.py` 顶部
+注释。
+
+全量 2211 passed / 3 skipped，ruff 通过。

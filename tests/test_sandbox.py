@@ -32,6 +32,10 @@ def _clean_sandbox_state():
 # ============================================================
 
 def test_configured_mode_defaults_to_off():
+    """默认 off：仓库作为工作区时打标有真实副作用，不能默认开启。
+
+    见 sandbox.py 顶部「为什么没有默认开启」。
+    """
     assert sandbox.configured_mode({}) == 'off'
     assert sandbox.configured_mode({'HARNESS_OS_SANDBOX': ' AUTO '}) == 'auto'
     assert sandbox.configured_mode({'HARNESS_OS_SANDBOX': 'require'}) == 'require'
