@@ -154,3 +154,41 @@ def test_display_strings_are_gbk_safe():
                            f'(U+{ord(char):04X}) in {text[:40]!r}')
     assert not bad, ('user-facing text must be GBK-encodable; '
                      'use √ × · ~ instead of ✓ ✗ • ◐\n  ' + '\n  '.join(bad))
+
+
+#: 内部字段名被当成标签用的典型写法（`'recurring' if ...`、`f'exit={x}'`）。
+_FIELD_AS_LABEL = re.compile(r"['\"](recurring|allow_side_effects|deliver_to|"
+                             r"idle_after_s|exit_code|session_id|req_id)['\"]")
+_KV_IN_TEXT = re.compile(r'\b(exit|type|mode|scope|kind|status)=')
+#: 这些模块专门产用户可见文案。
+COPY_MODULES = ('feishu_cron_card.py', 'feishu_task_card.py',
+                'feishu_domain_card.py', 'feishu_sessions.py',
+                'terminal_views.py', 'status_report.py', 'approval_view.py')
+
+
+@pytest.mark.parametrize('name', COPY_MODULES)
+def test_field_names_are_not_used_as_labels(name):
+    """内部字段名不能直接当显示标签。
+
+    已修过：``kind = 'recurring' if …``（菜单元字段名）、``exit={code}``
+    （kv 形式）、``home=`` / ``change_id`` 占位符。这些不该出现在用户眼前。
+    """
+    path = SRC / name
+    if not path.is_file():
+        pytest.skip(f'{name} not present')
+    problems = []
+    for lineno, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            continue
+        match = _FIELD_AS_LABEL.search(line) or _KV_IN_TEXT.search(line)
+        if not match:
+            continue
+        # 字段名作为 dict 键 / 参数名 / 日志前缀不算泄漏
+        if any(token in line for token in (
+                "get(", "['", '["', "']", '"]', 'print(', 'logging',
+                f'{match.group(1)}=', 'as ', 'def ', 'import ')):
+            continue
+        problems.append(f'{name}:{lineno}  {stripped[:70]}')
+    assert not problems, ('internal field name used as a user-facing label:\n  '
+                          + '\n  '.join(problems))

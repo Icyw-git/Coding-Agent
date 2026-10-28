@@ -1275,8 +1275,9 @@ def test_cron_add_is_read_only_unless_writes_flag(gateway, tmp_path, monkeypatch
 
     gw.on_message('chat-cron-w', '/cron list')
     listing = fake.last_card()
-    assert 'recurring · 只读 · 推送本聊天' in listing
-    assert 'recurring · 可写（副作用仍审批） · 推送本聊天' in listing
+    # 不暴露内部字段名 recurring
+    assert '重复 · 只读 · 推送本聊天' in listing
+    assert '重复 · 可写（副作用仍审批） · 推送本聊天' in listing
     assert '允许写操作' in listing and '收回写权限' in listing
 
     # 只有开关没有表达式：退回用法，不创建任务

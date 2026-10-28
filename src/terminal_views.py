@@ -27,12 +27,9 @@ AUDIT_USAGE = '\n'.join([
 
 
 def _expiry_label(row: dict) -> str:
-    expires = str(row.get('expires') or '')
-    if not expires:
-        return '永久'
-    if row.get('active', True):
-        return f'有效至 {expires}'
-    return f'已过期（{expires}）'
+    # 与飞书卡片共用同一个实现，避免两边对「active 缺失」给出相反结论。
+    import net_grants
+    return net_grants.expiry_label(row)
 
 
 def domains(argument: str) -> str:

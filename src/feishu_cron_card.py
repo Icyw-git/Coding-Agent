@@ -47,7 +47,8 @@ def _push_label(job: dict, chat_id: str) -> str:
         return '不推送'
     if chat_id and target == chat_id:
         return '推送本聊天'
-    return f'推送→{target[:8]}'
+    # 截断到 8 个字符的聊天 id 对用户没用（认不出是哪个群）。
+    return '推送到其他聊天'
 
 
 def _idle_label(job: dict) -> str:
@@ -58,7 +59,7 @@ def _idle_label(job: dict) -> str:
 
 
 def _job_lines(job: dict, chat_id: str) -> list[str]:
-    kind = 'recurring' if job.get('recurring') else '一次性'
+    kind = '重复' if job.get('recurring') else '一次性'
     mode = '可写（副作用仍审批）' if job.get('allow_side_effects') else '只读'
     idle = _idle_label(job)
     gate = f' · {idle}' if idle else ''
@@ -146,10 +147,10 @@ def cron_text(jobs: list[dict], *, chat_id: str = '') -> str:
     """没有卡片能力时的纯文本回退。"""
     if not jobs:
         return '（没有定时任务）'
-    lines = ['定时任务:']
+    lines = ['定时任务：']
     for job in jobs:
-        kind = 'recurring' if job.get('recurring') else '一次性'
-        mode = '可写' if job.get('allow_side_effects') else '只读'
+        kind = '重复' if job.get('recurring') else '一次性'
+        mode = '允许副作用' if job.get('allow_side_effects') else '只读'
         idle = _idle_label(job)
         gate = f' · {idle}' if idle else ''
         prompt = ' '.join(str(job.get('prompt') or '').split())[:40]

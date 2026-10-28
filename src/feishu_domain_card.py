@@ -31,12 +31,9 @@ def _page_button(label: str, *, page: int, token: str) -> dict:
 
 
 def _expiry_label(row: dict) -> str:
-    expires = str(row.get('expires') or '')
-    if not expires:
-        return '永久'
-    if row.get('active'):
-        return f'有效至 {expires}'
-    return f'已过期（{expires}）'
+    # 唯一实现在 net_grants：自己按日期算，不看调用方是否传了 active。
+    import net_grants
+    return net_grants.expiry_label(row)
 
 
 def _row_lines(row: dict) -> list[str]:
@@ -104,8 +101,9 @@ def domain_text(rows: list[dict]) -> str:
     """没有卡片能力时的纯文本回退。"""
     if not rows:
         return '（没有域名规则；联网请求仍逐个审批）'
-    lines = ['域名策略:']
+    lines = ['域名策略：']
     for row in rows:
-        marker = 'deny ' if row.get('scope') == 'deny' else 'allow'
+        # 与终端版（terminal_views.domains）一致：用中文，不暴露 allow/deny 字面量。
+        marker = '拒绝' if row.get('scope') == 'deny' else '允许'
         lines.append(f"  {marker} {row.get('host')}  [{_expiry_label(row)}]")
     return chr(10).join(lines)

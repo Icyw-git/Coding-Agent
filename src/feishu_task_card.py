@@ -42,10 +42,30 @@ def _duration(task: dict) -> str:
     return '—'
 
 
+#: 任务状态的中文名。原始值是 ``running`` / ``completed`` / ``failed`` /
+#: ``cancelled`` ——给用户看英文状态等于没写。
+_STATUS_ZH = {
+    'running': '运行中',
+    'queued': '排队中',
+    'completed': '已完成',
+    'failed': '失败',
+    'cancelled': '已取消',
+}
+
+
+def _status_zh(status) -> str:
+    key = str(status or '').strip().lower()
+    return _STATUS_ZH.get(key) or key or '未知'
+
+
 def _task_line(task: dict) -> str:
-    status = task.get('status') or 'unknown'
+    status = _status_zh(task.get('status'))
     exit_code = task.get('exit_code')
-    tail = '' if exit_code is None else f' · exit={exit_code}'
+    # 不给 `exit=0` 这种 kv 形式：说清是「退出码」，并在 0 时干脆不提
+    # （0 就是正常退出，对它做提示只是噪音）。
+    tail = ''
+    if isinstance(exit_code, int) and exit_code != 0:
+        tail = f' · 退出码 {exit_code}'
     return f"{task.get('id')} · {status}{tail} · 用时 {_duration(task)}"
 
 

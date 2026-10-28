@@ -995,8 +995,13 @@ class FeishuGateway:
             print(f'[feishu] agent reply failed: {exc}')
             _trace_out(str(exc)[:80])
             hint = friendly_error(exc)
-            failed = ('处理未完成：' + (hint or str(exc)) + chr(10)
-                      + ('技术细节：' + str(exc) + chr(10) if hint else '')
+            # 认不出的错误**不能**把 `openai.APIStatusError: Error code: 500 - {...}`
+            # 直接当主文案——那是给开发者看的。给一句人话打头，原始信息留在
+            # 「技术细节」里供反馈；两者都截断，避免整屏堆栈。
+            detail = ' '.join(str(exc or '').split())[:300]
+            head = hint or '模型或服务返回了意外错误。'
+            failed = ('处理未完成：' + head + chr(10)
+                      + ('技术细节：' + detail + chr(10) if detail else '')
                       + '请先核实任务状态，再决定是否重试。' + chr(10) + chr(10)
                       + ''.join(parts))
             if message_id and updater and not stream_failed:

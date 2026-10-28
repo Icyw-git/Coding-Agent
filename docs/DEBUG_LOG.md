@@ -9509,3 +9509,68 @@ Decision.code → GATE.decide(code=…) → PermissionRequest.code → reason_zh
 顺带记录一个测量教训：这次全量第一次跑在 38% 卡了 900s 没结束，重跑 206s 就完了
 ——是上一轮 aborted 的进程残留占着资源，不是测试挂了。**看到"卡住"先确认没有
 残留进程**，再怀疑代码。
+
+## UX 打磨（九）：飞书卡片——字段名当标签、原始英文状态、两个模块结论相反
+
+继续扫飞书卡片与网关回复。这轮抓到 5 处，其中一处是**真 bug**。
+
+### 真 bug：同一份数据，终端说「有效至」，飞书说「已过期」
+
+`terminal_views._expiry_label` 与 `feishu_domain_card._expiry_label` 是同名同职责
+的两份实现，但**默认值相反**：
+
+```python
+# terminal_views（旧）
+if row.get('active', True):        # 缺字段 → 当「有效」
+# feishu_domain_card（旧）
+if row.get('active'):              # 缺字段 → 当「已过期」
+```
+
+`active` 是 `net_grants.list_rules()` 附带的**派生字段**，别的调用方（卡片、
+测试、未来的 API）拿到的行可能没有它。于是**同一条域名规则，两个界面给出相反的
+安全状态**——一个说「有效至 2026-12-31」，一个说「已过期（2026-12-31）」。
+
+安全规则的生效状态不能靠一个可能缺失的字段推断。改成
+`net_grants.expiry_label()` 作为唯一实现，**自己按日期算**，不看调用方。
+
+### 内部字段名当标签
+
+| 位置 | 泄漏 | 改法 |
+|---|---|---|
+| `cron_text` / `_job_lines` | `[recurring · 只读 · …]` | `[重复 · 只读 · …]` |
+| `cron_text` | `可写` | `允许副作用`（安全相关属性要说明白） |
+| `_push_label` | `推送→oc_chat1`（截断 8 字符，认不出是哪个群） | `推送到其他聊天` |
+| `_task_line` | `exit=0` | `退出码 1`，且 **0 时不提**（正常退出不是噪声） |
+| `domain_text` | `allow` / `deny` 字面量 | `允许` / `拒绝`（与终端版一致） |
+
+### 原始英文状态值
+
+`tasks_text` 直接显示 `completed` / `failed`：
+
+```
+OS-1 · completed · exit=0 · 用时 —
+```
+
+加 5 条状态映射（运行中/排队中/已完成/失败/已取消）。
+
+### 认不出的异常直接抛给用户
+
+```python
+failed = ('处理未完成：' + (hint or str(exc)) + …)
+```
+
+`friendly_error()` 返回空串时（未识别的错误），用户看到的是
+`处理未完成：openai.APIStatusError: Error code: 500 - {'error': …}`。
+
+**原始异常不能当主文案**。改成：人话打头（`模型或服务返回了意外错误。`），
+原始信息留在「技术细节：」里供反馈，两者都截断 300 字。
+
+### 守卫补到 13 条
+
+新增 `test_field_names_are_not_used_as_labels`（7 个模块参数化）：内部字段名
+（`recurring` / `exit_code` / `session_id`…）不能当显示标签，`exit=` / `type=`
+这类 kv 形式不能出现在文案里。
+
+### 测试
+
+全量 **2980 passed / 3 skipped**（207s），ruff 通过。

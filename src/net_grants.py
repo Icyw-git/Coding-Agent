@@ -231,6 +231,25 @@ def revoke_for_session(session_id: str) -> list[dict]:
     return removed
 
 
+def expiry_label(row: dict, *, today: date | None = None) -> str:
+    """「永久 / 有效至 X / 已过期（X）」的唯一实现。
+
+    为什么不用 ``row['active']``：那是 ``list_rules()`` 附带的派生字段，别的调用方
+    （卡片、测试）拿到的行可能没有它。之前终端版和飞书版各自写了一份，**同一个
+    缺失字段，一个当「有效」，一个当「已过期」**——用户看到的安全规则状态会互相
+    矛盾。这里自己按日期算，不依赖调用方。
+    """
+    expires = str(row.get('expires') or '').strip()
+    if not expires:
+        return '永久'
+    current = today or date.today()
+    try:
+        window = date.fromisoformat(expires)
+    except ValueError:
+        return f'到期 {expires}'
+    return f'有效至 {expires}' if window >= current else f'已过期（{expires}）'
+
+
 def _is_active(record: dict, today: date) -> bool:
     expires = record.get('expires') or ''
     return not expires or date.fromisoformat(expires) >= today
