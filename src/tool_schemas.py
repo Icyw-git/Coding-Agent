@@ -708,6 +708,24 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                            'the recycle bin'}},
                               'required': ['paths']}}},
  {'type': 'function',
+  'function': {'name': 'remind',
+               'description': 'Set a one-shot reminder at a natural-language time. '
+                              'Prefer this over schedule_cron for "remind me to X at '
+                              'Y": you do not need to compute a cron expression, and '
+                              'the user sees a readable time back instead of a cron '
+                              'string. Fires once, then removes itself.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'text': {'type': 'string',
+                                           'description': 'What to remind the user '
+                                                          'about, in their own words'},
+                                  'when': {'type': 'string',
+                                           'description': 'When, in natural language: '
+                                                          '"2026-11-04 15:00", "15:00", '
+                                                          '"in 2h", "tomorrow 9am", '
+                                                          '"明天下午3点"'}},
+                              'required': ['text', 'when']}}},
+ {'type': 'function',
   'function': {'name': 'move_paths',
                'description': 'Move or rename files and directories. Dry-run by '
                               'default: the first call returns a plan and changes '

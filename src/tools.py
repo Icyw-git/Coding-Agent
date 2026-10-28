@@ -177,6 +177,11 @@ def run_move_paths(moves: list, dry_run: bool = True) -> str:
                       audit=_screen_audit)
 
 
+def run_remind(text: str, when: str) -> str:
+    from tool_remind import remind as _remind_tool
+    return _remind_tool(text, when, audit=_screen_audit)
+
+
 def run_undo_moves(batch_id: str = '') -> str:
     import paths as _paths
     from tool_move import undo as _undo_tool
@@ -338,6 +343,7 @@ tool_registry = {
     'delete_paths': run_delete_paths,
     'move_paths': run_move_paths,
     'undo_moves': run_undo_moves,
+    'remind': run_remind,
     'remember': run_remember,
     'forget': run_forget,
     'recall': run_recall,
