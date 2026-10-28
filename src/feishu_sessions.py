@@ -40,8 +40,18 @@ def list_card(rows, token, current_id=None, page=0, *, filtered=False):
                 for item in rows)) else '工作区'
             elements.append(_text(f'{label} · {_short_path(workspace)}（{count} 个会话）'))
             previous_group = workspace
-        elements.append(_text(f'{index + 1}. {row["title"][:80]}\n'
-                              f'{session_status(row, current_id)} · 最近活跃 {relative_time(row.get("updated"))}'))
+        # 终端版会显示「最近：<预览>」，飞书原来只有标题——而标题是自动生成的，
+        # 认不出这会话聊的是什么。预览与标题相同时不重复（与终端同一规则）。
+        raw_title = str(row.get('title') or '')
+        title = raw_title[:80]
+        preview = str(row.get('preview') or '').strip()
+        recent = '' if preview == raw_title else preview
+        block = [f'{index + 1}. {title}']
+        if recent:
+            block.append(f'最近：{recent[:100]}')
+        block.append(f'{session_status(row, current_id)} · '
+                     f'最近活跃 {relative_time(row.get("updated"))}')
+        elements.append(_text(chr(10).join(block)))
         elements.append({'tag': 'action', 'actions': [
             _button('查看详情', token, 'details', index),
             _button('切换到此会话', token, 'switch', index, True),

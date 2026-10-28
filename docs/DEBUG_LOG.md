@@ -9636,3 +9636,52 @@ failed = ('处理未完成：' + (hint or str(exc)) + …)
 ### 测试
 
 全量 **2981 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（十一）：`/sessions` 飞书卡片丢了会话内容预览
+
+并排对照最后一对功能：`/sessions` 的终端 vs 飞书。
+
+```
+终端：  网关重构
+          工作区：工作目录未记录
+          最近：网关重构的请求路由        ← 有预览
+          最近活跃：刚刚
+
+飞书：  2. 网关重构
+          已绑定 · 最近活跃 刚刚         ← 没有预览
+```
+
+**飞书卡片只有标题，没有预览。** 而标题是自动生成的——`新会话`、`怎么跑测试`
+这类标题认不出"这会话到底聊的是什么"。终端那边早有这条信息。
+
+改：加上 `最近：<预览>`，规则与终端一致（**预览与标题相同时不重复**，避免两行
+一模一样）。截断 100 字。
+
+### 一个反复出现的操作失误
+
+这次改动的 `str.replace` 又没命中（`\n` 在 heredoc 里被折叠成真换行），我先看到
+"没生效"又不知道原因，只能回去 `sed -n` 看文件确认。这个坑在这一轮里出现了
+**四次**（改 `feishu_sessions`、改 `prompt_assembly`、改 `terminal_views`、
+改 `status_report`）。
+
+后来的做法固定成：**含 `\n` 或多行字符串的替换一律用 `edit` 工具或
+`chr(10).join(...)`**，不用 heredoc + `str.replace`。
+
+### 十一轮下来，「一个功能两处实现」的完整清单
+
+| 功能 | 终端 | 飞书 | 是否已对齐 |
+|---|---|---|---|
+| 域名有效期 | `terminal_views._expiry_label` | `feishu_domain_card._expiry_label` | ✅ |
+| 审计事件名 | `terminal_views._AUDIT_LABELS` | `feishu_audit_card.event_line` | ✅ 共用 `audit.EVENT_LABELS` |
+| 待审批列表 | `format_pending_approvals` | `approval_text` | ✅ |
+| 审批原因 | 同上 | 同上 | ✅ 共用 `reason_zh(code)` |
+| cron 行 | `cron_text` | `_job_lines`（同文件） | ✅ |
+| 任务状态 | `tasks_text` | `_task_line`（同文件） | ✅ |
+| 会话列表 | `session_label` | `list_card` | ✅ 这轮补上预览 |
+| 记忆渲染 | `_render_memory` | `_render_entry`（同文件） | ✅ 共用 |
+
+八对全部对齐。**这八对里没有一对是靠测试发现的**——测试各自测各自都通过。
+
+### 测试
+
+全量 **2981 passed / 3 skipped**，ruff 通过。
