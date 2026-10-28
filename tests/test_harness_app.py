@@ -261,8 +261,9 @@ def test_slash_help_is_handled_locally(monkeypatch):
             await pilot.pause()
             assert len(app.model) == 1
             assert app.model.snapshot()[0].kind == 'notice'
-            assert 'commands:' in str(
-                app.model.snapshot()[0].payload['text']).lower()
+            # /help 的表头改成中文了（它同时给终端与飞书用，
+            # 写死 "TUI commands:" 在比例字体下也没有对齐意义）。
+            assert '命令' in str(app.model.snapshot()[0].payload['text'])
             assert len(app._pending) == 0
 
     asyncio.run(scenario())
@@ -1332,7 +1333,7 @@ def test_enter_accepts_selected_command_before_submitting(monkeypatch):
             await pilot.pause()
             assert not app.has_suggestions()
             assert app._composer.text == ''
-            assert 'TUI commands' in app.model.snapshot()[-1].payload['text']
+            assert '命令' in app.model.snapshot()[-1].payload['text']
 
     asyncio.run(scenario())
 

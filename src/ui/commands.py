@@ -434,17 +434,28 @@ def did_you_mean(name: str) -> str | None:
 
 
 def help_text() -> str:
+    """`/help` 的纯文本（终端与飞书共用）。
+
+    不用定宽对齐：``/improvements`` 的用法串有 70 字，而飞书是比例字体，
+    列对齐在那里毫无意义——超长时直接把描述换到下一行，两边都能读。
+    """
     ported = [spec for spec in COMMANDS if spec.ported]
     unported = [spec for spec in COMMANDS if not spec.ported]
-    lines = ['TUI commands:']
+    column = 24
+    lines = [f'命令（{len(ported)} 个）：']
     for spec in ported:
-        lines.append(f'  {spec.usage:<28}{spec.description}')
+        usage = spec.usage
+        if len(usage) <= column:
+            lines.append(f'  {usage:<{column}}  {spec.description}')
+        else:
+            lines.append(f'  {usage}')
+            lines.append(f'    {spec.description}')
     if unported:
-        lines.append('Only in line REPL (--ui ansi):')
+        lines.append('只能在文字模式（--ui ansi）用：')
         lines.append('  ' + '  '.join(f'/{spec.name}' for spec in unported))
     skills = skill_commands()
     if skills:
-        lines.append(f'Skills ({len(skills)}): ' + '  '.join(
+        lines.append(f'技能（{len(skills)}）：' + '  '.join(
             f'/{spec.name}' for spec in skills))
     return chr(10).join(lines)
 

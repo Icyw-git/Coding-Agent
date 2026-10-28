@@ -621,8 +621,12 @@ class CommandActionsMixin:
             note = f' · {rule.note}' if rule.note else ''
             lines.append(f'  {rule.decision:<5} [{tools}]{scope} '
                          f'{", ".join(rule.prefixes)}{note}')
-        lines.append('说明：只作用于 destructive / opaque_command / external_tool 三类询问；'
-                     '档位、秘密文件、域名与桌面控制不受影响。')
+        # 不点名内部决策码（destructive / opaque_command / external_tool）：
+        # 那是代码里的枚举，用户读不出自己能影响什么。说清"能改什么、改不动什么"。
+        lines.append('说明：规则只能决定「本该问你的操作要不要问」——'
+                     'allow 不再问、deny 直接拒。')
+        lines.append('  改不动：秘密文件、破坏性命令黑名单、执行档位、'
+                     '域名规则、桌面/屏幕/剪贴板工具。')
         self._notice(chr(10).join(lines))
 
     def handle_grants(self, argument: str) -> None:
@@ -637,7 +641,12 @@ class CommandActionsMixin:
         if not action:
             rows = grants.list_grants()
             if not rows:
-                self._notice('（没有目录写授权）\n' + usage)
+                # 已经在 /grants 里了，再说“用法：/grants（查看）”是废话。
+                # 空状态该回答的是“这东西干什么用、怎么加一条”。
+                self._notice(
+                    '（没有目录写授权）' + chr(10)
+                    + '作用：默认档下允许往该目录写改而不逐次审批。' + chr(10)
+                    + '加一条：/grants add "<目录>" [until YYYY-MM-DD] [note 备注]')
                 return
             lines = ['目录写授权：']
             for row in rows:

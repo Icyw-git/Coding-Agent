@@ -9209,3 +9209,79 @@ detail: moves=[{'from': 'a.txt', 'to': 'b.txt'}]
 ### 测试
 
 `test_approval_view.py` +10。全量 **2967 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（六）：/help 的列对齐在飞书上完全失效
+
+扫 `/archive`、`/grants`、`/rules`、`/workspaces`、`/approvals`、`/help`。
+
+`/archive`（候选→确认→逐个报失败）、`/workspaces`、`/approvals` 都没问题。
+另三处有问题。
+
+### `/help`：定宽列对齐 + 内部术语
+
+**（a）长用法串和描述粘在一起**
+
+```
+  /cache [profile|gc [天数] [--apply]]存储 profile / 工具缓存
+                                      ↑ 没有空格
+```
+
+`{spec.usage:<28}` 定宽 28，而 `/improvements` 的用法串有 **70 字**——超过宽度的
+条目，填充为 0，描述直接贴上去。
+
+**（b）同一个文本也给飞书用**
+
+`help_text()` 被 `feishu_gateway._help_text()` 调用。**飞书是比例字体，列对齐在
+那里毫无意义**——固定宽度只会在窄屏上排版崩掉。
+
+改：`column = 24`，超长时把描述换到下一行缩进。终端整齐，飞书也能读。
+
+**（c）表头是内部术语**
+
+```
+TUI commands:
+Only in line REPL (--ui ansi):
+Skills (1):
+```
+
+「TUI」「ported」「Only in line REPL」都是实现概念。而且当前 48 个命令**全部
+ported**，那个分区根本不会显示——但表头仍然写死为 TUI。
+
+改成中文并说明数量：`命令（48 个）：`、`技能（1）：`。分区名也改成
+`只能在文字模式（--ui ansi）用：`。
+
+### `/grants` 空状态：在 `/grants` 里告诉你「用法：/grants（查看）」
+
+```
+（没有目录写授权）
+用法：/grants（查看）        ← 我们已经在 /grants 里了
+```
+
+空状态该回答的是"这东西干什么用、怎么加一条"：
+
+```
+（没有目录写授权）
+作用：默认档下允许往该目录写改而不逐次审批。
+加一条：/grants add "<目录>" [until YYYY-MM-DD] [note 备注]
+```
+
+### `/rules` 说明用了内部决策码
+
+```
+说明：只作用于 destructive / opaque_command / external_tool 三类询问
+```
+
+和 `/audit` 的事件名同一类问题：**这三个是代码里的枚举**，用户读不出自己能影响
+什么。改成说清"能改什么、改不动什么"：
+
+```
+说明：规则只能决定「本该问你的操作要不要问」——allow 不再问、deny 直接拒。
+  改不动：秘密文件、破坏性命令黑名单、执行档位、域名规则、桌面/屏幕/剪贴板工具。
+```
+
+这句话也更有用：用户设置 allow 之前最想知道的正是"哪些它管不到"。
+
+### 测试
+
+`test_ui_commands.py` / `test_harness_app.py` 的三处断言随文案更新。
+全量 **2967 passed / 3 skipped**，ruff 通过。

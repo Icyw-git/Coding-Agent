@@ -41,7 +41,7 @@ roles: {main: main-ref}
 
 def test_help_lists_all_commands_as_ported():
     text = commands.help_text()
-    assert 'TUI commands:' in text
+    assert '命令' in text
     assert '/sessions' in text and '/review' in text
     assert 'Only in line REPL' not in text
     assert all(spec.ported for spec in commands.COMMANDS)
