@@ -10,8 +10,6 @@ import hashlib
 import tempfile
 from pathlib import Path
 
-import document_render
-import documents
 from agent_core import estimate_image_tokens
 from tool_text import BinaryFileError
 
@@ -104,11 +102,14 @@ def read_document(path: str, cwd: str | None, *, gate, resolve,
         if not file_path.is_file():
             return f'Error: document not found: {path}'
         data = file_path.read_bytes()
+        # 惰性导入：document 解析链（zipfile/元素解析）只在真读文档时才需要，
+        # 启动时就加载会让每次 headless / cron 多付 ~25ms。
+        import documents
         return documents.extract_document(
             data, file_path.name, pages=pages, sheets=sheets)
-    except documents.DocumentError as exc:
-        return f'Error: {exc}'
     except Exception as exc:
+        # DocumentError 也被这条接住：模块在 try 内导入，except 子句里引用它的
+        # 名字在导入失败时反而会 NameError。文案由异常本身带。
         return f'Error: {exc}'
 
 
@@ -123,6 +124,7 @@ def render_document(path: str, cwd: str | None, *, gate, resolve,
         if not file_path.is_file():
             return f'Error: document not found: {path}'
         data = file_path.read_bytes()
+        import document_render
         rendered = document_render.render_document(
             data, file_path.name, pages=pages, dpi=dpi)
         if not rendered:
@@ -145,7 +147,5 @@ def render_document(path: str, cwd: str | None, *, gate, resolve,
                 'attached in the next user message; inspect layout, charts, tables, '
                 'and scanned text. Use read_document when you only need text.')
         return ImageResult(text, images)
-    except document_render.RenderError as exc:
-        return f'Error: {exc}'
     except Exception as exc:
         return f'Error: {exc}'

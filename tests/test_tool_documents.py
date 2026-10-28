@@ -52,7 +52,7 @@ def test_cache_image_is_content_addressed(tmp_path):
 def test_render_document_returns_cached_page_refs(tmp_path, monkeypatch):
     (tmp_path / 'doc.pdf').write_bytes(b'%PDF-1.4')
     monkeypatch.setattr(
-        'tool_documents.document_render.render_document',
+        'document_render.render_document',
         lambda data, name, pages=None, dpi=110: [(1, b'page-one')])
     gate, resolve = _access(tmp_path)
     cache = tmp_path / 'cache'

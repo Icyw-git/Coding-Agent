@@ -8444,3 +8444,72 @@ rel = Path(path).resolve().relative_to(root.resolve()).as_posix()
 - `profile_memory.py` 增加：RSS 测量、常驻模拟（含对照组）、冷启动
 
 全量 **2827 passed / 3 skipped**，ruff 通过。
+
+## 冷启动优化：摘掉文档渲染链（-25~40ms）
+
+上轮我判断"启动省不下来"，是**想当然**。实际测了一遍，发现一处可安全摘除的依赖。
+
+### 分析过程
+
+先把"模块级执行的代码"与"导入"分开——前者常是隐藏成本来源：
+
+| 模块级动作 | 耗时 |
+|---|---|
+| `load_dotenv()` | 1.1 ms |
+| `_apply_secure_credentials()` | 0.8 ms |
+| `enforce_trusted_policy_env()` | 0.0 ms |
+| `scan_skills()` | 1.1 ms |
+
+全是 < 2ms。**启动成本几乎 100% 是导入**，不是执行。
+
+再按累计耗时看导入树，找到一条不该在启动时存在的链：
+
+```
+harness → subagent → tools → tool_documents → document_render
+                                          → documents
+```
+
+`document_render` 单独导入就是 **118 ms**（shutil 44ms、documents 25ms、zipfile 21ms），
+在已加载多数依赖的上下文里仍占 **25.5 ms**。而它只在用户真正渲染文档时才需要。
+
+### 改法
+
+`tool_documents` 里把 `import document_render` / `import documents` 移进各自的函数体。
+两个模块的用法都在函数内（`documents.extract_document`、`document_render.render_document`），
+所以是纯延迟，不改行为。
+
+**一个连带问题**：`except documents.DocumentError` 在惰性导入后不可用——模块在
+`try` 内导入，导入失败时 `except` 子句引用它的名字反而会 `NameError`。改成
+`except Exception`，文案本来就只用 `{exc}`，输出不变。
+
+**测试影响**：`monkeypatch.setattr('tool_documents.document_render.render_document', ...)`
+会失败（惰性导入后该属性不存在）。改成直接打桩 `document_render.render_document`。
+这是惰性导入的固有代价——**打桩面从"经由调用方模块"变成"直接打到目标模块"**，
+值得在注释里记一笔。
+
+### 验证
+
+确定性证据（不依赖计时噪声）：
+
+```
+启动后 document_render 已加载?  False
+导入 tool_documents 后?         False     ← 只在真正渲染时才加载
+tool_documents 自身            1.4 ms     ← 原来带着整条链
+```
+
+计时（7 次取最小）：**344 ms**（改前 361–380 ms）。
+
+### 剩下的两处，判断为不值得动
+
+| 项 | 耗时 | 为什么不动 |
+|---|---|---|
+| `yaml` | 32 ms | 由 `llm_config._read_config` 与 `memory._parse_frontmatter` 使用。两者都可延迟，但**一次 `-p` 运行必然会读到记忆**，延迟只是把成本从导入挪到首次使用，总量不变 |
+| `dotenv` | 30 ms | `load_dotenv()` 在模块级执行，而所有后续逻辑都依赖 .env 已加载，无法推迟 |
+
+替掉这两者意味着自己写 YAML/.env 解析器——**我们已经在"description 里带冒号"
+上栽过一次**，为 62ms 冒静默解析错误的风险不划算。
+
+### 结论
+
+冷启动 361–380 → **344 ms**（约 -30ms）。剩下 62ms 是格式解析库，动它的风险
+大于收益。**至此启动优化到此为止**，理由与数据都记在这里，避免以后重复投入。
