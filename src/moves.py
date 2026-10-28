@@ -232,11 +232,16 @@ def _append_journal(cache_dir, journal_id: str, moved: list[dict]) -> None:
 
 
 def recent_batches(cache_dir, limit: int = 10) -> list[dict]:
-    """最近的移动批次（新的在前）。"""
+    """最近的移动批次（新的在前），带 ``undone`` 标记。
+
+    日志保持 append-only：撤销不改原记录，而是追加一条 ``{"undone": id}``。
+    读取时合并。这样「哪批撤过」本身也是可追溯的。
+    """
     path = _journal_path(cache_dir)
     if not path.is_file():
         return []
-    rows = []
+    rows: list[dict] = []
+    undone: set[str] = set()
     try:
         with path.open('r', encoding='utf-8') as handle:
             for line in handle:
@@ -244,12 +249,32 @@ def recent_batches(cache_dir, limit: int = 10) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(row, dict):
+                    continue
+                if row.get('undone'):
+                    undone.add(str(row['undone']))
+                    continue
+                rows.append(row)
     except OSError:
         return []
+    for row in rows:
+        row['undone'] = str(row.get('id')) in undone
     return list(reversed(rows))[:limit]
+
+
+def _mark_undone(cache_dir, batch_id: str) -> None:
+    """追加一条「这批已撤销」记录（不改原行）。写不了只忽略——
+    撤销本身已经完成，不该因为记账失败而报错。"""
+    path = _journal_path(cache_dir)
+    try:
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({'undone': batch_id, 'ts': time.time()},
+                                    ensure_ascii=False) + chr(10))
+    except OSError:
+        pass
 
 
 def undo(cache_dir, *, batch_id: str = '', runner=None) -> dict:
@@ -271,7 +296,19 @@ def undo(cache_dir, *, batch_id: str = '', runner=None) -> dict:
                 f'no move batch with id {batch_id}. '
                 f'Recent batches: {recent or "(none)"}')
     else:
-        batch = batches[0]
+        # 默认选**最近一批尚未撤销的**：连按两次 /undo-move 应该继续往前撤，
+        # 而不是把同一批再处理一遍报「Restored 0 item(s)」。
+        pending = [row for row in batches if not row.get('undone')]
+        if not pending:
+            raise MoveError(
+                'every recorded batch has already been undone — nothing to undo.')
+        batch = pending[0]
+
+    if batch.get('undone'):
+        # 显式点名一个已撤销的批次：说清楚，而不是去试一遍然后报「文件不见了」。
+        raise MoveError(
+            f'batch {batch.get("id")} has already been undone. '
+            'Omit batch_id to undo the most recent batch that has not been undone.')
 
     restored, skipped = [], []
     for item in batch.get('moves') or []:
@@ -290,6 +327,8 @@ def undo(cache_dir, *, batch_id: str = '', runner=None) -> dict:
             restored.append({'from': str(target), 'to': str(source)})
         except OSError as exc:
             skipped.append({'path': str(target), 'reason': str(exc)[:120]})
+    if restored:
+        _mark_undone(cache_dir, str(batch.get('id')))
     return {'restored': restored, 'skipped': skipped, 'batch': batch.get('id')}
 
 

@@ -51,17 +51,17 @@ def _tool_batch(*items, status='ok'):
 
 def test_counts_requests_and_tokens(sessions):
     _session(sessions, events=[
-        ('turn_started', {}),
+        ('message', {'message': {'role': 'user', 'content': 'hi'}}),
         ('usage', _usage(prompt=100, completion=20, cached=60, total=120)),
         ('usage', _usage(prompt=200, completion=40, cached=100, total=240)),
-        ('turn_completed', {}),
+        ('message', {'message': {'role': 'assistant', 'content': 'ok'}}),
     ])
     stats = usage_stats.collect(sessions, days=7)
     assert stats['requests'] == 2
     assert stats['tokens']['prompt'] == 300
     assert stats['tokens']['completion'] == 60
     assert stats['tokens']['cached'] == 160
-    assert stats['turns'] == 1
+    assert stats['user_messages'] == 1
     assert stats['sessions'] == 1
 
 
@@ -142,8 +142,7 @@ def test_models_are_counted(sessions):
 # ---------------------------------------------------------------- 时间窗口与容错
 
 def test_old_sessions_are_excluded(sessions):
-    _session(sessions, age_days=30, events=[
-        ('usage', _usage()), ('turn_completed', {})])
+    _session(sessions, age_days=30, events=[('usage', _usage())])
     assert usage_stats.collect(sessions, days=7)['requests'] == 0
     assert usage_stats.collect(sessions, days=60)['requests'] == 1
 
@@ -172,11 +171,10 @@ def test_file_limit_is_respected(sessions):
 
 def test_report_lists_key_numbers(sessions):
     _session(sessions, events=[
-        ('turn_started', {}),
+        ('message', {'message': {'role': 'user', 'content': 'hi'}}),
         ('usage', _usage(prompt=1000, cached=800, completion=200, total=1200,
                          request_ms=1500)),
         ('tool_profile', _tool_batch(('bash', 100))),
-        ('turn_completed', {}),
     ])
     text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
     assert 'token' in text
@@ -187,7 +185,7 @@ def test_report_lists_key_numbers(sessions):
 
 def test_report_on_empty_window(generic_sessions=None):
     assert '没有可统计的会话' in usage_stats.format_report(
-        {'window_days': 7, 'requests': 0, 'turns': 0})
+        {'window_days': 7, 'requests': 0, 'user_messages': 0})
 
 
 def test_report_warns_when_no_model_requests(sessions):
@@ -235,3 +233,41 @@ def test_answers_where_the_time_went(sessions):
     assert stats['tools']['desktop_snapshot']['total_ms'] == 9000
     text = usage_stats.format_report(stats)
     assert 'desktop_snapshot' in text
+
+
+def test_does_not_report_unreliable_per_turn_ratio(sessions):
+    """不报「每回合请求数」：turn_* 三个事件在 schema 演进中不一致。
+
+    实测同一批会话：turn_started 21 / turn_completed 77 / turn_terminal 21，
+    而用户消息 502 条——任何用它们做分母的比例都不可信。
+    口径含糊的统计比没有统计更容易误导。
+    """
+    for _ in range(5):
+        _session(sessions, events=[('usage', _usage(request_ms=100))])
+    for _ in range(20):
+        _session(sessions, events=[
+            ('message', {'message': {'role': 'user', 'content': 'q'}})])
+    text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
+    assert '每回合' not in text
+    assert '用户消息' in text
+
+
+def test_ranks_tools_by_total_time_not_just_count(sessions):
+    """按调用次数排看不出时间花在哪：4 次 desktop_snapshot（均 9.9s）
+    比 63 次 bash（均 545ms）更贵。"""
+    _session(sessions, events=[
+        ('tool_profile', _tool_batch(*[('bash', 500)] * 10)),
+        ('tool_profile', _tool_batch(('desktop_snapshot', 9000))),
+    ])
+    text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
+    assert '最耗时' in text
+    # desktop_snapshot 总耗时更高，必须在「最耗时」里排第一
+    line = next(l for l in text.splitlines() if '最耗时' in l)
+    assert line.index('desktop_snapshot') < line.index('bash')
+
+
+def test_tool_line_shows_total_time(sessions):
+    _session(sessions, events=[('tool_profile', _tool_batch(('bash', 2500)))])
+    text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
+    assert '总' in text
+    assert '2.5s' in text

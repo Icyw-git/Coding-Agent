@@ -83,8 +83,12 @@ def undo(cache_dir, *, batch_id: str = '', runner=None, audit=None) -> str:
     _notify(audit, 'moves_undone', count=len(restored),
             batch=result.get('batch') or '', skipped=len(skipped))
     lines = [f'Restored {len(restored)} item(s) (batch {result.get("batch")}).']
-    lines.extend(f"  {item['from']} -> {item['to']}" for item in restored[:20])
+    if restored:
+        # 复用 describe：撤销与移动必须用同一套路径缩短。
+        # 自己拼 f"{from} -> {to}" 会退回满屏绝对路径，和移动预览不一致。
+        lines.append(engine.describe(restored))
     if skipped:
         lines.append(f'Skipped {len(skipped)} item(s) — not overwriting anything:')
-        lines.extend(f"  {item['path']}: {item['reason']}" for item in skipped[:10])
+        for item in skipped[:10]:
+            lines.append(f"  {item['path']}: {item['reason']}")
     return '\n'.join(lines)

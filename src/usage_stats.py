@@ -45,7 +45,7 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 #: tool_started，它们的正文里几乎不出现这些键，所以预筛很干净——误命中最多
 #: 多解码一行，类型仍由后续判断确认。实测 22 个会话全解码 1095ms。
 _INTERESTING = (
-    b'"usage"', b'"tool_profile"', b'"turn_completed"',
+    b'"usage"', b'"tool_profile"', b'"message"',
     b'"approval_auto"', b'"policy_denied"',
     b'"memory_written"', b'"memory_forgotten"', b'"memory_redacted"',
     b'"proactive_suggested"',
@@ -106,7 +106,7 @@ def collect(sessions_dir, *, days: int = DEFAULT_DAYS,
     tools: dict[str, dict] = {}
     tool_batches = 0
     sessions = 0
-    turns = 0
+    user_messages = 0
     approvals = {'auto': 0, 'denied': 0}
     memory = {'written': 0, 'forgotten': 0, 'redacted': 0, 'suggested': 0}
     models: dict[str, int] = {}
@@ -146,8 +146,10 @@ def collect(sessions_dir, *, days: int = DEFAULT_DAYS,
                     duration = item.get('duration_ms')
                     if isinstance(duration, (int, float)):
                         row['total_ms'] += float(duration)
-            elif kind == 'turn_completed':
-                turns += 1
+            elif kind == 'message':
+                message = event.get('message') or {}
+                if isinstance(message, dict) and message.get('role') == 'user':
+                    user_messages += 1
             elif kind == 'approval_auto':
                 approvals['auto'] += 1
             elif kind == 'policy_denied':
@@ -178,7 +180,7 @@ def collect(sessions_dir, *, days: int = DEFAULT_DAYS,
     return {
         'window_days': days,
         'sessions': sessions,
-        'turns': turns,
+        'user_messages': user_messages,
         'requests': requests,
         'tokens': tokens,
         # 口径：缓存命中率的分母是**输入** token，不是总数
@@ -198,7 +200,7 @@ def format_report(stats: dict, *, top_tools: int = 8) -> str:
     # 只看请求和回合会漏掉「只跑了本地命令」的情况——那也有会话、也有工具调用，
     # 报「没有数据」会让人以为统计坏了。
     if not any(stats.get(key) for key in
-               ('requests', 'turns', 'sessions', 'tools', 'tool_batches')):
+               ('requests', 'user_messages', 'sessions', 'tools', 'tool_batches')):
         return (f"（最近 {stats.get('window_days')} 天没有可统计的会话）\n"
                 '跑几轮对话后再看。')
 
@@ -208,7 +210,8 @@ def format_report(stats: dict, *, top_tools: int = 8) -> str:
         return f'{value / 1000:.1f}k' if value >= 1000 else str(value)
 
     lines = [f"使用统计（最近 {stats['window_days']} 天）",
-             f"  会话 {stats['sessions']} · 回合 {stats['turns']} · "
+             f"  会话 {stats['sessions']} · "
+             f"用户消息 {stats.get('user_messages', 0)} · "
              f"模型请求 {stats['requests']}"]
 
     if tokens['total']:
@@ -233,8 +236,20 @@ def format_report(stats: dict, *, top_tools: int = 8) -> str:
         lines.append(f'  工具调用（{stats.get("tool_batches", 0)} 批）：')
         for name, row in list(tools.items())[:top_tools]:
             fail = f" · 失败 {row['failed']}" if row['failed'] else ''
+            total_s = row['total_ms'] / 1000
             lines.append(f"    {name:22} {row['calls']:>4} 次  "
-                         f"均 {row['avg_ms']:.0f}ms{fail}")
+                         f"总 {total_s:>6.1f}s  均 {row['avg_ms']:>6.0f}ms{fail}")
+        # 按调用次数排看不出**时间花在哪**：4 次 desktop_snapshot（均 9.9s）
+        # 比 63 次 bash（均 545ms）更贵。单列一行按总耗时排。
+        by_time = sorted(tools.items(), key=lambda kv: -kv[1]['total_ms'])[:3]
+        if by_time and by_time[0][1]['total_ms'] >= 1000:
+            spent = ' · '.join(f'{name} {row["total_ms"] / 1000:.1f}s'
+                               for name, row in by_time)
+            lines.append(f'  最耗时：{spent}')
+        # 不报「每回合请求数」：turn_started / turn_completed / turn_terminal
+        # 三个事件在 schema 演进中不一致（实测同一批会话里 21 / 77 / 21 条，
+        # 而用户消息 502 条），任何用它做分母的比例都不可信。
+        # 口径含糊的统计比没有统计更容易误导，所以宁可不报。
 
     approvals = stats.get('approvals') or {}
     if approvals.get('auto') or approvals.get('denied'):

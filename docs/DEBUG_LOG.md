@@ -8925,3 +8925,76 @@ that time is in the past (2020-01-01 09:00, now 2026-10-28 14:30).
 确认文案说明自动清理）、`test_usage_stats.py` +2（本地活动不被报成空、耗时排序）。
 
 全量 **2942 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（二）：连续撤销、路径一致性、统计口径
+
+第二轮把成功路径也走一遍，找到三个问题——其中两个是**功能对但用户拿不到预期结果**。
+
+### 1. `/undo-move` 连按两次第二次无效（真 bug）
+
+```
+第一批：a -> done/a
+第二批：b -> done/b
+/undo-move  → Restored 1 item(s) (batch 2)     ✓
+/undo-move  → Restored 0 item(s) (batch 2)     ✗ 又是同一批
+```
+
+用户自然的手势是"再撤一次"，期望继续往前撤。实际它重新选中已撤销的批次，
+报告 "Restored 0"。
+
+改：撤销日志保持 append-only，但**追加一条 `{"undone": id}`**；`recent_batches()`
+合并这个标记；不带 id 时选**最近一批尚未撤销的**。
+
+现在连按两次会依次撤第二批、第一批。全部撤完后明确说
+`every recorded batch has already been undone`。显式点名一个已撤销批次时也直接
+说 `has already been undone`，而不是去试一遍再报"文件不见了"。
+
+### 2. 撤销输出没复用路径缩短
+
+移动预览已经相对化，但 `undo()` 自己拼 `f"{from} -> {to}"`，于是撤销时又变成
+满屏绝对路径。同一个东西两套格式。
+
+改：撤销直接复用 `moves.describe()`。**一处格式化，两个入口。**
+
+### 3. `/usage` 的两个口径问题（更重要）
+
+**（a）`每回合 10 次模型请求` 是错的。** 我原来用 `turn_completed` 计回合。
+实测同一批 30 天会话：
+
+```
+用户消息 502 | turn_started 21 | turn_terminal 21 | turn_completed 77 | usage 768
+```
+
+三个 turn 事件互相矛盾，而且都远少于用户消息数——说明它们在 schema 演进中
+不一致（`turn_started` 是后加的）。
+
+`usage / user 消息 = 1.5`（合理），`usage / turn_terminal = 36.6`（荒谬）。
+
+**决定：不报这个比例。** 口径含糊的统计比没有统计更容易误导——这正是我写在
+模块 docstring 里的原则，这里自己违反了。回合数也换成**用户消息数**（唯一跨版本
+可靠的计数）。
+
+**（b）按调用次数排看不出时间花在哪。**
+
+```
+bash                63 次  均  545ms
+desktop_snapshot     4 次  均 9970ms     ← 真正的耗时大头
+```
+
+改：每行加**总耗时**，并单列一行按总耗时排：
+
+```
+    bash                     63 次  总   34.3s  均    545ms · 失败 1
+    desktop_snapshot          4 次  总   39.9s  均   9970ms
+  最耗时：desktop_snapshot 39.9s · bash 34.3s · grep 12.2s
+```
+
+这一行是真的有用：它直接指出"桌面截图比 63 次 shell 更贵"。
+
+### 测试
+
+`test_moves.py` +5（连续撤销走历史、全部撤完的提示、显式点名已撤销批次、
+日志 append-only、undone 标记）；`test_usage_stats.py` +3（不报不可靠比例、
+按总耗时排序、行内显示总耗时）。
+
+全量 **2950 passed / 3 skipped**，ruff 通过。

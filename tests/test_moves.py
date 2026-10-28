@@ -328,3 +328,60 @@ def test_undo_unknown_batch_lists_recent(work, cache):
     out = tool_move.undo(cache, batch_id='ghost')
     assert 'no move batch with id ghost' in out
     assert batch['journal_id'] in out      # 列出最近的，便于抄对 id
+
+
+# ---------------------------------------------------------------- 连续撤销
+
+def test_consecutive_undo_walks_back_through_history(work, cache):
+    """连按两次 /undo-move 应该继续往前撤。
+
+    原来第二次会重新选中已撤销的那批，报「Restored 0 item(s)」——
+    用户自然的手势是"再撤一次"，而不是"再处理同一批"。
+    """
+    first = moves.move([{'from': str(work / 'a.txt'), 'to': 'a.1.txt'}],
+                       cache_dir=cache)
+    second = moves.move([{'from': str(work / 'b.txt'), 'to': 'b.1.txt'}],
+                        cache_dir=cache)
+
+    one = moves.undo(cache)
+    assert one['batch'] == second['journal_id']
+    assert (work / 'b.txt').is_file()
+
+    two = moves.undo(cache)
+    assert two['batch'] == first['journal_id']
+    assert (work / 'a.txt').is_file()
+    assert len(two['restored']) == 1
+
+
+def test_undo_says_so_when_everything_is_undone(work, cache):
+    moves.move([{'from': str(work / 'a.txt'), 'to': 'a.1.txt'}], cache_dir=cache)
+    moves.undo(cache)
+    with pytest.raises(moves.MoveError, match='already been undone'):
+        moves.undo(cache)
+
+
+def test_explicit_undo_of_undone_batch_explains_itself(work, cache):
+    """显式点名已撤销批次：要说清，而不是试一遍再报「文件不见了」。"""
+    batch = moves.move([{'from': str(work / 'a.txt'), 'to': 'a.1.txt'}],
+                       cache_dir=cache)
+    moves.undo(cache)
+    with pytest.raises(moves.MoveError, match='has already been undone'):
+        moves.undo(cache, batch_id=batch['journal_id'])
+
+
+def test_undo_journal_stays_append_only(work, cache):
+    """撤销不改原记录，而是追加一条 undone——历史本身要可追溯。"""
+    moves.move([{'from': str(work / 'a.txt'), 'to': 'a.1.txt'}], cache_dir=cache)
+    before = len((cache / moves.UNDO_NAME).read_text(encoding='utf-8').splitlines())
+    moves.undo(cache)
+    after = len((cache / moves.UNDO_NAME).read_text(encoding='utf-8').splitlines())
+    assert after == before + 1
+
+
+def test_recent_batches_expose_undone_flag(work, cache):
+    first = moves.move([{'from': str(work / 'a.txt'), 'to': 'a.1.txt'}],
+                       cache_dir=cache)
+    moves.move([{'from': str(work / 'b.txt'), 'to': 'b.1.txt'}], cache_dir=cache)
+    moves.undo(cache)          # 撤销最新一批
+    rows = {row['id']: row['undone'] for row in moves.recent_batches(cache)}
+    assert rows[first['journal_id']] is False
