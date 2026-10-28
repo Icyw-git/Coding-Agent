@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -53,10 +54,19 @@ DEFAULT_MAX_ROUNDS = 5
 
 
 def editable(path: str, *, workdir=None) -> bool:
-    """这个路径是否属于可自我改进的范围（Ring 1）。"""
-    root = Path(workdir) if workdir else Path.cwd()
+    """这个路径是否属于可自我改进的范围（Ring 1）。
+
+    相对路径按 **workdir** 解析，不是 cwd——两者不同时（会话工作区与进程目录
+    不一致）按 cwd 解析会把合法的 ``skills/a.md`` 误判成越界。
+    实测踩到：``workdir`` 指向临时目录时 ``editable('skills/a.md')`` 返回 False，
+    于是每一轮都被当成越界丢弃，而且因为早退连状态都不落盘。
+    """
+    root = Path(workdir or Path.cwd()).resolve()
+    target = Path(path)
+    if not target.is_absolute():
+        target = root / target
     try:
-        rel = Path(path).resolve().relative_to(root.resolve()).as_posix()
+        rel = target.resolve().relative_to(root).as_posix()
     except (ValueError, OSError):
         return False
     return any(rel == area.rstrip('/') or rel.startswith(area)
@@ -283,6 +293,43 @@ def explainable(mechanism: str) -> bool:
     return bool(text) and len(text) <= 120
 
 
+#: 会话状态文件名。**必须持久化**：耐心窗口的意义就是跨多轮，而"多轮"可能是
+#: 跨天的多次调用（人不是一口气跑完 5 轮）。状态只在内存里的话，一次重启就把
+#: 观察期清零——本来在等的回归会被误判成"新的一轮"重新开始等。
+SESSION_NAME = 'self-improve-session.json'
+
+
+def _session_path(cache_dir) -> Path:
+    return Path(cache_dir) / SESSION_NAME
+
+
+def load_state(cache_dir) -> dict | None:
+    path = _session_path(cache_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_state(cache_dir, state: dict) -> None:
+    path = _session_path(cache_dir)
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1),
+                       encoding='utf-8')
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def clear_state(cache_dir) -> None:
+    _session_path(cache_dir).unlink(missing_ok=True)
+
+
 class Session:
     """一次有界改进尝试。用 ``begin`` → ``propose`` → ``measure`` → ``decide``。
 
@@ -305,11 +352,51 @@ class Session:
         self.without_best = 0
         self.pending_regression: int | None = 0
         self.changes: list[str] = []
+        self._restore()
+
+    # ---------- 状态持久化 ----------
+    #
+    # 耐心窗口的意义是跨多轮，而"多轮"可能是跨天的多次调用。状态只在内存里的话，
+    # 一次重启就把观察期清零——本来在等的回归会被当成新的一轮重新开始等，
+    # 永远走不到 discard/keep。
+
+    def _snapshot(self) -> dict:
+        return {
+            'goal': self.goal,
+            'metric': self.metric,
+            'max_rounds': self.max_rounds,
+            'rounds': self.rounds,
+            'best': self.best,
+            'without_best': self.without_best,
+            'pending_regression': self.pending_regression,
+            'changes': self.changes,
+        }
+
+    def _restore(self) -> None:
+        """从磁盘接上未完成的会话。
+
+        只恢复**同一目标、同一指标**的会话：换目标等于换了一件事，旧进度没有
+        参照意义。
+        """
+        state = load_state(self.cache_dir)
+        if not state:
+            return
+        if state.get('goal') != self.goal or state.get('metric') != self.metric:
+            return
+        self.rounds = int(state.get('rounds') or 0)
+        self.best = state.get('best') or None
+        self.without_best = int(state.get('without_best') or 0)
+        self.pending_regression = int(state.get('pending_regression') or 0)
+        self.changes = list(state.get('changes') or [])
+
+    def save(self) -> None:
+        save_state(self.cache_dir, self._snapshot())
 
     def baseline(self) -> dict:
         """跑一次基线。后面每轮都与它比。"""
         self.best = {name: spec['measure'](workdir=self.workdir)
                      for name, spec in METRICS.items()}
+        self.save()
         return self.best
 
     def exhausted(self) -> bool:
@@ -389,6 +476,7 @@ class Session:
             self.without_best = 0
         else:
             self.without_best += 1
+        self.save()
         return {'change_id': change_id, 'decision': decision, 'reason': reason,
                 'before': self.best or {}, 'after': after, 'drift': drift}
 

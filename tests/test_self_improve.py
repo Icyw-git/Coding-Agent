@@ -355,3 +355,101 @@ def test_mechanism_is_stored_separately_from_metrics(tmp_path):
     assert row['mechanism'] == '减少重复段落'
     assert row['metric'] == {'round': 1}       # 代码给的
     assert row['decision'] == 'keep'           # 来自判定，不来自 summary
+
+
+# ---------------------------------------------------------------- editable 的 workdir 语义
+
+def test_editable_resolves_relative_paths_against_workdir(tmp_path):
+    """相对路径必须按 workdir 解析，不是 cwd。
+
+    实测踩到的 bug：workdir 指向临时目录时 `editable('skills/a.md')` 返回 False，
+    于是每一轮都被当成越界丢弃，而且因为早退连状态都不落盘。
+    """
+    (tmp_path / 'skills').mkdir()
+    (tmp_path / 'skills' / 'a.md').write_text('v1', encoding='utf-8')
+    assert si.editable('skills/a.md', workdir=str(tmp_path))
+
+
+def test_editable_accepts_absolute_path_under_workdir(tmp_path):
+    (tmp_path / 'skills').mkdir()
+    target = tmp_path / 'skills' / 'a.md'
+    target.write_text('v1', encoding='utf-8')
+    assert si.editable(str(target), workdir=str(tmp_path))
+
+
+def test_editable_still_blocks_outside_workdir(tmp_path):
+    (tmp_path / 'skills').mkdir()
+    assert not si.editable('tests/a.py', workdir=str(tmp_path))
+    assert not si.editable('src/memory.py', workdir=str(tmp_path))
+    assert not si.editable('../escape.md', workdir=str(tmp_path))
+
+
+# ---------------------------------------------------------------- 状态持久化
+
+def _stub_metrics(monkeypatch, sequence, state):
+    def make(name):
+        def measure(*, workdir):
+            return sequence[min(state['i'], len(sequence) - 1)].get(name, {})
+        return measure
+    for name, spec in si.METRICS.items():
+        monkeypatch.setitem(spec, 'measure', make(name))
+
+
+def test_patience_window_survives_restart(tmp_path, monkeypatch):
+    """耐心窗口的意义是跨多轮，而多轮可能跨天。状态只在内存里的话，
+    一次重启就把观察期清零——本来在等的回归永远走不到 discard。"""
+    state = {'i': 0}
+    _stub_metrics(monkeypatch, [_hard(errors=5), _hard(errors=8), _hard(errors=9)],
+                  state)
+    (tmp_path / 'skills').mkdir()
+    (tmp_path / 'skills' / 'a.md').write_text('v1', encoding='utf-8')
+
+    first = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='降 lint')
+    first.baseline()
+    state['i'] = 1
+    assert first.evaluate(['skills/a.md'], summary='r1',
+                          mechanism='调整措辞')['decision'] == 'observe'
+
+    # 模拟重启
+    second = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='降 lint')
+    assert second.rounds == 1
+    assert second.pending_regression == 1
+    state['i'] = 2
+    assert second.evaluate(['skills/a.md'], summary='r2',
+                           mechanism='调整措辞')['decision'] == 'observe'
+
+    third = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='降 lint')
+    assert third.pending_regression == 2
+    assert third.evaluate(['skills/a.md'], summary='r3',
+                          mechanism='调整措辞')['decision'] == 'discard'
+
+
+def test_state_is_not_restored_across_different_goals(tmp_path, monkeypatch):
+    """换目标等于换了一件事，旧进度没有参照意义。"""
+    state = {'i': 0}
+    _stub_metrics(monkeypatch, [_hard(errors=5)], state)
+    (tmp_path / 'skills').mkdir()
+    (tmp_path / 'skills' / 'a.md').write_text('v1', encoding='utf-8')
+
+    first = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='目标 A')
+    first.baseline()
+    second = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='目标 B')
+    assert second.rounds == 0
+    assert second.best is None
+
+
+def test_clear_state_resets_session(tmp_path, monkeypatch):
+    state = {'i': 0}
+    _stub_metrics(monkeypatch, [_hard(errors=5)], state)
+    session = si.Session(cache_dir=tmp_path, workdir=str(tmp_path), goal='g')
+    session.baseline()
+    assert si.load_state(tmp_path) is not None
+    si.clear_state(tmp_path)
+    assert si.load_state(tmp_path) is None
+
+
+def test_corrupt_state_file_is_ignored(tmp_path):
+    (tmp_path / si.SESSION_NAME).write_text('{not json', encoding='utf-8')
+    assert si.load_state(tmp_path) is None
+    # 构造不应因此报错
+    assert si.Session(cache_dir=tmp_path, workdir='.', goal='g').rounds == 0

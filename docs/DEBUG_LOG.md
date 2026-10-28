@@ -8204,3 +8204,69 @@ MINJA（NeurIPS 2025）通过普通用户查询达到 **>95% 注入成功率**�
 台账 mechanism 与 metric 分离存储。
 
 全量 **2809 passed / 3 skipped**（1 个 UI 时序偶发，单跑连跑三次全绿），ruff 通过。
+
+## B3 落地为可用：CLI 入口 + 状态持久化（2026-10-28）
+
+上一轮的 B3 是个**库**：`Session.evaluate()` 存在，但没有任何东西调用它，而且状态
+只在内存里。这轮把它做成真能用的东西。
+
+### 两个缺口
+
+**缺口一：耐心窗口不跨重启。** `pending_regression` 是内存字段。而耐心窗口的意义
+就是跨多轮——多轮可能是跨天的多次调用。一次重启把观察期清零，本来在等的回归会被
+当成新的一轮重新开始等，**永远走不到 discard/keep**。
+
+改成 `self-improve-session.json` 持久化 `rounds / best / without_best /
+pending_regression / changes`，`__init__` 时按 `goal + metric` 匹配恢复。
+
+实测：
+```
+round1: observe
+重启后 rounds/pending: 1 1      ← 接上了
+round2: observe
+再重启 pending: 2
+round3: discard                  ← 终于走到
+```
+
+**缺口二：没有入口。** `/improvements` 只能看台账和回滚，开不了会话。
+
+补三个动词（保持「人驱动」——不自动触发，那正是 RSI 第三层的入口）：
+
+```
+/improvements begin <目标>     跑基线，记住起点
+（人来改 skills/*.md 或 AGENTS.md）
+/improvements check <一句话机制>  测一轮并判定
+/improvements status            看当前会话
+/improvements end               结束会话（台账与快照保留）
+```
+
+`check` 强制要求机制说明——说不清就说明可能不是在改进，而是在优化某个自己没打算
+优化的东西。
+
+### 修掉一个真 bug：`editable` 按 cwd 解析相对路径
+
+做 CLI 验证时发现 `check` 一直返回 `discard / paths outside editable scope`。
+根因：
+
+```python
+rel = Path(path).resolve().relative_to(root.resolve()).as_posix()
+```
+
+`Path('skills/a.md').resolve()` 按**当前工作目录**解析，不是按 `workdir`。两者不同时
+（会话工作区 ≠ 进程目录，正是 CLI 的场景），合法的 `skills/a.md` 被判成越界。
+
+更糟的是它**连锁**：越界分支提前 return，连 `save()` 都不走——所以上面那个"状态没
+落盘"的现象其实是这个 bug 的表象，不是两个独立问题。
+
+**为什么之前的测试没抓到**：所有用例都用 `workdir='.'`，cwd 恰好等于 workdir，
+按 cwd 解析正好也对。这是"测试用了和生产不同的前提"的典型例子。
+
+修法：相对路径先拼到 `root` 上再 resolve。补三条测试锁住（相对路径 / 绝对路径 /
+越界仍拦）。
+
+### 测试
+
+`test_self_improve.py` 扩到 51 条，新增：`editable` 的 workdir 语义（3 条）、
+耐心窗口跨重启、换目标不继承旧进度、`clear_state`、损坏状态文件不报错。
+
+全量 **2817 passed / 3 skipped**，ruff 通过。

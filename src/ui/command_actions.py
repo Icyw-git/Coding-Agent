@@ -356,6 +356,20 @@ class CommandActionsMixin:
 
         arg = (argument or '').strip()
         cache = paths.cache_path()
+        if arg.startswith('begin'):
+            self._improvements_begin(cache, arg[len('begin'):].strip())
+            return
+        if arg.startswith('check'):
+            self._improvements_check(cache, arg[len('check'):].strip())
+            return
+        if arg in ('status', 'session'):
+            self._improvements_status(cache)
+            return
+        if arg.startswith('end'):
+            import self_improve
+            self_improve.clear_state(cache)
+            self._notice('已结束当前改进会话（台账与快照保留）。')
+            return
         if arg.startswith('rollback'):
             change_id = arg[len('rollback'):].strip()
             if not change_id:
@@ -372,6 +386,111 @@ class CommandActionsMixin:
                             + '、'.join(created) if created else ''))
             return
         self._notice(ledger.format_ledger(cache))
+
+    def _improvements_begin(self, cache, goal: str) -> None:
+        """开一个改进会话并跑基线。
+
+        基线是后续每一轮的比较起点，必须现在测——事后再补就没有"改之前"了。
+        """
+        import self_improve
+
+        if not goal:
+            self._notice('用法：/improvements begin <目标>')
+            return
+        existing = self_improve.load_state(cache)
+        if existing and existing.get('goal') != goal:
+            self._notice(
+                f"已有未完成的会话：{existing.get('goal')}"
+                f"（{existing.get('rounds')} 轮）。先 /improvements end 结束它。")
+            return
+        session = self_improve.Session(cache_dir=cache, workdir=self._workdir_for_improve(),
+                                       goal=goal)
+        baseline = session.baseline()
+        self._notice('基线已记录：' + self._describe_metrics(baseline)
+                     + chr(10) + '改完用 /improvements check <一句话机制说明> 判定。')
+
+    def _improvements_check(self, cache, mechanism: str) -> None:
+        """测一轮并判定。
+
+        ``mechanism`` 是强制参数：说不清机制就说明可能不是在改进，而是在优化
+        某个自己没打算优化的东西（这条来自车间经验，见 docs/RSI_2026_RESEARCH.md）。
+        """
+        import self_improve
+
+        state = self_improve.load_state(cache)
+        if not state:
+            self._notice('没有进行中的会话。先用 /improvements begin <目标>。')
+            return
+        if not mechanism:
+            self._notice('需要一句话机制说明：/improvements check <为什么这个改动有用>')
+            return
+        workdir = self._workdir_for_improve()
+        session = self_improve.Session(
+            cache_dir=cache, workdir=workdir, goal=state['goal'],
+            metric=state.get('metric') or 'ruff_errors',
+            max_rounds=int(state.get('max_rounds') or 5))
+        # 本轮碰过哪些文件：用台账里最新一笔的路径；没有就按 Ring 1 全量估。
+        changed = self._improve_scope_paths(workdir)
+        result = session.evaluate(changed, summary=mechanism, mechanism=mechanism)
+        mark = {'keep': '✓ 保留', 'observe': '◐ 观察中', 'discard': '✗ 放弃'}
+        lines = [f"第 {session.rounds} 轮：{mark.get(result['decision'], result['decision'])}",
+                 f"理由：{result['reason']}"]
+        if result.get('after'):
+            lines.append('当前：' + self._describe_metrics(result['after']))
+        if session.exhausted():
+            lines.append('会话已收敛（/improvements end 结束，/improvements 看记录）。')
+        self._notice(chr(10).join(lines))
+
+    def _improvements_status(self, cache) -> None:
+        import self_improve
+
+        state = self_improve.load_state(cache)
+        if not state:
+            self._notice('没有进行中的改进会话。'
+                         '/improvements begin <目标> 开始一次。')
+            return
+        lines = [f"目标：{state.get('goal')}",
+                 f"指标：{state.get('metric')}",
+                 f"轮数：{state.get('rounds')}/{state.get('max_rounds')}",
+                 f"观察中：{state.get('pending_regression') or 0}"
+                 f"/{self_improve.PATIENCE_ROUNDS}"]
+        if state.get('best'):
+            lines.append('基线：' + self._describe_metrics(state['best']))
+        self._notice(chr(10).join(lines))
+
+    def _workdir_for_improve(self):
+        """改进作用于当前工作区（skills/ 与 AGENTS.md 都在那里）。"""
+        import llm_route
+
+        return llm_route.harness().get_workdir()
+
+    def _improve_scope_paths(self, workdir) -> list[str]:
+        """会被本轮判定覆盖的路径：现有的 skills/*.md 与 AGENTS.md。
+
+        不猜"模型刚改了哪个文件"——那要靠比对快照，而快照在登记时才建。
+        直接列全部可改范围，判定更保守（任一个越界都会被拦）。
+        """
+        from pathlib import Path as _Path
+
+        root = _Path(workdir)
+        paths = []
+        skills = root / 'skills'
+        if skills.is_dir():
+            paths += [p.relative_to(root).as_posix()
+                      for p in sorted(skills.rglob('*.md'))]
+        if (root / 'AGENTS.md').is_file():
+            paths.append('AGENTS.md')
+        return paths or ['skills/']
+
+    @staticmethod
+    def _describe_metrics(metrics: dict) -> str:
+        parts = []
+        for values in (metrics or {}).values():
+            if not isinstance(values, dict) or not values:
+                continue
+            for key, value in values.items():
+                parts.append(f'{key}={value}')
+        return ' '.join(parts) or '（无可用指标）'
 
     def handle_memory_quality(self) -> None:
         """`/memories quality`：看异步 LLM 评测的汇总。
