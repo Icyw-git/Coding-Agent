@@ -264,3 +264,20 @@ def test_new_tools_do_not_leak_raw_kwargs():
         text = approval_view.detail(tool, args)
         assert 'moves=' not in text, tool
         assert 'batch_id=' not in text, tool
+
+
+def test_detail_requires_raw_tool_name_not_label():
+    """`detail()` 按工具名分支渲染；传中文标签会静默退化成原始 params。
+
+    实测踩到：为了显示中文，把 `tool_label()` 的结果传进 detail()，
+    于是审批面又变成 ``moves=[{'from': 'a', 'to': 'b'}]``。
+    """
+    label = approval_view.tool_label('move_paths')      # 移动/重命名文件 (move_paths)
+    args = {'moves': [{'from': 'a', 'to': 'b'}]}
+
+    # 传原始名：得到人话
+    assert '移动 1 项' in approval_view.detail('move_paths', args)
+
+    # 传标签：退化（这正是要避免的）
+    degraded = approval_view.detail(label, args)
+    assert "{'from'" in degraded, 'label no longer degrades; guard may be obsolete'

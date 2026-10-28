@@ -243,11 +243,19 @@ def format_pending_approvals() -> str:
         return '  没有待审批操作。'
     lines = ['  待审批操作：']
     for index, request in enumerate(pending, 1):
-        reason = str(request.reason or '').strip() or '未提供原因'
-        tool = str(request.tool or '未知操作')
-        lines.append(f'    {index}. {approval_view.safe_text(f"{tool} · {reason}")}')
+        # 与飞书卡片一致：工具名用中文标签、原因按 code 翻译。
+        # 这两处原来只有飞书做了，终端还显示 `move_paths · moves or renames files`。
+        # 显示用中文标签，但 detail() 要的是**原始工具名**——它按工具名分支渲染
+        # 内容，传标签会匹配不上，退化成把原始 params 打成 key=value。
+        raw_tool = str(request.tool or '')
+        label = approval_view.tool_label(raw_tool)
+        reason = approval_view.reason_zh(
+            getattr(request, 'code', ''),
+            str(request.reason or '').strip()) or '未提供原因'
+        lines.append(f'    {index}. {approval_view.safe_text(label)}'
+                     f' · {approval_view.safe_text(reason)}')
         # 批的就是这条命令：只列工具名等于让人盲批（旧版就是这样）
-        detail = approval_view.detail(tool, request.args)
+        detail = approval_view.detail(raw_tool, request.args)
         lines.extend(f'         {line}' for line in detail.splitlines())
     lines.append('  请使用飞书 /approve 或审批卡片处理；CLI 可回复 /approvals <序号> y|n 决议。')
     return '\n'.join(lines)

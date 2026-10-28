@@ -57,6 +57,48 @@ AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
     'proactive_accepted': ('suggestion_id',),
 }
 
+#: 审计事件的中文名（终端与飞书卡片共用）。用原名会让用户看到 ``desktop_snapshot_failed`` 这种
+#: 标识符——那是给代码读的，不是给人读的。
+EVENT_LABELS = {
+    'approval_timeout': '审批超时',
+    'approval_auto': '自动放行',
+    'policy_denied': '策略拒绝',
+    'permission_revoked': '撤销授权',
+    'screen_captured': '截屏',
+    'screen_ocr': 'OCR',
+    'clipboard_read': '读剪贴板',
+    'clipboard_written': '写剪贴板',
+    'desktop_snapshot': '桌面快照',
+    'desktop_snapshot_failed': '桌面快照失败',
+    'desktop_list_windows': '列出窗口',
+    'desktop_focus': '切换窗口',
+    'desktop_focus_failed': '切换窗口失败',
+    'desktop_action': '桌面操作',
+    'desktop_action_failed': '桌面操作失败',
+    'grant_added': '目录授权',
+    'grant_removed': '撤销目录授权',
+    'domain_added': '域名规则',
+    'domain_removed': '撤销域名规则',
+    'memory_written': '记忆写入',
+    'memory_forgotten': '记忆删除',
+    'memory_redacted': '记忆脱敏',
+    'memory_archived': '记忆归档',
+    'memory_scope': '记忆开关',
+    'proactive_suggested': '主动建议',
+    'proactive_accepted': '采纳建议',
+    'delete_trashed': '删除到回收站',
+    'delete_failed': '删除失败',
+    'moved': '移动文件',
+    'move_preview': '移动预览',
+    'move_rejected': '移动被拒',
+    'move_failed': '移动失败',
+    'moves_undone': '撤销移动',
+    'move_undo_failed': '撤销移动失败',
+    'remind_scheduled': '设置提醒',
+    'remind_rejected': '提醒被拒',
+    'remind_failed': '提醒失败',
+}
+
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 50
 DEFAULT_MAX_FILES = 64

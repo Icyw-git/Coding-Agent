@@ -44,7 +44,8 @@ def test_audit_card_renders_event_details():
     payload = card.audit_card(events, counts={'desktop_action': 1})
     text = str(payload)
     assert '🖱️' in text and 'type · notepad · pid=42 · 2 步' in text
-    assert 'domain_removed' in text and 'deny ads.example.com' in text
+    # 事件名与 scope 都翻成中文（与终端版共用 audit.EVENT_LABELS）
+    assert '撤销域名规则' in text and '拒绝 ads.example.com' in text
     assert 'bash · 等待 300s' in text
     assert '共 3 条' in text
 

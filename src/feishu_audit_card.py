@@ -55,9 +55,20 @@ def _clock(ts) -> str:
         return '时间未知'
 
 
+def _scope_zh(value) -> str:
+    """allow / deny / write 这些字面量要翻成人话。"""
+    return {'allow': '允许', 'deny': '拒绝', 'write': '可写',
+            'read': '只读'}.get(str(value or '').strip().lower(),
+                                str(value or ''))
+
+
 def event_line(event: dict) -> str:
     icon = _ICONS.get(str(event.get('type') or ''), '•')
-    parts = [f"{icon} {_clock(event.get('ts'))}  {event.get('type')}"]
+    # 与终端版共用 audit.EVENT_LABELS：两处都必须给人话，不能一处中文一处英文。
+    import audit
+    kind = str(event.get('type') or '')
+    parts = [f"{icon} {_clock(event.get('ts'))}  "
+             f"{audit.EVENT_LABELS.get(kind, kind)}"]
     detail = _detail(event)
     if detail:
         parts.append(detail)
@@ -70,9 +81,9 @@ def _detail(event: dict) -> str:
     """按事件类型挑最关键的几个字段，不做通用 repr（避免把大对象糊上去）。"""
     kind = str(event.get('type') or '')
     if kind in ('grant_added', 'grant_removed'):
-        return f"{event.get('path', '')} [{event.get('scope', '')}]"
+        return f"{event.get('path', '')} [{_scope_zh(event.get('scope'))}]"
     if kind in ('domain_added', 'domain_removed'):
-        return f"{event.get('scope', '')} {event.get('host', '')}"
+        return f"{_scope_zh(event.get('scope'))} {event.get('host', '')}"
     if kind.startswith('screen_'):
         bits = [str(value) for value in (
             event.get('region'), event.get('lang'),

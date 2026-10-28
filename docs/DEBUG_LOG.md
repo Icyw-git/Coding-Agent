@@ -9574,3 +9574,65 @@ failed = ('处理未完成：' + (hint or str(exc)) + …)
 ### 测试
 
 全量 **2980 passed / 3 skipped**（207s），ruff 通过。
+
+## UX 打磨（十）：并排对照终端与飞书，找「同一功能两个结论」
+
+前九轮都是"读代码找泄漏"。这轮换了方法：**把同一功能的终端输出与飞书输出并排
+渲染**，专门找不一致。这个方法比读代码有效得多——三条不一致里有两条是靠并排
+看出来的，读单个模块时都是"正确"的。
+
+### 不一致 1：`/audit` 终端中文，飞书英文
+
+```
+终端：  01-01 08:00:00 策略拒绝  tool=bash  code=destructive  x
+飞书：  ⛔ 01-01 08:00:00  policy_denied
+        bash · destructive · x
+```
+
+上一轮我只给 `terminal_views` 加了 `_AUDIT_LABELS`，忘了飞书卡片是**另一份实现**。
+
+改：把标签表搬到 `audit.EVENT_LABELS`，两处共用。顺带修了 `_detail` 里
+`scope` 的 `allow`/`deny` 字面量 → 允许/拒绝。
+
+### 不一致 2：`/approvals` 终端原始工具名 + 英文原因
+
+```
+终端：  1. move_paths · moves or renames files
+飞书：  #1 · 移动/重命名文件 (move_paths)
+        原因: 要移动或重命名文件（可用 /undo-move 撤销）
+```
+
+同一批待审批请求，飞书是中文、终端是英文。上一轮我修的是 `feishu_approval_card`，
+**没回头看 `status_report.format_pending_approvals`**。
+
+改：终端版也用 `tool_label()` + `reason_zh(code)`。
+
+### 我自己引入的 bug，下一个手动检查就抓到
+
+修完上面那处，我顺手把 `tool` 变量改成了标签，然后：
+
+```
+待审批操作：
+  1. 移动/重命名文件 (move_paths) · 要移动或重命名文件…
+       moves=[{'from': 'a', 'to': 'b'}]        ← 又变回原始 dict
+```
+
+原因：`detail(tool, args)` **按原始工具名分支渲染**，传标签匹配不上，退化成
+`_pairs(args)`。
+
+这类"参数类型错就静默退化"的接口很危险——它不报错，只是悄悄降级。补了一条
+断言把行为钉住（`test_detail_requires_raw_tool_name_not_label`）。
+
+### 教训
+
+**修一处必须搜同类实现。** 前九轮修的多数是"一个功能两处实现"：
+`_expiry_label`（终端/飞书）、`_AUDIT_LABELS`（终端/飞书）、
+`format_pending_approvals` / `approval_text`（终端/飞书）、
+`cron_text` / `_job_lines`（同一文件内两份）、`_render_memory`（memory 内两份）。
+
+这个仓的界面层没有单一的渲染入口，终端与飞书各写一份是历史形成的。**并排对照
+是发现它们的唯一可靠办法**——读任何单独一份都看不出问题。
+
+### 测试
+
+全量 **2981 passed / 3 skipped**，ruff 通过。
