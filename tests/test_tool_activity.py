@@ -29,8 +29,9 @@ def test_format_line_marks_status_and_background():
     background = tool_activity.format_line('bash', {'command': 'npm build'}, 0.1,
                                            background=True)
 
-    assert ok.startswith('  • bash') and 'pytest -q' in ok and '3.40s ✓' in ok
-    assert '0.02s ✗' in failed
+    # 工具行用中文名（用户在转录里读它，不是开发者日志）
+    assert ok.startswith('  · 执行命令') and 'pytest -q' in ok and '3.40s √' in ok
+    assert '0.02s ×' in failed
     assert '↗后台' in background
 
 

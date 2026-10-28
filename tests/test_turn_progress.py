@@ -15,7 +15,8 @@ def test_format_progress_line_thinking_and_tool():
                                  'elapsed': 7, 'elapsed_text': '00:07'})
 
     assert '思考中' in thinking and '00:05' in thinking
-    assert '正在执行 bash' in tool and '00:07' in tool
+    # 进度行用中文工具名，不暴露 desktop_snapshot 这类标识符
+    assert '正在执行命令' in tool and '00:07' in tool
 
 
 def test_ticker_writes_progress_and_clears_line():

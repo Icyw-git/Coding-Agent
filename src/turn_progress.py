@@ -101,7 +101,14 @@ def format_progress_line(snapshot: dict) -> str:
     elapsed = snapshot.get('elapsed_text') or format_duration(
         snapshot.get('elapsed', 0))
     if snapshot.get('phase') == 'tool':
-        return f"  ⏳ {elapsed} · 正在执行 {snapshot.get('tool') or '工具'}"
+        # 用中文工具名：这一行会被反复覆盖，塞原名会把「已用时」挤掉，
+        # 而「已用时」才是用户等的时候唯一关心的数字。
+        import approval_view
+        current = approval_view.tool_name_zh(snapshot.get('tool'))
+        # 没有中文名时 tool_name_zh 回 '工具'，直接拼会得到「正在工具」。
+        # 动词单独决定，别让兜底词被当宾语。
+        verb = '正在使用工具' if current == '工具' else f'正在{current}'
+        return f'  ⏳ {elapsed} · {verb}'
     return f'  ⏳ {elapsed} · 思考中（Ctrl-C 中断）'
 
 

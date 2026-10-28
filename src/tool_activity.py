@@ -8,6 +8,8 @@ from __future__ import annotations
 _PRIORITY = (
     'command', 'path', 'pattern', 'url', 'query', 'name', 'subject',
     'teammate', 'task', 'todos', 'patch', 'label', 'job_id', 'bg_id',
+    # 新增工具的参数：不给的话工具行上只有裸名字
+    'moves', 'text', 'when', 'batch_id',
 )
 
 
@@ -24,6 +26,10 @@ def summarize(name: str, arguments: dict | None) -> str:
             text = str(value).splitlines()[0] if str(value) else ''
             return text[:60] + ('…' if len(text) > 60 else '')
         if isinstance(value, (list, tuple)):
+            # 元素是 dict 时不能 str()：会打出 {'from': 'a', 'to': 'b'} 这种
+            # 原始容器。移动这类工具补成「3 项」。
+            if any(isinstance(item, dict) for item in value):
+                return f'{len(value)} 项'
             return ', '.join(str(item) for item in value)[:60]
         if isinstance(value, dict):
             continue
@@ -37,11 +43,15 @@ def format_line(name: str, arguments: dict | None, elapsed: float,
                 failed: bool = False, background: bool = False,
                 hint: str = '') -> str:
     """`  • bash  pytest -q  3.40s ✓  → 42 行` 形式的单行活动。"""
-    parts = [f'• {name}{" ↗后台" if background else ""}']
+    # 符号必须 GBK 安全：这一行每次工具调用都打印，`•` `✓` `✗` 在中文 Windows
+    # 控制台上会变成 • ✓ 这种转义串（harden_stdio 只保证不崩）。
+    import approval_view
+    label = approval_view.tool_name_zh(name)
+    parts = [f'· {label}{" ↗后台" if background else ""}']
     detail = summarize(name, arguments)
     if detail:
         parts.append(detail)
-    parts.append(f'{elapsed:.2f}s {"✗" if failed else "✓"}')
+    parts.append(f'{elapsed:.2f}s {"×" if failed else "√"}')
     if hint and not failed:
         parts.append(f'→ {hint}')
     return '  ' + '  '.join(parts)

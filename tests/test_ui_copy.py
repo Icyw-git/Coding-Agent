@@ -133,3 +133,24 @@ def test_help_does_not_expose_internal_surfaces():
     text = help_text()
     for banned in ('TUI commands', 'ported', 'line REPL', 'Skills ('):
         assert banned not in text, f'/help leaks {banned!r}'
+
+
+def test_display_strings_are_gbk_safe():
+    """用户可见文案必须能编码成 GBK。
+
+    ``harden_stdio()`` 只把流设成 backslashreplace——**不崩，但会打印
+    ``\u2713`` 这种转义串**。对每次工具调用都出现的活动行来说，这等于用户
+    看到的是乱码。
+
+    已经踩过两次：台账的 ✓ ✗ ◐、工具活动行的 • ✓ ✗。
+    """
+    bad = []
+    for path, line, text in _display_strings():
+        for char in set(text):
+            try:
+                char.encode('gbk')
+            except UnicodeEncodeError:
+                bad.append(f'{path.relative_to(SRC.parent)}:{line}  {char!r} '
+                           f'(U+{ord(char):04X}) in {text[:40]!r}')
+    assert not bad, ('user-facing text must be GBK-encodable; '
+                     'use √ × · ~ instead of ✓ ✗ • ◐\n  ' + '\n  '.join(bad))

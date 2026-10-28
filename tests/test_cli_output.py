@@ -173,7 +173,10 @@ def test_exec_tool_call_prints_activity_line_on_tty(monkeypatch):
                            on_activity=harness._print_tool_activity)
 
     output = fake.getvalue()
-    assert '• read' in output and 'a.py' in output and '✓' in output
+    # 符号必须 GBK 安全：• ✓ 在中文 Windows 控制台上是转义串
+    assert '· 读文件' in output
+    assert 'a.py' in output
+    assert '√' in output
 
 
 def test_exec_tool_call_is_silent_without_a_tty(capsys, monkeypatch):

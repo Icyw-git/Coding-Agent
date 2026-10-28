@@ -9368,3 +9368,76 @@ No saved sessions.（home=...）                  → 还没有保存的会话�
 
 `tests/test_ui_copy.py`（5 条守卫）+ 若干断言随文案更新。
 全量 **2972 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（七）：工具活动行——每次调用都出现，却暴露原始工具名且 GBK 不安全
+
+继续扫飞书卡片与回合内文案。飞书卡片文案合格（中文、有下一步提示）。
+问题在**工具活动行**：`tool_activity.format_line` 每次工具调用都打印一次。
+
+### 三个问题
+
+```
+• bash  pytest -q  3.40s ✓
+• desktop_snapshot  3.40s ✓          ← 原始工具名，且无参数摘要
+• move_paths  3.40s ✓                ← 连"移什么"都没有
+```
+
+**（a）原始工具名。** 用户在转录里读到的是 `desktop_snapshot`、`move_paths`，
+不是「看前台窗口」「移动文件」。
+
+**（b）`•` `✓` `✗` 全部 GBK 不安全。** 实测三个字符都编不进 GBK——而
+`harden_stdio()` 只保证不崩，于是**每一行工具活动都以 `\u2022` 开头**。
+这是本轮第三次踩同一个坑（台账的 `✓✗◐`、`/audit` 的乱码、现在这里）。
+
+**（c）新工具没有参数摘要。** `_PRIORITY` 里没有 `moves`/`text`/`when`，
+所以 `move_paths`、`remember`、`remind` 在工具行上只有裸名字。
+
+### 改法
+
+```python
+# 符号必须 GBK 安全
+parts = [f'· {label}{" ↗后台" if background else ""}']   # 原 • → ·
+parts.append(f'{elapsed:.2f}s {"×" if failed else "√"}')  # 原 ✗ ✓ → × √
+```
+
+`label` 用新加的 `approval_view.tool_name_zh()`——**只要中文名，不带原名**。
+和审批面的 `tool_label()`（`看前台窗口 (desktop_snapshot)`）分开：审批面需要
+原名对照日志，而活动行是单行、会被反复覆盖，塞原名会挤掉"已用时"。
+
+`_PRIORITY` 补 `moves`/`text`/`when`/`batch_id`。同时修一个必然踩的坑：
+`','.join(str(item) for item in value)` 在元素是 dict 时会打出
+`{'from': 'a', 'to': 'b'}`——遇到 dict 元素改成 `3 项`。
+
+现在的输出：
+
+```
+· 执行命令  ls -la  1.23s √
+· 看前台窗口  1.23s √
+· 移动/重命名文件  2 项  1.23s √
+· 记住一条  周三不看代码  1.23s √
+· 设置提醒  交周报  1.23s √
+```
+
+### 进度行也一并修
+
+`turn_progress.format_progress_line` 同样用原始工具名：
+
+```
+⏳ 00:02 · 正在执行 desktop_snapshot      →  ⏳ 00:02 · 正在看前台窗口
+```
+
+顺带修了一个中文病句：工具名未知时 `tool_name_zh` 回 `工具`，直接拼会得到
+**「正在工具」**。改成按兜底词切换动词（`正在使用工具`）。
+
+### 守卫补第 6 条
+
+`test_display_strings_are_gbk_safe`：用户可见文案必须能编码成 GBK。
+
+这条把"第三次踩同一个坑"变成不可能——`✓ ✗ • ◐` 现在会被 CI 直接挡住，
+并在失败信息里指出该用 `√ × · ~`。
+
+### 测试
+
+`test_ui_copy.py` +1（6 条守卫）、`test_tool_activity.py` / `test_turn_progress.py`
+/ `test_cli_output.py` 断言随文案更新。
+全量 **2973 passed / 3 skipped**，ruff 通过。

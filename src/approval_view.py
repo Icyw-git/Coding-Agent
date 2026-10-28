@@ -146,6 +146,17 @@ _TOOL_LABELS = {
 }
 
 
+def tool_name_zh(tool: str) -> str:
+    """只要中文名，不带原名。
+
+    进度行是**单行、会被反复覆盖**的短文案（``⏳ 2.3s · 正在执行 …``），
+    塞进 ``看前台窗口 (desktop_snapshot)`` 会挤掉真正重要的"已用时"。审批面
+    用 ``tool_label()``（带原名便于对照日志），这里用短名。
+    """
+    name = str(tool or '').strip()
+    return _TOOL_LABELS.get(name) or name or '工具'
+
+
 def tool_label(tool: str) -> str:
     """「中文名 (原名)」；没有中文名时只回原名。
 
