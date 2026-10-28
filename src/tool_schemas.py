@@ -575,7 +575,9 @@ TOOL_SCHEMAS = [{'type': 'function',
  {'type': 'function',
   'function': {'name': 'screen_capture',
                'description': 'Capture the local screen to a PNG and attach it for '
-                              'inspection (requires approval). Use screen_ocr for text.',
+                              'inspection (requires approval). Use screen_ocr for '
+                              'text. Pixels are absolute screen coordinates: the '
+                              'same space desktop_action clicks in.',
                'parameters': {'type': 'object',
                               'properties': {
                                   'screen': {'type': 'string',
@@ -629,6 +631,63 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'each time. Use pid and window_id for a following action.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
+  'function': {'name': 'desktop_inspect',
+               'description': 'List the interactive controls of the foreground window '
+                              'with stable numbers, their type, label, current value and '
+                              'screen rectangle. Read-only. Use this instead of guessing '
+                              'coordinates: find the control, then act on its number. The '
+                              'list is capped and may be truncated. Requires '
+                              'HARNESS_DESKTOP_CONTROL=1 and explicit approval.',
+               'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'desktop_displays',
+               'description': 'List monitors with their physical pixel bounds, work '
+                              'area and DPI scale, and say which monitor the '
+                              'foreground window is on. Read-only. Use it when '
+                              'coordinates look wrong on a scaled or multi-monitor '
+                              'setup. Requires HARNESS_DESKTOP_CONTROL=1 and explicit '
+                              'approval.',
+               'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'desktop_wait',
+               'description': 'Wait inside one call until something appears or '
+                              'disappears, polling the real desktop instead of '
+                              'sleeping and re-checking. Use it after an action that '
+                              'triggers loading, a dialog, a toast, or a new window. '
+                              'Read-only. Requires HARNESS_DESKTOP_CONTROL=1 and '
+                              'explicit approval.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'text': {'type': 'string',
+                                           'description': 'Substring to look for: a '
+                                                          'control name or value, or a '
+                                                          'window title'},
+                                  'target': {'type': 'string',
+                                             'enum': ['control', 'window', 'foreground'],
+                                             'description': "control = a control in the "
+                                                            "foreground window (default); "
+                                                            "window = any visible window "
+                                                            "title; foreground = the "
+                                                            "foreground window's title"},
+                                  'state': {'type': 'string',
+                                            'enum': ['present', 'absent'],
+                                            'description': 'Wait for it to appear '
+                                                           '(default) or disappear'},
+                                  'timeout_ms': {'type': 'integer',
+                                                 'description': 'How long to wait, '
+                                                                '200-30000 ms (default '
+                                                                '5000)'},
+                                  'expected_pid': {'type': 'integer',
+                                                   'description': 'Optional: only '
+                                                                  'consider this process '
+                                                                  '(needs '
+                                                                  'expected_window_id too)'},
+                                  'expected_window_id': {'type': 'string',
+                                                         'description': 'Optional: pair '
+                                                                        'with '
+                                                                        'expected_pid'}},
+                              'required': ['text']}}},
+ {'type': 'function',
   'function': {'name': 'desktop_windows',
                'description': 'List visible top-level windows with pid, window_id and '
                               'title. Read-only; use it to discover a target instead of '
@@ -655,15 +714,36 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'properties': {
                                   'action': {'type': 'string',
                                              'enum': ['move', 'click', 'type', 'key',
-                                                      'scroll', 'sequence']},
+                                                      'scroll', 'sequence', 'element'],
+                                             'description': "element targets a control by "
+                                                            "number from desktop_inspect "
+                                                            "instead of a pixel coordinate"},
+                                  'element': {'type': 'integer',
+                                              'description': 'For action=element: the control '
+                                                             'number from desktop_inspect'},
+                                  'operation': {'type': 'string',
+                                                'enum': ['invoke', 'setvalue', 'toggle',
+                                                         'select', 'expand', 'collapse',
+                                                         'focus'],
+                                                'description': 'For action=element: what to do '
+                                                               'with it (default invoke)'},
+                                  'tree': {'type': 'string',
+                                           'description': 'For action=element: the structure '
+                                                          'fingerprint desktop_inspect '
+                                                          'returned. If the window changed '
+                                                          'since then the action is refused.'},
                                   'expected_pid': {'type': 'integer',
                                                    'description': 'PID from desktop_snapshot'},
                                   'expected_window_id': {'type': 'string',
                                                          'description': 'Hexadecimal window id'},
                                   'x': {'type': 'integer',
-                                        'description': 'Pixel coordinate inside the target window'},
+                                        'description': 'Absolute screen pixel '
+                                                       '(same space as screen_capture '
+                                                       'and screen_ocr); must fall '
+                                                       'inside the target window'},
                                   'y': {'type': 'integer',
-                                        'description': 'Pixel coordinate inside the target window'},
+                                        'description': 'Absolute screen pixel; must '
+                                                       'fall inside the target window'},
                                   'text': {'type': 'string',
                                            'description': 'Text to type, max 1000 characters'},
                                   'key': {'type': 'string',

@@ -571,7 +571,10 @@ def approval_class(tool: str, args) -> str:
     文件工具返回空串：一次「写 a.txt」的批准不该免审同会话的任意路径写入，
     尤其是越界写。按目录的范围授权需要先解析 cwd/工作区，留到路径范围化那一轮。
     """
-    if tool in ('desktop_snapshot', 'desktop_action'):
+    if tool in ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
+                'desktop_displays', 'desktop_windows', 'desktop_action'):
+        # 桌面工具一律不给「同会话同类免审」的键：exec_policy 里它们每次都
+        # 走 ASK，给个可复用的键等于开了后门。清单从 exec_policy 同步。
         return ''
     if tool in ('read', 'write', 'edit', 'apply_patch'):
         return ''

@@ -47,21 +47,27 @@ def capture(screen: str = 'primary', region=None, delay_ms=0, *,
     try:
         shot = screen_capture.capture(
             screen=screen, region=region, delay_ms=delay_ms, runner=runner)
-        target = screen_capture.save_png(shot.png, directory)
+        target = screen_capture.save_png(shot.png, directory, meta={
+            'screen': shot.screen,
+            'width': shot.width, 'height': shot.height,
+            'region': list(shot.region) if shot.region else None,
+            'origin': list(shot.origin),
+        })
     except screen_capture.ScreenError as exc:
         return f'Error: {exc}'
     except OSError as exc:
-        return f'Error: cannot save screenshot: {exc}'
+        return f'截图存不下来：{exc}'
     region_text = (','.join(str(part) for part in shot.region)
                    if shot.region else 'full')
     text = (
-        f'Screenshot saved: {target}\n'
-        f'Size: {shot.width}x{shot.height}px, {len(shot.png)} bytes\n'
-        f'Screen: {shot.screen}, region: {region_text}, '
-        f'capture took {shot.duration_ms}ms\n'
-        f'Displays: {_screen_summary(shot)}\n'
-        'The image is attached in the next user message; inspect it before '
-        'answering. Use screen_ocr with this path to extract text.')
+        f'截图已保存：{target}\n'
+        f'尺寸 {shot.width}x{shot.height}px，{len(shot.png)} 字节\n'
+        f'屏幕 {shot.screen}，区域 {region_text}，用时 {shot.duration_ms}ms\n'
+        f'显示器：{_screen_summary(shot)}\n'
+        f'坐标系：绝对屏幕像素，图片左上角对应屏幕 ({shot.origin[0]},'
+        f'{shot.origin[1]})；desktop_action 的 x/y 用同一套坐标。\n'
+        '图片在接下来的用户消息里，回答前先看一眼。要取文字用 screen_ocr，'
+        '它会直接给出可点击的屏幕坐标。')
     _notify(audit, 'screen_captured', path=str(target), sha1=target.stem,
             bytes=len(shot.png), screen=shot.screen,
             region=list(shot.region) if shot.region else None,
@@ -98,13 +104,26 @@ def _resolve_screenshot(path, directory) -> Path:
     return candidate
 
 
-def _format_lines(lines: list[dict]) -> str:
+def _line_center(line: dict) -> tuple[int, int] | None:
+    bbox = line.get('bbox') or []
+    if len(bbox) != 4:
+        return None
+    x, y, width, height = (int(part) for part in bbox)
+    return x + width // 2, y + height // 2
+
+
+def _format_lines(lines: list[dict], origin: tuple[int, int] | None = None) -> str:
     rendered = []
     for index, line in enumerate(lines[:MAX_OCR_LINES], start=1):
         bbox = ','.join(str(part) for part in line['bbox'])
-        rendered.append(f'{index}. [{bbox}] {line["text"]}')
+        head = f'{index}. '
+        if origin is not None:
+            center = _line_center(line)
+            if center is not None:
+                head += f'@({center[0] + origin[0]},{center[1] + origin[1]}) '
+        rendered.append(f'{head}[{bbox}] {line["text"]}')
     if len(lines) > MAX_OCR_LINES:
-        rendered.append(f'... ({len(lines) - MAX_OCR_LINES} more lines)')
+        rendered.append(f'... (还有 {len(lines) - MAX_OCR_LINES} 行未显示)')
     return '\n'.join(rendered)
 
 
@@ -119,16 +138,31 @@ def ocr(path=None, lang: str = ocr_windows.DEFAULT_LANGUAGE, region=None, *,
     _notify(audit, 'screen_ocr', path=str(target), chars=len(result.text),
             lang=result.language, region=list(result.region) if result.region else None,
             lines=len(result.lines), duration_ms=result.duration_ms)
-    header = (f'OCR ({result.language}) {result.width}x{result.height}px, '
-              f'{len(result.lines)} lines, {len(result.text)} chars, '
-              f'{result.duration_ms}ms · {target}')
+    meta = screen_capture.load_meta(target)
+    origin = None
+    if meta and isinstance(meta.get('origin'), (list, tuple)):
+        try:
+            origin = (int(meta['origin'][0]), int(meta['origin'][1]))
+        except (IndexError, TypeError, ValueError):
+            origin = None
+    header = (f'识别结果（{result.language}）{result.width}x{result.height}px，'
+              f'{len(result.lines)} 行、{len(result.text)} 字，'
+              f'用时 {result.duration_ms}ms · {target}')
     if not result.text.strip() and not result.lines:
-        return f'{header}\nNo text found.'
+        return f'{header}\n没有识别到文字。'
     text = result.text
     if len(text) > MAX_OCR_TEXT_CHARS:
         text = (text[:MAX_OCR_TEXT_CHARS]
-                + f'\n... (truncated; {len(result.text)} chars total)')
-    blocks = [header, text.strip() or '(no plain text)']
+                + f'\n...（截断，原文 {len(result.text)} 字）')
+    blocks = [header, text.strip() or '（没有纯文本内容）']
     if result.lines:
-        blocks.append('Lines (bbox x,y,w,h):\n' + _format_lines(result.lines))
+        if origin is not None:
+            lead = (f'每行的 @(x,y) 是该行中心点的屏幕坐标，'
+                    f'可以直接给 desktop_action 当 x/y 用；方括号里是图像内的 '
+                    f'bbox x,y,w,h。截图原点 ({origin[0]},{origin[1]})。')
+            blocks.append(lead + '\n' + _format_lines(result.lines, origin))
+        else:
+            blocks.append('这张截图没有留下坐标信息（不是 screen_capture 生成的），'
+                          '下面的 bbox 只能按图像像素理解。\n'
+                          + _format_lines(result.lines))
     return '\n\n'.join(blocks)

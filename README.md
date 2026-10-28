@@ -221,7 +221,10 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
 - `screen_ocr` 用 Windows 自带的 WinRT OCR 在本地识别文字，返回纯文本与每行的边界框，
   不联网也不经过视觉模型；不传 `path` 时读最近一张截图，只接受 `.cache/screenshots` 里的文件。
   默认语言 `zh-Hans-CN`，`lang=auto` 跟随系统语言；识别区域可用 `region` 限定。语言包缺失时
-  会列出本机可用语言并提示安装，不会静默返回空文本。
+  会列出本机可用语言并提示安装，不会静默返回空文本。每行会直接给出**中心点的屏幕坐标**
+  （`@(x,y)`）：截图落盘时写了边车 `json` 记下原点，所以 OCR 的「图像像素」能换算成
+  `desktop_action` 要的「绝对屏幕坐标」，中间不用模型自己加偏移。没有边车的截图（手动放进
+  目录的）会明说 bbox 只能按图像像素看。
 - 屏幕工具默认开启，但**每次调用都要审批**（不提供「本会话允许同类」；`never` 档位下按
   fail-closed 直接拒绝，`danger-full-access` + `never` 沿用既有语义放行）；后台与定时回合
   直接拒绝，子代理也拿不到这两个工具。`HARNESS_SCREEN_TOOLS=0` 可整体关闭。从飞书发起的
@@ -235,7 +238,12 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   直接拒绝，子代理也拿不到这两个工具。`HARNESS_CLIPBOARD_TOOLS=0` 可整体关闭。审计事件只记
   字节数/字符数/是否截断/耗时，不记录剪贴板内容或哈希。
 - 桌面输入工具默认**关闭**。显式设置 `HARNESS_DESKTOP_CONTROL=1` 后，`desktop_snapshot` 返回
-  前台窗口标题、进程/PID、窗口句柄与 UI Automation 当前焦点；`desktop_action` 支持单次
+  前台窗口标题、进程/PID、窗口句柄与 UI Automation 当前焦点；`desktop_inspect` 返回一张
+  **裁剪过的控件清单**（编号、中文控件类型、名字、当前值、屏幕矩形、可用操作），并附一个
+  结构指纹；`desktop_wait` 在一次调用里轮询等待（控件或窗口出现/消失，`timeout_ms`
+  200–30000），省掉「sleep + 重新快照 + 再审批」的往返；`desktop_displays` 给出每块
+  显示器的**物理**矩形、工作区与 DPI 缩放，并指出前台窗口在哪块、逻辑坐标要不要乘缩放；
+  `desktop_action` 支持单次
   `move`/`click`/`type`/`key`/`scroll`，也支持 `action=sequence` 把 1–12 个步骤组合成
   一个动作计划（如 点击→输入→回车），**一次审批覆盖整组**，每步执行前脚本内重新校验
   前台窗口身份与敏感词，任何一步命中即中止并报告步骤序号。`click` 可选 `button`
@@ -247,9 +255,18 @@ LLM 审查官自动放行的请求不进待审批队列（登记与决议在同�
   单步文本最多 1000 字符，滚轮前会把光标收拢进目标窗口。密码输入控件和标题/进程/焦点
   名称命中敏感词时拒绝，但这是启发式防误操作，**不是可靠的支付页面识别或 OS 隔离**。
   先使用 `screen_capture` 观察画面（它有独立审批），再取 `desktop_snapshot` 并执行动作或
-  序列；每次动作完成后应重新观察。PowerShell 结果以 base64(UTF-8) 回传（GBK 控制台不碰
+  序列；每次动作完成后应重新观察（动作结果会报前台窗口/焦点/标题有没有变，并明确
+  说明「都没变」不等于「没生效」）。**按编号操作优先于按坐标**：`desktop_inspect` 给出
+  控件编号后，用 `desktop_action` 的 `action=element`（`operation` 取 `invoke`/`setvalue`/
+  `toggle`/`select`/`expand`/`collapse`/`focus`）沿 UIA 直接操作，不动鼠标、不受遮挡和 DPI
+  影响，还能读回控件值验证。元素动作用必须携带 `desktop_inspect` 给的结构指纹，界面在这
+  两步之间变化时会被拒绝（要求重新看一眼），这是刻意的：旧编号可能指向另一个控件。
+  密码框拒绝写入，控件名命中「密码/验证码/支付/提权」时按第四档直接拒绝、不进审批队列。
+  PowerShell 结果以 base64(UTF-8) 回传（GBK 控制台不碰
   中文），坐标为物理像素（`SetProcessDPIAware`，与 `screen_capture` 同一坐标系）。审计记录
   动作类型、步数、目标 PID/HWND、标题哈希与耗时，不记录输入文本。
+  性能与内存的数字用 `python scripts/profile_desktop.py` 复现（遍历耗时 / 回包大小 /
+  Python 侧峰值与泄漏 / token 成本），设计取舍与实测见 `docs/DESKTOP_CONTROL_RESEARCH.md`。
 - 本地通知与空闲感知：`src/notify.py` 通过 Windows Toast 弹系统通知（PowerShell
   `-EncodedCommand` + base64 XML，绕开 GBK 控制台的引号/中文解析问题），10 秒内最多一条，
   失败只返回原因、不抛异常，`HARNESS_NOTIFY=0` 关闭；`src/idle.py` 用 `GetLastInputInfo`

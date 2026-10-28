@@ -85,6 +85,29 @@ _ARG_RULES: tuple[tuple[str, re.Pattern, str], ...] = (
 _FORM_RULES: tuple[tuple[re.Pattern, str], ...] = ()
 
 
+#: 界面控件上的第四档：按**控件名**匹配。
+#:
+#: 和上面的命令规则是两套东西——shell 命令词表对「点一个写着"修改密码"的按钮」
+#: 完全无效，而元素级动作恰恰不经过命令行。这里用 .NET 兼容的简单正则
+#: （不含前后瞻），由 PowerShell 侧对控件名求值。
+#:
+#: 误伤是接受的：点「忘记密码」也会被挡。这一档的定义就是「宁可让用户自己点」。
+_UI_RULES: tuple[str, ...] = (
+    r'(?i)密码|passwo?rd|passcode',
+    r'(?i)验证码|verification code|verify code|one.?time code|(?<![a-z])otp(?![a-z])|'
+    r'2fa|two.factor|双重验证|两步验证',
+    r'(?i)转账|汇款|付款|支付|下单|结算|(?<![a-z])pay(?![a-z])|payment|checkout|(?<![a-z])transfer(?![a-z])|purchase',
+    r'(?i)提权|以管理员身份|管理员权限|run as administrator|elevat|(?<![a-z])uac(?![a-z])',
+)
+
+
+def ui_forbidden_patterns() -> list[str]:
+    """给元素级桌面动作用的控件名模式（.NET 正则语法）。"""
+    if not enabled():
+        return []
+    return list(_UI_RULES)
+
+
 def check(tool: str, args: dict) -> str:
     """返回拒绝语（非空即命中第四档），未命中返回空串。
 

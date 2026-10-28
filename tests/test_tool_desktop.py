@@ -52,8 +52,8 @@ def test_sequence_output_lists_steps_and_audit_counts_them(monkeypatch):
                            {'action': 'type', 'text': 'private text'}],
         expected_pid=42, expected_window_id='ABCD',
         audit=lambda event, **payload: events.append((event, payload)))
-    assert '1. click ok' in output
-    assert '2. type ok' in output
+    assert '1. 点击 完成' in output
+    assert '2. 输入文字 完成' in output
     assert 'private text' not in repr(events)
     assert events[0][0] == 'desktop_action'
     assert events[0][1]['steps'] == 2
@@ -67,7 +67,7 @@ def test_snapshot_unavailable_reports_error(monkeypatch):
     events = []
     output = tool_desktop.snapshot(
         audit=lambda event, **payload: events.append((event, payload)))
-    assert 'No foreground window available (no_foreground_window)' in output
+    assert '当前没有可用的前台窗口（no_foreground_window）' in output
     assert events[0][0] == 'desktop_snapshot'
 
 

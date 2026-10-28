@@ -123,6 +123,9 @@ _TOOL_LABELS = {
     'clipboard_read': '读剪贴板',
     'clipboard_write': '写剪贴板',
     'desktop_snapshot': '看前台窗口',
+    'desktop_inspect': '看界面结构',
+    'desktop_wait': '等界面变化',
+    'desktop_displays': '看显示器',
     'desktop_windows': '列出窗口',
     'desktop_action': '操作键鼠',
     'delete_paths': '删除（进回收站）',
@@ -275,6 +278,12 @@ def _desktop_step_summary(step) -> str:
 def _desktop_detail(tool: str, args: dict) -> str:
     if tool == 'desktop_snapshot':
         return 'inspect foreground window metadata and focused UI control'
+    if tool == 'desktop_inspect':
+        return 'list the interactive controls of the foreground window (read-only)'
+    if tool == 'desktop_wait':
+        return 'wait for a control or window to appear or disappear (read-only)'
+    if tool == 'desktop_displays':
+        return 'list monitors with bounds, work area and DPI scale (read-only)'
     if tool == 'desktop_windows':
         return 'list visible top-level windows (read-only)'
     action = args.get('action') or 'unknown'
@@ -306,6 +315,12 @@ def _desktop_detail(tool: str, args: dict) -> str:
         fields.append(f"amount={args.get('amount', '')}")
     elif action == 'focus':
         fields.append('bring that window to the foreground')
+    elif action == 'element':
+        control = args.get('element')
+        fields.append(f"control #{control if control is not None else '?'}")
+        fields.append(f"operation {args.get('operation') or 'invoke'}")
+        if isinstance(args.get('text'), str):
+            fields.append(f"text length={len(args['text'])}")
     return 'desktop input: ' + ', '.join(fields)
 
 
@@ -476,7 +491,8 @@ def detail(tool: str, args) -> str:
         return safe_text(_screen_detail(tool, args))
     if tool in ('clipboard_read', 'clipboard_write'):
         return safe_text(_clipboard_detail(tool, args))
-    if tool in ('desktop_snapshot', 'desktop_windows', 'desktop_action'):
+    if tool in ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
+               'desktop_displays', 'desktop_windows', 'desktop_action'):
         return safe_text(_desktop_detail(tool, args))
     if tool == 'delete_paths':
         return safe_text(_delete_detail(args))

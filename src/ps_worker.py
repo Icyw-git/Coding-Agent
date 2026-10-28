@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import os
 import shutil
@@ -71,6 +72,23 @@ function Read-Request {
     if (-not $line) { return @{} }
     return $line | ConvertFrom-Json
 }
+'''
+
+#: 引导脚本：真正的 worker 脚本从**标准输入**读进来再编译。
+#:
+#: 为什么不直接 `-Command <整段脚本>`：Windows 命令行上限 32767 字符，而桌面
+#: 能力的脚本（UIA 遍历 + 键鼠注入 + 协议循环）已经 41KB，实测直接启动就是
+#: WinError 206「文件名或扩展名太长」。走 stdin 顺带解决了引号转义与编码问题。
+#:
+#: `[scriptblock]::Create` 而不是 `Invoke-Expression`：前者的 `$script:` 作用域
+#: 属于这个 scriptblock 自己，函数之间共享状态的行为与真实 .ps1 文件一致
+#: （已实测：一个函数写 `$script:X`，另一个函数读得到）。
+BOOTSTRAP = r'''
+$ErrorActionPreference = 'Stop'
+$line = [Console]::In.ReadLine()
+if ($null -eq $line) { exit 2 }
+$code = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line.Trim()))
+& ([scriptblock]::Create($code))
 '''
 
 LOOP = r'''
@@ -138,13 +156,32 @@ class Worker:
         try:
             self._proc = subprocess.Popen(
                 [exe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                 '-WindowStyle', 'Hidden', '-Command', self.script],
+                 '-WindowStyle', 'Hidden', '-Command', BOOTSTRAP],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding='utf-8',
                 errors='replace', bufsize=1, creationflags=flags,
             )
         except OSError as exc:
             raise WorkerError(f'cannot start PowerShell worker: {exc}') from exc
+        self._send_script()
+
+    def _send_script(self) -> None:
+        """把脚本作为第一行交给引导脚本编译。
+
+        写失败说明 PowerShell 已经退出（引导脚本语法错、执行策略被组策略覆盖等），
+        这时把 stderr 尾巴带出来，比让调用方等 ping 超时有用得多。
+        """
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise WorkerError(f'{self.name} worker is not running')
+        encoded = base64.b64encode(self.script.encode('utf-8')).decode('ascii')
+        try:
+            proc.stdin.write(encoded + chr(10))
+            proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise WorkerError(
+                f'cannot hand the script to {self.name} worker: {exc} '
+                f'{self._stderr_tail()}') from exc
 
     def _stop(self) -> None:
         proc, self._proc = self._proc, None

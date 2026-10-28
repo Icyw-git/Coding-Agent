@@ -21,12 +21,13 @@ ORDER = [
     'request_shutdown', 'request_plan', 'review_plan', 'create_worktree',
     'remove_worktree', 'keep_worktree', 'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
-    'desktop_snapshot', 'desktop_windows', 'desktop_action',
+    'desktop_snapshot', 'desktop_inspect', 'desktop_displays', 'desktop_wait',
+    'desktop_windows', 'desktop_action',
     'delete_paths', 'remind', 'move_paths', 'undo_moves',
     'remember', 'forget', 'recall',
 ]
 
-SCHEMA_SHA1 = '0cd1223d88dca6174a23c6dec1c9d59226ac0aff'
+SCHEMA_SHA1 = '76e47d6dd2817ab30ab0b4feed9463d92baf4923'
 
 
 def test_tool_order_is_stable():

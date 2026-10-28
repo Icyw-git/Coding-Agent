@@ -90,6 +90,10 @@
 | `HARNESS_OCR_REGION` | — | 固定 OCR 区域 |
 | `HARNESS_SCREEN_DELAY_MS` | — | 截屏前延迟（等动画） |
 | `HARNESS_DESKTOP_PAYLOAD` | — | 桌面控制的载荷开关（内部用） |
+| `HARNESS_DESKTOP_TREE_NODES` | `120` | `desktop_inspect` 最多列多少个控件（5~400） |
+| `HARNESS_DESKTOP_TREE_DEPTH` | `12` | 界面结构遍历的最大层级（2~40） |
+| `HARNESS_DESKTOP_TREE_MS` | `2500` | 单次遍历的时间预算（毫秒），超了就返回已采集部分；`desktop_wait` 复用这三个值，但每轮最多 80 个控件 / 900ms |
+| `HARNESS_DESKTOP_EXCLUDE_PROCESSES` | — | 逗号分隔的进程名，读无障碍树时直接跳过（病灶 provider 会卡住遍历） |
 
 ## 6. PowerShell worker（性能）
 

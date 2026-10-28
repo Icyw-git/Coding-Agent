@@ -36,6 +36,9 @@ class Capture:
     region: tuple[int, int, int, int] | None
     screens: tuple[dict, ...]
     duration_ms: int
+    #: 截图像素 (0,0) 对应的**绝对屏幕坐标**。OCR 的 bbox 是图像像素，
+    #: 而 desktop_action 要的是屏幕坐标——没有这个原点，两边永远对不上。
+    origin: tuple[int, int] = (0, 0)
 
 
 CAPTURE_SCRIPT = r'''
@@ -227,28 +230,63 @@ def capture(*, screen: str = 'primary', region=None, delay_ms=0,
             height = int(meta['height'])
         except (KeyError, TypeError, ValueError) as exc:
             raise ScreenError('screen metadata is missing width/height') from exc
+        origin = (0, 0)
+        rect = meta.get('rect')
+        if isinstance(rect, (list, tuple)) and len(rect) >= 2:
+            try:
+                origin = (int(rect[0]), int(rect[1]))
+            except (TypeError, ValueError):
+                origin = (0, 0)
         screens = tuple(
             item for item in (meta.get('screens') or []) if isinstance(item, dict))
         return Capture(
             png=data, width=width, height=height, screen=mode,
             region=parsed_region, screens=screens,
             duration_ms=round((time.perf_counter() - started) * 1000),
+            origin=origin,
         )
 
 
-def save_png(data: bytes, directory, *, keep_ms: int | None = None) -> Path:
-    """按内容哈希落盘；`keep_ms` 命中未过期文件时直接复用。"""
+def save_png(data: bytes, directory, *, keep_ms: int | None = None,
+             meta: dict | None = None) -> Path:
+    """按内容哈希落盘；`keep_ms` 命中未过期文件时直接复用。
+
+    ``meta`` 写成同名 `.json` 边车文件。截图之后才 OCR 的时候，只有边车能把
+    「图像像素」换算成「屏幕坐标」；这个原点信息不留下来，后面就只能靠猜。
+    """
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f'{hashlib.sha1(data).hexdigest()}.png'
-    if target.exists():
-        if keep_ms is None:
-            return target
+    digest = hashlib.sha1(data).hexdigest()
+    target = target_dir / f'{digest}.png'
+    sidecar = target_dir / f'{digest}.json'
+    reuse = target.exists()
+    if reuse and keep_ms is not None:
         age = (time.time() - target.stat().st_mtime) * 1000
-        if age <= keep_ms:
-            return target
-    target.write_bytes(data)
+        reuse = age <= keep_ms
+    if not reuse:
+        target.write_bytes(data)
+    if meta is not None:
+        import json
+
+        payload = {**meta, 'sha1': digest, 'captured_at': time.time()}
+        try:
+            sidecar.write_text(json.dumps(payload, ensure_ascii=False),
+                               encoding='utf-8')
+        except OSError:
+            # 边车写失败不该让一次成功的截图变成失败：只是少一个换算信息。
+            pass
     return target
+
+
+def load_meta(png_path) -> dict | None:
+    """读截图的边车元数据；老截图没有边车就返回 None。"""
+    import json
+
+    path = Path(png_path)
+    try:
+        return json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
 
 
 def latest_png(directory) -> Path | None:
@@ -291,6 +329,7 @@ def prune(directory, *, days: int = RETENTION_DAYS, now: float | None = None) ->
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
+                path.with_suffix('.json').unlink(missing_ok=True)
                 removed += 1
         except OSError:
             continue

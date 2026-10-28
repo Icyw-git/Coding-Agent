@@ -11,8 +11,12 @@ from tool_clipboard import read as _clipboard_read_tool
 from tool_clipboard import write as _clipboard_write_tool
 from tool_delete import delete as _delete_tool
 from tool_desktop import action as _desktop_action_tool
+from tool_desktop import displays as _desktop_displays_tool
+from tool_desktop import element_action as _desktop_element_tool
+from tool_desktop import inspect as _desktop_inspect_tool
 from tool_desktop import list_windows as _desktop_list_tool
 from tool_desktop import snapshot as _desktop_snapshot_tool
+from tool_desktop import wait as _desktop_wait_tool
 from tool_documents import (
     ImageResult,  # noqa: F401
     read_document,
@@ -211,6 +215,24 @@ def run_desktop_snapshot() -> str:
     return _desktop_snapshot_tool(audit=_screen_audit)
 
 
+def run_desktop_inspect() -> str:
+    return _desktop_inspect_tool(audit=_screen_audit)
+
+
+def run_desktop_displays() -> str:
+    return _desktop_displays_tool(audit=_screen_audit)
+
+
+def run_desktop_wait(text: str, target: str = 'control', state: str = 'present',
+                     timeout_ms: int | None = None,
+                     expected_pid: int | None = None,
+                     expected_window_id: str | None = None) -> str:
+    return _desktop_wait_tool(
+        target=target, text=text, state=state, timeout_ms=timeout_ms,
+        expected_pid=expected_pid, expected_window_id=expected_window_id,
+        audit=_screen_audit)
+
+
 def run_desktop_windows(limit: int = 20) -> str:
     return _desktop_list_tool(limit=limit, audit=_screen_audit)
 
@@ -220,7 +242,14 @@ def run_desktop_action(action: str, x: int | None = None, y: int | None = None,
                        amount: int | None = None, button: str | None = None,
                        count: int | None = None, expected_pid: int | None = None,
                        expected_window_id: str | None = None,
-                       steps: list | None = None) -> str:
+                       steps: list | None = None, element: int | None = None,
+                       operation: str | None = None,
+                       tree: str | None = None) -> str:
+    if str(action or '').strip().casefold() == 'element':
+        return _desktop_element_tool(
+            operation=operation or 'invoke', element=element, tree=tree,
+            text=text, expected_pid=expected_pid,
+            expected_window_id=expected_window_id, audit=_screen_audit)
     return _desktop_action_tool(
         action, x=x, y=y, text=text, key=key, amount=amount, button=button,
         count=count, steps=steps,
@@ -384,6 +413,9 @@ tool_registry = {
     'forget': run_forget,
     'recall': run_recall,
     'desktop_snapshot': run_desktop_snapshot,
+    'desktop_inspect': run_desktop_inspect,
+    'desktop_displays': run_desktop_displays,
+    'desktop_wait': run_desktop_wait,
     'desktop_windows': run_desktop_windows,
     'desktop_action': run_desktop_action,
     'read_document': run_read_document,

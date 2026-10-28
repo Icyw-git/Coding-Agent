@@ -50,7 +50,7 @@ def test_capture_saves_png_and_returns_image_result(tmp_path):
         runner=_capture_runner(), audit=lambda event, **data: events.append((event, data)))
 
     assert isinstance(result, tool_documents.ImageResult)
-    assert 'Screenshot saved:' in result.text
+    assert '截图已保存：' in result.text
     assert '200x100' not in result.text  # 尺寸来自后端，不是请求区域
     assert '800x600px' in result.text
     attachment = result.images[0]
@@ -82,7 +82,7 @@ def test_capture_reports_unsaveable_directory(tmp_path):
     result = tool_screen.capture(
         directory=blocker, runner=_capture_runner())
 
-    assert result.startswith('Error: cannot save screenshot')
+    assert result.startswith('截图存不下来')
 
 
 def test_ocr_defaults_to_latest_screenshot(tmp_path):
@@ -98,9 +98,9 @@ def test_ocr_defaults_to_latest_screenshot(tmp_path):
         directory=tmp_path, runner=_ocr_runner('hi'),
         audit=lambda event, **data: events.append((event, data)))
 
-    assert 'OCR (zh-Hans-CN)' in result
+    assert '识别结果（zh-Hans-CN）' in result
     assert 'hi' in result
-    assert 'Lines (bbox x,y,w,h):' in result
+    assert '没有留下坐标信息' in result
     assert '1. [10,20,100,18] hi' in result
     assert str(new) in result
     assert events[0][0] == 'screen_ocr'
@@ -148,8 +148,8 @@ def test_ocr_truncates_long_text_and_limits_lines(tmp_path):
         'shot.png', directory=tmp_path,
         runner=_ocr_runner('x' * 20_000, lines))
 
-    assert 'chars total' in result
-    assert '50 more lines' in result
+    assert '原文 20000 字' in result
+    assert '还有 50 行未显示' in result
     assert '250. ' not in result
 
 

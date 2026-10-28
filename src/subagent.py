@@ -23,7 +23,8 @@ _SUBAGENT_EXCLUDED = frozenset({
     'background_output', 'kill_background',
     'screen_capture', 'screen_ocr',
     'clipboard_read', 'clipboard_write',
-    'desktop_snapshot', 'desktop_windows', 'desktop_action',
+    'desktop_snapshot', 'desktop_inspect', 'desktop_wait', 'desktop_displays',
+    'desktop_windows', 'desktop_action',
     'delete_paths',
 })
 
