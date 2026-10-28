@@ -137,6 +137,12 @@ _TOOL_LABELS = {
     'review_plan': '审助手的方案',
     'create_task': '建任务',
     'todo_write': '更新待办',
+    'move_paths': '移动/重命名文件',
+    'undo_moves': '撤销文件移动',
+    'remind': '设置提醒',
+    'remember': '记住一条',
+    'forget': '删除一条记忆',
+    'recall': '查记忆',
 }
 
 
@@ -352,6 +358,54 @@ def _apply_patch_detail(args: dict) -> str:
     return head + chr(10) + chr(10).join(summary)
 
 
+#: 记忆类型的含义。审批时看到 ``type=preference`` 不如看到中文。
+_MEMORY_TYPE_LABELS = {
+    'preference': '偏好',
+    'correction': '纠正',
+    'fact': '事实',
+    'context': '背景',
+}
+
+
+def _move_detail(args) -> str:
+    """移动审批的内容。
+
+    绝不能把原始 args 打成 ``moves=[{'from': ...}]``——用户正是在这里决定
+    "要不要让它动这些文件"，给他一个 Python dict 等于让他无法核对。
+    """
+    moves = args.get('moves')
+    if isinstance(moves, dict):
+        moves = [moves]
+    if not isinstance(moves, list) or not moves:
+        return '（没有可移动的条目）'
+    lines = [f'移动 {len(moves)} 项：']
+    for item in moves[:20]:
+        if not isinstance(item, dict):
+            lines.append(f'  {item}')
+            continue
+        lines.append(f"  {item.get('from') or '?'} -> {item.get('to') or '?'}")
+    if len(moves) > 20:
+        lines.append(f'  … 还有 {len(moves) - 20} 项')
+    if args.get('dry_run') is False:
+        lines.append('（会真的移动文件，可用 /undo-move 撤销）')
+    return chr(10).join(lines)
+
+
+def _memory_detail(tool: str, args) -> str:
+    """记忆审批的内容：说清记什么、删什么，而不是 raw kwargs。"""
+    if tool == 'forget':
+        return f"删除记忆：{args.get('name') or '?'}"
+    if tool == 'recall':
+        query = str(args.get('query') or '').strip()
+        return f'查询记忆：{query}' if query else '列出全部记忆'
+    kind = str(args.get('type') or 'preference')
+    label = _MEMORY_TYPE_LABELS.get(kind, kind)
+    text = ' '.join(str(args.get('text') or '').split())
+    name = str(args.get('name') or '').strip()
+    head = f'记住（{label}）' + (f'：{name}' if name else '')
+    return head + chr(10) + text[:300]
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -367,6 +421,17 @@ def detail(tool: str, args) -> str:
         return safe_text(_desktop_detail(tool, args))
     if tool == 'delete_paths':
         return safe_text(_delete_detail(args))
+    if tool == 'move_paths':
+        return safe_text(_move_detail(args))
+    if tool == 'undo_moves':
+        batch = str(args.get('batch_id') or '').strip()
+        return safe_text(f'撤销批次：{batch}' if batch else '撤销最近一批移动')
+    if tool == 'remind':
+        when = args.get('when') or '?'
+        body = args.get('text') or ''
+        return safe_text(f'提醒时间：{when}' + chr(10) + f'内容：{body}')
+    if tool in ('remember', 'forget', 'recall'):
+        return safe_text(_memory_detail(tool, args))
     if tool == 'write':
         return safe_text(_write_detail(tool, args))
     if tool == 'edit':

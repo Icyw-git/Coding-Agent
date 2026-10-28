@@ -9161,3 +9161,51 @@ UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'
 
 `test_terminal_views.py` +4（中文标签、all 对照表、任何事件都显示 reason、
 乱码历史不崩且 GBK 可编码）。全量 **2953 passed / 3 skipped**。
+
+## UX 打磨（五）：审批面——用户做安全决策的地方
+
+这次扫 `/sessions`、`/workspaces`，但它们不是重点。重点是**审批面**：用户在那里
+决定"要不要让它做这件事"，读不懂就等于没有知情同意。
+
+### 新加的四项工具在审批面上是原始 Python dict
+
+```
+=== move_paths ===
+title:  move_paths
+detail: moves=[{'from': 'a.txt', 'to': 'b.txt'}]
+```
+
+用户要在这一屏决定"要不要让它移动这些文件"，而我们给他一个 dict repr。
+
+**这是五轮扫描里最严重的一处**：不是"不够友好"，是**无法核对**。
+
+根因是 `approval_view._TOOL_LABELS` 和新一轮的 detail 分支都没跟着加。补上：
+
+| 工具 | 标签 | 内容 |
+|---|---|---|
+| `move_paths` | 移动/重命名文件 | `移动 2 项：` + 逐条 `a.pdf -> arch/a.pdf` |
+| `undo_moves` | 撤销文件移动 | `撤销批次：17931` |
+| `remind` | 设置提醒 | `提醒时间：明天下午3点` + `内容：交周报` |
+| `remember` | 记住一条 | `记住（偏好）：pref-wed` + 正文 |
+| `forget` | 删除一条记忆 | `删除记忆：deploy` |
+| `recall` | 查记忆 | `查询记忆：部署` |
+
+几个细节：
+- `move_paths` 在 **超过 20 项时折叠**（`… 还有 10 项`）——审批卡片放不下
+- `dry_run=false` 时附一句 `（会真的移动文件，可用 /undo-move 撤销）`
+- 记忆的 `type=preference` 翻译成「偏好」——审批时看英文枚举没有意义
+
+### 加了一条防回归断言
+
+`test_new_tools_do_not_leak_raw_kwargs`：这些工具的审批面**不能出现**
+`moves=` / `batch_id=` 这类原始 kwargs。以后再加重审批的工具，忘了写 detail
+分支就会被这条挡住。
+
+### `/sessions` 文本输出
+
+一处小问题：`工作区：工作目录未记录` —— 准确但不可操作。不过这是少数情况
+（会话创建时没记录 workspace），且不影响选择，这轮不改。
+
+### 测试
+
+`test_approval_view.py` +10。全量 **2967 passed / 3 skipped**，ruff 通过。

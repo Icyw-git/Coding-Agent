@@ -5,6 +5,7 @@
 用例锁的是「同一份可读内容」，而不是某个 print 的字面排版。
 """
 
+import approval_view
 from approval_view import detail, safe_text, summarize, tool_label
 from exec_policy import approval_class
 from hooks import GATE as permission_gate
@@ -189,3 +190,77 @@ def test_approval_card_shows_the_chinese_label():
     card = fc.approval_card([{'req_id': 'r', 'tool': 'desktop_action',
                               'args': {}, 'reason': 'why'}])
     assert '操作键鼠' in card['elements'][0]['content']
+
+
+# ---------------------------------------------------------------- 新工具的审批面
+
+def test_move_paths_has_chinese_label():
+    """审批面上写 move_paths 等于没写——用户要在这判断要不要让它动文件。"""
+    label = approval_view.tool_label('move_paths')
+    assert '移动' in label
+    assert 'move_paths' in label          # 原名保留，便于对照日志
+
+
+def test_move_paths_detail_is_not_raw_dict():
+    """绝不能把 args 打成 moves=[{'from': ...}]：用户无法核对。"""
+    text = approval_view.detail('move_paths', {'moves': [
+        {'from': 'a.pdf', 'to': 'arch/a.pdf'},
+        {'from': 'b.pdf', 'to': 'arch/b.pdf'}]})
+    assert '移动 2 项' in text
+    assert 'a.pdf -> arch/a.pdf' in text
+    assert "{'from'" not in text
+
+
+def test_move_paths_detail_marks_real_move():
+    text = approval_view.detail('move_paths', {
+        'moves': [{'from': 'a', 'to': 'b'}], 'dry_run': False})
+    assert '/undo-move' in text            # 告诉用户怎么撤销
+
+
+def test_move_paths_detail_caps_long_batches():
+    moves = [{'from': f'f{i}', 'to': f'g{i}'} for i in range(30)]
+    text = approval_view.detail('move_paths', {'moves': moves})
+    assert '还有 10 项' in text
+
+
+def test_undo_moves_detail():
+    assert '17931' in approval_view.detail('undo_moves', {'batch_id': '17931'})
+    assert '最近一批' in approval_view.detail('undo_moves', {})
+
+
+def test_remind_detail_shows_time_and_text():
+    text = approval_view.detail('remind', {'text': '交周报', 'when': '明天下午3点'})
+    assert '明天下午3点' in text
+    assert '交周报' in text
+
+
+def test_remember_detail_translates_type():
+    """type=preference 不如「偏好」直观。"""
+    text = approval_view.detail('remember', {'text': '周三不看代码',
+                                             'type': 'preference'})
+    assert '偏好' in text
+    assert '周三不看代码' in text
+    assert 'preference' not in text
+
+
+def test_forget_detail_says_what_is_deleted():
+    assert 'deploy' in approval_view.detail('forget', {'name': 'deploy'})
+
+
+def test_recall_detail():
+    assert '部署' in approval_view.detail('recall', {'query': '部署'})
+    assert '全部' in approval_view.detail('recall', {})
+
+
+def test_new_tools_do_not_leak_raw_kwargs():
+    """这些工具在审批面上都不能出现 ``key=value`` 形式的原始 kwargs。"""
+    cases = {
+        'move_paths': {'moves': [{'from': 'a', 'to': 'b'}]},
+        'undo_moves': {'batch_id': 'x'},
+        'remind': {'text': 't', 'when': 'w'},
+        'remember': {'text': 't', 'type': 'fact'},
+    }
+    for tool, args in cases.items():
+        text = approval_view.detail(tool, args)
+        assert 'moves=' not in text, tool
+        assert 'batch_id=' not in text, tool
