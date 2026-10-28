@@ -70,7 +70,7 @@ def test_keywords_empty_inputs():
 
 def test_derive_keywords_finds_condition_words():
     """条件偏好的关键词在条件词上——这是它能被召回的前提。"""
-    words = ms.derive_keywords('sleepy-tea', 'when sleepy: prefers tea')
+    words = ms.derive_keywords('when sleepy: prefers tea')
     assert any('sleepy' in w for w in words)
 
 
@@ -178,7 +178,7 @@ def test_same_name_is_strong_signal():
     """名字相同基本就是同一条：模型起名比措辞稳定。"""
     left = {'name': 'deploy', 'description': 'a', 'keywords': ['x']}
     right = {'name': 'deploy', 'description': 'b', 'keywords': ['y']}
-    assert ms.similarity(left, right) >= 0.3
+    assert ms.similarity(left, right) >= 0.15
 
 
 def test_similarity_is_bounded():

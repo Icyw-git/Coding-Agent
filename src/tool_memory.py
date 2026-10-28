@@ -61,12 +61,24 @@ def remember(text: str, *, mem_type: str = 'preference', name: str = '',
             session_id = hooks.current_session_id() or ''
         except Exception:
             pass
-        path = memory.write_memory_file(label, kind, desc, body,
-                                        source=session_id, quote=body[:200])
+        path, action = memory.write_memory_file(
+            label, kind, desc, body, source=session_id, quote=body[:200],
+            confidence=_confidence_for(kind))
     except Exception as exc:
         return f'Error: could not save memory: {type(exc).__name__}: {exc}'
+    if action == 'update':
+        return (f'Updated memory "{label}" (type={kind}) in {path.name}: '
+                'an existing note was close enough to merge into.')
+    if action == 'supersede':
+        return (f'Replaced the earlier note with memory "{label}" (type={kind}) '
+                f'as {path.name}. The old one is archived, not deleted.')
     return (f'Saved memory "{label}" (type={kind}) as {path.name}. '
             'It will be recalled automatically in later sessions.')
+
+
+def _confidence_for(kind: str) -> float:
+    """来源决定初值：用户明确要求的比模型推测的可信。"""
+    return 0.9 if kind in ('preference', 'correction') else 0.6
 
 
 def forget(name: str) -> str:

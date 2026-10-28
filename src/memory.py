@@ -16,6 +16,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import date as _date
+from pathlib import Path
 
 import yaml
 
@@ -25,6 +26,7 @@ import memory_feedback
 import memory_redact
 import memory_schema
 import memory_scope
+import memory_write
 from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
 
@@ -136,43 +138,73 @@ def _atomic_write(path, text: str) -> None:
         raise
 
 
-def _render_memory(name: str, mem_type: str, description: str, body: str,
-                   *, source: str = '', quote: str = '',
-                   scope: str = None, keywords=None, confidence=None,
-                   supersedes: str = '') -> str:
-    """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。
+def _render_entry(entry: dict) -> str:
+    """写盘前的唯一出入口：先脱敏，再渲染。
 
-    写盘前对 description/body 做凭据脱敏：记忆是长期状态，一条 .env 内容被
-    记下来之后每次会话都会被召回，泄露面比会话本身大得多（会话能删，记忆
-    会一直跟着）。
-
-    ``source`` / ``quote`` 记「这条记忆从哪来」：用户原话片段 + 会话 id。
-    没有它就只能猜——TIME 那篇调查批评的正是不可观察的长期档案。
+    所有写入（新增 / 合并 / 覆盖）都必须走这里——记忆是长期状态，一条 .env 内容
+    被记下来之后每次会话都会被召回，泄露面比会话本身大得多（会话能删，记忆会
+    一直跟着）。
     """
     def one_line(value) -> str:
         return ' '.join(str(value or '').split())
 
-    safe_desc, desc_hits = memory_redact.redact(str(description or ''))
-    safe_body, body_hits = memory_redact.redact(str(body or ''))
-    safe_quote, quote_hits = memory_redact.redact(str(quote or ''))
+    safe_desc, desc_hits = memory_redact.redact(str(entry.get('description') or ''))
+    safe_body, body_hits = memory_redact.redact(str(entry.get('body') or ''))
+    safe_quote, quote_hits = memory_redact.redact(str(entry.get('source_quote') or ''))
     hits = sorted(set(desc_hits) | set(body_hits) | set(quote_hits))
     if hits:
         _record_redaction(hits)
-    entry = {
+
+    name = one_line(entry.get('name'))
+    # 关键词也必须脱敏：它们是**从原始描述派生**的，不处理就会把密钥写进
+    # frontmatter（实测泄过一次：`keywords: api,key,sk-abcdef...`）。
+    raw_keywords = (memory_schema.normalize_keywords(entry.get('keywords'))
+                    or memory_schema.derive_keywords(safe_desc or name))
+    safe_keywords = [_clean_keyword(word) for word in raw_keywords]
+    prepared = {
+        **entry,
         'name': name,
         'description': safe_desc,
+        'body': safe_body,
+        'source_quote': safe_quote[:200],
+        'last_update_date': (entry.get('last_update_date')
+                             or memory_schema.today()),
+        'keywords': [word for word in safe_keywords if word],
+    }
+    return memory_schema.render_document(prepared)
+
+
+def _clean_keyword(word: str) -> str:
+    """单个关键词过一遍脱敏；命中则整词丢弃。
+
+    丢弃而不是替换成 ``[redacted:x]``：关键词是检索用的碎片，带一段替换标记
+    既召不回也污染索引。
+    """
+    cleaned, hits = memory_redact.redact(word)
+    return '' if hits else cleaned
+
+
+def _render_memory(name: str, mem_type: str, description: str, body: str,
+                   *, source: str = '', quote: str = '', scope: str = None,
+                   keywords=None, confidence=None, supersedes: str = '') -> str:
+    """按字段渲染一条记忆（``_render_entry`` 的字段式入口）。
+
+    合并路径拿到的是一个条目 dict，走 ``_render_entry``；这里只是把字段拼成
+    dict 再委托过去，保证**两者共用同一套脱敏与序列化**。
+    """
+    return _render_entry({
+        'name': name,
+        'description': description,
         'type': mem_type,
+        'body': body,
         'scope': scope or memory_schema.DEFAULT_SCOPE,
-        'keywords': (memory_schema.normalize_keywords(keywords)
-                     or memory_schema.derive_keywords(name, safe_desc, safe_body)),
+        'keywords': keywords,
         'confidence': (memory_schema.DEFAULT_CONFIDENCE
                        if confidence is None else confidence),
-        'last_update_date': memory_schema.today(),
         'supersedes': supersedes,
         'source_session': source,
-        'source_quote': safe_quote[:200],
-    }
-    return memory_schema.render_frontmatter(entry) + f'\n{safe_body}\n'
+        'source_quote': quote,
+    })
 
 
 def _audit(event: str, payload: dict) -> None:
@@ -197,27 +229,97 @@ def _record_redaction(kinds: list[str]) -> None:
     })
 
 
-def write_memory_file(name: str, mem_type: str, description: str, body: str,  # 保存记忆文件
-                      *, source: str = '', quote: str = ''):
+def write_memory_file(name: str, mem_type: str, description: str, body: str,
+                      *, source: str = '', quote: str = '', scope: str = None,
+                      confidence: float | None = None,
+                      supersedes: str = '', keywords=None) -> tuple[Path, str]:
+    """写一条记忆，返回 ``(路径, 动作)``。动作是 add / update / supersede。
+
+    写入前决定怎么落盘（``memory_write.decide``）：同一个偏好的多个措辞版本在
+    召回时可能互相矛盾，合并时又要靠模型重新判定，确定性去重比事后补救便宜。
+
+    ``supersedes`` 是**显式**的"我修正了哪一条"（记忆名或文件名）。它优先于
+    相似度推测：一条修正和它纠正的错误内容，字面相似度往往不高（措辞本来就会变），
+    而抽取提示词里已经有现有记忆清单，让模型直接指认比猜准得多。
+
+    调用方持有写锁。
+    """
     with _write_guard():
-        written = _write_memory_file_unlocked(name, mem_type, description, body,
-                                              source=source, quote=quote)
+        result = _write_memory_file_unlocked(
+            name, mem_type, description, body, source=source, quote=quote,
+            scope=scope, confidence=confidence, supersedes=supersedes,
+            keywords=keywords)
     _audit('memory_written', {'name': str(name), 'type': str(mem_type),
                               'chars': len(str(body or ''))})
-    return written
+    return result
 
 
 def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
                                body: str, *, source: str = '',
-                               quote: str = ''):
+                               quote: str = '', scope: str = None,
+                               confidence: float | None = None,
+                               supersedes: str = '', keywords=None):
     h = _h()
     h.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = h.MEMORY_DIR / f'{_slug(name)}.md'
-    _atomic_write(filepath, _render_memory(name, mem_type, description, body,
-                                           source=source, quote=quote))
+
+    draft = {
+        'name': name,
+        'description': description,
+        'type': memory_schema.canonical_type(mem_type),
+        'body': body,
+        'scope': scope or memory_schema.DEFAULT_SCOPE,
+        'confidence': (memory_schema.DEFAULT_CONFIDENCE
+                       if confidence is None else confidence),
+        'last_update_date': memory_schema.today(),
+        'source_session': source,
+        'source_quote': quote,
+    }
+    draft['keywords'] = (memory_schema.normalize_keywords(keywords)
+                         or memory_schema.derive_keywords(description or name))
+
+    existing = list_memory_files()
+    action, target = memory_write.decide(draft, existing, supersedes=supersedes)
+    target_name = f"{_slug(name)}.md"
+    if action == memory_write.SUPERSEDE and target['filename'] == target_name:
+        # 新旧同名 = 同一个文件：不是替换而是写入。若真按 supersede 处理，
+        # 会把刚写好的新内容归档掉，那一条记忆就凭空消失了（实测踩到）。
+        action = memory_write.UPDATE
+    if action == memory_write.UPDATE:
+        entry = memory_write.merge(draft, target)
+        filepath = h.MEMORY_DIR / target['filename']
+        _atomic_write(filepath, _render_entry(entry))
+    else:
+        entry = dict(draft)
+        if action == memory_write.SUPERSEDE:
+            entry['supersedes'] = target['filename']
+        filepath = h.MEMORY_DIR / target_name
+        _atomic_write(filepath, _render_entry(entry))
+        if action == memory_write.SUPERSEDE:
+            _retire(target, superseded_by=filepath.name)
+
     _cache_drop(filepath)
-    _rebuild_index_unlocked()  # 重建记忆索引
-    return filepath
+    _rebuild_index_unlocked()
+    return filepath, action
+
+
+def _retire(entry: dict, *, superseded_by: str) -> None:
+    """让一条被修正的记忆退出召回：标记 superseded_by 后移入 .archive/。
+
+    归档而不是删除：既有约束是不删用户数据，`/memories archived` 仍能看到。
+    留在 MEMORY_DIR 里会让它继续被扫到（list_memory_files 靠 superseded_by 过滤），
+    两个机制交叠反而难排查，所以只保留一个。
+    """
+    h = _h()
+    old_path = h.MEMORY_DIR / entry['filename']
+    if not old_path.is_file():
+        return
+    text = old_path.read_text(encoding='utf-8', errors='replace')
+    meta, body = _parse_frontmatter(text)
+    retired = {**memory_schema.normalize_entry(meta, body, entry['filename']),
+               'superseded_by': superseded_by}
+    _atomic_write(old_path, _render_entry(retired))
+    _cache_drop(old_path)
+    memory_aging.archive(h.MEMORY_DIR, {'filename': entry['filename']})
 
 
 def _rebuild_index():
@@ -600,7 +702,10 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             desc = ' '.join(str(mem.get('description') or '').split())
             body = str(mem.get('body') or '').strip()
             if desc and body:
-                write_memory_file(name, mem_type, desc, body)  # 写入新记忆文件
+                write_memory_file(
+                    name, mem_type, desc, body,
+                    keywords=mem.get('keywords'),
+                    supersedes=str(mem.get('supersedes') or ''))
                 count += 1
         if count:
             print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
@@ -664,8 +769,10 @@ def _replace_memory_files(prepared: list[dict]) -> None:
             staged = {}
             for item in prepared:
                 path = staging / f"{item['slug']}.md"
-                _atomic_write(path, _render_memory(
-                    item['name'], item['type'], item['description'], item['body']))
+                _atomic_write(path, _render_entry({
+                    'name': item['name'], 'type': item['type'],
+                    'description': item['description'], 'body': item['body'],
+                }))
                 meta, _body = _parse_frontmatter(path.read_text(encoding='utf-8'))
                 if (str(meta.get('name')) != item['name']
                         or str(meta.get('type')) != item['type']):

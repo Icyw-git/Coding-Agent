@@ -174,20 +174,28 @@ def normalize_scope(value) -> str:
     return text if text in SCOPES else DEFAULT_SCOPE
 
 
-def derive_keywords(name: str, description: str, body: str = '') -> list[str]:
-    """没有显式 keywords 时，从名字/描述里兜底抽几个词。
+def derive_keywords(text: str) -> list[str]:
+    """从描述里抽关键词（描述为空时调用方传名字）。
 
-    只做最朴素的切分（英文词 + 中文二元组），够本地关键词召回用。
-    正文不参与：正文长，会把稀有词权重稀释。
+    **不把 name 混进来**：name 在 ``similarity()`` 里已经单独加权，再进关键词会让
+    "同内容不同名"的 Jaccard 被稀释（实测：`deploy` 与 `deploy-v2` 会因此卡在
+    0.7，永远达不到 UPDATE 阈值）。
+
+    也不含正文：正文长，会把稀有词权重稀释。
     """
-    text = f'{name} {description}'
     words = re.findall(r'[A-Za-z][A-Za-z0-9_\-]{2,}', text)
+    # 数字必须留：版本号、端口、日期、次数、编组号靠它区分。丢掉会让
+    # "item number 0" 与 "item number 1"、"话题0" 与 "话题1" 变成同一个
+    # 关键词集合而互相合并（两种写法都实测踩到过）。
+    # 不能用 `\b\d+\b`：CJK 与数字相邻时 `\b` 不成立（中文被当作 word 字符），
+    # "话题0" 里的 0 会整个漏掉。
+    numbers = re.findall(r'\d+', text)
     cjk = re.sub(r'[^\u4e00-\u9fff]', ' ', text)
     bigrams = []
     for run in cjk.split():
         if len(run) >= 2:
             bigrams.extend(run[i:i + 2] for i in range(len(run) - 1))
-    return normalize_keywords(words + bigrams)
+    return normalize_keywords(numbers + words + bigrams)
 
 
 def normalize_entry(meta: dict, body: str, filename: str) -> dict:
@@ -201,7 +209,7 @@ def normalize_entry(meta: dict, body: str, filename: str) -> dict:
     mem_type = normalize_type(meta.get('type'))
     keywords = normalize_keywords(meta.get('keywords'))
     if not keywords:
-        keywords = derive_keywords(name, description, body)
+        keywords = derive_keywords(description or name)
     return {
         'filename': filename,
         'name': name,
@@ -246,10 +254,25 @@ def render_frontmatter(entry: dict) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def render_document(entry: dict) -> str:
+    """完整文档 = frontmatter + 正文。调用方负责先做脱敏。"""
+    body = str(entry.get('body') or '')
+    return render_frontmatter(entry) + f'\n{body}\n'
+
+
 def similarity(left: dict, right: dict) -> float:
     """两条记忆的相似度 0..1，用于 update-vs-add 判定。
 
-    组成：关键词 Jaccard（主）+ 名字精确相同（强信号）+ 描述二元组重合（辅）。
+    三项加权，缺一不可：
+
+    - **关键词 Jaccard（0.55）**：内容重叠的主体信号。
+    - **名字精确相同（0.15）**：辅助。同名但关键词完全不同不该自动合并
+      （那是两件事），所以给不高。
+    - **描述二元组（0.30）**：**不能低**。只靠关键词时，同一段模板化的短描述
+      （"item number 0" / "item number 1"）会被当成同一条而互相吞掉——实测踩到
+      两次（并发写入测试只剩 1 个文件）。
+
+    实测锚点：同内容不同名 → 0.85（能合并）；不同内容 → < 0.2（不合并）。
     不做向量：本地零往返是硬约束，见 docs/PERSONAL_AGENT_LEARNING_RSI_DESIGN.md。
     """
     left_keys = {k.casefold() for k in normalize_keywords(left.get('keywords'))}
@@ -272,7 +295,7 @@ def similarity(left: dict, right: dict) -> float:
     else:
         desc = 0.0
 
-    return min(1.0, 0.6 * jaccard + 0.3 * same_name + 0.1 * desc)
+    return min(1.0, 0.55 * jaccard + 0.15 * same_name + 0.30 * desc)
 
 
 def _bigrams(text: str) -> set[str]:

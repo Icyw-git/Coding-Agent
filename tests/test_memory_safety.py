@@ -89,7 +89,7 @@ def test_memory_name_cannot_escape_directory(monkeypatch, tmp_path):
     monkeypatch.setattr(harness, 'MEMORY_DIR', mem)
     monkeypatch.setattr(harness, 'MEMORY_INDEX', mem / 'MEMORY.md')
     for name in ('../evil', '..\\evil', '/etc/passwd', 'a/b'):
-        path = harness.write_memory_file(name, 'user', 'd', 'b')
+        path, _action = harness.write_memory_file(name, 'user', 'd', 'b')
         assert path.parent == mem, path
         assert mem in path.parents
     assert not (tmp_path / 'evil.md').exists()
@@ -114,8 +114,13 @@ def test_concurrent_writes_keep_index_consistent(monkeypatch, tmp_path):
     def worker(prefix):
         try:
             for index in range(5):
-                harness.write_memory_file(f'{prefix}-{index}', 'user',
-                                          f'{prefix} 描述', f'{prefix} 正文')
+                # 内容必须真正不同：写入策略会合并"同一条信息的不同措辞"，
+                # 只差一个字母的描述（a/b 开头）本来就会被当成同一条。
+                # 这里测的是并发写索引，不是去重。
+                harness.write_memory_file(
+                    f'{prefix}-{index}', 'user',
+                    f'{prefix} 主题{index} 的部署说明',
+                    f'{prefix} 正文{index} 关于构建与发布的细节')
         except Exception as exc:  # pragma: no cover - 失败即测试失败
             errors.append(exc)
 
