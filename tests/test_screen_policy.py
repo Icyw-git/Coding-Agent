@@ -38,7 +38,7 @@ def test_screen_tools_ignore_the_session_whitelist(config, monkeypatch):
     monkeypatch.setattr(hooks.GATE, 'session_allows', lambda *a, **k: True)
     asked = []
 
-    def decide(tool, args, reason):
+    def decide(tool, args, reason, **kw):
         asked.append(tool)
         return True, 'ok'
 
@@ -53,7 +53,7 @@ def test_other_approvals_still_honour_the_whitelist(config, monkeypatch):
     monkeypatch.setattr(hooks.GATE, 'session_allows', lambda *a, **k: True)
     asked = []
     monkeypatch.setattr(hooks.GATE, 'decide',
-                        lambda tool, args, reason: asked.append(tool) or (True, 'ok'))
+                        lambda tool, args, reason, **kw: asked.append(tool) or (True, 'ok'))
 
     assert hooks.enforce('web_fetch', {'url': 'https://example.com'},
                          interactive=True) is None
@@ -64,7 +64,7 @@ def test_disabled_screen_tools_are_denied_before_asking(config, monkeypatch):
     monkeypatch.setenv('HARNESS_SCREEN_TOOLS', '0')
     asked = []
     monkeypatch.setattr(hooks.GATE, 'decide',
-                        lambda tool, args, reason: asked.append(tool) or (True, 'ok'))
+                        lambda tool, args, reason, **kw: asked.append(tool) or (True, 'ok'))
 
     message = hooks.enforce('screen_capture', {'screen': 'primary'},
                             interactive=True)

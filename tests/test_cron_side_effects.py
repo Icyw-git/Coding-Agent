@@ -82,7 +82,7 @@ def test_read_only_turn_denies_writes_network_and_coordination(workspace):
 def test_side_effect_job_approves_through_queue_not_stdin(workspace, monkeypatch):
     asked = []
 
-    def queued(tool, args, reason):
+    def queued(tool, args, reason, **kw):
         asked.append((tool, reason))
         return True, 'approved'
 

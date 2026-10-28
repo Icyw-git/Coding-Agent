@@ -41,7 +41,11 @@ def _request_block(req: dict, index: int, budget: int) -> tuple[str, list[dict]]
     """单条请求的正文与按钮；预算用于控制整卡长度。"""
     tool = approval_view.safe_text(
         approval_view.tool_label(req.get('tool')))
-    reason = _clip(approval_view.safe_text(req.get('reason') or ''), MAX_REASON_CHARS)
+    # 按 code 给中文解释：req['reason'] 是写给模型的英文
+    # （"moves or renames files (reversible via undo_moves...)"）。
+    reason = _clip(approval_view.safe_text(
+        approval_view.reason_zh(req.get('code'), req.get('reason'))),
+        MAX_REASON_CHARS)
     detail = approval_view.detail(tool, req.get('args') or {})
     if detail and len(detail) > budget:
         detail = _clip(detail, budget)
@@ -114,13 +118,18 @@ def approval_text(requests: list[dict]) -> str:
     blocks = []
     for index, req in enumerate(requests, 1):
         tool = approval_view.safe_text(req.get('tool') or '工具')
-        reason = _clip(approval_view.safe_text(req.get('reason') or ''), MAX_REASON_CHARS)
+        # 按 code 给中文解释：req['reason'] 是写给模型的英文
+        # （"moves or renames files (reversible via undo_moves...)"）。
+        reason = _clip(approval_view.safe_text(
+            approval_view.reason_zh(req.get('code'), req.get('reason'))),
+            MAX_REASON_CHARS)
         detail = approval_view.detail(tool, req.get('args') or {})
         if detail:
             detail = _clip(detail, 600)
         tail = 'y' if index == 1 else f'y{index}'
         no = 'n' if index == 1 else f'n{index}'
-        blocks.append(f'#{index} · {tool}\n原因: {reason}'
+        blocks.append(f'#{index} · {approval_view.tool_label(req.get("tool"))}'
+                      f'\n原因: {reason}'
                       + (f'\n```\n{detail}\n```' if detail else '')
                       + f'\n回复 {tail} 允许 / {no} 拒绝')
     return chr(10).join(blocks[:MAX_DETAIL_ITEMS]) + (

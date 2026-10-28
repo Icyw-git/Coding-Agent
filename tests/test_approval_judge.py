@@ -204,7 +204,7 @@ def test_judge_skipped_for_headless_threads(monkeypatch):
     monkeypatch.setattr(harness, 'client', client)
     queued = []
     monkeypatch.setattr(hooks.GATE, 'decide_queued',
-                        lambda tool, args, reason: queued.append(tool) or (True, ''))
+                        lambda tool, args, reason, **kw: queued.append(tool) or (True, ''))
 
     assert hooks.enforce('bash', {'command': 'python -m pytest'},
                          interactive=False) is None

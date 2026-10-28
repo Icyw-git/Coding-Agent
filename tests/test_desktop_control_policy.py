@@ -36,7 +36,7 @@ def test_desktop_control_never_uses_session_allow(monkeypatch):
     monkeypatch.setattr(hooks.GATE, 'session_allows', lambda *args, **kwargs: True)
     asked = []
     monkeypatch.setattr(hooks.GATE, 'decide',
-                        lambda tool, args, reason: asked.append(tool) or (True, 'ok'))
+                        lambda tool, args, reason, **kw: asked.append(tool) or (True, 'ok'))
     assert hooks.enforce('desktop_action', {'action': 'click'}, interactive=True) is None
     assert asked == ['desktop_action']
 

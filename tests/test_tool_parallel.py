@@ -111,7 +111,7 @@ def test_bash_batch_with_mutable_command_serializes(tmp_path, monkeypatch):
     monkeypatch.setattr(harness, 'tool_registry', {'bash': rec})
     # 本测的是调度串并行，不测审批：解释器命令会触发 ASK，直接放行
     monkeypatch.setattr(hooks.GATE, 'decide',
-                        lambda tool, args, reason: (True, 'approved-by-test'))
+                        lambda tool, args, reason, **kw: (True, 'approved-by-test'))
     _memory_isolated(tmp_path, monkeypatch)
     store = SessionEventStore(tmp_path, session_id='bash-serial')
     fake = tcm.FakeCompletions([

@@ -102,9 +102,9 @@ def test_different_class_still_requires_approval(remote_gate, monkeypatch):
     called = []
     original = GATE.decide
 
-    def tracking(tool, args, reason):
+    def tracking(tool, args, reason, **kwargs):
         called.append(tool)
-        return original(tool, args, reason)
+        return original(tool, args, reason, **kwargs)
 
     monkeypatch.setattr(GATE, 'decide', tracking)
     results = {}

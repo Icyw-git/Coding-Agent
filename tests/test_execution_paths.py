@@ -67,7 +67,8 @@ def asks(monkeypatch):
     """把交互式审批（GATE.decide）换成「一律批准」并记录问了什么，不读 stdin。"""
     recorded = []
 
-    def decide(tool, args, reason):
+    def decide(tool, args, reason, **_kwargs):
+        # 真实 GATE.decide 还有 code= 参数（审批面按它给中文解释）
         recorded.append(args.get('command', args))
         return True, 'approved'
 
@@ -113,7 +114,7 @@ def test_hook_approval_reaches_the_tool_boundary_once(env, asks):
 
 
 def test_denied_approval_leaves_no_grant(env, monkeypatch):
-    monkeypatch.setattr(GATE, 'decide', lambda *a: (False, 'denied'))
+    monkeypatch.setattr(GATE, 'decide', lambda *a, **kw: (False, 'denied'))
     assert hooks.permission_hook('bash', {'command': 'del f'}) \
         == 'Permission denied by user'
     assert hooks.current_grants() == frozenset()

@@ -9441,3 +9441,71 @@ parts.append(f'{elapsed:.2f}s {"×" if failed else "√"}')  # 原 ✗ ✓ → �
 `test_ui_copy.py` +1（6 条守卫）、`test_tool_activity.py` / `test_turn_progress.py`
 / `test_cli_output.py` 断言随文案更新。
 全量 **2973 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（八）：审批卡片的「原因」是写给模型的英文
+
+继续扫飞书卡片。`feishu_approval_card` 的详情已经用 `approval_view.detail`（中文），
+但**原因那一行是英文**：
+
+```
+#1 · bash
+原因: destructive command
+```
+
+这行来自 `Decision.reason`——**写给模型看的**，例如：
+
+```
+moves or renames files (reversible via undo_moves, but still changes the filesystem)
+```
+
+而用户正是在这一屏决定要不要批准。给他一句英文技术描述，等于没解释。
+
+### 改法：按 code 映射，不按文本替换
+
+`Decision` 本来就有稳定的 `code`（`destructive` / `move_paths` / `secret_egress`…），
+只是它没被传到审批请求里。补上整条链路：
+
+```
+Decision.code → GATE.decide(code=…) → PermissionRequest.code → reason_zh()
+```
+
+`approval_view.reason_zh(code, reason)` 用 28 条映射给出人话：
+
+| code | 中文 |
+|---|---|
+| `destructive` | 看起来是破坏性命令 |
+| `opaque_command` | 命令里含有无法静态判断的部分（解释器、变量展开等） |
+| `secret_egress` | 命令同时提到了秘密文件和对外发送 |
+| `move_paths` | 要移动或重命名文件（可用 /undo-move 撤销） |
+| `forget_memory` | 要永久删除一条记忆（不可恢复） |
+| … | … |
+
+没有映射时**退回原文**——宁可显示英文，也不丢掉信息。
+
+现在卡片显示：
+
+```
+#2 · 移动/重命名文件 (move_paths)
+原因: 要移动或重命名文件（可用 /undo-move 撤销）
+```
+
+**为什么不用文本替换**：`reason` 的措辞会随实现改动（改一个词就失效），而 `code`
+是策略层的稳定标识。这也是 `/audit` 那次「用事件名映射」的同一条经验。
+
+### 顺带修：纯文本回退版本用原始工具名
+
+`approval_text()` 里是 `req.get('tool')`，而卡片版早就用 `tool_label()` 了。
+两边不一致：卡片显示「操作键鼠」，文字版显示 `desktop_action`。
+
+### 一处测试连带
+
+`decide()` / `decide_queued()` 多了 `code=` 参数，6 个测试文件里的假审批函数签名
+（`lambda tool, args, reason:`）不兼容，统一加 `**kw`。
+
+### 全量
+
+**2973 passed / 3 skipped**（206s），ruff 通过。
+
+顺带记录一个测量教训：这次全量第一次跑在 38% 卡了 900s 没结束，重跑 206s 就完了
+——是上一轮 aborted 的进程残留占着资源，不是测试挂了。**看到"卡住"先确认没有
+残留进程**，再怀疑代码。

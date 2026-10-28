@@ -146,6 +146,54 @@ _TOOL_LABELS = {
 }
 
 
+#: 决策码 → 给人看的原因。
+#:
+#: 审批卡片上的 `reason` 原本是 ``Decision.reason``——**写给模型看的英文**，
+#: 例如 "moves or renames files (reversible via undo_moves, but still changes
+#: the filesystem)"。而用户正是在这一屏决定要不要批准，给他英文技术描述
+#: 等于没解释。
+#:
+#: 按 code 映射而不是按文本替换：文本会随实现改动，code 是稳定标识。
+_REASON_ZH = {
+    'destructive': '看起来是破坏性命令',
+    'opaque_command': '命令里含有无法静态判断的部分（解释器、变量展开等）',
+    'sandbox_read_only': '当前是只读档，写操作需要你确认',
+    'outside_workspace_write': '要写到工作区外的路径',
+    'network_egress': '要向网络发送请求',
+    'external_tool': '第三方工具，副作用无法预先判断',
+    'secret_egress': '命令同时提到了秘密文件和对外发送',
+    'untrusted': '当前档位要求每条命令都确认',
+    'screen_access': '要读取本机屏幕',
+    'clipboard_access': '要读剪贴板（可能含密码或私信）',
+    'clipboard_write': '要写剪贴板（会覆盖你刚复制的内容）',
+    'desktop_control': '要操作本机键鼠',
+    'delete_paths': '要删除文件（会进回收站，可恢复）',
+    'move_paths': '要移动或重命名文件（可用 /undo-move 撤销）',
+    'undo_moves': '要撤销上一批文件移动（不会覆盖已有文件）',
+    'remember_memory': '要写入一条长期记忆（会影响之后每个会话）',
+    'forget_memory': '要永久删除一条记忆（不可恢复）',
+    'path_grant': '要长期放行一个目录的写权限',
+    'domain_allowed': '这个域名已设为免审',
+    'invalid_url': 'URL 不合法或指向非公网地址',
+    'invalid_path': '路径不合法',
+    'invalid_patch': '补丁格式无法解析',
+    'deny_pattern': '命令命中黑名单',
+    'deny_root_delete': '命令会删除文件系统根目录',
+    'system_path': '要写系统目录',
+    'secret_path': '要读写秘密文件',
+    'domain_denied': '这个域名被设为拒绝',
+    'rule_allowed': '用户规则放行',
+}
+
+
+def reason_zh(code: str, reason: str = '') -> str:
+    """审批原因的中文解释；没有映射时退回原文（宁可显示英文也不丢信息）。"""
+    text = _REASON_ZH.get(str(code or '').strip())
+    if text:
+        return text
+    return ' '.join(str(reason or '').split())
+
+
 def tool_name_zh(tool: str) -> str:
     """只要中文名，不带原名。
 

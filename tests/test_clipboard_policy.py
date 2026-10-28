@@ -74,7 +74,7 @@ def test_clipboard_tools_ignore_the_session_whitelist(config, monkeypatch):
     asked = []
     monkeypatch.setattr(
         hooks.GATE, 'decide',
-        lambda tool, args, reason: asked.append(tool) or (True, 'ok'))
+        lambda tool, args, reason, **kw: asked.append(tool) or (True, 'ok'))
 
     assert hooks.enforce('clipboard_read', {}, interactive=True) is None
     assert hooks.enforce('clipboard_write', {'text': 'x'}, interactive=True) is None
@@ -85,7 +85,7 @@ def test_disabled_clipboard_tools_are_denied_before_asking(config, monkeypatch):
     monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '0')
     asked = []
     monkeypatch.setattr(hooks.GATE, 'decide',
-                        lambda tool, args, reason: asked.append(tool) or (True, 'ok'))
+                        lambda tool, args, reason, **kw: asked.append(tool) or (True, 'ok'))
 
     message = hooks.enforce('clipboard_read', {}, interactive=True)
 

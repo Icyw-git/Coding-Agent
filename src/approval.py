@@ -73,6 +73,7 @@ class PermissionRequest:
     status: str = 'pending'        # pending | approved | denied | timeout
     resolved_by: str = ''
     session_id: str = ''           # 登记时的会话（空串 = 无会话上下文，白名单退回进程级）
+    code: str = ''                 # 策略决策码：审批面按它给中文解释（reason 是英文）
     _event: threading.Event = field(default_factory=threading.Event,
                                     repr=False, compare=False)
 
@@ -148,7 +149,8 @@ class PermissionGate:
     # ---------- 登记 / 查询（供 API 与测试使用） ----------
 
     def request(self, tool: str, args: dict, reason: str,
-                session_id: str | None = None) -> PermissionRequest:
+                session_id: str | None = None,
+                code: str = '') -> PermissionRequest:
         req = PermissionRequest(
             req_id=f'perm_{uuid.uuid4().hex[:10]}',
             tool=tool,
@@ -156,6 +158,7 @@ class PermissionGate:
             created_at=time.time(),
             args=approval_view.summarize(tool, dict(args)),
             session_id=self._session_id_provider() if session_id is None else session_id,
+            code=str(code or ''),
         )
         with self._lock:
             self._requests[req.req_id] = req
@@ -327,9 +330,10 @@ class PermissionGate:
 
     # ---------- 决议入口（enforce 调用） ----------
 
-    def decide(self, tool: str, args: dict, reason: str) -> tuple[bool, str]:
+    def decide(self, tool: str, args: dict, reason: str,
+               code: str = '') -> tuple[bool, str]:
         """登记请求并等待决议，返回 (allowed, message)。阻塞调用方线程。"""
-        req = self.request(tool, args, reason)
+        req = self.request(tool, args, reason, code=code)
         if _ui_mode():
             # Textual 正占用终端：input() 读不到，打印会刷坏屏幕；
             # 交给渲染层弹窗应答（弹窗自带超时与取消）。a 的同类范围在
@@ -343,7 +347,8 @@ class PermissionGate:
             self._decide_console(req)
         return self._conclude(req)
 
-    def decide_queued(self, tool: str, args: dict, reason: str) -> tuple[bool, str]:
+    def decide_queued(self, tool: str, args: dict, reason: str,
+                      code: str = '') -> tuple[bool, str]:
         """无头路径（teammate / 后台 worker / 任务 runner / HTTP）的审批。
 
         这些线程不能读 stdin，否则会和主循环抢控制台、或在工作线程里静默吃掉

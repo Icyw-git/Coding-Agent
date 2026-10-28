@@ -674,7 +674,7 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         if taint_reason:
             print(f'\n\033[33m[taint] {taint_reason}\033[0m')
             ask = GATE.decide if interactive else GATE.decide_queued
-            allowed, message = ask(tool, args, taint_reason)
+            allowed, message = ask(tool, args, taint_reason, code='secret_egress')
             if not allowed:
                 if message.split(' ', 1)[0] == 'timeout':
                     return (f'Permission denied: approval timed out after '
@@ -721,7 +721,7 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         if taint_reason:
             print(f'\n\033[33m[taint] {taint_reason}\033[0m')
             ask = GATE.decide if interactive else GATE.decide_queued
-            allowed, message = ask(tool, args, taint_reason)
+            allowed, message = ask(tool, args, taint_reason, code='secret_egress')
             if not allowed:
                 if message.split(' ', 1)[0] == 'timeout':
                     return (f'Permission denied: approval timed out after '
@@ -738,7 +738,7 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     if taint_reason:
         print(f'\n\033[33m[taint] {taint_reason}\033[0m')
         ask = GATE.decide if interactive else GATE.decide_queued
-        allowed, message = ask(tool, args, taint_reason)
+        allowed, message = ask(tool, args, taint_reason, code='secret_egress')
         if not allowed:
             if message.split(' ', 1)[0] == 'timeout':
                 return (f'Permission denied: approval timed out after '
@@ -759,7 +759,8 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
         issue_grant(tool, args)
         return None
     ask = GATE.decide if interactive else GATE.decide_queued
-    allowed, message = ask(tool, args, decision.reason)
+    allowed, message = ask(tool, args, decision.reason,
+                           code=decision.code)
     if not allowed:
         # message 首段是终态（approval.PermissionGate._conclude）。超时要和「用户
         # 拒绝」区分开：模型据此决定是换个方式还是稍后重试，远程端也能看到审批
