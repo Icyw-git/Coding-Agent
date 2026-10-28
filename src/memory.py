@@ -21,6 +21,7 @@ from pathlib import Path
 
 import yaml
 
+import bounded_cache
 import llm_route
 import memory_aging
 import memory_durability
@@ -119,13 +120,10 @@ def _cached_entry(path):
         return None
     meta, body = _parse_frontmatter(raw)
     with _CACHE_LOCK:
-        # 逐条淘汰最旧的一半，而不是 clear()：
-        # 整体清空在条目数超过上限时会变成「每次插入都清空」，缓存永远不命中。
-        # 淘汰一半而不是一条，避免每插入一次就触发一次淘汰扫描。
-        if len(_FRONTMATTER_CACHE) >= _CACHE_MAX:
-            for stale_key in list(_FRONTMATTER_CACHE)[: _CACHE_MAX // 2]:
-                _FRONTMATTER_CACHE.pop(stale_key, None)
-        _FRONTMATTER_CACHE[key] = (signature, meta, body, raw)
+        # 逐条淘汰最旧的一半，而不是 clear()：整体清空在条目数超过上限时会
+        # 变成「每次插入都清空」，缓存永远不命中（详见 bounded_cache）。
+        bounded_cache.put(_FRONTMATTER_CACHE, key,
+                          (signature, meta, body, raw), _CACHE_MAX)
     return meta, body, raw
 
 

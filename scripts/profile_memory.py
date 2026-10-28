@@ -349,6 +349,95 @@ def profile_recall_quality() -> dict:
             memory._cache_clear()
 
 
+def rss_mb() -> float | None:
+    """进程 RSS（Windows working set）。非 Windows 返回 None。"""
+    try:
+        import ctypes
+        import ctypes.wintypes as w
+    except ImportError:
+        return None
+    if not hasattr(ctypes, 'WinDLL'):
+        return None
+
+    class _Counters(ctypes.Structure):
+        _fields_ = [('cb', w.DWORD), ('PageFaultCount', w.DWORD),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t)]
+
+    psapi = ctypes.WinDLL('psapi')
+    kernel = ctypes.WinDLL('kernel32')
+    kernel.GetCurrentProcess.restype = w.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [w.HANDLE,
+                                           ctypes.POINTER(_Counters), w.DWORD]
+    psapi.GetProcessMemoryInfo.restype = w.BOOL
+    counters = _Counters()
+    counters.cb = ctypes.sizeof(counters)
+    psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(),
+                               ctypes.byref(counters), counters.cb)
+    return round(counters.WorkingSetSize / 1048576, 1)
+
+
+def profile_turn_memory(turns: int = 300, *, write_memories: bool = True) -> list[dict]:
+    """常驻模拟：反复读记忆 + 写会话事件，看 RSS 与堆是否持续上涨。
+
+    ``write_memories=False`` 是**对照组**：不写记忆时曲线应该完全平——用来区分
+    "数据在增长"和"有泄漏"。
+    """
+    from session_store import SessionEventStore
+
+    rows = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        saved = (harness.MEMORY_DIR, harness.MEMORY_INDEX, harness.SESSIONS_DIR)
+        harness.MEMORY_DIR = root / 'memories'
+        harness.MEMORY_DIR.mkdir()
+        harness.MEMORY_INDEX = harness.MEMORY_DIR / 'MEMORY.md'
+        harness.SESSIONS_DIR = root / 'sessions'
+        harness.SESSIONS_DIR.mkdir()
+        memory._cache_clear()
+        store = SessionEventStore(harness.SESSIONS_DIR)
+        tracemalloc.start()
+        try:
+            for index in range(turns):
+                store.append('message', message={'role': 'user',
+                                                 'content': f'第 {index} 轮'})
+                store.append('message', message={'role': 'assistant',
+                                                 'content': '好的' * 20})
+                if write_memories and index % 5 == 0:
+                    memory.write_memory_file(f'm{index}', 'fact',
+                                             f'note {index}', 'body')
+                memory.load_memories([{'role': 'user', 'content': 'note'}])
+                if (index + 1) % 50 == 0:
+                    gc.collect()
+                    heap = tracemalloc.get_traced_memory()[0] / 1048576
+                    rows.append({'turns': index + 1,
+                                 'heap_mb': round(heap, 2),
+                                 'rss_mb': rss_mb(),
+                                 'cache_entries': len(memory._FRONTMATTER_CACHE)})
+        finally:
+            tracemalloc.stop()
+            harness.MEMORY_DIR, harness.MEMORY_INDEX, harness.SESSIONS_DIR = saved
+            memory._cache_clear()
+    return rows
+
+
+def profile_startup() -> dict:
+    """冷启动：新进程导入 harness 的耗时（headless / cron 每次都要付）。"""
+    code = ('import sys; sys.path.insert(0, r"%s"); sys.path.insert(0, r"%s"); '
+            'import harness' % (ROOT, ROOT / 'src'))
+    started = time.perf_counter()
+    import subprocess
+    subprocess.run([sys.executable, '-c', code], cwd=str(ROOT),
+                   capture_output=True, timeout=120, check=False)
+    return {'import_harness_ms': round((time.perf_counter() - started) * 1000, 0)}
+
+
 def main() -> int:
     as_json = '--json' in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
@@ -381,6 +470,9 @@ def main() -> int:
         'injection': profile_injection_savings(scaling),
         'write_scaling': profile_write_scaling(scaling),
         'footprint': profile_memory_footprint(basic_count),
+        'turn_memory': profile_turn_memory(300),
+        'turn_memory_control': profile_turn_memory(300, write_memories=False),
+        'startup': profile_startup(),
     }
 
     if as_json:
@@ -414,6 +506,19 @@ def main() -> int:
     print(f"\n== 常驻内存 ==  {f['entries']} 条 -> 解析缓存 "
           f"{f['cache_kb']} KB（峰值 {f['peak_kb']} KB，"
           f"约 {f['per_entry_bytes']} B/条）")
+
+    print('\n== 常驻模拟（左：写记忆；右：不写，对照组用来区分增长与泄漏）==')
+    print(f"  {'轮数':>6} {'堆MB':>7} {'RSS MB':>8} {'缓存':>6}   | "
+          f"{'堆MB':>7} {'RSS MB':>8}")
+    control = report['turn_memory_control']
+    for index, row in enumerate(report['turn_memory']):
+        other = control[index] if index < len(control) else {}
+        print(f"  {row['turns']:>6} {row['heap_mb']:>7} {row['rss_mb']:>8} "
+              f"{row['cache_entries']:>6}   | {other.get('heap_mb', '-')!s:>7} "
+              f"{other.get('rss_mb', '-')!s:>8}")
+    print('\n== 冷启动 ==')
+    print(f"  导入 harness：{report['startup']['import_harness_ms']:.0f} ms"
+          '（headless / cron 每次都要付）')
     return 0
 
 

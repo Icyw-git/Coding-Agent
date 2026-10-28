@@ -31,6 +31,8 @@ import sys
 import threading
 from pathlib import Path
 
+import bounded_cache
+
 ENV = 'HARNESS_OS_SANDBOX'
 MODES = ('off', 'auto', 'require')
 # 为什么没有默认开启（2026-10-27 实测后回退）
@@ -555,9 +557,8 @@ def _environment_block(temp_dir: Path):
                    sorted(values.values(), key=lambda item: item[0].upper()))
     block = ctypes.create_unicode_buffer(text + '\0')
     with _ENV_BLOCK_LOCK:
-        if len(_ENV_BLOCK_CACHE) >= _ENV_BLOCK_MAX:
-            _ENV_BLOCK_CACHE.clear()
-        _ENV_BLOCK_CACHE[cache_key] = block
+        # 上限 4：用 clear() 时环境一变就全失效。详见 bounded_cache。
+        bounded_cache.put(_ENV_BLOCK_CACHE, cache_key, block, _ENV_BLOCK_MAX)
     return block
 
 

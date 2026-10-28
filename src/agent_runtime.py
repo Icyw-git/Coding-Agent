@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Type
 
+import bounded_cache
 import hooks
 import turn_control
 import turn_files
@@ -45,6 +46,7 @@ class TurnCancelled(RuntimeError):
 # 概括全部会话文件，store 的实例级缓存跨列表失效；key 含 size/mtime，
 # 追加自动过期。上限兜底防爆炸（陈旧 key 只占少量内存）。
 _summary_cache: dict[tuple, dict] = {}
+_SUMMARY_CACHE_MAX = 512
 
 
 def _summary_cached(path, stat) -> dict | None:
@@ -60,9 +62,10 @@ def _cached_summary(store) -> dict:
         return hit
     hit = store.session_summary()
     stat = store.path.stat()
-    if len(_summary_cache) > 512:
-        _summary_cache.clear()
-    _summary_cache[(str(store.path), stat.st_size, stat.st_mtime_ns)] = hit
+    # 逐条淘汰而不是 clear()：整体清空在会话文件版本数接近上限时会让缓存失效。
+    bounded_cache.put(_summary_cache,
+                      (str(store.path), stat.st_size, stat.st_mtime_ns),
+                      hit, _SUMMARY_CACHE_MAX)
     return dict(hit)  # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
 
 

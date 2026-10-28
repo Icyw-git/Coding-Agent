@@ -26,6 +26,7 @@ import threading
 from datetime import date, datetime
 from pathlib import Path
 
+import bounded_cache
 import net_policy
 import paths
 from file_lock import exclusive_file_lock
@@ -117,9 +118,11 @@ def _read(strict: bool = False) -> list[dict]:
         key = _cache_key()
         if key is not None:
             with _CACHE_LOCK:
-                if len(_CACHE) >= _CACHE_MAX:
-                    _CACHE.clear()
-                _CACHE[key] = [dict(record) for record in records]
+                # 上限只有 8 且键含 mtime：授权文件一改就换键，用 clear() 会频繁
+                # 全失效。逐条淘汰最旧的一半（详见 bounded_cache）。
+                bounded_cache.put(_CACHE, key,
+                                  [dict(record) for record in records],
+                                  _CACHE_MAX)
     return records
 
 
