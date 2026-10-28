@@ -986,7 +986,7 @@ def archive_session_scope(*, days: int = SESSION_SCOPE_DAYS,
 
 
 def age_memories(days: int | None = None) -> list[dict]:
-    """把长期未用的记忆移到 .archive/。返回被归档的条目。
+    """把"该退出召回了"的记忆移到 .archive/。返回被归档的条目。
 
     **不删除**：归档目录里的文件可以随时放回。我们有一条既有约束是不删除
     用户数据，淘汰也必须遵守。
@@ -995,7 +995,15 @@ def age_memories(days: int | None = None) -> list[dict]:
     更是要一直记得。
     """
     h = _h()
-    stale = memory_aging.stale_entries(h.MEMORY_DIR, list_memory_files(), days=days)
+    entries = list_memory_files()
+    # 两种归档理由，各自独立：
+    # - stale：放了很久没动（时间维度）
+    # - low_signal：从没被召回、置信度低、过了观察期（信号维度）
+    # 合并去重，同一条只归档一次。都只归档不删除。
+    stale = memory_aging.stale_entries(h.MEMORY_DIR, entries, days=days)
+    marked = {item.get('filename') for item in stale}
+    stale += [item for item in memory_aging.low_signal_entries(
+        h.MEMORY_DIR, entries) if item.get('filename') not in marked]
     if not stale:
         return []
     moved = []

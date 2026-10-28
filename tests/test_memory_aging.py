@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import time
 
+import pytest
+
 import memory_aging
 
 
@@ -207,3 +209,99 @@ def test_age_memories_keeps_preferences(tmp_path, monkeypatch):
 
     assert memory.age_memories() == []
     assert (memories / 'my-pref.md').is_file()
+
+
+# ---------------------------------------------------------------- A6 低信号剪枝
+
+@pytest.fixture
+def low_signal_home(tmp_path, monkeypatch):
+    """把记忆目录指到 tmp，读写都落在这里（否则会写进真实 .cache）。"""
+    import memory
+    home = memory._h()
+    monkeypatch.setattr(home, 'MEMORY_DIR', tmp_path, raising=False)
+    monkeypatch.setattr(home, 'MEMORY_INDEX', tmp_path / 'MEMORY.md', raising=False)
+    memory._cache_clear()
+    yield tmp_path
+    memory._cache_clear()
+
+
+def _entry_with(memory_dir, name, mem_type='fact', confidence=0.1, age_days=60):
+    """造一条带置信度的条目并设年龄（需配合 low_signal_home）。"""
+    import memory
+    memory.write_memory_file(name, mem_type, f'{name} description', 'body',
+                             confidence=confidence)
+    path = memory_dir / f'{name}.md'
+    stamp = time.time() - age_days * 86400
+    os.utime(path, (stamp, stamp))
+    memory._cache_clear()
+    return next(item for item in memory.list_memory_files()
+                if item['name'] == name)
+
+
+def test_low_signal_entry_is_pruned(low_signal_home, tmp_path):
+    entry = _entry_with(tmp_path, 'noise', confidence=0.1)
+    found = memory_aging.low_signal_entries(tmp_path, [entry])
+    assert [item['name'] for item in found] == ['noise']
+
+
+def test_high_confidence_is_kept(low_signal_home, tmp_path):
+    """高置信条目即使没被召回也不清——它可能是刚写的、还没用上。"""
+    entry = _entry_with(tmp_path, 'solid', confidence=0.9)
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+
+
+def test_recalled_entry_is_kept(low_signal_home, tmp_path):
+    """只要有召回记录，就说明它对某次对话有用。"""
+    entry = _entry_with(tmp_path, 'used', confidence=0.1)
+    memory_aging.record_recall(tmp_path, ['used.md'])
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+
+
+def test_fresh_low_signal_entry_is_kept(low_signal_home, tmp_path):
+    """观察期内不清：新条目还没来得及被用到。"""
+    entry = _entry_with(tmp_path, 'newish', confidence=0.1, age_days=1)
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+
+
+@pytest.mark.parametrize('mem_type', ['preference', 'correction'])
+def test_preferences_and_corrections_never_pruned(low_signal_home, tmp_path, mem_type):
+    entry = _entry_with(tmp_path, f'keep-{mem_type}', mem_type=mem_type,
+                        confidence=0.05)
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+
+
+def test_low_signal_thresholds_are_configurable(low_signal_home, tmp_path):
+    entry = _entry_with(tmp_path, 'x', confidence=0.25, age_days=10)
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+    assert memory_aging.low_signal_entries(
+        tmp_path, [entry], days=5, confidence=0.3)
+
+
+def test_missing_confidence_is_not_pruned(tmp_path):
+    """没记置信度的旧条目按"不清楚"处理，不清——宁可留。"""
+    path = tmp_path / 'old.md'
+    path.write_text('---\nname: old\ndescription: d\ntype: fact\n---\n\nbody\n',
+                    encoding='utf-8')
+    stamp = time.time() - 90 * 86400
+    os.utime(path, (stamp, stamp))
+    entry = {'filename': 'old.md', 'name': 'old', 'type': 'fact'}
+    assert memory_aging.low_signal_entries(tmp_path, [entry]) == []
+
+
+def test_age_memories_prunes_noise_but_keeps_signal(tmp_path, monkeypatch):
+    """端到端：噪音被归档，高置信 / 被召回 / 偏好全部保留。"""
+    import memory
+    home = memory._h()
+    monkeypatch.setattr(home, 'MEMORY_DIR', tmp_path, raising=False)
+    monkeypatch.setattr(home, 'MEMORY_INDEX', tmp_path / 'MEMORY.md', raising=False)
+    memory._cache_clear()
+
+    _entry_with(tmp_path, 'noise', confidence=0.1)
+    _entry_with(tmp_path, 'solid', confidence=0.9)
+    memory_aging.record_recall(tmp_path, ['solid.md'])
+    _entry_with(tmp_path, 'pref', mem_type='preference', confidence=0.1)
+
+    moved = memory.age_memories()
+    assert [item['name'] for item in moved] == ['noise']
+    remaining = {item['name'] for item in memory.list_memory_files()}
+    assert remaining == {'solid', 'pref'}

@@ -142,6 +142,55 @@ def stale_entries(memory_dir, entries, *, days: int | None = None) -> list[dict]
     return out
 
 
+#: 低信号剪枝默认参数。三种条件同时成立才归档：
+#: 从没被召回、置信度低、写入已过观察期。
+LOW_SIGNAL_DAYS = 30
+LOW_SIGNAL_CONFIDENCE = 0.3
+
+
+def low_signal_entries(memory_dir, entries, *, days: int | None = None,
+                       confidence: float | None = None) -> list[dict]:
+    """挑出"一直没被用到、也不太可信"的条目。不碰磁盘。
+
+    与 ``stale_entries`` 的区别：那条只看时间（90 天没动），这条看**信号**——
+    一条从没被召回过的低置信条目，即使只放了一周也在占召回预算。
+
+    三个条件必须同时成立，缺一不可：
+
+    - **从未被召回**：召回记录里没有它。只要有召回记录，就说明它对某次对话有用。
+    - **置信度低**：默认 < 0.3。用户明确要求写的记忆（0.9）不会因为没召回就被清。
+    - **过了观察期**：默认 30 天。新写入的条目还没来得及被用到。
+
+    ``preference``/``correction`` 仍然豁免：偏好和教训不该因为"暂时没召回"消失。
+    """
+    if not enabled():
+        return []
+    limit_days = LOW_SIGNAL_DAYS if days is None else days
+    floor = LOW_SIGNAL_CONFIDENCE if confidence is None else confidence
+    memory_dir = Path(memory_dir)
+    recalls = _read_log(memory_dir)
+    out = []
+    for item in entries:
+        filename = item.get('filename') or ''
+        if not filename.endswith('.md'):
+            continue
+        if str(item.get('type') or '').strip().lower() in KEEP_FOREVER:
+            continue
+        if filename in recalls:
+            continue                      # 被用到过，不是低信号
+        value = item.get('confidence')
+        if not isinstance(value, (int, float)) or value >= floor:
+            continue
+        path = memory_dir / filename
+        if not path.is_file():
+            continue
+        age = age_days(memory_dir, filename, path)
+        if age < limit_days:
+            continue
+        out.append({**item, 'age_days': age, 'confidence': value})
+    return out
+
+
 def archive(memory_dir, entry) -> Path | None:
     """把一条记忆移到 .archive/，不删除。返回归档后的路径。"""
     memory_dir = Path(memory_dir)

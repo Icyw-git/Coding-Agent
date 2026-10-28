@@ -8038,3 +8038,62 @@ LLM_MODEL_ID is empty. If this is a script, import harness first so .env is load
 ### 验证
 
 新增 `test_memory_durability.py` (23)。全量 **2757 passed / 3 skipped**，ruff 通过。
+
+## A6 低信号剪枝 + B2 台账回滚 + B3 有界改进循环（2026-10-28）
+
+校准因账号余额暂缓（已改成失败时明确提示，不再崩溃）。继续做剩下三项。
+
+### A6 低信号剪枝
+
+原来只有"时间老化"（90 天没动）一个维度。加 `low_signal_entries`：
+**从没被召回 + 置信度 < 0.3 + 过了 30 天观察期**，三个条件同时成立才归档。
+
+三条豁免各有理由：
+- **有召回记录**就不清：说明它对某次对话真的有用
+- **高置信**不清：可能是刚写的、还没用上
+- **preference / correction** 不清：偏好和教训不该因"暂时没召回"消失
+
+实测：`noise`（低置信+从未召回+60 天）被归档，`solid`（高置信）、`used`（召回过）、
+`pref`（偏好）全部保留。
+
+两条归档路径在 `age_memories` 里合并去重（同一条只归档一次），但理由分开写：
+`stale` 是"放了很久"，`low_signal` 是"一直没用且不太可信"——排查时分得清。
+
+### B2 改动台账与回滚
+
+`self_improve_ledger.py`：append-only jsonl + 按 change id 分目录的文件快照。
+
+- **append-only** 是硬要求：这是"自我改进"的记录本身，能改就等于没记录
+- **判定更新也是追加**（`update_decision` 写一条 `decision_update`），不改原行
+- **快照失败不阻止登记**：宁可没有回滚点，也不能让改动"没记录"
+- **回滚只恢复快照里有的文件**：新增文件没有快照，自动删有风险（可能是别的
+  进程刚写的），改用 `created_paths()` 报出来让人决定
+
+`/improvements` 看记录，`/improvements rollback <id>` 回滚。
+
+### B3 有界改进循环
+
+`self_improve.py`，照 autoresearch 骨架但把范围限死在 Ring 1：
+
+- **指标固定两项**（`pytest_pass` / `ruff_errors`），`Session` 构造时传别的直接
+  `ValueError`。这是"自己抬标准"的唯一入口，必须堵死。
+- **两项都是硬门槛**：任何一项变差 → discard，不看其他指标
+- **测不出来算变差**（`unmeasured` 进 regression 列表）：那正是最容易藏问题的地方
+- 轮数上限硬性收敛到 20，连续 3 轮无新最优即停
+
+### 两个实测调出来的阈值
+
+**`MIN_IMPROVEMENT` 从 0.02 提到 0.15。** 0.02 时 10 → 9 的 lint 错误（10%）
+被判成改进，而 lint 错误数抖 1~2 个是常事——把它当 keep 会让循环沿着噪声走。
+
+**加 `MIN_ABSOLUTE_STEP = 1`。** 只用相对阈值会让 `1 → 0`（100% 改善，实打实的
+胜利）算不出来，因为 `scale = abs(old) or 1` 在 old=0 时的边界很别扭。现在
+两条件取其一：绝对改善 ≥1 或相对改善 ≥15%。
+
+### 测试
+
+新增 `test_self_improve.py` (33)。重点不在"能不能改进"，而在**边界守不守得住**：
+`tests/`、`src/`、`conftest.py`、`pytest.ini`、`ruff.toml`、`.github/workflows`
+全部断言不可改；指标不可自定义；回归必 discard；台账 append-only；回滚不删新增文件。
+
+全量 **2799 passed / 3 skipped**，ruff 通过。

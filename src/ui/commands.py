@@ -348,6 +348,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
                 '[allow|deny|remove <主机>] [until 日期] [note 备注]',
                 ('domain',)),
     CommandSpec('audit', '查看最近的安全相关事件', '[类型|all]'),
+    CommandSpec('improvements', '自我改进记录与回滚',
+                '[rollback <change_id>]', ()) ,
     CommandSpec('rules', '查看用户规则文件（allow/ask/deny）'),
     CommandSpec('memories',
                 '记忆：开关 / 来源 / 质量评测',

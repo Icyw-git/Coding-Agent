@@ -183,6 +183,8 @@ class CommandActionsMixin:
             self.handle_rules()
         elif verb == 'memories':
             self.handle_memories(argument)
+        elif verb == 'improvements':
+            self.handle_improvements(argument)
         elif verb == 'grants':
             self.handle_grants(argument)
         elif verb == 'workspaces':
@@ -342,6 +344,34 @@ class CommandActionsMixin:
         lines.append('  readonly  = 用已有记忆，不产生新的')
         lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
         self._notice(chr(10).join(lines))
+
+    def handle_improvements(self, argument: str) -> None:
+        """`/improvements`：看自我改进记录，或回滚某次改动。
+
+        记录只覆盖 Ring 1（skills / AGENTS.md）。策略、审批、测试由
+        verifier_guard 硬拒，不会出现在这里——那条路不该有"被改过"的记录。
+        """
+        import paths
+        import self_improve_ledger as ledger
+
+        arg = (argument or '').strip()
+        cache = paths.cache_path()
+        if arg.startswith('rollback'):
+            change_id = arg[len('rollback'):].strip()
+            if not change_id:
+                self._notice('用法：/improvements rollback <change_id>')
+                return
+            restored = ledger.rollback(cache, change_id)
+            if not restored:
+                self._notice(f'回滚失败：{change_id} 没有可恢复的快照')
+                return
+            created = ledger.created_paths(cache, change_id)
+            self._notice(f'已恢复 {len(restored)} 个文件：'
+                         + '、'.join(restored)
+                         + (chr(10) + '新增的文件不会自动删除：'
+                            + '、'.join(created) if created else ''))
+            return
+        self._notice(ledger.format_ledger(cache))
 
     def handle_memory_quality(self) -> None:
         """`/memories quality`：看异步 LLM 评测的汇总。
