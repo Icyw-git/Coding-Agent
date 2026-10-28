@@ -91,14 +91,14 @@ class SessionActionsMixin:
                                               session_id=session_id)
             summary = store.session_summary()
         except Exception as exc:
-            self._notice(f'New session failed: {exc}', level='error')
+            self._notice(f'新建会话失败： {exc}', level='error')
             return
         self._adopt_session(store, [], summary.get('title', ''))
         self._notice(f"New session: {store.session_id}")
 
     def rename_session(self, argument: str) -> None:
         if not self._store:
-            self._notice('No session context; cannot rename.', level='error')
+            self._notice('当前没有会话，无法重命名。', level='error')
             return
         if not argument:
             self._notice('用法：/rename <标题>', level='error')
@@ -115,12 +115,12 @@ class SessionActionsMixin:
             return
         self._title = title['title']
         self._refresh_footer()
-        self._notice(f"Session title: {self._title}")
+        self._notice(f"会话标题： {self._title}")
 
     def fork_session(self, argument: str = '') -> None:
         """`/fork [事件序号]`；`/clone` 无参复制到当前叶。"""
         if not self._store:
-            self._notice('No session context; cannot fork.', level='error')
+            self._notice('当前没有会话，无法分叉。', level='error')
             return
         upto = None
         if argument:
@@ -129,7 +129,7 @@ class SessionActionsMixin:
                 return
             upto = int(argument)
         if self._fork_to(upto):
-            self._notice(f'Forked to {self._session_id} (original kept).')
+            self._notice(f'已分叉到 {self._session_id} （原会话保留）.')
 
     def _fork_to(self, upto: int | None) -> bool:
         try:
@@ -137,7 +137,7 @@ class SessionActionsMixin:
             messages = forked.rebuild_openai_history(recover_pending=True)
             summary = forked.session_summary()
         except Exception as exc:
-            self._notice(f'Fork failed: {exc}', level='error')
+            self._notice(f'分叉失败： {exc}', level='error')
             return False
         self._adopt_session(forked, messages, summary.get('title', ''))
         return True
@@ -145,11 +145,11 @@ class SessionActionsMixin:
     def open_fork_picker(self) -> None:
         """Pi 风格 `/fork`：列出用户消息，默认选最新一条。"""
         if not self._store:
-            self._notice('No session context; cannot fork.', level='error')
+            self._notice('当前没有会话，无法分叉。', level='error')
             return
         rows = self._forkable_messages()
         if not rows:
-            self._notice('No messages to fork from.')
+            self._notice('没有可用来分叉的消息。')
             return
         self._fork_rows = {row['seq']: row['text'] for row in rows}
         self.push_screen(ForkPickerModal(rows), self._on_fork_picked)
@@ -193,36 +193,36 @@ class SessionActionsMixin:
             self._composer.text = text
             self._composer.cursor_location = (0, len(text))
             self._composer.focus()
-        self._notice(f'Forked to {self._session_id}; message restored to editor.')
+        self._notice(f'已分叉到 {self._session_id}，消息已放回输入框。')
 
     def show_checkpoints(self) -> None:
         import harness
         if not self._store:
-            self._notice('No session context.', level='error')
+            self._notice('当前没有会话。', level='error')
             return
         try:
             manager = harness.get_checkpoint_manager(self._store)
             self._notice(harness.format_checkpoint_list(manager))
         except Exception as exc:
-            self._notice(f'Checkpoints failed: {exc}', level='error')
+            self._notice(f'读取快照失败： {exc}', level='error')
 
     def create_checkpoint(self, label: str = '') -> None:
         """`/checkpoint [label]`：手动快照当前会话（文件前像 + 历史）。"""
         import harness
         if self._busy:
-            self._notice('Cannot create a checkpoint while a request is running.')
+            self._notice('回合进行中，无法创建快照。')
             return
         if not self._store:
-            self._notice('No session context.', level='error')
+            self._notice('当前没有会话。', level='error')
             return
         try:
             manager = harness.get_checkpoint_manager(self._store)
             cp_id = manager.begin_turn(self._messages, self._store,
                                        label=label.strip(), trigger='manual')
             manager.seal()
-            self._notice(f'Created checkpoint {cp_id}. Use /rewind head to restore.')
+            self._notice(f'已创建快照 {cp_id}. 可用 /rewind head 回滚。')
         except Exception as exc:
-            self._notice(f'Checkpoint failed: {exc}', level='error')
+            self._notice(f'创建快照失败： {exc}', level='error')
 
     def start_checkpoint_gc(self, argument: str) -> None:
         """`/checkpoint-gc [--all] [--keep N]`：当前会话直接回收，全局先确认。"""
@@ -234,7 +234,7 @@ class SessionActionsMixin:
             self._notice(str(exc), level='error')
             return
         except Exception as exc:
-            self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
+            self._notice(f'清理快照失败： {exc}', level='error')
             return
         summary = harness.format_checkpoint_gc(preview)
         if not preview['removed']:
@@ -263,16 +263,16 @@ class SessionActionsMixin:
                 harness.get_checkpoint_manager(self._store), argument)
             self._notice(harness.format_checkpoint_gc(result, done=True))
         except Exception as exc:
-            self._notice(f'Checkpoint cleanup failed: {exc}', level='error')
+            self._notice(f'清理快照失败： {exc}', level='error')
 
     def start_rewind(self, argument: str) -> None:
         """`/rewind`：先预览，再确认；`--yes` 跳过确认，`/undo` 即 turn --yes。"""
         import harness
         if self._busy:
-            self._notice('Cannot rewind while a request is running.')
+            self._notice('回合进行中，无法回溯。')
             return
         if not self._store:
-            self._notice('No session context.', level='error')
+            self._notice('当前没有会话。', level='error')
             return
         argument = (argument or '').strip()
         error = harness.command_error('/rewind', argument)
@@ -287,7 +287,7 @@ class SessionActionsMixin:
             manager = harness.get_checkpoint_manager(self._store)
             cp_id = manager.resolve(ref)
             if not manager.snapshot_path(cp_id).exists():
-                self._notice(f'[rewind] snapshot missing for {cp_id}', level='error')
+                self._notice(f'[回溯] 缺少快照： {cp_id}', level='error')
                 return
             preview = manager.plan_restore(cp_id, scope=scope)
             preview['scope'] = scope
@@ -329,7 +329,7 @@ class SessionActionsMixin:
             return
         detail = _strip_ansi(output.getvalue()).strip()
         if not ok:
-            self._notice(detail or f'[rewind] could not restore {cp_id}',
+            self._notice(detail or f'[回溯] 无法恢复 {cp_id}',
                          level='error')
             return
         self._reload_transcript()
@@ -346,10 +346,10 @@ class SessionActionsMixin:
     def start_compact(self, instructions: str = '') -> None:
         """`/compact`：后台压缩当前上下文（Pi `/compact [instructions]`）。"""
         if self._busy:
-            self._notice('Cannot compact while a request is running.')
+            self._notice('回合进行中，无法压缩上下文。')
             return
         if not self._store:
-            self._notice('No session context.', level='error')
+            self._notice('当前没有会话。', level='error')
             return
         if not self._messages:
             self._notice('当前会话没有可压缩的内容。')
@@ -357,7 +357,7 @@ class SessionActionsMixin:
         self._busy = True
         self._operation = 'compact'
         self._turn_started = time.monotonic()
-        block = self.model.append('notice', {'text': 'compact: running…'})
+        block = self.model.append('notice', {'text': '压缩中…'})
         self._mark_dirty()
         threading.Thread(target=self._run_compact,
                          args=(block.id, list(self._messages)),
@@ -397,8 +397,9 @@ class SessionActionsMixin:
         if not rows:
             # 空列表容易被误读成“会话丢了”：把实际使用的目录和 home 一起报出来。
             self._notice(
-                f'No saved sessions. 会话目录：{harness.SESSIONS_DIR}'
-                f'（home={harness.HOME_DIR}；可用 HARNESS_HOME 指定）')
+                '还没有保存的会话。' + chr(10)
+                + f'会话目录：{harness.SESSIONS_DIR}' + chr(10)
+                + f'数据根目录：{harness.HOME_DIR}（可用环境变量 HARNESS_HOME 指定）')
             return
         current_workspace = harness.get_workdir()
         self.push_screen(
@@ -424,11 +425,11 @@ class SessionActionsMixin:
         if not title:
             return
         if self._busy:
-            self._notice('Cannot rename a session while a request is running.')
+            self._notice('回合进行中，无法重命名会话。')
             return
         import harness
         if title == str(row.get('title') or ''):
-            self._notice('Session title is unchanged.')
+            self._notice('标题没有变化。')
             return
         try:
             if row['id'] == self._session_id and self._store is not None:
@@ -438,18 +439,18 @@ class SessionActionsMixin:
                     harness.resolve_session_path(row['id']))
             event = store.append_session_title(title[:80], source='user')
         except Exception as exc:
-            self._notice(f'Session rename failed: {exc}', level='error')
+            self._notice(f'重命名会话失败： {exc}', level='error')
             return
         if row['id'] == self._session_id:
             self._title = event['title']
             self._refresh_footer()
-        self._notice(f"Session title: {event['title']}")
+        self._notice(f"会话标题： {event['title']}")
 
     async def _resume_by_argument(self, argument: str) -> None:
         import harness
         rows = harness.session_rows(limit=None, include_empty=False)
         if not rows:
-            self._notice('No saved sessions.')
+            self._notice('还没有保存的会话。')
             return
         selected = None
         if argument.casefold() == 'last':
@@ -465,10 +466,10 @@ class SessionActionsMixin:
             if len(matches) == 1:
                 selected = matches[0]
             elif len(matches) > 1:
-                self._notice(f'{len(matches)} sessions match; use /sessions.')
+                self._notice(f'{len(matches)} 个会话匹配；用 /sessions 查看。')
                 return
         if selected is None:
-            self._notice(f'No session matches {argument!r}.')
+            self._notice(f'没有匹配的会话 {argument!r}.')
             return
         await self._resume_session_row(selected)
 
@@ -483,13 +484,13 @@ class SessionActionsMixin:
             messages = store.rebuild_openai_history(recover_pending=True)
             summary = store.session_summary()
         except Exception as exc:
-            self._notice(f'Unable to resume: {exc}', level='error')
+            self._notice(f'无法恢复会话： {exc}', level='error')
             return
         try:
             if summary.get('workspace'):
                 harness.set_workspace(summary['workspace'])
         except (OSError, ValueError) as exc:
-            self._notice(f'Unable to resume workspace: {exc}', level='error')
+            self._notice(f'无法恢复该工作区： {exc}', level='error')
             return
         self._mention_root = None
         self._adopt_session(store, messages, summary.get('title', ''))

@@ -1,4 +1,4 @@
-"""Fork from message：选择一条用户消息，从它之前分叉（对齐 Pi）。"""
+"""从这条消息分叉：选择一条用户消息，从它之前分叉（对齐 Pi）。"""
 from __future__ import annotations
 
 from textual.app import ComposeResult
@@ -19,7 +19,7 @@ class ForkPickerModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='fork-box'):
-            yield Static('Fork from message', classes='modal-title')
+            yield Static('从这条消息分叉', classes='modal-title')
             yield Static('从选中的用户消息之前分叉；消息会回填到输入框。',
                          classes='modal-hint')
             yield OptionList(id='fork-list')

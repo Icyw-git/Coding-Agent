@@ -417,7 +417,7 @@ def test_session_picker_renames_selected_session(tmp_path, monkeypatch):
                 harness.resolve_session_path(target.session_id))
             assert updated.session_summary()['title'] == 'Renamed target'
             assert app.model.snapshot()[-1].payload['text'] == (
-                'Session title: Renamed target')
+                '会话标题： Renamed target')
 
     asyncio.run(scenario())
 
@@ -453,7 +453,7 @@ def test_session_picker_archive_confirms_and_protects_current(tmp_path, monkeypa
             await pilot.press('alt+a')
             await pilot.pause()
             assert current.path.is_file()
-            assert 'Cannot archive the current session.' in _notice_texts(app)[-1]
+            assert '不能归档当前正在用的会话。' in _notice_texts(app)[-1]
 
             app.open_session_picker()
             await pilot.pause()
@@ -963,7 +963,7 @@ def test_unknown_skill_reports_error(monkeypatch):
             await pilot.pause()
             notice = app.model.snapshot()[-1]
             assert notice.kind == 'notice'
-            assert 'Unknown skill' in notice.payload['text']
+            assert '未知技能' in notice.payload['text']
 
     asyncio.run(scenario())
 
@@ -1591,7 +1591,7 @@ def test_copy_last_tool_output(monkeypatch):
             await pilot.pause()
             assert copied == ['line1\nline2']
             assert app.model.snapshot()[-1].payload['text'] == (
-                'Copied 10 non-whitespace chars from the last tool output.')
+                '已复制 10 个字符（来自最近一次工具输出）。')
     asyncio.run(scenario())
 
 
@@ -1783,7 +1783,7 @@ def test_checkpoint_rewind_and_undo_commands(tmp_path, monkeypatch):
             assert manager.begun[1] == 'before refactor'
             assert manager.begun[2] == 'manual'
             assert manager.sealed
-            assert 'Created checkpoint' in app.model.snapshot()[-1].payload['text']
+            assert '已创建快照' in app.model.snapshot()[-1].payload['text']
 
             app.submit_text('/rewind head')
             await pilot.pause()

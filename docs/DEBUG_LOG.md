@@ -9285,3 +9285,86 @@ ported**，那个分区根本不会显示——但表头仍然写死为 TUI。
 
 `test_ui_commands.py` / `test_harness_app.py` 的三处断言随文案更新。
 全量 **2967 passed / 3 skipped**，ruff 通过。
+
+## 系统性修复：内部概念泄漏（74 处纯英文 + 若干字段名）
+
+按用户点出的根因（**功能都对，但开发者视角直接暴露给用户**）做了一次系统扫描，
+而不是继续零散找。
+
+### 先写扫描器，再修
+
+三版扫描器逐次收敛：
+
+| 版本 | 判据 | 结果 |
+|---|---|---|
+| 1 | 界面层所有字符串里的 `snake_case` | 229 处，**几乎全是误报**（Textual API 名、docstring） |
+| 2 | 只追踪流向 `_notice`/`print`/`Text` 的字符串，排除 docstring | 23 处，多数是有意的诊断/配置引导 |
+| 3 | 补两类：**中文界面里整句英文**、**字段名当占位符 / 原始 repr / `key=value`** | **74 处真泄漏** |
+
+关键教训：**第一版扫了个寂寞**。`snake_case` 在代码里到处都是，只有"它会不会
+出现在屏幕上"才是判据。
+
+### 最严重的一类：TUI 里 74 处纯英文
+
+```
+src/ui/session_actions.py       31 处
+src/ui/command_actions.py       10
+src/ui/harness_app.py            7
+src/ui/session_admin_actions.py  6
+src/ui/queue_actions.py          5
+模态框 4 个文件                   13
+```
+
+TUI 其余文案都是中文，中间夹着：
+
+```
+Cannot rename a session while a request is running.
+No saved sessions.
+Forked to X; message restored to editor.
+Unknown skill: nope
+Copied 10 non-whitespace chars from the last tool output.
+Select transcript text first, or use /copy for the last tool output.
+```
+
+全部改成中文。这类文案的读者是**正在对话框里操作的人**，让他切换语言就是让他
+切换身份（"我是用户" → "我是调用者"）。
+
+一处连带问题：`_copy_text(text, destination='from the last tool output')` ——
+参数本身是英文串，直接拼进中文句就变成
+`已复制 10 个字符from the last tool output。`。改成 `destination=''` 默认配
+中文兜底，调用方传中文片段。
+
+### 字段名当占位符
+
+```
+用法：/improvements rollback <change_id>      → <批次号>（批次号在 /improvements 列表里）
+Use /allow <tool>.                            → 用法：/allow <工具名>，例如 /allow web_fetch。
+                                                工具名在审批提示里能看到。
+No saved sessions.（home=...）                  → 还没有保存的会话。
+                                                会话目录：…
+                                                数据根目录：…（可用环境变量 HARNESS_HOME 指定）
+```
+
+`home=` 这种写法是把内部字段名当标签用——用户不知道 `home` 是什么。
+
+### 加了防回归守卫：`tests/test_ui_copy.py`
+
+这是这轮最重要的产出。前面六轮修的每一条**测试都不会失败**，因为没人断言
+"这句话用户能读懂"。补上 5 条：
+
+1. `test_no_english_only_user_messages` —— 用户可见提示不能整句英文（≥3 个英文
+   单词就算）。排除 `/quit`、`Esc`、Textual 标记
+2. `<字段名>` 占位符不能出现在用法里（用 `<批次号>` 不用 `<change_id>`）
+3. 不能把原始 Python 容器（`[{`）打到界面
+4. 不能出现 `key=value` 形式的原始参数
+5. `/help` 不能出现 `TUI commands` / `ported` / `line REPL` / `Skills (`
+
+判据只覆盖**流向显示层**的字符串，不看 docstring、不看 Textual 样式标记、不看
+工具返回给模型的英文文案（模型侧英文更可靠，不在范围）。
+
+以后再犯，CI 会直接挡住。
+
+### 测试
+
+`tests/test_ui_copy.py`（5 条守卫）+ 若干断言随文案更新。
+全量 **2972 passed / 3 skipped**，ruff 通过。

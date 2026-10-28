@@ -45,12 +45,12 @@ class CommandPaletteModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='command-palette-box'):
-            yield Static('Command palette', classes='modal-title')
+            yield Static('命令面板', classes='modal-title')
             yield CommandPaletteInput(
                 placeholder='Search commands', id='command-palette-search')
             yield OptionList(id='command-palette-list')
             yield Static('', id='command-palette-empty', classes='modal-hint')
-            yield Static('↑↓ select · Enter run or edit · Esc close',
+            yield Static('↑↓ select · Enter run or edit · Esc 关闭',
                          classes='modal-hint')
 
     def on_mount(self) -> None:

@@ -38,16 +38,16 @@ class TranscriptSearchModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='transcript-search-box'):
-            yield Static('Search this conversation', classes='modal-title')
+            yield Static('搜索当前对话', classes='modal-title')
             yield TranscriptSearchInput(
                 value=self.initial_query,
                 placeholder='Search message text',
                 max_length=200,
                 id='transcript-search-input')
-            yield Static('Type to search', id='transcript-search-status',
+            yield Static('输入以搜索', id='transcript-search-status',
                          classes='modal-hint')
             yield Static('', id='transcript-search-preview', markup=False)
-            yield Static('Enter next · Shift+Enter previous · Esc close',
+            yield Static('Enter 下一个 · Shift+Enter 上一个 · Esc 关闭',
                          classes='modal-hint')
 
     def on_mount(self) -> None:
@@ -71,7 +71,7 @@ class TranscriptSearchModal(ModalScreen):
         elif count:
             status = f'{index + 1} / {count} messages'
         else:
-            status = 'No matching messages' if self._query.strip() else 'Type to search'
+            status = 'No matching messages' if self._query.strip() else '输入以搜索'
         self.query_one('#transcript-search-status', Static).update(status)
         self.query_one('#transcript-search-preview', Static).update(snippet)
 

@@ -37,7 +37,7 @@ def test_markdown_mouse_selection_copies_unicode_without_quitting(monkeypatch, r
             assert app.screen.get_selected_text() == '中文 🙂'
             assert copied == ['中文 🙂']  # 松开鼠标即复制，无需快捷键。
             assert app.model.snapshot()[-1].payload['text'] == (
-                'Copied 3 non-whitespace chars to clipboard.')
+                '已复制 3 个字符到剪贴板。')
             highlighted = app.view.render_line(y)
             assert any(segment.style and segment.style.bgcolor == app.view.selection_style.bgcolor
                        for segment in highlighted if '中' in segment.text)
@@ -107,7 +107,7 @@ def test_code_selection_removes_padding_and_preserves_indent(monkeypatch):
             assert '\n    ' in expected
             count = sum(not char.isspace() for char in expected)
             assert app.model.snapshot()[-1].payload['text'] == (
-                f'Copied {count} non-whitespace chars to clipboard.')
+                f'已复制 {count} 个字符到剪贴板。')
             # 单击与只选择行尾填充，都不覆盖剪贴板。
             await pilot.click(app.view, offset=(0, y))
             await pilot.pause()
@@ -142,7 +142,7 @@ def test_centered_heading_count_excludes_layout_whitespace(monkeypatch, width):
             assert copied[0].strip() == 'Heading'
             assert len(copied[0]) > 7
             assert app.model.snapshot()[-1].payload['text'] == (
-                'Copied 7 non-whitespace chars to clipboard.')
+                '已复制 7 个字符到剪贴板。')
 
     asyncio.run(scenario())
 

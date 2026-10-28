@@ -30,10 +30,10 @@ class QueueActionsMixin:
         items = self._steering.drain() + self._pending.drain()
         items = [item for item in items if item]
         if not items:
-            self._notice('No queued messages to restore.')
+            self._notice('没有可取回的排队消息。')
             return
         self._restore_to_composer(items)
-        self._notice(f'Restored {len(items)} queued message(s) to editor.')
+        self._notice(f'已取回 {len(items)} 条排队消息到输入框。')
 
     def _restore_to_composer(self, items: list[str]) -> None:
         """保留当前草稿，把消息按顺序接在后面，并同步队列状态。"""
@@ -69,7 +69,7 @@ class QueueActionsMixin:
         """Ctrl+G / Alt+↑ / `/dequeue`：单条直接取回，多条用选择器管理。"""
         rows = self._queued_rows()
         if not rows:
-            self._notice('No queued messages to restore.')
+            self._notice('没有可取回的排队消息。')
             return
         if len(rows) == 1:
             self._restore_queue_row(rows[0])
@@ -86,7 +86,7 @@ class QueueActionsMixin:
             self._notice('队列已变化（消息可能已被消费），请重新打开。')
             return
         self._restore_to_composer([text])
-        self._notice('Restored 1 queued message to editor.')
+        self._notice('已取回 1 条排队消息到输入框。')
 
     def _on_queue_action(self, result) -> None:
         if not result:
@@ -118,7 +118,7 @@ class QueueActionsMixin:
             return
         self._refresh_queue()
         preview = text.replace(chr(10), ' ')[:40]
-        self._notice(f'Deleted queued message: {preview}')
+        self._notice(f'已删除排队消息：{preview}')
 
     def _refresh_queue(self) -> None:
         if self._queue_widget is None:

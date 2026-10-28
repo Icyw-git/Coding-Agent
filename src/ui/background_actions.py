@@ -59,9 +59,9 @@ class BackgroundActionsMixin:
     def start_review(self) -> None:
         """`/review`：后台只读审阅，进度/结果写进同一块（不占对话回合）。"""
         if self._busy:
-            self._notice('Cannot review while a request is running.')
+            self._notice('回合进行中，无法开始审阅。')
             return
-        block = self.model.append('notice', {'text': 'review: running…'})
+        block = self.model.append('notice', {'text': '审阅中…'})
         self._mark_dirty()
         threading.Thread(target=self._run_review,
                          args=(block.id,), daemon=True).start()
@@ -96,7 +96,7 @@ class BackgroundActionsMixin:
 
     def start_watch(self, argument: str) -> None:
         """`/watch`：后台线程轮询，进度与最终输出写进同一块。"""
-        block = self.model.append('notice', {'text': 'watch: 等待后台任务…'})
+        block = self.model.append('notice', {'text': '等待后台任务…'})
         self._mark_dirty()
         threading.Thread(target=self._run_watch,
                          args=(block.id, argument), daemon=True).start()

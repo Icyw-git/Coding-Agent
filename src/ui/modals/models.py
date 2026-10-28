@@ -53,12 +53,12 @@ class ModelPickerModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='model-box'):
-            yield Static('Select model', classes='modal-title')
+            yield Static('选择模型', classes='modal-title')
             yield ModelSearchInput(
                 placeholder='Search model or provider', id='model-search')
             yield OptionList(id='model-list')
             yield Static('', id='model-empty', classes='modal-hint')
-            yield Static('↑↓ select · Enter apply · Esc close',
+            yield Static('↑↓ select · Enter 应用 · Esc 关闭',
                          classes='modal-hint')
 
     def on_mount(self) -> None:

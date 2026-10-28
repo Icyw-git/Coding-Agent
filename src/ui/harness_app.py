@@ -205,18 +205,19 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         except Exception:
             return None
 
-    def _copy_text(self, text: str, *, destination: str = 'to clipboard') -> None:
+    def _copy_text(self, text: str, *, destination: str = '') -> None:
         # 显示字符数不含布局填充、代码缩进或换行；复制内容保留原有结构。
         count = sum(not char.isspace() for char in text)
         self.copy_to_clipboard(text)
-        self._notice(f'Copied {count} non-whitespace chars {destination}.')
+        self._notice(f'已复制 {count} 个字符{destination}。' if destination
+                     else f'已复制 {count} 个字符到剪贴板。')
 
     def action_copy_selection(self) -> None:
         text = self._selected_text()
         if text:
             self._copy_text(text)
         else:
-            self._notice('Select transcript text first, or use /copy for the last tool output.')
+            self._notice('先选中记录里的文字，或用 /copy 复制最近一次工具输出。')
 
     def action_interrupt(self) -> None:
         # 有选中文本时 Ctrl-C 复制，不再直接退出；无选中保持原来的退出行为。
@@ -317,11 +318,11 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             if block.kind == 'tool':
                 output = str(block.payload.get('output') or '')
                 if output:
-                    self._copy_text(output, destination='from the last tool output')
+                    self._copy_text(output, destination='（来自最近一次工具输出）')
                 else:
-                    self._notice('The last tool block has no output yet.')
+                    self._notice('最近一个工具块还没有输出。')
                 return
-        self._notice('No tool output to copy.', level='error')
+        self._notice('最近没有可复制的工具输出。', level='error')
 
     def toggle_last_tool(self) -> None:
         for block in reversed(self.model.snapshot()):
@@ -502,7 +503,7 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         import skill_system
         body = skill_system.load_skill(name)
         if body.startswith('Error:'):
-            self._notice(f'Unknown skill: {name}', level='error')
+            self._notice(f'未知技能： {name}', level='error')
             return
         content = f'<skill name="{name}">' + chr(10) + body + chr(10) + '</skill>'
         if argument.strip():

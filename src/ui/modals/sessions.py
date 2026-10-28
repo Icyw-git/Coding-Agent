@@ -68,10 +68,10 @@ class RenameSessionModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='rename-session-box'):
-            yield Static('Rename session', classes='modal-title')
+            yield Static('重命名会话', classes='modal-title')
             yield Input(value=self.title_text, id='rename-session-input',
                         max_length=80)
-            yield Static('Enter save · Esc cancel · 80 characters maximum',
+            yield Static('Enter 保存 · Esc 取消 · 最多 80 字',
                          classes='modal-hint')
             yield Static('', id='rename-session-error', classes='modal-hint')
 
@@ -125,7 +125,7 @@ class SessionPickerModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id='session-box'):
-            yield Static('Active sessions', id='session-title',
+            yield Static('进行中的会话', id='session-title',
                          classes='modal-title')
             yield SessionSearchInput(
                 placeholder='搜索标题 / 工作区 / 会话 ID / 摘要',
@@ -180,7 +180,7 @@ class SessionPickerModal(ModalScreen):
         options.clear_options()
         loading = self._view == 'archived' and self._archive_rows is None
         self.query_one('#session-title', Static).update(
-            'Archived sessions' if self._view == 'archived' else 'Active sessions')
+            'Archived sessions' if self._view == 'archived' else '进行中的会话')
         if loading:
             self._visible = []
             self._by_id = {}
@@ -232,7 +232,7 @@ class SessionPickerModal(ModalScreen):
             actions = 'Enter restore · Alt+D delete'
         self.query_one('#session-controls', Static).update(
             f'{count} sessions · {sort} · {scope} · Alt+S sort · Alt+W workspace'
-            f' · Alt+V active/archived · {actions} · Esc close')
+            f' · Alt+V active/archived · {actions} · Esc 关闭')
 
     def action_toggle_archive_view(self) -> None:
         self._view = 'archived' if self._view == 'active' else 'active'

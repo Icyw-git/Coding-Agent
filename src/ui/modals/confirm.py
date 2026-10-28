@@ -34,7 +34,7 @@ class ConfirmModal(ModalScreen):
                     yield Static(markup_escape(self.body), classes='modal-hint')
             yield Static(
                 f'[yellow]y[/]/[yellow]Enter[/] = {markup_escape(self.confirm_label)}    '
-                '[yellow]n[/]/[yellow]Esc[/] = Cancel',
+                '[yellow]n[/]/[yellow]Esc[/] = 取消',
                 classes='modal-hint')
 
     def action_confirm(self) -> None:

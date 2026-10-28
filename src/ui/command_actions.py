@@ -68,7 +68,7 @@ class CommandActionsMixin:
         if spec is None:
             hint = commands.did_you_mean(verb)
             suffix = f'；是否想输入 {hint}？' if hint else ''
-            self._notice(f'Unknown command: /{verb}{suffix}', level='error')
+            self._notice(f'未知命令：/{verb}{suffix}', level='error')
             return True
         verb = spec.name
         if not spec.ported:
@@ -127,7 +127,7 @@ class CommandActionsMixin:
             try:
                 self._notice(harness.format_workspace_diff(color=False))
             except Exception as exc:
-                self._notice(f'Diff failed: {exc}', level='error')
+                self._notice(f'生成 diff 失败： {exc}', level='error')
         elif verb == 'cache':
             try:
                 if argument.strip().lower() == 'profile':
@@ -136,7 +136,7 @@ class CommandActionsMixin:
                     self._notice(harness.tool_cache.handle_cache_command(
                         harness.TOOL_RESULTS_DIR, harness.SESSIONS_DIR, argument))
             except Exception as exc:
-                self._notice(f'Cache failed: {exc}', level='error')
+                self._notice(f'读取缓存失败： {exc}', level='error')
         elif verb == 'sandbox':
             try:
                 if argument:
@@ -147,7 +147,7 @@ class CommandActionsMixin:
                     message = harness.format_sandbox_tier()
                 self._notice(message)
             except Exception as exc:
-                self._notice(f'Sandbox failed: {exc}', level='error')
+                self._notice(f'切换档位失败： {exc}', level='error')
         elif verb == 'review':
             self.start_review()
         elif verb == 'watch':
@@ -158,7 +158,7 @@ class CommandActionsMixin:
             self.open_queue_picker()
         elif verb == 'expand':
             self.toggle_last_tool()
-            self._notice('Toggled the most recent tool block.')
+            self._notice('已折叠/展开最近一个工具块。')
         elif verb == 'approvals':
             error = harness.command_error('/approvals', argument)
             if error:
@@ -233,7 +233,7 @@ class CommandActionsMixin:
             if self._busy:
                 self._notice('当前任务尚未结束，请结束后再清理快照。')
             elif not self._store:
-                self._notice('No session context.', level='error')
+                self._notice('当前没有会话。', level='error')
             else:
                 self.start_checkpoint_gc(argument)
         elif verb == 'rewind':
@@ -257,13 +257,14 @@ class CommandActionsMixin:
                 path = harness.export_session(self._messages)
                 self._notice(f'Exported transcript: {path}')
             except Exception as exc:
-                self._notice(f'Export failed: {exc}', level='error')
+                self._notice(f'导出失败： {exc}', level='error')
         elif verb in ('allow', 'deny', 'ask'):
             if not argument:
-                self._notice(f'Use /{verb} <tool>.')
+                self._notice(f'用法：/{verb} <工具名>，例如 /{verb} web_fetch。'
+                             '工具名在审批提示里能看到。')
             else:
                 harness.permission_gate.set_policy(argument, verb)
-                self._notice(f'Permission policy for {argument}: {verb}')
+                self._notice(f'已设置工具策略： {argument}: {verb}')
         return True
 
     def _display_status(self) -> dict:
@@ -424,7 +425,8 @@ class CommandActionsMixin:
         if arg.startswith('rollback'):
             change_id = arg[len('rollback'):].strip()
             if not change_id:
-                self._notice('用法：/improvements rollback <change_id>')
+                self._notice('用法：/improvements rollback <批次号>'
+                             '（批次号在 /improvements 列表里）')
                 return
             restored = ledger.rollback(cache, change_id)
             if not restored:
@@ -779,10 +781,10 @@ class CommandActionsMixin:
         try:
             target = harness.llm_config.load_settings(environ).resolve_for('main')
         except harness.llm_config.ConfigError as exc:
-            self._notice(f'Model unchanged: {exc}', level='error')
+            self._notice(f'模型未更改： {exc}', level='error')
             return
         if not target.supports('tools'):
-            self._notice(f'Model unchanged: {target.ref} does not support tools.',
+            self._notice(f'模型未更改： {target.ref} 不支持工具。',
                          level='error')
             return
 

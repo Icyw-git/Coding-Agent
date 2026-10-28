@@ -49,13 +49,13 @@ class SessionAdminActionsMixin:
     def start_picker_session_action(self, action: str, row: dict) -> None:
         """Confirm a single picker action through the shared cleanup pipeline."""
         if self._busy:
-            self._notice('Cannot manage sessions while a request is running.')
+            self._notice('回合进行中，无法管理会话。')
             return
         if action not in ('archive', 'restore', 'delete'):
-            self._notice('Unknown session action.', level='error')
+            self._notice('未知的会话操作。', level='error')
             return
         if action == 'archive' and row.get('id') == self._session_id:
-            self._notice('Cannot archive the current session.')
+            self._notice('不能归档当前正在用的会话。')
             return
         threading.Thread(target=self._scan_picker_session_action,
                          args=(action, dict(row), self._session_id),
@@ -94,7 +94,7 @@ class SessionAdminActionsMixin:
     def _picker_session_action_ready(self, action: str, selected: dict,
                                      current_id: str, result, error: str) -> None:
         if error:
-            self._notice(f'Session action failed: {error}', level='error')
+            self._notice(f'会话操作失败： {error}', level='error')
             return
         if self._busy or self._session_id != current_id:
             self._notice('会话状态已变化，请重新打开选择器。')
@@ -260,10 +260,10 @@ class SessionAdminActionsMixin:
         """`/archive`、`/delete`：后台扫描候选，再打开多选与确认。"""
         import harness
         if self._busy:
-            self._notice('Cannot clean up sessions while a request is running.')
+            self._notice('回合进行中，无法整理会话。')
             return
         if not self._store:
-            self._notice('No session context.', level='error')
+            self._notice('当前没有会话。', level='error')
             return
         error = harness.command_error('/' + command, argument)
         if error:
