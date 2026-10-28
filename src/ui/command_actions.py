@@ -187,6 +187,8 @@ class CommandActionsMixin:
             self.handle_improvements(argument)
         elif verb == 'undo-move':
             self.handle_undo_move(argument)
+        elif verb == 'usage':
+            self.handle_usage(argument)
         elif verb == 'grants':
             self.handle_grants(argument)
         elif verb == 'workspaces':
@@ -346,6 +348,24 @@ class CommandActionsMixin:
         lines.append('  readonly  = 用已有记忆，不产生新的')
         lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
         self._notice(chr(10).join(lines))
+
+    def handle_usage(self, argument: str) -> None:
+        """`/usage [天数]`：聚合 token、耗时、工具、审批与记忆。
+
+        数据全部来自既有事件流，不新增埋点。这也是判断"记忆/主动性/自改进
+        有没有用"的前提——没有它只能不断加机制、永远无法判断。
+        """
+        import harness
+        import usage_stats
+
+        try:
+            days = int((argument or '').strip() or usage_stats.DEFAULT_DAYS)
+        except ValueError:
+            self._notice('用法：/usage [天数]，天数需为整数')
+            return
+        days = max(1, min(days, 365))
+        stats = usage_stats.collect(harness.SESSIONS_DIR, days=days)
+        self._notice(usage_stats.format_report(stats))
 
     def handle_undo_move(self, argument: str) -> None:
         """`/undo-move [batch_id]`：撤销上一批文件移动。

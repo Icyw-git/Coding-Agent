@@ -348,6 +348,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
                 '[allow|deny|remove <主机>] [until 日期] [note 备注]',
                 ('domain',)),
     CommandSpec('audit', '查看最近的安全相关事件', '[类型|all]'),
+    CommandSpec('usage', '使用统计：token/耗时/工具/审批/记忆',
+                '[天数]', ()),
     CommandSpec('undo-move', '撤销上一批文件移动',
                 '[batch_id]', ()),
     CommandSpec('improvements', '自我改进：会话/记录/回滚',

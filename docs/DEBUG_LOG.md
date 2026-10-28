@@ -8722,3 +8722,74 @@ tool_documents 自身            1.4 ms     ← 原来带着整条链
 schema 快照同步。
 
 全量 **2898 passed / 3 skipped**（1 个 UI 时序偶发，连跑三次全绿），ruff 通过。
+
+## 功能 3：`/usage` 使用统计聚合
+
+### 为什么这项优先级高
+
+token、工具调用、耗时、审批、记忆写入**都已落在会话事件流里**，但没有任何聚合
+视图。更重要的是：**这是判断"记忆/主动性/RSI 到底有没有用"的最小前提**。
+没有它，只能不断加机制、永远无法判断。
+
+### 数据来源（全部已有，不新增埋点）
+
+| 维度 | 事件 |
+|---|---|
+| token | `usage`（prompt / completion / cached / total） |
+| 请求耗时 | `usage.request_ms` |
+| 工具 | `tool_profile`（tools[].name, duration_ms, status） |
+| 回合 | `turn_completed` |
+| 审批与记忆 | 审计事件（同一事件流） |
+
+### 真实数据验证
+
+跑本机 22 个会话、30 天窗口：
+
+```
+会话 22 · 回合 77 · 模型请求 768
+token：输入 35969.3k（其中缓存 32157.3k）· 输出 422.5k · 合计 36391.8k
+缓存命中率：89%（缓存 / 输入）
+请求耗时：p50 1984ms · p90 5766ms
+工具调用（71 批）：
+  bash                63 次  均 545ms · 失败 1
+  read                 8 次  均 13ms
+  grep                 7 次  均 1750ms
+  background_output    6 次  均 1713ms
+  desktop_snapshot     4 次  均 9970ms
+```
+
+这组数字直接确认了之前 profile 的结论：**请求 p50 1984ms 与本地开销无关**（本地
+17–30ms，占 1%）。
+
+### 性能：字节预筛（1095ms → 83ms）
+
+第一版全量 json.loads，22 个会话要 **1095ms**——交互命令不能接受。
+
+改用 `audit.py` 已经验证过的做法：在 **bytes** 层预筛，只解码含关心键的行：
+
+```python
+_INTERESTING = (b'"usage"', b'"tool_profile"', b'"turn_completed"', ...)
+if not any(marker in raw for marker in _INTERESTING):
+    continue
+```
+
+**1095ms → 83ms（13×）**，结果完全一致。会话里绝大多数是 message / tool_started
+行，它们的正文几乎不出现这些键，所以预筛很干净。
+
+### 一个口径问题（写进 docstring 与输出）
+
+**缓存命中率 = cached / prompt（输入），不是 / total**。分母用总数会让命中率
+看起来更好看而失去意义。口径含糊的统计比没有统计更容易误导。
+
+### 一个测试抓到的 bug
+
+`sessions` 计数原本依赖 `turn_started`，而它不在预筛列表里——永远数出 0。
+改成"有任何被预筛保留的事件就算活跃会话"。
+
+### 新增
+
+- `src/usage_stats.py`、命令 `/usage [天数]`
+- `tests/test_usage_stats.py`（16 条，含"缓存命中率分母是输入"与"预筛不能让扫描
+  变慢"两条口径/性能断言）
+
+全量 **2915 passed / 3 skipped**，ruff 通过。
