@@ -190,7 +190,19 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                       'description': 'File or directory to '
                                                                      'search. Relative to the '
                                                                      'workspace/cwd, or absolute; '
-                                                                     'defaults to the workspace'},
+                                                                     'defaults to the workspace. '
+                                                                     'Ignored when scope is '
+                                                                     '"workspaces"'},
+                                             'scope': {'type': 'string',
+                                                       'enum': ['workspace', 'workspaces'],
+                                                       'description': '"workspace" (default) '
+                                                                      'searches one path; '
+                                                                      '"workspaces" searches '
+                                                                      'every workspace registered '
+                                                                      'with /workspace add and '
+                                                                      'groups the hits by '
+                                                                      'project. Use it to answer '
+                                                                      '"where did I see this?"'},
                                              'glob': {'type': 'string',
                                                       'description': 'Only search files matching '
                                                                      "this glob, e.g. '*.py' or "

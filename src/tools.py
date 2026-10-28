@@ -287,10 +287,46 @@ def _grep_backend(pattern, root, glob, case_insensitive, limit):
 
 def run_grep(pattern: str, path: str = '.', glob: str = None,
              case_insensitive: bool = False, max_results: int = 100,
-             cwd: str = None) -> str:
+             cwd: str = None, scope: str = 'workspace') -> str:
+    if str(scope or '').strip().casefold() == 'workspaces':
+        return _grep_across_workspaces(
+            pattern, glob=glob, case_insensitive=case_insensitive,
+            max_results=max_results)
     return grep_files(pattern, path, glob, case_insensitive=case_insensitive,
                       max_results=max_results, cwd=cwd, gate=_gate_file,
                       resolve=safe_path, backend=_grep_backend)
+
+
+def _grep_across_workspaces(pattern, *, glob, case_insensitive, max_results):
+    """跨**已登记**工作区搜索，按工作区分组。
+
+    只搜登记过的目录：全盘扫描在性能（可能几分钟）与隐私（把没让 agent 看过的
+    目录纳进来）上都不可接受。
+    """
+    import workspace_search
+
+    roots = workspace_search.targets()
+    if not roots:
+        return ('No workspaces registered yet. Add one with '
+                '/workspace add <path>, or pass an explicit path instead.')
+
+    def _one(root, budget):
+        # 单工作区复用既有实现：分区判定、秘密文件与忽略目录规则都一致。
+        output = grep_files(pattern, str(root), glob,
+                            case_insensitive=case_insensitive,
+                            max_results=budget['max_results'],
+                            gate=_gate_file, resolve=safe_path,
+                            backend=_grep_backend)
+        if output.startswith('Error:'):
+            return {'hits': [], 'scanned': 0}
+        hits = [line for line in output.splitlines() if line.strip()]
+        return {'hits': hits, 'scanned': 0}
+
+    return workspace_search.format_groups(
+        workspace_search.search(pattern, roots=roots, glob=glob,
+                                case_insensitive=case_insensitive,
+                                max_results=max_results,
+                                search_workspace=_one))
 
 
 def run_ls(path: str = '.', all: bool = False, cwd: str = None) -> str:
