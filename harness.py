@@ -82,6 +82,7 @@ from agent_core import (
     inject_memories,
     list_memory_files,
     load_memories,
+    local_relevant_memories,
     micro_compact,
     persist_large_output,
     reactive_compact,
@@ -808,6 +809,27 @@ def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn
         consolidate_memories()
     except Exception as exc:
         print(f'  \033[33m[memory] skipped: {exc}\033[0m')
+    # 异步 LLM 评测（默认关）：判“这轮召回的记忆真的有用吗”与“库里的记忆
+    # 该不该长期保留”。只写 jsonl 报告，不参与任何决策、不改记忆。
+    # 放在抽取/合并**之后**：这样质量评测带得到本轮新沉淀的条目。
+    try:
+        import memory_eval
+        if memory_eval.should_sample(turn_no):
+            import paths
+            recalled_files = local_relevant_memories(messages_snapshot)
+            by_name = {item['filename']: item for item in list_memory_files()}
+            recalled = [by_name[name] for name in recalled_files
+                        if name in by_name]
+            last_user = next((msg.get('content') for msg in reversed(messages_snapshot)
+                              if msg.get('role') == 'user'), '')
+            memory_eval.run_async(
+                cache_dir=paths.cache_path(),
+                turn_no=turn_no,
+                message=str(last_user or ''),
+                recalled=recalled,
+                library=list_memory_files()[:memory_eval.MAX_JUDGED])
+    except Exception as exc:
+        print(f'  \033[90m[memory-eval] skipped: {type(exc).__name__}\033[0m')
 
 
 _housekeeping_threads: list[threading.Thread] = []

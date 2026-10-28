@@ -7846,3 +7846,61 @@ turn_coordinator 跨进程锁超时），原因是同一个日志文件上并发
 **评测集此前没有真实评测价值**：`test_memory_eval.py` 只测机制契约，测不出召回
 质量——40% 的召回率它一条都不会失败。现在补了 `test_memory_benchmark.py`，
 有了带数字的质量基准和明确的能力边界记录。
+
+## 异步 LLM-as-judge 记忆评测（2026-10-28）
+
+补上上一轮指出的最大缺口：**无法测量真实效果**。离线基准
+（`test_memory_benchmark.py`）只能守住术语表内的召回率，测不到真实使用里的两件事：
+
+1. 这一轮召回的记忆，对这个问题**真的有用吗**（PAHF 的 injection quality）
+2. 写进库里的记忆，是**持久偏好还是一次性噪音**（distillation quality）
+
+### 设计：三条硬约束
+
+**必须异步。** 判一次要一次模型调用（1~3 秒）。记忆是背景设施，不能占用主路径。
+全部在回合结束后由 housekeeping 线程跑，`run_async` 立即返回（测试断言
+调用方耗时 < 0.2s，而假模型 sleep 0.4s）。
+
+**成本可控。**
+- 默认关闭（`HARNESS_MEMORY_EVAL=1` 才开）——多数人不该为此付费
+- 每 N 轮采样一次（默认 10），用**轮次**而不是概率：可复现、测试能确定命中
+- 单次上限：1 个回合 / 至多 8 条记忆 / 45s 超时
+
+**评测不能反过来动系统。** 结果只写 `.cache/memory-eval.jsonl` + 展示，不改记忆、
+不改召回、不触发任何自动动作。让评测能反过来动系统，等于给它一条自我强化的路径
+——这正是 RSI 那一节讨论的红线。
+
+### 两项评测
+
+- `judge_recall`：给「用户消息 + 本轮召回的记忆」，让模型指出哪些真的相关、
+  缺了什么。产出 `recall_precision` 与 `missing_rate`。
+  提示词里明确「光是话题重叠不算相关」——否则模型会说每条都相关，指标就没意义。
+- `judge_quality`：抽样若干条库里的记忆，判 keep/drop。产出 `keep_rate`。
+
+`/memories quality` 看汇总（含"这是模型自己的判断，只作参考"的提示）。
+
+### 踩到一个真 bug（被演示脚本抓到）
+
+`RECALL_PROMPT` 里有 JSON 示例 `{"relevant": [...]}`，而它对 `.format()` 调用——
+未转义的花括号直接 `KeyError: 'relevant'`。而我的 `except Exception: pass`
+把它**静默吞掉**了：只有 quality 那条落了盘，recall 那条凭空消失，汇总里
+`recall_samples: 0`。
+
+两处都改了：
+- 转义花括号（`{{`/`}}`）
+- 不再静默吞异常，打印一行 `[memory-eval] recall judge skipped: KeyError`
+
+**这是我这一轮第三次被"静默失败"咬到**（前两次：patch 脚本无条件 print('ok')、
+`\b\d+\b` 匹配不到 CJK 相邻数字）。共同点都是"看起来成功了，实际没生效"。
+所以评测模块里的失败一律留痕，不再 `pass`。
+
+### 防护措施
+
+模型输出不可信：索引一律收敛（非整数/越界/布尔/重复全部丢弃），
+`judge_quality` 里 keep 与 drop 冲突时以 keep 为准、drop 去重。
+
+### 测试
+
+新增 `test_memory_eval_judge.py` (25)，覆盖：默认关闭、按轮次采样、
+代码围栏容错、非法索引过滤、异步不阻塞、判失败只丢那一轮、汇总算法、坏行跳过。
+全量 **2721 passed / 3 skipped**，ruff 通过。

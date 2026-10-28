@@ -273,6 +273,9 @@ class CommandActionsMixin:
         import memory_scope
 
         arg = (argument or '').strip().lower()
+        if arg.startswith('quality') or arg.startswith('eval'):
+            self.handle_memory_quality()
+            return
         if arg.startswith('why'):
             self.handle_why((argument or '').strip()[len('why'):].strip())
             return
@@ -339,6 +342,17 @@ class CommandActionsMixin:
         lines.append('  readonly  = 用已有记忆，不产生新的')
         lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
         self._notice(chr(10).join(lines))
+
+    def handle_memory_quality(self) -> None:
+        """`/memories quality`：看异步 LLM 评测的汇总。
+
+        数据由回合结束后的后台线程写入（默认关闭，`HARNESS_MEMORY_EVAL=1`
+        开启，每 10 轮采样一次），只展示不改记忆。
+        """
+        import memory_eval
+        import paths
+
+        self._notice(memory_eval.format_summary(paths.cache_path()))
 
     def handle_why(self, name: str) -> None:
         """`/memories why <名字>`：这条记忆从哪来。

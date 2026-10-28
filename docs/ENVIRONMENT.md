@@ -54,6 +54,8 @@
 | `HARNESS_MEMORY_CONTRIBUTE` | `1` | 全局：会话结束后是否抽取成记忆（进程级） |
 | `HARNESS_MEMORY_AGING` | `1` | 是否淘汰长期未用的记忆 |
 | `HARNESS_MEMORY_MAX_AGE_DAYS` | `90` | 超过多少天未用到就归档（`preference`/`correction` 不过期） |
+| `HARNESS_MEMORY_EVAL` | **`0`** | 异步 LLM-as-judge 记忆评测（判召回相关性 + 沉淀质量）。默认关：多数人不该为此付费 |
+| `HARNESS_MEMORY_EVAL_EVERY` | `10` | 每 N 轮采样一次 |
 
 **逐会话开关**用命令，不用环境变量：`/memories on|off|readonly|writeonly`。
 会话级选择优先于上面的全局值，且**不改全局设置**。
