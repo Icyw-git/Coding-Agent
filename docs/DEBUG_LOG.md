@@ -9685,3 +9685,59 @@ failed = ('处理未完成：' + (hint or str(exc)) + …)
 ### 测试
 
 全量 **2981 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（十二）：CLI 补全比 TUI 少 14 个命令
+
+用户指出「CLI 命令提示好像没跟上」。核对后发现是**两份命令表**：
+
+```
+cli_commands.COMMANDS   34 个   ← CLI 补全、CLI help
+ui.commands.COMMANDS    48 个   ← TUI 命令面板
+```
+
+TUI 有的、CLI 补不出来的 **14 个**：
+
+```
+/memories  /improvements  /usage  /undo-move    ← 我这几轮新加的，全中
+/allow  /deny  /ask                              ← 会话级工具策略
+/hotkeys  /clear  /more  /copy  /dequeue
+/clone  /export
+```
+
+后果：在 CLI 里敲 `/mem` 什么都不补，敲错也没有「是否想输入」提示（那个提示也查
+这份表）——**用户只能靠记忆敲全名**。
+
+### 补法
+
+给 `cli_commands.COMMANDS` 补上这 14 条（含参数提示、说明、分组）。现在两边都是
+48 条，命令名集合完全一致（CLI 多出来的只有 `/n` `/p` `/w` `/s` `/r` `/cp`
+这类别名）。
+
+验证：
+
+```
+/mem    -> ['/memories']
+/imp    -> ['/improvements']
+/usa    -> ['/usage']
+/undo-m -> ['/undo-move']
+/all    -> ['/allow']
+```
+
+### 加守卫
+
+`test_cli_and_tui_command_sets_match`：TUI 命令面板里的每一条都必须也能在 CLI
+补全里找到。
+
+这条特别值得加，因为**两份表没有共同的注册点**——`cli_commands.Command` 与
+`ui.commands.CommandSpec` 是两套 dataclass，谁都不知道对方存在。以后再加命令，
+只改一边就会静默漂移，而两边各自的功能测试都通过。
+
+### 这是「一个功能两处实现」的第九对
+
+前十一轮梳理过八对（有效期、审计标签、待审批、审批原因、cron 行、任务状态、
+会话列表、记忆渲染），这次是**命令注册表**这一对。同一类问题，只是这次的后果
+不是"显示不一致"而是**功能缺失**（补不出来）。
+
+### 测试
+
+全量 **2982 passed / 3 skipped**，ruff 通过。

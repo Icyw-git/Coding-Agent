@@ -192,3 +192,29 @@ def test_field_names_are_not_used_as_labels(name):
         problems.append(f'{name}:{lineno}  {stripped[:70]}')
     assert not problems, ('internal field name used as a user-facing label:\n  '
                           + '\n  '.join(problems))
+
+
+def test_cli_and_tui_command_sets_match():
+    """CLI 补全与 TUI 命令面板必须是同一套命令。
+
+    实测漂移过：TUI 有 48 个、CLI 补全只有 34 个，`/memories` `/improvements`
+    `/usage` `/undo-move` 这些新命令**在 CLI 里补不出来**——用户只能靠记忆敲
+    全名，敲错还没有提示（`/memori` 不会补成 `/memories`）。
+
+    两份实现（`cli_commands.COMMANDS` 与 `ui.commands.COMMANDS`）是历史形成的，
+    没有共同的注册点，只能靠断言钉住。
+    """
+    import sys
+
+    sys.path.insert(0, str(SRC))
+    import cli_commands
+    import ui.commands
+
+    cli = {c.name.lstrip('/') for c in cli_commands.COMMANDS}
+    cli |= {alias.lstrip('/') for c in cli_commands.COMMANDS for alias in c.aliases}
+    tui = {spec.name for spec in ui.commands.COMMANDS}
+
+    missing = sorted(tui - cli)
+    assert not missing, (
+        'these commands exist in the TUI palette but not in CLI completion '
+        f'(users cannot tab-complete them): {missing}')
