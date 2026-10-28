@@ -24,7 +24,7 @@ COMMANDS = (
     Command('/new', ('/n',), '[--ws <序号|名称|路径>|会话ID]',
             '选择工作区开始新会话；--ws 直接指定，Enter 用当前目录', '会话'),
     Command('/resume', ('/r',), '[last|会话ID或前缀]', '选择并恢复会话及其工作目录；last 直达最近会话', '会话'),
-    Command('/sessions', ('/s',), '', '打开会话管理；按工作区分组、预览和切换', '会话'),
+    Command('/sessions', ('/s',), '', '列出会话（含最近任务）；切换用 /resume', '会话'),
     Command('/archive', (), '[天数|all|empty|restore]', '归档旧会话；默认 30 天，可查看全部或恢复归档', '会话'),
     Command('/delete', (), '', '永久删除已归档会话及关联快照（不可恢复）', '会话'),
     Command('/status', (), '', '查看当前会话与运行状态', '常用'),
@@ -37,22 +37,22 @@ COMMANDS = (
             '查看存储 profile；gc 预览或清理过期且未被会话引用的工具缓存', '常用'),
     Command('/review', (), '', '用只读子代理审阅未提交改动并给出分级问题', '常用'),
     Command('/compact', (), '', '压缩当前会话上下文并保留完整记录', '常用'),
-    Command('/undo', (), '', '撤销最近一次用户回合的文件和会话改动', '常用'),
+    Command('/undo', (), '', '快速回滚最近一个回合（= /rewind turn --yes，不预览）', '常用'),
     Command('/model', (), '', '查看当前模型配置', '常用'),
-    Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '常用'),
-    Command('/revoke', (), '', '撤销当前会话已允许的同类操作与目录写授权', '常用'),
+    Command('/approvals', ('/perms',), '[序号] y|n', '查看待审批操作；带序号时按序号决议', '安全'),
+    Command('/revoke', (), '', '撤销当前会话已允许的同类操作与目录写授权', '安全'),
     Command('/grants', ('/grant',), '[add "<目录>" [until 日期] [note 备注]|remove "<目录>"]',
-            '查看/维护目录级持久写授权；只放宽工作区外写入的审批', '常用'),
+            '查看/维护目录级持久写授权；只放宽工作区外写入的审批', '安全'),
     Command('/domains', ('/domain',),
             '[allow|deny|remove <主机>] [until 日期] [note 备注]',
-            '域名策略：允许（免审）或拒绝（硬拒）特定域名', '常用'),
+            '域名策略：允许（免审）或拒绝（硬拒）特定域名', '安全'),
     Command('/audit', (), '[类型|all]',
-            '查看最近的安全相关事件（审批超时、截屏、桌面、授权变更）', '常用'),
+            '查看最近的安全相关事件（审批超时、截屏、桌面、授权变更）', '安全'),
     Command('/rules', (), '[add <allow|ask|deny> "<前缀>" [note 备注]|remove "<前缀>"]',
-            '查看/维护用户规则文件，只影响「问不问」，改不动硬拒与档位', '常用'),
+            '查看/维护用户规则文件，只影响「问不问」，改不动硬拒与档位', '安全'),
     Command('/sandbox', (), '[档位|approvals <档位>]',
             '查看或切换执行档位（read-only|workspace-write|danger-full-access）与审批档位',
-            '常用'),
+            '安全'),
     Command('/fork', (), '[事件序号]', '从当前会话分叉出新会话（原会话保留）', '会话'),
     Command('/find', ('/search',), '<关键词>', '跨会话搜索历史内容', '会话'),
     Command('/rename', (), '<新主题>', '设置当前会话主题', '会话'),
@@ -60,7 +60,7 @@ COMMANDS = (
     Command('/cd', (), '[路径]', '切换当前会话工作区；换项目建议 /new', '工作区'),
     Command('/workspaces', (), '', '列出已登记工作区', '工作区'),
     Command('/workspace', (), '[add <路径> [--name 名称]|remove <序号|名称|路径>]',
-            '登记、命名或移除工作区', '工作区'),
+            '登记/命名/移除工作区；不带参数同 /workspaces', '工作区'),
     Command('/checkpoints', ('/cps',), '', '列出当前会话的快照', '快照'),
     Command('/checkpoint', ('/cp',), '[标签]', '创建手动快照', '快照'),
     Command('/rewind', (), '[ID|turn|last|head] [--force] [--session] [--yes]',
@@ -69,11 +69,13 @@ COMMANDS = (
             '手动清理当前会话旧快照；--all 清理所有会话，--keep 覆盖本次保留上限', '快照'),
     Command('/quit', ('/exit',), '', '退出；会话自动保存', '常用'),
     Command('/memories', (), '[on|off|readonly|writeonly | why <名字> | quality]',
-            '记忆：本会话开关 / 某条记忆的来源 / 质量评测', '记忆'),
+            '记忆：本会话开关 / 某条记忆的来源 / 质量评测',
+            '记忆与自我改进'),
     Command('/improvements', (), '[begin <目标> | check <机制> | status | end | rollback <批次号>]',
-            '自我改进：开一次会话、判定一轮、回滚某次改动', '记忆'),
+            '自我改进：开一次会话、判定一轮、回滚某次改动',
+            '记忆与自我改进'),
     Command('/usage', (), '[天数]',
-            '使用统计：token、耗时、工具、审批、记忆（默认 7 天）', '记忆'),
+            '使用统计：token、耗时、工具、审批、记忆（默认 7 天）', '常用'),
     Command('/undo-move', (), '[批次号]',
             '撤销上一批文件移动（与 /undo 不同：那个回退对话）', '文件'),
     Command('/allow', (), '<工具名>',
@@ -93,7 +95,7 @@ COMMANDS = (
     Command('/dequeue', (), '[序号|all]',
             '取回或删除排队中的消息', '常用'),
     Command('/clone', (), '',
-            '从当前叶子复制出新会话（含分支）', '会话'),
+            '同 /fork：从当前叶复制出新会话（原会话保留）', '会话'),
     Command('/export', (), '',
             '导出当前会话 transcript', '会话'),
 )
@@ -194,7 +196,19 @@ def format_command_help(argument: str = '') -> str:
         aliases = ', '.join(command.aliases) or '无'
         return f'  {command.usage}\n  {command.description}\n  别名：{aliases}'
     lines = ['  直接输入消息开始对话；/help <命令> 查看用法。']
-    for group in ('常用', '会话', '工作区', '快照'):
+    # **不硬编码组名**：原来写死 ('常用','会话','工作区','快照')，新加的
+    # 「记忆」「文件」「安全」三组共 7 个命令在 /help 里根本不显示
+    # （/memories /improvements /usage /undo-move /allow /deny /ask）。
+    # 按命令出现顺序推导，未知组名也照常显示。
+    order: list[str] = []
+    for command in COMMANDS:
+        if command.group not in order:
+            order.append(command.group)
+    preferred = ('常用', '会话', '文件', '工作区', '快照',
+                 '记忆与自我改进', '安全')
+    ordered = ([group for group in preferred if group in order]
+               + [group for group in order if group not in preferred])
+    for group in ordered:
         lines.append(f'\n  {group}')
         for command in COMMANDS:
             if command.group == group:
