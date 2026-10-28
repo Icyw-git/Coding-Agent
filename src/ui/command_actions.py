@@ -185,6 +185,8 @@ class CommandActionsMixin:
             self.handle_memories(argument)
         elif verb == 'improvements':
             self.handle_improvements(argument)
+        elif verb == 'undo-move':
+            self.handle_undo_move(argument)
         elif verb == 'grants':
             self.handle_grants(argument)
         elif verb == 'workspaces':
@@ -344,6 +346,17 @@ class CommandActionsMixin:
         lines.append('  readonly  = 用已有记忆，不产生新的')
         lines.append('  writeonly = 不受旧记忆影响，但本会话会被学习')
         self._notice(chr(10).join(lines))
+
+    def handle_undo_move(self, argument: str) -> None:
+        """`/undo-move [batch_id]`：撤销上一批文件移动。
+
+        与 `/undo` 不同：`/undo` 回退**对话**，这个回退**文件移动**。
+        """
+        import paths
+        from tool_move import undo as undo_moves
+
+        self._notice(undo_moves(paths.cache_path(),
+                                batch_id=(argument or '').strip()))
 
     def handle_improvements(self, argument: str) -> None:
         """`/improvements`：看自我改进记录，或回滚某次改动。

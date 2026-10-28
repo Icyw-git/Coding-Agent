@@ -169,6 +169,21 @@ def run_delete_paths(paths: list) -> str:
     return _delete_tool(paths, audit=_screen_audit)
 
 
+def run_move_paths(moves: list, dry_run: bool = True) -> str:
+    # 惰性导入：moves 引擎与 tool_move 只在真用移动时才需要。
+    import paths as _paths
+    from tool_move import move as _move_tool
+    return _move_tool(moves, cache_dir=_paths.cache_path(), dry_run=dry_run,
+                      audit=_screen_audit)
+
+
+def run_undo_moves(batch_id: str = '') -> str:
+    import paths as _paths
+    from tool_move import undo as _undo_tool
+    return _undo_tool(_paths.cache_path(), batch_id=batch_id,
+                      audit=_screen_audit)
+
+
 def run_remember(text: str, type: str = 'preference', name: str = '',
                  description: str = '') -> str:
     # 惰性导入：tool_memory → memory → llm_route → harness，放到顶层会把
@@ -321,6 +336,8 @@ tool_registry = {
     'clipboard_read': run_clipboard_read,
     'clipboard_write': run_clipboard_write,
     'delete_paths': run_delete_paths,
+    'move_paths': run_move_paths,
+    'undo_moves': run_undo_moves,
     'remember': run_remember,
     'forget': run_forget,
     'recall': run_recall,

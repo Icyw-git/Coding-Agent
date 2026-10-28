@@ -708,6 +708,45 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                            'the recycle bin'}},
                               'required': ['paths']}}},
  {'type': 'function',
+  'function': {'name': 'move_paths',
+               'description': 'Move or rename files and directories. Dry-run by '
+                              'default: the first call returns a plan and changes '
+                              'nothing. Call again with dry_run=false to perform '
+                              'it. Every batch can be undone with undo_moves. '
+                              'Validates the whole batch first — one bad item '
+                              'rejects everything, so you never get a half-done '
+                              'move. Prefer this over `mv`/`move`/`ren` in bash, '
+                              'which cannot be undone.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'moves': {'type': 'array',
+                                            'maxItems': 50,
+                                            'description': '1-50 {from, to} pairs; '
+                                                           'a relative target is '
+                                                           'resolved against the '
+                                                           'source directory',
+                                            'items': {'type': 'object',
+                                                      'properties': {
+                                                          'from': {'type': 'string'},
+                                                          'to': {'type': 'string'}},
+                                                      'required': ['from', 'to']}},
+                                  'dry_run': {'type': 'boolean',
+                                              'description': 'true (default) only '
+                                                             'returns the plan'}},
+                              'required': ['moves']}}},
+ {'type': 'function',
+  'function': {'name': 'undo_moves',
+               'description': 'Undo a batch of moves made by move_paths. Defaults '
+                              'to the most recent batch. Never overwrites: an item '
+                              'is skipped if its original location is occupied.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'batch_id': {'type': 'string',
+                                               'description': 'Batch id from '
+                                                              'move_paths; omit for '
+                                                              'the latest batch'}},
+                              'required': []}}},
+ {'type': 'function',
   'function': {'name': 'remember',
                'description': 'Save one long-term memory that will be recalled in later '
                               'sessions. Use when the user says to remember something, '

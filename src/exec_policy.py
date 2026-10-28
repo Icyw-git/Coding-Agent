@@ -267,6 +267,23 @@ class Policy:
                 decision = Decision(
                     DENY, 'clipboard_tools_disabled',
                     f'{tool} is disabled ({CLIPBOARD_ENV}=0)')
+        elif tool == 'move_paths':
+            # dry_run（默认）不改磁盘：预览是安全的，不该逼用户先批一次。
+            # 真正的移动与删除同级——它同样可能一次动 50 个文件。
+            dry = args.get('dry_run')
+            if dry is None or dry is True:
+                decision = Decision(ALLOW)
+            else:
+                decision = Decision(
+                    ASK, 'move_paths',
+                    'moves or renames files (reversible via undo_moves, but still '
+                    'changes the filesystem)')
+        elif tool == 'undo_moves':
+            # 撤销只把文件移回原位，且不覆盖已有文件：比移动本身更安全，
+            # 但也不该默默动盘。
+            decision = Decision(
+                ASK, 'undo_moves',
+                'undoes a previous batch of moves (never overwrites existing files)')
         elif tool in DELETE_TOOLS:
             # 走回收站所以可撤销，但删除本身仍要人点头：路径可能展开成多个文件，
             # 「看起来删一个」和「实际删了 20 个」只差一个 glob。
