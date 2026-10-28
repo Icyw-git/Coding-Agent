@@ -937,7 +937,8 @@ python scripts/install_autostart.py install             # 当前用户，不提�
 [Personal Agent 路线图](docs/PERSONAL_AGENT_ROADMAP.md)；
 记忆/主动性/委托边界的第三轮规划见
 [Round 3](docs/PERSONAL_AGENT_ROUND3.md)；
-全部环境变量开关见 [环境变量参考](docs/ENVIRONMENT.md)。
+全部环境变量开关见 [环境变量参考](docs/ENVIRONMENT.md)；
+后续功能候选与优先级见 [功能建议](docs/FEATURE_BACKLOG.md)。
 
 验收辅助（本地预检 + 卡片结构校验 + 可选真机发卡）：
 
