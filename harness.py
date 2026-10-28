@@ -372,7 +372,9 @@ _SESSION_SUMMARY_CACHE_MAX = 512
 # ============================================================
 
 # ---------- 记忆系统配置 ----------
-MEMORY_TYPES=['user','feedback','project','reference']
+# 记忆类型词表（schema v2 统一）：旧词表 user/feedback/project/reference
+# 由 memory_schema.LEGACY_ALIASES 归一，磁盘上不再新写旧词。
+MEMORY_TYPES=['preference','correction','fact','context']
 MEMORY_DIR=CACHE_DIR/'memories'
 MEMORY_INDEX=MEMORY_DIR/'MEMORY.md'
 CONSOLIDATE_THRESHOLD=10

@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import date as _date
 
 import yaml
 
@@ -22,6 +23,7 @@ import llm_route
 import memory_aging
 import memory_feedback
 import memory_redact
+import memory_schema
 import memory_scope
 from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
@@ -135,7 +137,9 @@ def _atomic_write(path, text: str) -> None:
 
 
 def _render_memory(name: str, mem_type: str, description: str, body: str,
-                   *, source: str = '', quote: str = '') -> str:
+                   *, source: str = '', quote: str = '',
+                   scope: str = None, keywords=None, confidence=None,
+                   supersedes: str = '') -> str:
     """frontmatter 必须单行，否则 YAML 解析会把后续正文吞掉。
 
     写盘前对 description/body 做凭据脱敏：记忆是长期状态，一条 .env 内容被
@@ -154,14 +158,21 @@ def _render_memory(name: str, mem_type: str, description: str, body: str,
     hits = sorted(set(desc_hits) | set(body_hits) | set(quote_hits))
     if hits:
         _record_redaction(hits)
-    lines = [f"---\nname: {one_line(name)}\ndescription: {one_line(safe_desc)}",
-             f"type: {one_line(mem_type)}"]
-    if source:
-        lines.append(f"source_session: {one_line(source)}")
-    if safe_quote:
-        # 单行 + 限长：原话只作证据，不是正文。
-        lines.append(f"source_quote: {one_line(safe_quote)[:200]}")
-    return '\n'.join(lines) + f"\n---\n\n{safe_body}\n"
+    entry = {
+        'name': name,
+        'description': safe_desc,
+        'type': mem_type,
+        'scope': scope or memory_schema.DEFAULT_SCOPE,
+        'keywords': (memory_schema.normalize_keywords(keywords)
+                     or memory_schema.derive_keywords(name, safe_desc, safe_body)),
+        'confidence': (memory_schema.DEFAULT_CONFIDENCE
+                       if confidence is None else confidence),
+        'last_update_date': memory_schema.today(),
+        'supersedes': supersedes,
+        'source_session': source,
+        'source_quote': safe_quote[:200],
+    }
+    return memory_schema.render_frontmatter(entry) + f'\n{safe_body}\n'
 
 
 def _audit(event: str, payload: dict) -> None:
@@ -273,6 +284,12 @@ def delete_memory_file(name: str) -> bool:
 
 
 def list_memory_files() -> list:  # 列出所有记忆文件
+    """列出全部记忆条目（已归一成 schema v2 字段）。
+
+    已 superseded 的条目**不返回**：它们的修正版已在列表里，两者同时参与召回
+    可能取到错的那个（FAMA 惩罚的正是这种行为）。文件仍在磁盘上，可用
+    `/memories archived` 看到。
+    """
     h = _h()
     results = []
     for f in sorted(h.MEMORY_DIR.glob('*.md')):
@@ -282,13 +299,10 @@ def list_memory_files() -> list:  # 列出所有记忆文件
         if entry is None:
             continue
         meta, body, _raw = entry
-        results.append({
-            'filename': f.name,
-            'name': meta.get('name', f.stem),
-            'description': meta.get('description', ''),
-            'type': meta.get('type', 'user'),
-            'body': body,
-        })
+        item = memory_schema.normalize_entry(meta, body, f.name)
+        if item.get('superseded_by'):
+            continue
+        results.append(item)
     return results
 
 
@@ -340,6 +354,14 @@ def local_relevant_memories(messages: list, files: list | None = None,
     打分 = 2×ASCII 词命中 + 1×中文二元组命中（去重），阈值 ≥2：
     单个英文关键词即可命中（信息量大），中文需要至少两个二元组
     （例如「简短」+「回答」），避免常见字偶然撞车。
+
+    schema v2 起参与打分的字段从 ``name + description`` 扩到 **+ keywords**：
+    条件性偏好的关键词往往在 keywords 里（「困了」）而不在名字里，不扩就召回
+    不到。正文仍不参与——正文长，会把稀有词权重稀释。
+
+    两个加权（对应 PAHF 的 recency correctness 与 correction 优先级）：
+    - ``correction`` 类 ×1.3：用户纠正过的信息比普通偏好更重要
+    - 时间衰减：每 30 天 ×0.9，旧记忆排在后面但不会消失
     """
     if files is None:
         files = list_memory_files()
@@ -349,15 +371,38 @@ def local_relevant_memories(messages: list, files: list | None = None,
     if not recent.strip():
         return []
     tokens = set(_local_tokens(recent))
+    today = _date.today()
     scored = []
     for f in files:
-        haystack = (f['name'] + ' ' + f['description']).lower()
+        haystack = ' '.join([
+            str(f.get('name') or ''), str(f.get('description') or ''),
+            ' '.join(f.get('keywords') or []),
+        ]).lower()
         score = sum(2 if len(token) > 2 and token.isascii() else 1
                     for token in tokens if token in haystack)
-        if score >= 2:
-            scored.append((score, f['filename']))
+        if score < 2:
+            continue
+        if f.get('type') == 'correction':
+            score *= 1.3
+        score *= _recency_factor(f.get('last_update_date'), today)
+        scored.append((score, f['filename']))
     scored.sort(key=lambda pair: (-pair[0], pair[1]))
     return [filename for _, filename in scored[:max_items]]
+
+
+def _recency_factor(stamp: str, today=None) -> float:
+    """时间衰减：每 30 天 ×0.9。日期缺失/不可解析时不衰减（当作新鲜）。"""
+    text = memory_schema.normalize_date(stamp)
+    if not text:
+        return 1.0
+    try:
+        when = _date.fromisoformat(text)
+    except ValueError:
+        return 1.0
+    age = ((today or _date.today()) - when).days
+    if age <= 0:
+        return 1.0
+    return 0.9 ** (age / 30.0)
 
 
 def select_relevant_memories(messages: list, max_items: int = 5) -> list:
@@ -549,9 +594,9 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             if not isinstance(mem, dict):
                 continue
             name = str(mem.get('name') or f'memory_{int(time.time())}')
-            mem_type = str(mem.get('type') or 'user')
-            if mem_type not in _h().MEMORY_TYPES:
-                mem_type = 'user'   # schema 外的类型不落盘，避免污染后续合并
+            # 归一旧词表 + 未知类型回落：抽取是自由文本，
+            # 一个字段写坏不该让整条记忆丢掉（合并路径另有严格校验）。
+            mem_type = memory_schema.canonical_type(mem.get('type'))
             desc = ' '.join(str(mem.get('description') or '').split())
             body = str(mem.get('body') or '').strip()
             if desc and body:
@@ -571,7 +616,6 @@ def _validate_consolidated(items) -> list[dict]:
     合并会删旧文件，所以不能像提取那样「跳过坏项继续写」：只写回一部分
     也等于丢数据。这里只做纯数据校验，不碰磁盘。
     """
-    h = _h()
     if not isinstance(items, list) or not items:
         raise ValueError('result is not a non-empty list')
     if len(items) > _MAX_MEMORY_ITEMS:
@@ -582,15 +626,19 @@ def _validate_consolidated(items) -> list[dict]:
         if not isinstance(item, dict):
             raise ValueError(f'item {index} is not an object')
         name = str(item.get('name') or '').strip()
-        mem_type = str(item.get('type') or '').strip()
-        if not mem_type:
-            mem_type = 'user'   # 缺省按提取路径的约定；显式错误类型仍整批拒绝
+        # 类型归一：旧词表（user/feedback/project/reference）映射到规范词表，
+        # 否则 `remember` 写入的记忆会让整批合并永久失败（已修的真 bug）。
+        # 但**未知类型仍必须报错**：合并会删旧文件，把一个格式错误的 LLM
+        # 输出静默当成 fact，等于用错数据换掉正确数据。
+        try:
+            mem_type = memory_schema.canonical_type(item.get('type'), strict=True)
+        except ValueError:
+            raise ValueError(
+                f'item {index} has invalid type {item.get("type")!r}') from None
         description = ' '.join(str(item.get('description') or '').split())
         body = str(item.get('body') or '').strip()
         if not name or not description or not body:
             raise ValueError(f'item {index} is missing name/description/body')
-        if mem_type not in h.MEMORY_TYPES:
-            raise ValueError(f'item {index} has invalid type {mem_type!r}')
         slug = _slug(name)
         if slug in seen:
             raise ValueError(f'duplicate memory name {name!r}')

@@ -7601,3 +7601,79 @@ B2/B3 放最后：没有 A 的数据，自改进就是无源之水。
 
 新增 `test_verifier_guard.py` (40) + `test_memory_injection.py` (2)。
 全量 **2615 passed / 3 skipped**（200s），ruff 通过。
+
+## 实施 A2（schema v2）+ B4（记忆评估集）+ A3 召回改进
+
+### 顺手修掉一个真 bug：类型词表分裂
+
+核对 schema 时发现 M1 留下的缺陷：
+
+- `remember` 工具写入语义类型 `preference`/`correction`/`fact`/`context`
+- 合并校验用的是旧词表 `MEMORY_TYPES = ['user','feedback','project','reference']`
+- 后果：**用户一旦用过 `remember`，后续每次合并都整批校验失败并被静默跳过**
+  （`[memory] skipped`）。实测确认四种新类型全部 REJECTED。
+
+修法：`memory_schema` 做双向归一（`LEGACY_ALIASES`），`harness.MEMORY_TYPES`
+改成规范四词。旧文件继续可读，磁盘上不再新写旧词。
+
+**区分了宽容与严格两个入口**（重要）：
+
+- `normalize_type()` —— 读取路径，未知类型回落 `fact`（一个字段写坏不该让整批
+  记忆不可读）
+- `canonical_type(strict=True)` —— 合并校验，未知类型**必须报错**
+
+为什么合并必须严格：合并会**删旧文件**。把一个格式错误的 LLM 输出静默当成
+`fact` 落盘，等于用错数据换掉正确数据。既有测试
+`test_invalid_consolidation_keeps_existing_memories` 正是守这条，它先失败了一次
+——说明原来的断言是对的，我的第一版归一太松。
+
+### A2 schema v2
+
+新增字段：`scope` / `keywords` / `confidence` / `last_update_date` /
+`supersedes` / `superseded_by`。全部有默认值，旧文件照常读。
+
+**`keywords` 而不是 embedding**：召回是本地关键词匹配（零网络往返，省 ~2s/轮）。
+embedding 要么每次调 API（违反本地优先），要么本地跑模型（依赖重）。`keywords`
+由写入时顺手产出、成本为零，且让正文里的词参与检索——直接解决"条件偏好的关键词
+写在正文、名字里没有就召回不到"。将来真要向量检索，它就是现成的稀疏索引。
+
+**`last_update_date` 为什么必须显式**：原来靠文件 mtime，但召回记录写在独立 json
+里以避免扰动 mtime，一旦要"哪条最新"的确定性排序就不可靠。
+
+### 踩到一个会静默毁数据的坑：冒号破坏 YAML
+
+PAHF 推荐的条件偏好写法就是 `when sleepy: prefers tea`——**里面带 `: `**。
+直接写进 `description:` 会让 YAML 报 "mapping values are not allowed here"，
+**整个 frontmatter 变成空映射**，于是 type 回落成 fact、scope/keywords/
+last_update_date 全丢。
+
+实测才发现（渲染出的文件看着很正常，读回来 type 变成了 `fact`）。修法：加
+`_yaml_scalar()`，仅在必要时加双引号（含 `: `、` #`、以特殊字符开头、会被当布尔
+的字面量），普通值保持不加引号以保证 diff 干净。
+
+这个坑很值得记：**推荐的写法恰好是存储层的破格式**。
+
+### B4 记忆评估集（tests/test_memory_eval.py）
+
+按 PAHF 的 eval 框架建场景回归，不是单点断言：
+
+| 组 | 用例 |
+|---|---|
+| Precision | durable 偏好保留；session 笔记必须标 scope=session |
+| Recall | 条件偏好按**条件词**召回；无关记忆不召回 |
+| Recency | 同主题两条时 last_update_date 新者在前 |
+| **FAMA** | 被 superseded 的记忆必须退出召回（文件仍保留） |
+| Over-influence | 记忆块必须声明当轮指令优先，且声明在正文之前 |
+| Safety | 密钥落盘前脱敏 |
+| Token | 召回条数有上限 |
+
+### A3 召回改进
+
+- 打分字段 `name + description` → `+ keywords`
+- `correction` 类 ×1.3
+- 时间衰减：每 30 天 ×0.9（旧记忆排后但不消失）
+
+### 验证
+
+新增 `test_memory_schema.py` (42) + `test_memory_eval.py` (13)。
+全量 **2672 passed / 3 skipped**（160s），ruff 通过。

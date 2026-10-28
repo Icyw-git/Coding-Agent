@@ -48,11 +48,16 @@ def test_memory_pipeline_all_types():
 
         files = harness.list_memory_files()
         types = sorted(f['type'] for f in files)
-        assert types == ['feedback', 'project', 'reference', 'user'], f"记忆类型不完整: {types}"
+        # schema v2 起类型词表统一：模型给的旧词表（user/feedback/project/
+        # reference）写入时归一成规范词表，读取自然也是规范词。
+        # 这一致性顺便修掉一个真 bug：`remember` 写的规范类型原本会被合并校验
+        # 整批拒绝。
+        assert types == ['context', 'correction', 'fact', 'preference'], \
+            f"记忆类型不完整: {types}"
         assert all(t in harness.MEMORY_TYPES for t in types), "类型必须在 MEMORY_TYPES 内"
         by_name = {f['name']: f for f in files}
         assert by_name['prefer-chinese']['body'].strip() == 'Always reply in Chinese.'
-        assert by_name['harness-is-core']['type'] == 'project'
+        assert by_name['harness-is-core']['type'] == 'fact'
         assert 'prefer-chinese' in harness.read_memory_index(), "索引未重建"
 
         # --- 2. load_memories：LLM 挑相关索引 → 只召回选中的记忆 ---
@@ -78,7 +83,9 @@ def test_memory_pipeline_all_types():
         harness.CONSOLIDATE_THRESHOLD = orig_thr
 
         merged = {f['name']: f['type'] for f in harness.list_memory_files()}
-        assert merged == {'merged-user': 'user', 'core-facts': 'project'}, f"合并结果错误: {merged}"
+        # 模型在合并输出里仍用旧词表（user/project），落盘时归一成规范词。
+        assert merged == {'merged-user': 'preference',
+                          'core-facts': 'fact'}, f"合并结果错误: {merged}"
     finally:
         harness.MEMORY_DIR = orig_dir
         harness.MEMORY_INDEX = orig_index

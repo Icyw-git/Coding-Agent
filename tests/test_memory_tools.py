@@ -21,7 +21,7 @@ def memory_home(tmp_path, monkeypatch):
     monkeypatch.setattr(home, 'MEMORY_DIR', memories, raising=False)
     monkeypatch.setattr(home, 'MEMORY_INDEX', memories / 'MEMORY.md', raising=False)
     monkeypatch.setattr(home, 'MEMORY_TYPES',
-                        ['user', 'feedback', 'project', 'reference'], raising=False)
+                        ['preference', 'correction', 'fact', 'context'], raising=False)
     import memory
     memory._cache_clear()
     return memories
