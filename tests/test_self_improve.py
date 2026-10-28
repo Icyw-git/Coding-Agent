@@ -217,3 +217,141 @@ def test_session_report(tmp_path):
     text = session.report()
     assert '降 lint 错误' in text
     assert '轮数' in text
+
+
+# ---------------------------------------------------------------- 软指标（SICA 三目标）
+
+def test_soft_metrics_are_registered():
+    """SICA 的效用是 性能 .5 / 成本 .25 / 时间 .25。只有正确性没有成本，
+    「测试全绿但 token 翻三倍」在本判据里会是「无变化」。"""
+    soft = {name for name, spec in si.METRICS.items() if not spec['hard']}
+    assert soft == {'tokens', 'wall_time'}
+
+
+def test_soft_drift_is_reported_but_not_blocking():
+    hard = {'pytest_pass': {'pass': 1}, 'ruff_errors': {'errors': 0}}
+    before = {**hard, 'tokens': {'tokens_per_turn': 100.0},
+              'wall_time': {'wall_time_s': 10.0}}
+    after = {**hard, 'tokens': {'tokens_per_turn': 300.0},
+             'wall_time': {'wall_time_s': 10.0}}
+    drift = si.soft_drift(before, after)
+    assert any('tokens' in item for item in drift)
+    # 不进硬门槛：软指标不否决改动
+    assert si.regressed(before, after) == []
+
+
+def test_small_soft_drift_is_ignored():
+    before = {'tokens': {'tokens_per_turn': 100.0}}
+    after = {'tokens': {'tokens_per_turn': 105.0}}
+    assert si.soft_drift(before, after) == []
+
+
+def test_soft_metric_without_data_is_skipped():
+    """测不出来就不比较——不填默认值，也不当恶化。"""
+    assert si.soft_drift({}, {'tokens': {}}) == []
+
+
+# ---------------------------------------------------------------- 耐心窗口（Gödel 92%）
+
+def test_regression_enters_observation_not_discard():
+    """Gödel Agent 实测 92% 的优化在变好之前必然先变差。
+
+    「一变差就丢弃」会掐死绝大多数正确方向。
+    """
+    assert si.PATIENCE_ROUNDS >= 1
+
+
+@pytest.fixture
+def stubbed(tmp_path, monkeypatch):
+    """把指标测量替换成可控序列，避免真的跑 pytest。"""
+    def build(sequence):
+        state = {'i': 0}
+
+        def make(name):
+            def measure(*, workdir):
+                step = sequence[min(state['i'], len(sequence) - 1)]
+                return step.get(name, {})
+            return measure
+
+        for name, spec in si.METRICS.items():
+            monkeypatch.setitem(spec, 'measure', make(name))
+        return state
+
+    # workdir 用仓库根：被测路径是 skills/a.md，越界检查按 workdir 解析。
+    session = si.Session(cache_dir=tmp_path, workdir='.',
+                         goal='g', max_rounds=10)
+    return session, build
+
+
+def _hard(pass_=1, errors=0):
+    return {'pytest_pass': {'pass': pass_}, 'ruff_errors': {'errors': errors}}
+
+
+def test_observe_then_discard_when_never_recovers(stubbed):
+    session, build = stubbed
+    state = build([
+        _hard(errors=5), _hard(errors=8), _hard(errors=9), _hard(errors=9),
+    ])
+    state['i'] = 0
+    session.best = session.baseline()
+
+    decisions = []
+    for index in (1, 2, 3):
+        state['i'] = index
+        out = session.evaluate(['skills/a.md'], summary='s', mechanism='调整措辞')
+        decisions.append(out['decision'])
+    assert decisions == ['observe', 'observe', 'discard']
+
+
+def test_recovering_regression_is_kept(stubbed):
+    """先退后进：若一变差就丢弃，第 2 轮那个真正的改进永远看不到。"""
+    session, build = stubbed
+    state = build([_hard(errors=5), _hard(errors=8), _hard(errors=2)])
+    state['i'] = 0
+    session.best = session.baseline()
+
+    state['i'] = 1
+    assert session.evaluate(['skills/a.md'], summary='s',
+                            mechanism='合并重复段落')['decision'] == 'observe'
+    state['i'] = 2
+    assert session.evaluate(['skills/a.md'], summary='s',
+                            mechanism='合并重复段落')['decision'] == 'keep'
+
+
+# ---------------------------------------------------------------- 可解释性门槛
+
+def test_mechanism_is_required():
+    assert not si.explainable('')
+    assert not si.explainable('   ')
+
+
+def test_mechanism_must_be_short():
+    """能一句话讲清的多是真正的改进；需要一段话辩护的往往是漂移。"""
+    assert si.explainable('缩短提示词以减少重复前缀')
+    assert not si.explainable('很长的理由' * 40)
+
+
+def test_evaluate_rejects_change_without_mechanism(tmp_path):
+    session = si.Session(cache_dir=tmp_path, workdir='.', goal='g')
+    result = session.evaluate(['skills/a.md'], summary='改了', mechanism='')
+    assert result['decision'] == 'discard'
+    assert 'mechanism' in result['reason']
+    assert ledger.entries(tmp_path) == []      # 说不清就不该进台账
+
+
+# ---------------------------------------------------------------- 台账防污染
+
+def test_mechanism_is_stored_separately_from_metrics(tmp_path):
+    """OWASP ASI06：agent 自己写的总结若能反向影响决策，就是正反馈回路。
+
+    metrics/decision 由代码算；mechanism/summary 只是人类可读文本。
+    """
+    (tmp_path / 'AGENTS.md').write_text('v1', encoding='utf-8')
+    change_id = ledger.record(tmp_path, paths=['AGENTS.md'], summary='改了',
+                              metric={'round': 1}, workdir=tmp_path)
+    ledger.update_decision(tmp_path, change_id, 'keep', '指标变好',
+                           mechanism='减少重复段落')
+    row = ledger.entries(tmp_path)[0]
+    assert row['mechanism'] == '减少重复段落'
+    assert row['metric'] == {'round': 1}       # 代码给的
+    assert row['decision'] == 'keep'           # 来自判定，不来自 summary

@@ -82,13 +82,21 @@ def record(cache_dir, *, paths, summary: str, metric: dict | None = None,
 
 
 def update_decision(cache_dir, change_id: str, decision: str,
-                    reason: str = '') -> bool:
-    """改判定结果（keep / discard）。台账本身仍不改写，只追加一条更新记录。"""
+                    reason: str = '', mechanism: str = '') -> bool:
+    """追加判定结果（keep / observe / discard）。
+
+    台账本身不改写。``reason`` 与 ``mechanism`` 是**人类可读文本，不进入任何判定**
+    ——这是 OWASP ASI06（Memory & Context Poisoning）的直接防线：一旦 agent 自己
+    写的"我改进了"能反向影响下一轮决策，就形成了正反馈回路
+    （agent 写乐观总结 → 总结成为下一轮输入 → agent 读自己的乐观并在此基础上
+    继续发挥）。
+    """
     entry = {
         'change_id': change_id,
         'ts': time.time(),
         'decision_update': decision,
         'reason': reason,
+        'mechanism': ' '.join(str(mechanism or '').split())[:200],
     }
     path = _ledger(cache_dir)
     if not path.is_file():
@@ -128,6 +136,8 @@ def entries(cache_dir, limit: int = 100) -> list[dict]:
                         records[change_id]['decision'] = row['decision_update']
                         if row.get('reason'):
                             records[change_id]['reason'] = row['reason']
+                        if row.get('mechanism'):
+                            records[change_id]['mechanism'] = row['mechanism']
                     continue
                 if change_id not in records:
                     order.append(change_id)
@@ -184,8 +194,11 @@ def format_ledger(cache_dir, limit: int = 12) -> str:
     for row in reversed(rows):
         stamp = time.strftime('%m-%d %H:%M', time.localtime(row.get('ts') or 0))
         decision = row.get('decision') or 'pending'
-        mark = {'keep': '✓', 'discard': '✗', 'pending': '…'}.get(decision, decision)
+        mark = {'keep': '✓', 'observe': '◐', 'discard': '✗',
+                'pending': '…'}.get(decision, decision)
         lines.append(f"  {mark} {stamp}  {row.get('summary') or '(无说明)'}")
+        if row.get('mechanism'):
+            lines.append(f'      机制：{row["mechanism"]}')
         metric = row.get('metric') or {}
         if metric:
             parts = ' '.join(f'{k}={v}' for k, v in metric.items())

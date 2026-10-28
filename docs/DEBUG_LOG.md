@@ -8097,3 +8097,110 @@ LLM_MODEL_ID is empty. If this is a script, import harness first so .env is load
 全部断言不可改；指标不可自定义；回归必 discard；台账 append-only；回滚不删新增文件。
 
 全量 **2799 passed / 3 skipped**，ruff 通过。
+
+## RSI 深度调研：三个设计错误被推翻（2026-10-28）
+
+按要求深挖 2026 主流实现，写成 `docs/RSI_2026_RESEARCH.md`。结论是**我们照
+autoresearch 写的那版有三个真问题**，不是参数没调好，是判据假设错了。
+
+### 错误一：「变差就丢弃」会扔掉 92% 正确的路径
+
+Gödel Agent（ACL 2025）实测：
+
+> **92% of optimization runs experience temporary regressions before finding
+> improvements.** Without error handling, performance drops 14.8%.
+
+我们的 `regressed()` 是硬门槛：任何一项变差立刻 discard。按这个数据，92% 的
+改进轨迹会被自己的判据掐死——它们在变好之前**必然**先变差。
+
+**改法：加 `observe` 状态与耐心窗口（`PATIENCE_ROUNDS=2`）。**
+回归不立即丢弃，进入观察；连续超出窗口仍未恢复才 discard。
+
+实测验证（先退后进的轨迹）：
+
+```
+round 1: observe  regression within patience window 1/2: ruff_errors: 5 -> 8
+round 2: keep     ruff_errors improved          ← 若一变差就丢，这一步永远看不到
+```
+
+这个状态是本次调研最有价值的产出：没有它，我们只能看见"一次成功"，
+看不见"先退后进"。
+
+### 错误二：只有正确性，没有成本与时间
+
+SICA 的效用函数是三目标：
+
+```
+utility = 0.5 × performance + 0.25 × cost_efficiency + 0.25 × execution_time
+```
+
+> This multi-objective framing prevents the agent from optimizing performance
+> at absurd computational cost.
+
+我们只有 `pytest_pass`（二值）和 `ruff_errors`（计数）。一个让测试全绿但把
+token 成本翻三倍的改动，在本判据里是"无变化"甚至"改进"。
+
+**改法：加 `tokens` / `wall_time` 两个软指标**，从会话事件流里**由代码计算**
+（不接受模型自报，见错误三）。软指标不否决改动，只让它的恶化出现在理由里：
+
+```
+soft drift: tokens: 100 -> 300
+```
+
+静默接受就是 SICA 警告的那件事。
+
+### 错误三：台账本身是新的攻击面（最严重）
+
+OWASP 2026 把 **ASI06: Memory & Context Poisoning** 加进 Agentic Top 10；
+MINJA（NeurIPS 2025）通过普通用户查询达到 **>95% 注入成功率**。
+
+真实事故（从业者跑了 220+ 自主循环）：
+
+> after 100+ iterations, his agent had **invented metrics ("99.8% recall
+> accuracy"), inflated impact claims, and was citing its own fabricated numbers
+> as established fact.**
+
+机制：agent 写乐观总结 → 总结成为下一轮输入 → agent 读自己的乐观并继续发挥。
+**正反馈回路。**
+
+对照我们的 `self-improvements.jsonl`：agent 写 summary，下一轮又读台账——
+这就是那个回路。而且 summary 是模型写的散文，正是"可被修辞"的形态。
+
+**改法三条**：
+1. `metrics` / `decision` 由代码计算；`mechanism` / `summary` 是**人类可读文本，
+   不进入任何判定**（docstring 里写明这是 ASI06 防线）
+2. 软指标不接受模型上报的数字——"自己发明 99.8% recall"就是从接受自报数字开始的
+3. 机制说明独立存储、独立展示，与指标分开
+
+### 额外加的一条：可解释性门槛
+
+来自车间经验的启发式（r/AI_Agents 讨论串）：
+
+> the changes I can explain in one sentence are usually genuine improvements.
+> The ones that require a paragraph of justification are usually me optimizing
+> for something I did not intend to optimize for.
+
+`explainable(mechanism)`：非空且 ≤120 字（一句话量级）。**在测量之前校验**——
+说不清要在改什么，就不该跑一轮，也不该进台账。
+
+### 明确没解决的（写进文档，不假装）
+
+| 缺口 | 为什么没做 |
+|---|---|
+| **轮换评估者** | 只有一个 pytest 命令；个人单机没有第二套独立评估可换 |
+| 定期人工复核"看起来很好"的案例 | `/improvements` 是唯一入口，靠人 |
+| 目标漂移本身 | 判定标准是人定的，它错了整条链路就是更快走向错的地方 |
+
+最后这条抄自那个讨论串最诚实的一句：
+
+> every proposed solution **smuggles judgement in somewhere**. Humans reach for
+> process because process feels safer than responsibility. But the process
+> always has an author, a boundary, and a failure mode.
+
+### 测试
+
+`test_self_improve.py` 扩到 44 条，新增覆盖：软指标注册与漂移检测（不否决）、
+耐心窗口的 observe→discard 与先退后进→keep、机制门槛（空/过长都拒、且不进台账）、
+台账 mechanism 与 metric 分离存储。
+
+全量 **2809 passed / 3 skipped**（1 个 UI 时序偶发，单跑连跑三次全绿），ruff 通过。

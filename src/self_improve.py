@@ -86,6 +86,83 @@ def measure_pytest(*, workdir) -> dict:
             'summary': tail.strip()[:200]}
 
 
+def measure_tokens(*, workdir) -> dict:
+    """平均每轮 token（成本维度）。
+
+    取自 usage 事件，**由代码算**，不接受模型上报——「自己发明 99.8% recall」
+    那条路就是从接受模型自报数字开始的。
+
+    没有 usage 数据时返回 ``{}``：测不出来就是测不出来，不填默认值。
+    """
+    import json
+    cache = Path(workdir) / '.cache' / 'sessions'
+    if not cache.is_dir():
+        return {}
+    total_in = total_out = turns = 0
+    for path in cache.glob('session_*.jsonl'):
+        try:
+            with path.open('r', encoding='utf-8') as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or '"usage"' not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    usage = event.get('usage') or {}
+                    if not isinstance(usage, dict):
+                        continue
+                    total_in += int(usage.get('prompt_tokens') or 0)
+                    total_out += int(usage.get('completion_tokens') or 0)
+                    turns += 1
+        except OSError:
+            continue
+    if not turns:
+        return {}
+    return {'tokens_per_turn': round((total_in + total_out) / turns, 1)}
+
+
+def measure_wall_time(*, workdir) -> dict:
+    """平均回合耗时（时间维度，SICA 效用的第三项）。
+
+    取会话事件流里 turn_started → turn_completed 的间隔中位数。
+    """
+    import json
+    cache = Path(workdir) / '.cache' / 'sessions'
+    if not cache.is_dir():
+        return {}
+    spans: list[float] = []
+    for path in cache.glob('session_*.jsonl'):
+        started: dict[str, float] = {}
+        try:
+            with path.open('r', encoding='utf-8') as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    kind = event.get('type')
+                    turn_id = str(event.get('turn_id') or '')
+                    if not turn_id:
+                        continue
+                    if kind == 'turn_started':
+                        started[turn_id] = float(event.get('ts') or 0)
+                    elif kind == 'turn_completed' and turn_id in started:
+                        delta = float(event.get('ts') or 0) - started.pop(turn_id)
+                        if delta > 0:
+                            spans.append(delta)
+        except OSError:
+            continue
+    if not spans:
+        return {}
+    spans.sort()
+    return {'wall_time_s': round(spans[len(spans) // 2], 2)}
+
+
 def measure_ruff(*, workdir) -> dict:
     """硬门槛二：lint 错误数。"""
     code, output = _run([sys.executable, '-m', 'ruff', 'check', '.'], workdir=workdir)
@@ -105,6 +182,13 @@ METRICS = {
                     'key': 'pass', 'hard': True},
     'ruff_errors': {'direction': 'lower', 'measure': measure_ruff,
                     'key': 'errors', 'hard': True},
+    # 软指标：SICA 的三目标效用里成本与时间各占 0.25。只有正确性没有成本，
+    # 「测试全绿但 token 翻三倍」在我们的判据里会是"无变化"。
+    # 不做硬门槛：机器负载抖动会把好改动误杀。
+    'tokens': {'direction': 'lower', 'measure': measure_tokens,
+               'key': 'tokens_per_turn', 'hard': False},
+    'wall_time': {'direction': 'lower', 'measure': measure_wall_time,
+                  'key': 'wall_time_s', 'hard': False},
 }
 
 
@@ -112,8 +196,17 @@ def _value(spec: dict, result: dict):
     return result.get(spec['key'])
 
 
+#: 耐心窗口：回归后允许观察多少轮。Gödel Agent 实测 92% 的优化在变好之前
+#: 必然先变差——「一变差就丢弃」会掐死绝大多数正确方向。所以回归先进 observe，
+#: 连续这么多轮仍未恢复才真正放弃。
+PATIENCE_ROUNDS = 2
+
+#: 软指标恶化到这个比例才在说明里提一笔（不否决）。
+SOFT_DRIFT = 0.25
+
+
 def regressed(before: dict, after: dict) -> list[str]:
-    """硬门槛里哪些变差了。非空即本轮必须 discard。"""
+    """硬门槛里哪些变差了。非空即本轮**进入观察**（不是立刻丢弃）。"""
     broken = []
     for name, spec in METRICS.items():
         if not spec['hard']:
@@ -155,6 +248,41 @@ def improved(before: dict, after: dict, *, metric: str = 'ruff_errors') -> bool:
     return delta >= MIN_ABSOLUTE_STEP and (delta / scale) >= MIN_IMPROVEMENT
 
 
+
+def soft_drift(before: dict, after: dict) -> list[str]:
+    """软指标（成本/时间）的恶化。只用于说明，不否决改动。
+
+    为什么单独列：把成本翻三倍的正确性改进应该被**看见**——它不是"无变化"，
+    而是一个需要权衡的取舍。静默接受就是 SICA 说的
+    "optimizing performance at absurd computational cost"。
+    """
+    drifted = []
+    for name, spec in METRICS.items():
+        if spec['hard']:
+            continue
+        old = _value(spec, before.get(name) or {})
+        new = _value(spec, after.get(name) or {})
+        if old in (None, 0) or new is None:
+            continue
+        delta = (new - old) if spec['direction'] == 'higher' else (old - new)
+        if delta < 0 and abs(delta) / abs(old) >= SOFT_DRIFT:
+            drifted.append(f'{name}: {old} -> {new}')
+    return drifted
+
+
+def explainable(mechanism: str) -> bool:
+    """改动能否用一句话说清机制。
+
+    来自车间经验的启发式：「能一句话讲清的多是真正的改进，需要一段话才能辩护的
+    往往是你在优化某个自己没打算优化的东西」。这一条挡不住特意的作弊，但它挡住了
+    "说不清楚却通过了数字"的那一类。
+
+    要求：非空，且不超过 120 字（一句话的量级）。
+    """
+    text = ' '.join(str(mechanism or '').split())
+    return bool(text) and len(text) <= 120
+
+
 class Session:
     """一次有界改进尝试。用 ``begin`` → ``propose`` → ``measure`` → ``decide``。
 
@@ -175,6 +303,7 @@ class Session:
         self.rounds = 0
         self.best = None
         self.without_best = 0
+        self.pending_regression: int | None = 0
         self.changes: list[str] = []
 
     def baseline(self) -> dict:
@@ -187,14 +316,35 @@ class Session:
         return (self.rounds >= self.max_rounds
                 or self.without_best >= CONVERGENCE_ROUNDS)
 
-    def evaluate(self, paths: list[str], summary: str) -> dict:
-        """登记一轮改动并判定。返回 ``{decision, reason, before, after}``。"""
+    def evaluate(self, paths: list[str], summary: str,
+                 mechanism: str = '') -> dict:
+        """登记一轮改动并判定。
+
+        返回 ``{change_id, decision, reason, before, after, drift}``。
+        decision 是 ``keep`` / ``observe`` / ``discard``：
+
+        - ``keep``：主指标确实变好，且改动能一句话说清机制
+        - ``observe``：硬门槛回归，但还在耐心窗口内——**不丢，等它恢复**
+        - ``discard``：超出可改范围、说不出机制、或耐心耗尽仍未恢复
+
+        ``observe`` 这个状态是 Gödel Agent 那条实测的直接产物：92% 的优化在
+        变好之前必然先变差。没有它，我们只能看见"一次成功"，看不见"先退后进"。
+        """
         outside = [path for path in paths if not editable(path, workdir=self.workdir)]
         if outside:
             # Ring 0 的改动不该走到这里（verifier_guard 会在写入时硬拒），
             # 但判定层也要拦一道：宁可重复防守，不可让台账记下一笔"改了测试"。
-            return {'decision': 'discard',
-                    'reason': f'paths outside editable scope: {outside}'}
+            return {'change_id': '', 'decision': 'discard',
+                    'reason': f'paths outside editable scope: {outside}',
+                    'before': self.best or {}, 'after': {}, 'drift': []}
+
+        # 机制说明必须在**测量之前**校验：说不清要在改什么，就不该跑一轮。
+        # 这条挡不住特意的作弊，但挡住了"说不清楚却通过了数字"的那一类。
+        if not explainable(mechanism):
+            return {'change_id': '', 'decision': 'discard',
+                    'reason': ('mechanism must be one sentence (<=120 chars) '
+                               'explaining WHY this change helps'),
+                    'before': self.best or {}, 'after': {}, 'drift': []}
 
         change_id = ledger.record(
             self.cache_dir, paths=paths, summary=summary,
@@ -202,15 +352,36 @@ class Session:
 
         after = {name: spec['measure'](workdir=self.workdir)
                  for name, spec in METRICS.items()}
-        broken = regressed(self.best, after)
-        if broken:
-            decision, reason = 'discard', 'regression: ' + '; '.join(broken)
-        elif improved(self.best, after, metric=self.metric):
-            decision, reason = 'keep', f'{self.metric} improved'
-        else:
-            decision, reason = 'discard', f'{self.metric} did not improve enough'
+        broken = regressed(self.best or {}, after)
+        drift = soft_drift(self.best or {}, after)
 
-        ledger.update_decision(self.cache_dir, change_id, decision, reason)
+        if broken:
+            self.pending_regression = (self.pending_regression or 0) + 1
+            if self.pending_regression <= PATIENCE_ROUNDS:
+                decision = 'observe'
+                reason = (f'regression within patience window '
+                          f'{self.pending_regression}/{PATIENCE_ROUNDS}: '
+                          + '; '.join(broken))
+            else:
+                decision = 'discard'
+                reason = 'patience exhausted: ' + '; '.join(broken)
+                self.pending_regression = 0
+        elif improved(self.best or {}, after, metric=self.metric):
+            decision = 'keep'
+            reason = f'{self.metric} improved'
+            self.pending_regression = 0
+        else:
+            decision = 'discard'
+            reason = f'{self.metric} did not improve enough'
+            self.pending_regression = 0
+
+        if drift:
+            # 软指标恶化不否决，但必须出现在理由里——静默接受就是
+            # "把性能优化到荒谬的计算成本上"。
+            reason += ' | soft drift: ' + '; '.join(drift)
+
+        ledger.update_decision(self.cache_dir, change_id, decision, reason,
+                               mechanism=mechanism)
         self.rounds += 1
         self.changes.append(change_id)
         if decision == 'keep':
@@ -219,7 +390,7 @@ class Session:
         else:
             self.without_best += 1
         return {'change_id': change_id, 'decision': decision, 'reason': reason,
-                'before': self.best, 'after': after}
+                'before': self.best or {}, 'after': after, 'drift': drift}
 
     def report(self) -> str:
         state = '已收敛' if self.exhausted() else '可继续'
