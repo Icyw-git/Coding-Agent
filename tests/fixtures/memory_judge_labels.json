@@ -1,0 +1,116 @@
+{
+  "_comment": [
+    "记忆判官的人工校准集。用于验证 LLM 判官本身是否可信——不是测记忆机制。",
+    "label: 1 = 该记忆对这条消息确实有用 / 值得长期保留；0 = 不该。",
+    "这组样本刻意包含容易判错的边界：共用词但不同主题、一次性上下文、",
+    "条件偏好、以及确实相关的强样本。",
+    "维护方式：真实使用中遇到判官判错的例子就加进来，标注后跑",
+    "python scripts/calibrate_memory_judge.py 看 κ。"
+  ],
+  "recall": [
+    {
+      "message": "production 部署怎么发？",
+      "note": "production deploys go through make ship-prod",
+      "label": 1,
+      "why": "直接约束答案的命令"
+    },
+    {
+      "message": "production 部署怎么发？",
+      "note": "staging deploys use make ship-staging",
+      "label": 0,
+      "why": "同一话题但环境不同，照它会发错环境"
+    },
+    {
+      "message": "跑一下测试",
+      "note": "run tests with python -m pytest -m not-slow",
+      "label": 1,
+      "why": "正是要跑的命令"
+    },
+    {
+      "message": "跑一下测试",
+      "note": "API keys rotate every 90 days",
+      "label": 0,
+      "why": "无关"
+    },
+    {
+      "message": "我困了想喝点东西",
+      "note": "when sleepy: prefers tea over coffee",
+      "label": 1,
+      "why": "条件偏好正好命中条件"
+    },
+    {
+      "message": "我困了想喝点东西",
+      "note": "prefers replies in Chinese",
+      "label": 0,
+      "why": "同样写作偏好，但主题无关"
+    },
+    {
+      "message": "回答简短点",
+      "note": "prefers brief answers without preamble",
+      "label": 1,
+      "why": "直接可执行的偏好"
+    },
+    {
+      "message": "回答简短点",
+      "note": "commit messages use imperative mood",
+      "label": 0,
+      "why": "都是写作风格类，容易混，但对象不同"
+    },
+    {
+      "message": "src 目录放什么",
+      "note": "src holds runtime modules, tests mirrors them",
+      "label": 1,
+      "why": "直接回答目录结构"
+    },
+    {
+      "message": "src 目录放什么",
+      "note": "this trip: avoid checked bags",
+      "label": 0,
+      "why": "一次性上下文，与代码无关"
+    },
+    {
+      "message": "继续",
+      "note": "production deploys go through make ship-prod",
+      "label": 0,
+      "why": "消息过于模糊，无法判断相关性 —— 应弃权而非判相关"
+    },
+    {
+      "message": "帮我看看这个函数",
+      "note": "prefers tabs over spaces in code",
+      "label": 0,
+      "why": "看似沾边（代码），但不会改变这次回答"
+    }
+  ],
+  "quality": [
+    {
+      "note": "when sleepy: prefers tea over coffee",
+      "label": 1,
+      "why": "持久的条件偏好，带条件可执行"
+    },
+    {
+      "note": "commit messages use imperative mood",
+      "label": 1,
+      "why": "稳定的风格约定"
+    },
+    {
+      "note": "this trip: avoid checked bags",
+      "label": 0,
+      "why": "一次性，任务结束即失效"
+    },
+    {
+      "note": "project requires python 3.9",
+      "label": 1,
+      "why": "环境事实，但须随版本更新（边界样本）"
+    },
+    {
+      "note": "user seems to like good code",
+      "label": 0,
+      "why": "太笼统，无法据以行动"
+    },
+    {
+      "note": "the file I just opened is named report.md",
+      "label": 0,
+      "why": "当前任务的即时细节，不是长期信息"
+    }
+  ]
+}

@@ -102,7 +102,8 @@ def test_judge_recall_drops_invalid_indices():
 
 def test_judge_recall_without_notes_is_noop():
     assert me.judge_recall('x', [], complete=_fake()) == {
-        'relevant': [], 'missing': '', 'judged': 0}
+        'relevant': [], 'irrelevant': [], 'abstain': [],
+        'missing': '', 'confidence': 'low', 'judged': 0}
 
 
 def test_judge_recall_without_message_is_noop():
@@ -238,3 +239,95 @@ def test_report_is_valid_jsonl(tmp_path):
                          'note': '中文测试'})
     raw = (tmp_path / me.REPORT_NAME).read_text(encoding='utf-8')
     json.loads(raw.strip().splitlines()[0])
+
+
+# ---------------------------------------------------------------- 判据与弃权
+
+def test_recall_judge_has_explicit_criteria():
+    """判据必须是可核对的条件，不是"judge this"。"""
+    assert '(1)' in me.RECALL_PROMPT and '(2)' in me.RECALL_PROMPT
+    assert 'NOT relevant if' in me.RECALL_PROMPT
+    assert 'abstain' in me.RECALL_PROMPT
+
+
+def test_quality_judge_has_explicit_criteria():
+    assert '(1)' in me.QUALITY_PROMPT and '(2)' in me.QUALITY_PROMPT
+    assert 'KEEP examples' in me.QUALITY_PROMPT
+    assert 'DROP examples' in me.QUALITY_PROMPT
+
+
+def test_abstain_is_separate_from_irrelevant():
+    """弃权不能混进"不相关"：前者是判不了，后者是否定。"""
+    reply = '{"relevant":[0],"irrelevant":[1],"abstain":[2]}'
+    result = me.judge_recall('x', RECALLED + [{'description': 'vague'}],
+                             complete=_fake(recall=reply))
+    assert result['relevant'] == [0]
+    assert result['irrelevant'] == [1]
+    assert result['abstain'] == [2]
+
+
+def test_partition_is_mutually_exclusive():
+    """模型可能把同一索引写进多个列表，重复计数会让精确率虚高。"""
+    reply = '{"relevant":[0],"irrelevant":[0,1],"abstain":[0,1]}'
+    result = me.judge_recall('x', RECALLED, complete=_fake(recall=reply))
+    assert result['relevant'] == [0]
+    assert result['irrelevant'] == [1]
+    assert result['abstain'] == []
+
+
+def test_confidence_is_parsed():
+    assert me.judge_recall('x', RECALLED, complete=_fake(
+        recall='{"relevant":[0],"confidence":"high"}'))['confidence'] == 'high'
+    assert me.judge_recall('x', RECALLED, complete=_fake(
+        recall='{"relevant":[0]}'))['confidence'] == 'low'
+
+
+def test_abstain_excluded_from_precision(tmp_path):
+    """弃权从分母剔除：把"判不了"算成判错会惩罚正确的谨慎。"""
+    me.record(tmp_path, {'kind': 'recall', 'judged': 3,
+                         'relevant': [0], 'irrelevant': [1], 'abstain': [2]})
+    stats = me.summarize(tmp_path)
+    assert stats['recall_precision'] == 0.5      # 1 相关 / (3 - 1 弃权)
+    assert stats['recall_abstain_rate'] == 0.333
+
+
+# ---------------------------------------------------------------- κ 校准
+
+def test_kappa_perfect_agreement():
+    assert me.cohen_kappa([1, 0, 1, 0], [1, 0, 1, 0]) == 1.0
+
+
+def test_kappa_catches_always_positive_judge():
+    """关键用例：原始一致率 50%，但判官其实什么都没判（κ=0）。"""
+    report = me.validate_against_labels([1, 0, 1, 0], [1, 1, 1, 1])
+    assert report['raw_agreement'] == 0.5
+    assert report['kappa'] == 0.0
+    assert not report['usable']
+
+
+def test_kappa_chance_level_is_zero():
+    assert me.cohen_kappa([1, 1, 0, 0], [1, 0, 1, 0]) == 0.0
+
+
+def test_kappa_single_label_is_undefined():
+    """两边都只用一个类别时 κ 无定义（分母为 0），返回 None 而不是 1.0。"""
+    assert me.cohen_kappa([1, 1, 1], [1, 1, 1]) is None
+
+
+def test_kappa_length_mismatch():
+    assert me.cohen_kappa([1, 0], [1]) is None
+    assert me.cohen_kappa([], []) is None
+
+
+def test_kappa_bands():
+    assert '不可用' in me.kappa_band(0.1)
+    assert '趋势' in me.kappa_band(0.3)
+    assert '可参考' in me.kappa_band(0.5)
+    assert '验收' in me.kappa_band(0.7)
+    assert '无法计算' in me.kappa_band(None)
+
+
+def test_usable_threshold_is_substantial_agreement():
+    """0.41 是"中等一致"的下界：低于它不能当结论。"""
+    assert me.validate_against_labels([1, 0, 1, 0], [1, 0, 1, 1])['usable'] is True
+    assert me.validate_against_labels([1, 0, 1, 0], [1, 1, 0, 0])['usable'] is False
