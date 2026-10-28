@@ -30,7 +30,7 @@ def test_status_reports_screenshot_count_and_switch(tmp_path, monkeypatch):
     output = harness.format_status(store)
     # 能力分组展示：已启用的带状态，未启用的缩在“未启用”一行里。
     assert '已启用：' in output
-    assert '屏幕：开' in output
+    assert '屏幕：' in output
     assert '截图 1 张' in output
     assert '剪贴板：读写都需审批' in output
 

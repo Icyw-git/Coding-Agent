@@ -88,22 +88,94 @@ def domains(argument: str) -> str:
     return f'  已添加：{record["scope"]} {record["host"]}——{effect}'
 
 
+#: 审计事件的中文名。用原名会让用户看到 ``desktop_snapshot_failed`` 这种
+#: 标识符——那是给代码读的，不是给人读的。
+_AUDIT_LABELS = {
+    'approval_timeout': '审批超时',
+    'approval_auto': '自动放行',
+    'policy_denied': '策略拒绝',
+    'permission_revoked': '撤销授权',
+    'screen_captured': '截屏',
+    'screen_ocr': 'OCR',
+    'clipboard_read': '读剪贴板',
+    'clipboard_written': '写剪贴板',
+    'desktop_snapshot': '桌面快照',
+    'desktop_snapshot_failed': '桌面快照失败',
+    'desktop_list_windows': '列出窗口',
+    'desktop_focus': '切换窗口',
+    'desktop_focus_failed': '切换窗口失败',
+    'desktop_action': '桌面操作',
+    'desktop_action_failed': '桌面操作失败',
+    'grant_added': '目录授权',
+    'grant_removed': '撤销目录授权',
+    'domain_added': '域名规则',
+    'domain_removed': '撤销域名规则',
+    'memory_written': '记忆写入',
+    'memory_forgotten': '记忆删除',
+    'memory_redacted': '记忆脱敏',
+    'memory_archived': '记忆归档',
+    'memory_scope': '记忆开关',
+    'proactive_suggested': '主动建议',
+    'proactive_accepted': '采纳建议',
+    'delete_trashed': '删除到回收站',
+    'delete_failed': '删除失败',
+    'moved': '移动文件',
+    'move_preview': '移动预览',
+    'move_rejected': '移动被拒',
+    'move_failed': '移动失败',
+    'moves_undone': '撤销移动',
+    'move_undo_failed': '撤销移动失败',
+    'remind_scheduled': '设置提醒',
+    'remind_rejected': '提醒被拒',
+    'remind_failed': '提醒失败',
+}
+
+#: 这些字段已经用中文名或单独行表达，不再重复成 ``key=value``。
+_SKIP_KEYS = ('type',)
+
+
+def _displayable(text: str) -> str:
+    """把不能显示的字符换成可显示的。
+
+    会话日志是历史累积的：早期用错编码写入的记录会带 U+FFFD（解码替换符），
+    而 GBK 控制台连它都编不了——**一条乱码记录能让整个 /audit 崩掉**。
+    显示层负责兜住，而不是让用户看到报错。
+    """
+    if not text:
+        return ''
+    cleaned = str(text).replace('�', '?')
+    try:
+        cleaned.encode('gbk')
+    except UnicodeEncodeError:
+        # **只替换编不了的那个字**，不要整行退化——整体 ascii 会把中文全变成 ?，
+        # 比乱码还糟（用户连带能读的部分一起丢了）。
+        cleaned = cleaned.encode('gbk', 'replace').decode('gbk', 'replace')
+    # 历史脏数据的 reason 整段都是替换符，40 个 ? 只是噪音。折叠成 …，
+    # 让用户能读出结构（哪条事件、后面的字段），而不是被问号淹没。
+    import re as _re
+    return _re.sub(r'\?{4,}', '[无法显示]', cleaned)
+
+
 def _audit_line(event: dict) -> str:
     stamp = time.strftime('%m-%d %H:%M:%S',
                           time.localtime(event.get('ts') or 0))
-    bits = [f'{stamp} {event["type"]}']
+    kind = str(event.get('type') or '')
+    bits = [f'{stamp} {_AUDIT_LABELS.get(kind, kind)}']
     for key in ('tool', 'by', 'code', 'blocked_by', 'path', 'host',
-                'action', 'process'):
+                'action', 'process', 'name', 'mode', 'count'):
+        if key in _SKIP_KEYS:
+            continue
         value = event.get(key)
-        if value:
+        if value not in (None, '', 0):
             bits.append(f'{key}={value}')
-    # policy_denied 的原因最有信息量，单独放末尾（前面已有 code）
+    # reason **任何**有它的事件都要显示：``desktop_snapshot_failed`` 的全部信息
+    # 就在 reason 里，原来只有 policy_denied 显示它，于是这类记录只剩一个事件名。
     reason = str(event.get('reason') or '').strip()
-    if event.get('type') == 'policy_denied' and reason:
+    if reason:
         if reason.startswith('Error: '):
             reason = reason[7:]
         bits.append(reason[:70])
-    return '    ' + '  '.join(bits)
+    return '    ' + _displayable('  '.join(bits))
 
 
 def audit(argument: str, *, limit: int = 50) -> str:
@@ -113,8 +185,12 @@ def audit(argument: str, *, limit: int = 50) -> str:
 
     argument = (argument or '').strip()
     if argument.casefold() == 'all':
-        lines = ['  可过滤的审计类型：']
-        lines.extend(f'    {name}' for name in sorted(audit_mod.AUDIT_EVENTS))
+        # 列表视图用中文名（给用户看），但排查时需要原始标识符，
+        # 所以这里给对照：两边的名字都能查到。
+        lines = ['  可过滤的审计类型（原名 — 含义）：']
+        for name in sorted(audit_mod.AUDIT_EVENTS):
+            label = _AUDIT_LABELS.get(name)
+            lines.append(f'    {name}  —  {label}' if label else f'    {name}')
         return '\n'.join(lines)
 
     types = None

@@ -121,14 +121,27 @@ def format_status(session_store) -> str:
     active: list[tuple[str, str]] = []
     inactive: list[str] = []
 
-    def _cap(label: str, enabled: bool, detail: str) -> None:
-        (active if enabled else inactive).append((label, detail) if enabled else label)
+    def _cap(label: str, enabled: bool, detail: str,
+             hint: str = '') -> None:
+        """登记一项能力。
+
+        ``detail`` 是**启用时**的状态描述；``hint`` 是**未启用时**该怎么开的提示。
+        原来未启用只留 label，把「怎么开」也一起丢了——而那一刻用户最需要的
+        恰恰是它。
+        """
+        if enabled:
+            active.append((label, detail))
+        else:
+            inactive.append(f'{label}（{hint}）' if hint else label)
 
     _cap('屏幕', screen_tools_enabled(),
-         f"开 · 截图 {shots['files']} 张"
-         f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）")
-    _cap('剪贴板', clipboard_tools_enabled(), '读写都需审批')
-    _cap('桌面控制', desktop_control_enabled(), '每步需审批')
+         f"截图 {shots['files']} 张"
+         f"（{tool_cache.human_size(shots['bytes'])}，保留 7 天）",
+         '设 HARNESS_SCREEN_TOOLS=1')
+    _cap('剪贴板', clipboard_tools_enabled(), '读写都需审批',
+         '设 HARNESS_CLIPBOARD_TOOLS=1')
+    _cap('桌面控制', desktop_control_enabled(), '每步需审批',
+         '设 HARNESS_DESKTOP_CONTROL=1')
     _cap('域名策略', bool(allow_domains or deny_domains),
          f'允许 {allow_domains} · 拒绝 {deny_domains}')
     _cap('用户规则', bool(ruleset.rules), f'{len(ruleset.rules)} 条')
@@ -137,7 +150,12 @@ def format_status(session_store) -> str:
     _cap('回收站删除', trash.available()[0], '可用')
     _cap('资源限额', limits_snapshot.enabled,
          limits_snapshot.describe().replace('资源限额：', ''))
-    _cap('浏览器 profile', browser_profile.exists(), '已创建')
+    # 「未启用」和「未创建」含义不同：前者是开关关着，后者是还没初始化。
+    # 混在一起说会让人以为要去改开关，实际该去跑 setup 脚本。
+    # 「未启用」和「未创建」含义不同：前者是开关关着，后者是还没初始化。
+    # 混在一起说会让人以为要去改开关，实际该去跑 setup 脚本。
+    _cap('浏览器 profile', browser_profile.exists(), '已创建',
+         '跑 python scripts/browser_setup.py 创建')
     _cap('不可代做', never_do.enabled(),
          f'{len(never_do.actions())} 类（改密码/支付/2FA 等，不可绕过）')
 
@@ -150,31 +168,38 @@ def format_status(session_store) -> str:
     if path_grants:
         capability_lines += (f'\n    目录写授权：{len(path_grants)} 个'
                             '（/grants 查看）')
+
+    # 这几项都是**常开**的安全与关系能力，必须单独一节。
+    # 原来它们被拼在「未启用：…」之后且没有标题，读起来像未启用，
+    # 而它们全都是「开」。
+    hardening: list[str] = []
     if untrusted.enabled():
-        capability_lines += '\n    外部内容标记：开（web/MCP 结果标注不可信）'
+        hardening.append('外部内容标记（web/MCP 结果标注不可信）')
     if taint.enabled():
-        capability_lines += '\n    污点出网：开（读过敏感内容后出网强制审批）'
-    # 审批粒度：用户应该知道“批准一次”到底管多久。
+        hardening.append('污点出网（读过敏感内容后出网强制审批）')
     try:
         import approval_scope
-        capability_lines += (f'\n    审批作用域：{approval_scope.describe(approval_scope.default_scope())}'
-                            '（/sandbox 外的独立开关 HARNESS_APPROVAL_SCOPE）')
+        hardening.append('审批作用域：'
+                         + approval_scope.describe(
+                             approval_scope.default_scope())
+                         + '（HARNESS_APPROVAL_SCOPE）')
     except Exception:
         pass
-    # 记忆：自动抽取与显式工具都在，但两半的状态不一样。
     try:
         import memory_scope
-        capability_lines += f'\n    记忆：{memory_scope.describe()}'
+        hardening.append('记忆：' + memory_scope.describe())
     except Exception:
         pass
     try:
         import session_continue
         if session_continue.enabled():
             hours = session_continue.window_seconds() / 3600
-            capability_lines += (f'\n    跨渠道接续：开'
-                                f'（{hours:g} 小时内的会话自动接上）')
+            hardening.append(f'跨渠道接续（{hours:g} 小时内的会话自动接上）')
     except Exception:
         pass
+    if hardening:
+        capability_lines += '\n  安全与关系：\n' + '\n'.join(
+            f'    · {item}' for item in hardening)
     # 规则文件坏了必须**无条件**显示：那意味着所有规则一夜之间失效，
     # 而用户还以为自己的 allow 规则在生效。
     if ruleset.error:

@@ -240,7 +240,10 @@ class PermissionGate:
         with self._lock:
             stats = self.judge_stats
             tail = ' · 已熔断停用' if self.judge_broken else ''
-            return (f'LLM 审查官：放行 {stats["approved"]} · 升级 {stats["escalated"]}'
+            # 带上前置分隔符：调用方把它直接拼在别的字段后面，
+            # 不带就会读成 "OS 沙箱：offLLM 审查官：…"。
+            return (f' · LLM 审查官：放行 {stats["approved"]}'
+                    f' · 升级 {stats["escalated"]}'
                     f' · 失败 {stats["failed"]}{tail}')
 
     def pending(self) -> list[PermissionRequest]:

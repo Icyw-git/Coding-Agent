@@ -66,7 +66,7 @@ def test_audit_lists_events_with_key_fields(tmp_path, monkeypatch):
                  blocked_by='policy', reason='Error: denied command shutdown')
 
     text = terminal_views.audit('')
-    assert 'policy_denied' in text
+    assert '策略拒绝' in text
     assert 'tool=bash' in text
     assert 'blocked_by=policy' in text
     assert 'denied command shutdown' in text
@@ -74,7 +74,7 @@ def test_audit_lists_events_with_key_fields(tmp_path, monkeypatch):
 
 def test_audit_all_lists_filterable_types():
     text = terminal_views.audit('all')
-    assert 'policy_denied' in text and 'approval_auto' in text
+    assert '策略拒绝' in text and 'approval_auto' in text
 
 
 def test_audit_unknown_type_shows_usage(tmp_path, monkeypatch):
@@ -95,7 +95,7 @@ def test_audit_type_filter(tmp_path, monkeypatch):
     store.append('screen_captured', sha1='abc', bytes=1)
 
     text = terminal_views.audit('policy_denied')
-    assert 'policy_denied' in text
+    assert '策略拒绝' in text
     assert 'screen_captured' not in text
 
 
@@ -162,3 +162,55 @@ def test_remove_rule_can_filter_by_decision():
 
 def test_remove_missing_rule_returns_empty():
     assert rules.remove_rule('nope') == []
+
+
+# ---------------------------------------------------------------- 可读性
+
+def test_audit_uses_human_labels(tmp_path, monkeypatch):
+    """原始事件名（desktop_snapshot_failed）是给代码读的，不是给人读的。"""
+    import harness
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    for index in range(2):
+        (tmp_path / f'session_{index}.jsonl').write_text(
+            '{"type":"policy_denied","tool":"bash","reason":"x"}\n',
+            encoding='utf-8')
+    text = terminal_views.audit('')
+    assert '策略拒绝' in text
+    assert 'policy_denied' not in text
+
+
+def test_audit_all_maps_raw_names_to_labels():
+    """列表视图用中文，但排查时要原始标识符，所以 /audit all 给对照。"""
+    text = terminal_views.audit('all')
+    assert 'policy_denied' in text
+    assert '策略拒绝' in text
+
+
+def test_audit_shows_reason_for_any_event(tmp_path, monkeypatch):
+    """desktop_snapshot_failed 的全部信息都在 reason 里。
+
+    原来只有 policy_denied 显示 reason，于是这类记录只剩一个事件名。
+    """
+    import harness
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    (tmp_path / 'session_a.jsonl').write_text(
+        '{"type":"desktop_snapshot_failed","reason":"no foreground window"}\n',
+        encoding='utf-8')
+    text = terminal_views.audit('')
+    assert '桌面快照失败' in text
+    assert 'no foreground window' in text
+
+
+def test_audit_survives_mojibake_history(tmp_path, monkeypatch):
+    """历史脏数据（解码替换符）不能让整条命令崩。
+
+    GBK 控制台连 U+FFFD 都编不了。
+    """
+    import harness
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path)
+    (tmp_path / 'session_b.jsonl').write_text(
+        '{"type":"desktop_snapshot_failed","reason":"\ufffd\ufffd\ufffd\ufffd\ufffd"}\n',
+        encoding='utf-8')
+    text = terminal_views.audit('')
+    text.encode('gbk')          # 编码失败会抛异常
+    assert '无法显示' in text

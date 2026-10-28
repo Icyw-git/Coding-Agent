@@ -9061,3 +9061,103 @@ UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'
 
 `test_self_improve.py` +3（指标变化可见、隐藏内部 round、标记字符 GBK 安全）。
 全量 **2953 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（四）：/status 与 /audit 的问题
+
+扫 `/status`、`/audit`、`/domains`、`/grants`。`/domains` 没问题（期限与备注都在），
+另两个各有两处。
+
+### `/status`：两项被读成相反的意思
+
+**（a）`OS 沙箱：offLLM 审查：放行 0` —— 缺分隔符**
+
+`GATE.judge_summary()` 返回的字符串**不带前置分隔符**，而调用方把它直接拼在
+`OS 沙箱：off` 后面。改成由 `judge_summary()` 自己带 ` · ` 前缀——谁返回谁负责，
+调用方不用记得补。
+
+**（b）我上一轮加的五项「开」被排在「未启用：」之后**
+
+```
+  未启用：桌面控制、浏览器 profile      ← 这里开始是"未启用"列表
+    外部内容标记：开（…）              ← 但它们全都是"开"！
+    污点出网：开（…）
+    审批作用域：仅这一次（…）
+```
+
+没有标题，视觉上就是「未启用」列表的延续。**读起来完全反了。**
+
+改成独立一节：
+
+```
+  安全与关系：
+    · 外部内容标记（web/MCP 结果标注不可信）
+    · 污点出网（读过敏感内容后出网强制审批）
+    · 审批作用域：仅这一次（HARNESS_APPROVAL_SCOPE）
+    · 记忆：读+写（默认）
+    · 跨渠道接续（8 小时内的会话自动接上）
+```
+
+顺带去掉了与「已启用」列表重复的「不可代做」条目。
+
+**（c）未启用项丢了"怎么开启"**
+
+`_cap()` 在未启用时只留 label，把 detail 丢掉——而那一刻用户最需要的就是
+怎么开。改成 `_cap(label, enabled, detail, hint=...)`，未启用时显示 hint：
+
+```
+未启用：桌面控制（设 HARNESS_DESKTOP_CONTROL=1）、浏览器 profile（跑 python scripts/browser_setup.py 创建）
+```
+
+同时纠正一处语义错配：「浏览器 profile：未启用」不对——它是**未创建**
+（还没初始化），不是开关关着。这两个说法会把人引向完全不同的动作。
+
+### `/audit`：事件名是给代码读的
+
+**（a）满屏 `desktop_snapshot_failed` / `policy_denied`**
+
+加了 37 个事件的中文名映射。列表视图显示「策略拒绝」「桌面快照失败」。
+
+但排查时需要原始标识符，所以 `/audit all` 改成对照表：
+
+```
+    policy_denied  —  策略拒绝
+    desktop_snapshot_failed  —  桌面快照失败
+```
+
+两边都查得到。
+
+**（b）`reason` 只对一种事件显示**
+
+`_audit_line` 原来只在 `policy_denied` 时显示 `reason`。但 `AUDIT_EVENTS` 里有
+**7 个**事件带 reason 字段（`desktop_snapshot_failed`、`desktop_action_failed`、
+`approval_timeout`…）——对它们来说 reason 就是全部信息，丢了只剩一个事件名：
+
+```
+10-26 13:57:59 desktop_snapshot_failed        ← 为什么失败？不知道
+```
+
+改成任何事件有 reason 就显示。
+
+### `/audit` 还发现一个崩溃
+
+加了 reason 显示后，`/audit` 直接抛 `UnicodeEncodeError`：历史记录里有早期
+编码错误写入的 `U+FFFD`（解码替换符），而 GBK 控制台连它都编不了。
+
+**一条乱码记录能让整个命令崩掉。**
+
+加 `_displayable()` 在显示层兜住。第一版兜底写错了：整体 `ascii replace` 会把
+中文也变成 `?`，比乱码还糟（用户连带能读的部分一起丢了）。改成
+`gbk replace` ——**只替换编不了的那个字**。
+
+再把成串的 `?` 折叠成 `[无法显示]`，否则一行 40 个问号只是噪音：
+
+```
+10-26 13:57:59 桌面快照失败  [无法显示] PID[无法显示]
+```
+
+原文已经不可恢复（写进去时就是错的编码），显示层只能做到"诚实且不崩"。
+
+### 测试
+
+`test_terminal_views.py` +4（中文标签、all 对照表、任何事件都显示 reason、
+乱码历史不崩且 GBK 可编码）。全量 **2953 passed / 3 skipped**。
