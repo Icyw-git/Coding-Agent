@@ -453,3 +453,36 @@ def test_corrupt_state_file_is_ignored(tmp_path):
     assert si.load_state(tmp_path) is None
     # 构造不应因此报错
     assert si.Session(cache_dir=tmp_path, workdir='.', goal='g').rounds == 0
+
+
+def test_observe_does_not_count_toward_convergence(stubbed):
+    """observe 的语义是「还在等，不算失败」，不该推进收敛。
+
+    实测踩到的 bug：observe 走进 `else` 分支被计入 without_best，于是收敛在
+    耐心窗口用完之前就触发——**耐心窗口对收敛路径是空操作**。
+    消融实验里表现为「开关两种情况下结论相同」，才发现这条。
+    """
+    session, build = stubbed
+    state = build([_hard(errors=5), _hard(errors=8), _hard(errors=8),
+                   _hard(errors=8), _hard(errors=2)])
+    state['i'] = 0
+    session.best = session.baseline()
+
+    # 前两轮回归：observe，且不推进 without_best
+    for index in (1, 2):
+        state['i'] = index
+        assert session.evaluate(['skills/a.md'], summary='s',
+                                mechanism='合并重复段落')['decision'] == 'observe'
+    assert session.without_best == 0
+
+    # 第三轮超出耐心窗口 → discard，这一次才计入收敛
+    state['i'] = 3
+    assert session.evaluate(['skills/a.md'], summary='s',
+                            mechanism='合并重复段落')['decision'] == 'discard'
+    assert session.without_best == 1
+
+    # 仍能在收敛前跑到真正的改进
+    assert not session.exhausted()
+    state['i'] = 4
+    assert session.evaluate(['skills/a.md'], summary='s',
+                            mechanism='合并重复段落')['decision'] == 'keep'

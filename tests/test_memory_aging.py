@@ -305,3 +305,79 @@ def test_age_memories_prunes_noise_but_keeps_signal(tmp_path, monkeypatch):
     assert [item['name'] for item in moved] == ['noise']
     remaining = {item['name'] for item in memory.list_memory_files()}
     assert remaining == {'solid', 'pref'}
+
+
+# ---------------------------------------------------------------- 缓存淘汰（性能回归）
+
+def test_frontmatter_cache_survives_above_the_limit(tmp_path, monkeypatch):
+    """缓存超上限时逐条淘汰，不能整体清空。
+
+    实测踩到的 bug：原来到 256 条就 `clear()`，记忆数一旦超过上限，每次插入都
+    清空全表、命中率归零——500 条时一次索引重建要 6.8 秒，热缓存读也要 240ms。
+    """
+    import memory
+
+    home = memory._h()
+    monkeypatch.setattr(home, 'MEMORY_DIR', tmp_path, raising=False)
+    monkeypatch.setattr(home, 'MEMORY_INDEX', tmp_path / 'MEMORY.md', raising=False)
+    memory._cache_clear()
+
+    total = memory._CACHE_MAX + 40
+    for index in range(total):
+        (tmp_path / f'n{index}.md').write_text(
+            f'---\nname: n{index}\ndescription: d\ntype: fact\n---\n\nbody\n',
+            encoding='utf-8')
+    memory._cache_clear()
+
+    import time
+
+    started = time.perf_counter()
+    first = memory.list_memory_files()          # 冷：填满缓存（会触发淘汰）
+    cold = time.perf_counter() - started
+    assert len(first) == total
+    # 淘汰后缓存里仍应有内容，而不是被清空
+    assert memory._FRONTMATTER_CACHE, 'cache was cleared instead of evicted'
+    assert len(memory._FRONTMATTER_CACHE) <= memory._CACHE_MAX
+
+    # 相对比较而不是绝对阈值：淘汰掉一半后第一次仍是半冷，再读一次才全热。
+    # 绝对阈值在负载下会误报（实测冷读 296 条要 0.75s）。
+    memory.list_memory_files()
+    started = time.perf_counter()
+    memory.list_memory_files()
+    warm = time.perf_counter() - started
+    assert warm < cold * 0.6, f'cold={cold:.3f}s warm={warm:.3f}s: 缓存没生效'
+
+
+def test_age_scan_reads_recall_log_once(tmp_path, monkeypatch):
+    """扫描全部记忆时召回记录只读一次，不是每条重读。
+
+    实测：不传 log 时 30 条要 74ms（每次 age_days 都读盘 + 解析 json），
+    而 age_memories 每轮合并后都会跑。
+    """
+    import memory
+
+    home = memory._h()
+    monkeypatch.setattr(home, 'MEMORY_DIR', tmp_path, raising=False)
+    monkeypatch.setattr(home, 'MEMORY_INDEX', tmp_path / 'MEMORY.md', raising=False)
+    memory._cache_clear()
+    for index in range(20):
+        (tmp_path / f'n{index}.md').write_text(
+            f'---\nname: n{index}\ndescription: d\ntype: fact\n---\n\nbody\n',
+            encoding='utf-8')
+    memory._cache_clear()
+    entries = memory.list_memory_files()
+
+    calls = {'n': 0}
+    original = memory_aging._read_log
+
+    def counting(memory_dir):
+        calls['n'] += 1
+        return original(memory_dir)
+
+    monkeypatch.setattr(memory_aging, '_read_log', counting)
+    memory_aging.stale_entries(tmp_path, entries)
+    assert calls['n'] == 1, f'recall log read {calls["n"]} times, expected 1'
+
+    calls['n'] = 0
+    memory_aging.low_signal_entries(tmp_path, entries)
+    assert calls['n'] == 1

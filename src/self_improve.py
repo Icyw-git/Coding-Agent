@@ -474,8 +474,11 @@ class Session:
         if decision == 'keep':
             self.best = after
             self.without_best = 0
-        else:
+        elif decision == 'discard':
             self.without_best += 1
+        # observe **不计入** without_best：它的语义是"还在等，不算失败"。
+        # 计进去的话，收敛会在耐心窗口用完之前就触发——耐心窗口对收敛路径
+        # 就变成了空操作（实测消融时发现：开关两种情况下结论相同）。
         self.save()
         return {'change_id': change_id, 'decision': decision, 'reason': reason,
                 'before': self.best or {}, 'after': after, 'drift': drift}

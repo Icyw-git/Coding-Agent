@@ -102,21 +102,29 @@ def record_recall(memory_dir, names) -> None:
     _write_log(memory_dir, data)
 
 
-def last_used(memory_dir, filename: str, path: Path) -> float:
-    """这条记忆最后一次「有用」的时刻（写入时间与召回时间取大）。"""
+def last_used(memory_dir, filename: str, path: Path, *, log: dict | None = None) -> float:
+    """这条记忆最后一次「有用」的时刻（写入时间与召回时间取大）。
+
+    ``log`` 允许调用方传入已读好的召回记录。扫描全部记忆时**必须**这么传：
+    不传的话每条都要读盘 + 解析一次 json（实测 30 条时 age_memories 要 74ms，
+    而它每轮合并后都会跑一遍）。
+    """
     stamps = []
     try:
         stamps.append(path.stat().st_mtime)
     except OSError:
         pass
-    stamp = _read_log(Path(memory_dir)).get(filename)
+    records = _read_log(Path(memory_dir)) if log is None else log
+    stamp = records.get(filename)
     if isinstance(stamp, (int, float)):
         stamps.append(float(stamp))
     return max(stamps) if stamps else time.time()
 
 
-def age_days(memory_dir, filename: str, path: Path) -> int:
-    return int((time.time() - last_used(memory_dir, filename, path)) // 86400)
+def age_days(memory_dir, filename: str, path: Path, *,
+             log: dict | None = None) -> int:
+    return int((time.time() - last_used(memory_dir, filename, path, log=log))
+               // 86400)
 
 
 def stale_entries(memory_dir, entries, *, days: int | None = None) -> list[dict]:
@@ -125,6 +133,7 @@ def stale_entries(memory_dir, entries, *, days: int | None = None) -> list[dict]
         return []
     limit = days if days is not None else threshold_days()
     memory_dir = Path(memory_dir)
+    recency = _read_log(memory_dir)      # 读一次，不要每条重读
     out = []
     for item in entries:
         filename = item.get('filename') or ''
@@ -136,7 +145,7 @@ def stale_entries(memory_dir, entries, *, days: int | None = None) -> list[dict]
         path = memory_dir / filename
         if not path.is_file():
             continue
-        age = age_days(memory_dir, filename, path)
+        age = age_days(memory_dir, filename, path, log=recency)
         if age >= limit:
             out.append({**item, 'age_days': age})
     return out
@@ -184,7 +193,7 @@ def low_signal_entries(memory_dir, entries, *, days: int | None = None,
         path = memory_dir / filename
         if not path.is_file():
             continue
-        age = age_days(memory_dir, filename, path)
+        age = age_days(memory_dir, filename, path, log=recalls)
         if age < limit_days:
             continue
         out.append({**item, 'age_days': age, 'confidence': value})

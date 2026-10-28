@@ -52,7 +52,11 @@ MEMORY_PRECEDENCE = (
 # 解析结果能把固定开销降到读 stat。写入路径主动失效，外部修改靠 size/mtime 兜底。
 _FRONTMATTER_CACHE: dict[str, tuple[tuple[int, int], dict, str, str]] = {}
 _CACHE_LOCK = threading.Lock()
-_CACHE_MAX = 256
+#: 缓存上限。别设得太小：**淘汰必须是逐条淘汰，不能整体清空**。
+#: 实测踩到：原来到 256 就 `clear()`，而记忆数一旦超过 256（或条目数超过上限），
+#: 每次插入都清空全表，缓存命中率归零——500 条时一次索引重建要 6.8 秒，
+#: 热缓存下 list_memory_files 也要 240ms（等于冷读）。
+_CACHE_MAX = 512
 
 
 @contextmanager
@@ -115,8 +119,12 @@ def _cached_entry(path):
         return None
     meta, body = _parse_frontmatter(raw)
     with _CACHE_LOCK:
+        # 逐条淘汰最旧的一半，而不是 clear()：
+        # 整体清空在条目数超过上限时会变成「每次插入都清空」，缓存永远不命中。
+        # 淘汰一半而不是一条，避免每插入一次就触发一次淘汰扫描。
         if len(_FRONTMATTER_CACHE) >= _CACHE_MAX:
-            _FRONTMATTER_CACHE.clear()
+            for stale_key in list(_FRONTMATTER_CACHE)[: _CACHE_MAX // 2]:
+                _FRONTMATTER_CACHE.pop(stale_key, None)
         _FRONTMATTER_CACHE[key] = (signature, meta, body, raw)
     return meta, body, raw
 
