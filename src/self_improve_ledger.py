@@ -82,7 +82,8 @@ def record(cache_dir, *, paths, summary: str, metric: dict | None = None,
 
 
 def update_decision(cache_dir, change_id: str, decision: str,
-                    reason: str = '', mechanism: str = '') -> bool:
+                    reason: str = '', mechanism: str = '',
+                    metrics: dict | None = None) -> bool:
     """追加判定结果（keep / observe / discard）。
 
     台账本身不改写。``reason`` 与 ``mechanism`` 是**人类可读文本，不进入任何判定**
@@ -98,6 +99,10 @@ def update_decision(cache_dir, change_id: str, decision: str,
         'reason': reason,
         'mechanism': ' '.join(str(mechanism or '').split())[:200],
     }
+    if metrics:
+        # 指标快照**由代码算好传进来**，不是模型写的文字——台账里唯一能作为
+        # 证据的东西就是它。没有它，记录只剩"我改了 X"，看不出"改好了多少"。
+        entry['metrics'] = {str(key): value for key, value in metrics.items()}
     path = _ledger(cache_dir)
     if not path.is_file():
         return False
@@ -138,6 +143,8 @@ def entries(cache_dir, limit: int = 100) -> list[dict]:
                             records[change_id]['reason'] = row['reason']
                         if row.get('mechanism'):
                             records[change_id]['mechanism'] = row['mechanism']
+                        if row.get('metrics'):
+                            records[change_id]['metrics'] = row['metrics']
                     continue
                 if change_id not in records:
                     order.append(change_id)
@@ -194,15 +201,28 @@ def format_ledger(cache_dir, limit: int = 12) -> str:
     for row in reversed(rows):
         stamp = time.strftime('%m-%d %H:%M', time.localtime(row.get('ts') or 0))
         decision = row.get('decision') or 'pending'
-        mark = {'keep': '✓', 'observe': '◐', 'discard': '✗',
-                'pending': '…'}.get(decision, decision)
+        # 只用 GBK 安全的符号：✓ ✗ ◐ 在中文 Windows 控制台上会变成 ✓
+        # 这种转义串（harden_stdio 只保证不崩，不保证可读）。
+        mark = {'keep': '√', 'observe': '~', 'discard': '×',
+                'pending': '?'}.get(decision, '?')
         lines.append(f"  {mark} {stamp}  {row.get('summary') or '(无说明)'}")
         if row.get('mechanism'):
             lines.append(f'      机制：{row["mechanism"]}')
-        metric = row.get('metric') or {}
-        if metric:
-            parts = ' '.join(f'{k}={v}' for k, v in metric.items())
-            lines.append(f'      指标：{parts}')
+        # 优先展示判定时的指标快照（before -> after），它才是"改好了多少"。
+        snapshot = row.get('metrics') or {}
+        if snapshot:
+            parts = []
+            for name, value in snapshot.items():
+                if isinstance(value, dict):
+                    before = value.get('before')
+                    after = value.get('after')
+                    if before is None and after is None:
+                        continue
+                    parts.append(f'{name} {before} -> {after}')
+                else:
+                    parts.append(f'{name}={value}')
+            if parts:
+                lines.append('      指标：' + ' · '.join(parts))
         if row.get('reason'):
             lines.append(f'      理由：{row["reason"]}')
         lines.append(f'      回滚：/improvements rollback {row.get("change_id")}')

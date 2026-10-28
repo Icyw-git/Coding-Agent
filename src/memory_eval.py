@@ -383,7 +383,7 @@ def format_summary(cache_dir) -> str:
     if not stats.get('samples'):
         state = '开' if enabled() else '关'
         return (f'（还没有评测数据；LLM 评测当前{state}'
-                f'，用 HARNESS_MEMORY_EVAL=1 开启）')
+                '，设置 HARNESS_MEMORY_EVAL=1 并重启后生效）')
 
     lines = [f'记忆评测（最近 {stats["samples"]} 次）']
     if stats.get('recall_precision') is not None:

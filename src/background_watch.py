@@ -12,9 +12,11 @@ from turn_progress import format_duration
 DEFAULT_TIMEOUT = 600.0
 INTERVAL = 1.0
 MAX_OUTPUT = 50000
+#: 状态图标。**只用 GBK 安全字符**：✓ ✗ ⊘ 在中文 Windows 控制台上会显示成
+#: ``✓`` 这种转义串——``harden_stdio`` 只保证不崩，不保证可读。
 _ICONS = {
-    'queued': '○', 'running': '●', 'completed': '✓',
-    'failed': '✗', 'cancelled': '⊘',
+    'queued': '○', 'running': '●', 'completed': '√',
+    'failed': '×', 'cancelled': '-',
 }
 
 

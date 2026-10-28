@@ -330,6 +330,22 @@ def clear_state(cache_dir) -> None:
     _session_path(cache_dir).unlink(missing_ok=True)
 
 
+def _metric_snapshot(before: dict, after: dict) -> dict:
+    """把「改之前 → 改之后」压成可存的形状。
+
+    没有它，台账里只剩"我改了什么"，看不出"改好了多少"——而后者才是回头看时
+    唯一能判断这次改动值不值的东西。值由代码算，不接受模型自述。
+    """
+    snapshot = {}
+    for name, spec in METRICS.items():
+        old = _value(spec, before.get(name) or {})
+        new = _value(spec, after.get(name) or {})
+        if old is None and new is None:
+            continue
+        snapshot[name] = {'before': old, 'after': new}
+    return snapshot
+
+
 class Session:
     """一次有界改进尝试。用 ``begin`` → ``propose`` → ``measure`` → ``decide``。
 
@@ -468,7 +484,8 @@ class Session:
             reason += ' | soft drift: ' + '; '.join(drift)
 
         ledger.update_decision(self.cache_dir, change_id, decision, reason,
-                               mechanism=mechanism)
+                               mechanism=mechanism,
+                               metrics=_metric_snapshot(self.best or {}, after))
         self.rounds += 1
         self.changes.append(change_id)
         if decision == 'keep':

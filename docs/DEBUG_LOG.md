@@ -8998,3 +8998,66 @@ desktop_snapshot     4 次  均 9970ms     ← 真正的耗时大头
 按总耗时排序、行内显示总耗时）。
 
 全量 **2950 passed / 3 skipped**，ruff 通过。
+
+## UX 打磨（三）：扫 `/memories` 与 `/improvements`，发现 GBK 崩溃
+
+### `/memories` 四处
+
+| 问题 | 改法 |
+|---|---|
+| 归档显示 `0 天前归档`，紧跟"太久没用到"读着像 bug | `今天归档` / `昨天归档` / `N 天前归档` |
+| `restore` 失败只说找不到 | 列出可恢复的条目 |
+| `why` 找不到不给下一步 | 提示 `/memories` 看全部名称 |
+| `why` 结尾说"用 **forget 工具**" | 改成「想删掉它，直接说『忘掉这条』就行」 |
+
+最后一条是**对用户说的功能却用了模型侧措辞**：用户不调工具，他们说话。
+让他去做一件做不到的事，等于把话说给了错的人。
+
+`/memories quality` 也补了「设置后用**重启**生效」——原来说"用 X=1 开启"，但那是
+环境变量，不重启不生效。
+
+### `/improvements` 发现一个真崩溃
+
+`format_ledger` 用 `✓ ✗ ◐` 做状态标记，在 GBK 控制台上**直接抛
+UnicodeEncodeError**：
+
+```
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'
+```
+
+`console.harden_stdio()` 只把流设成 `errors=backslashreplace`——**不崩，但会打印
+`\u2717` 这种转义串**，用户看到的是乱码而不是叉号。两种结果都不能接受。
+
+实测 GBK 安全性：`✓` `✗` `◐` `⊘` **全部失败**；`√` `×` `·` `…` `—` `○` `●` 可用。
+
+改：`√`（keep）/ `~`（observe）/ `×`（discard）/ `?`（pending）。
+
+同一问题也在 `background_watch._ICONS`：`✓ ✗ ⊘` → `√ × -`，并且把"只用 GBK
+安全字符"写进注释，避免下次又踩。
+
+### 台账原来没记指标变化（更实质的问题）
+
+`format_ledger` 只显示 `指标：round=2`——**内部计轮编号泄漏给用户**，而真正的
+前后对比根本没被记录。
+
+`Session.evaluate` 只往台账写 `metric={'round': N}`，测出来的 before/after 全丢了。
+翻记录时只能看到"我改了 X"，看不出"改好了多少"——而后者是回头看时**唯一能判断
+这次改动值不值的东西**。
+
+改：加 `_metric_snapshot(before, after)`，判定时把每个指标的 `{before, after}` 存进
+台账；展示时过滤内部 `round` 字段。现在的输出：
+
+```
+  √ 10-28 14:26  去掉重复段
+      机制：合并重复段落
+      指标：pytest_pass 1 -> 1 · ruff_errors 9 -> 2
+      理由：ruff_errors improved
+      回滚：/improvements rollback 1793168771-94441a66
+```
+
+指标由代码算，不接受模型自述——与台账防污染那条一致。
+
+### 测试
+
+`test_self_improve.py` +3（指标变化可见、隐藏内部 round、标记字符 GBK 安全）。
+全量 **2953 passed / 3 skipped**，ruff 通过。

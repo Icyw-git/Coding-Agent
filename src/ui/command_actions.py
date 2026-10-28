@@ -12,6 +12,19 @@ from ui.modals.command_palette import CommandPaletteModal
 from ui.modals.models import ModelChoice, ModelPickerModal
 
 
+def _archived_when(age_days: int) -> str:
+    """归档时间的人话。
+
+    ``0 天前归档`` 读起来像 bug——今天归档的东西不该说成 "0 天前"，
+    而且它跟在 "已归档（太久没用到）" 后面，两个说法看着互相矛盾。
+    """
+    if age_days <= 0:
+        return '今天归档'
+    if age_days == 1:
+        return '昨天归档'
+    return f'{age_days} 天前归档'
+
+
 class CommandActionsMixin:
     """HarnessApp 的 `/` 命令分发与模型切换。"""
 
@@ -297,7 +310,12 @@ class CommandActionsMixin:
                 memory._rebuild_index()
                 self._notice(f'已恢复：{filename}')
             else:
-                self._notice(f'恢复失败：找不到归档条目 {filename}')
+                available = [item['filename'] for item in
+                             memory_aging.archived_entries(
+                                 llm_route.harness().MEMORY_DIR)]
+                hint = ('可恢复的：' + '、'.join(available[:5])
+                        if available else '归档目录是空的')
+                self._notice(f'恢复失败：找不到归档条目 {filename}。' + hint)
             return
         if arg:
             try:
@@ -341,7 +359,7 @@ class CommandActionsMixin:
             lines.append(f'已归档：{len(archived)} 条（太久没用到）')
             for item in archived[:5]:
                 lines.append(
-                    f"  · {item['filename']}（{item['age_days']} 天前归档）")
+                    f"  · {item['filename']}（{_archived_when(item['age_days'])}）")
             lines.append('  恢复：/memories restore <文件名>')
         lines.append('')
         lines.append('切换：/memories on|off|readonly|writeonly')
@@ -554,7 +572,8 @@ class CommandActionsMixin:
                     if needle in str(item.get('name') or '').casefold()
                     or needle in str(item.get('filename') or '').casefold()), None)
         if hit is None:
-            self._notice(f'没有叫 {target} 的记忆。')
+            self._notice(f'没有叫 {target} 的记忆。'
+                         '用 /memories 看全部名称（不带参数）。')
             return
         filename = hit.get('filename') or ''
         raw = ''
@@ -576,7 +595,9 @@ class CommandActionsMixin:
         if not quote and not session_id:
             lines.append('来源：未记录（早期写入或自动抽取，没有留下原话）')
         lines.append('')
-        lines.append('不满意就 /memories 查看后告诉我忘掉它（用 forget 工具）。')
+        # 用户不调工具，他们说话。"用 forget 工具"是模型侧的措辞，
+        # 对着用户说等于让他去做一件做不到的事。
+        lines.append('想删掉它，直接说「忘掉这条」就行。')
         self._notice(chr(10).join(lines))
 
     def handle_rules(self) -> None:

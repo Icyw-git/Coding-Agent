@@ -168,7 +168,8 @@ def test_format_ledger_shows_decision_and_rollback_hint(tmp_path):
     ledger.update_decision(tmp_path, change_id, 'keep', '指标变好')
     text = ledger.format_ledger(tmp_path)
     assert '改约定' in text
-    assert '✓' in text
+    # GBK 安全的符号：✓ 在中文 Windows 控制台上显示成转义串。
+    assert '√' in text
     assert change_id in text
 
 
@@ -486,3 +487,42 @@ def test_observe_does_not_count_toward_convergence(stubbed):
     state['i'] = 4
     assert session.evaluate(['skills/a.md'], summary='s',
                             mechanism='合并重复段落')['decision'] == 'keep'
+
+
+# ---------------------------------------------------------------- 台账可读性
+
+def test_ledger_shows_metric_change(tmp_path):
+    """没有指标前后值，记录只剩「我改了 X」，看不出「改好了多少」。"""
+    (tmp_path / 'AGENTS.md').write_text('v1', encoding='utf-8')
+    change_id = ledger.record(tmp_path, paths=['AGENTS.md'], summary='改约定',
+                              workdir=tmp_path)
+    ledger.update_decision(tmp_path, change_id, 'keep', 'better',
+                           mechanism='合并重复段落',
+                           metrics={'ruff_errors': {'before': 9, 'after': 2}})
+    text = ledger.format_ledger(tmp_path)
+    assert 'ruff_errors 9 -> 2' in text
+
+
+def test_ledger_hides_internal_round_counter(tmp_path):
+    """round 是记账用的编号，对用户没意义，还会挤掉真正的指标。"""
+    (tmp_path / 'AGENTS.md').write_text('v1', encoding='utf-8')
+    change_id = ledger.record(tmp_path, paths=['AGENTS.md'], summary='改',
+                              metric={'round': 3}, workdir=tmp_path)
+    ledger.update_decision(tmp_path, change_id, 'keep', 'ok')
+    text = ledger.format_ledger(tmp_path)
+    assert 'round=' not in text
+    assert 'round 3' not in text
+
+
+def test_ledger_marks_are_gbk_safe(tmp_path):
+    """✓ ✗ ◐ 在中文 Windows 控制台上会显示成 \u2713 这种转义串。
+
+    harden_stdio 只保证不崩，不保证可读。
+    """
+    (tmp_path / 'AGENTS.md').write_text('v1', encoding='utf-8')
+    for decision in ('keep', 'observe', 'discard'):
+        change_id = ledger.record(tmp_path, paths=['AGENTS.md'],
+                                  summary=decision, workdir=tmp_path)
+        ledger.update_decision(tmp_path, change_id, decision, 'x')
+    text = ledger.format_ledger(tmp_path)
+    text.encode('gbk')          # 编码失败会抛 UnicodeEncodeError
