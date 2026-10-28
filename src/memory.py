@@ -16,12 +16,14 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import date as _date
+from datetime import timedelta as _timedelta
 from pathlib import Path
 
 import yaml
 
 import llm_route
 import memory_aging
+import memory_durability
 import memory_feedback
 import memory_redact
 import memory_schema
@@ -267,7 +269,9 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
         'description': description,
         'type': memory_schema.canonical_type(mem_type),
         'body': body,
-        'scope': scope or memory_schema.DEFAULT_SCOPE,
+        # 留空交给 memory_durability 判：在这里填上默认值会让它误以为
+        # “调用方已显式指定”而跳过 durability 判定（实测踩到过）。
+        'scope': scope or '',
         'confidence': (memory_schema.DEFAULT_CONFIDENCE
                        if confidence is None else confidence),
         'last_update_date': memory_schema.today(),
@@ -276,6 +280,9 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
     }
     draft['keywords'] = (memory_schema.normalize_keywords(keywords)
                          or memory_schema.derive_keywords(description or name))
+    # 两层记忆：没显式指定 scope 时按 durability 判。一次性上下文（「这次不想托运」）
+    # 留在 session 层，不冒充长期偏好。显式指定不覆盖——人比规则准。
+    draft = memory_durability.apply(draft)
 
     existing = list_memory_files()
     action, target = memory_write.decide(draft, existing, supersedes=supersedes)
@@ -931,6 +938,53 @@ def _replace_memory_files(prepared: list[dict]) -> None:
         _rebuild_index_unlocked()
 
 
+#: session 层条目在多少天后归档。PAHF 的 session notes 合并即清除；我们给一天
+#: 宽限，让同一会话的后续轮次还能用到它，隔天就不再干扰。
+SESSION_SCOPE_DAYS = 1
+
+
+def archive_session_scope(*, days: int = SESSION_SCOPE_DAYS,
+                          today=None) -> list[dict]:
+    """归档过期的 session 层记忆（一次性上下文不该长期留在库里）。
+
+    与 ``age_memories`` 分开：那条管"太久没用的长期记忆"，这条管"本来就不该
+    长期存在的一次性上下文"。混在一起会让两套理由互相污染——排查时看不出
+    一条记忆是被"老化"还是被"降级"归档的。
+
+    同样只归档不删除。
+    """
+    h = _h()
+    limit = _date.today() - _timedelta(days=max(0, days))
+    stale = []
+    for item in list_memory_files():
+        if item.get('scope') != 'session':
+            continue
+        stamp = memory_schema.normalize_date(item.get('last_update_date'))
+        if not stamp:
+            continue
+        try:
+            written = _date.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if written <= limit:
+            stale.append(item)
+    if not stale:
+        return []
+    moved = []
+    with _write_guard():
+        for item in stale:
+            target = memory_aging.archive(h.MEMORY_DIR, item)
+            if target is not None:
+                moved.append({**item, 'archived_as': target.name})
+        if moved:
+            _cache_clear()
+            _rebuild_index_unlocked()
+    for item in moved:
+        _audit('memory_archived', {'name': item.get('name', ''),
+                                   'age_days': 0})
+    return moved
+
+
 def age_memories(days: int | None = None) -> list[dict]:
     """把长期未用的记忆移到 .archive/。返回被归档的条目。
 
@@ -967,8 +1021,11 @@ def age_memories(days: int | None = None) -> list[dict]:
 def consolidate_memories():
     """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
     h = _h()
-    # 先老化再合并：归档后可能已经低于阈值，那就省一次模型调用。
+    # 先清理再合并：归档后可能已经低于阈值，那就省一次模型调用。
+    # 两条清理理由不同——age_memories 管"太久没用的长期记忆"，
+    # archive_session_scope 管"本来就不该长期存在的一次性上下文"。
     try:
+        archive_session_scope()
         age_memories()
     except Exception as exc:
         print(f'  \033[33m[memory] aging skipped: {type(exc).__name__}: {exc}\033[0m')

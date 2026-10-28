@@ -7974,3 +7974,67 @@ positive > negative > abstain 的优先级，重复计数会让精确率虚高�
 κ 的完美/退化/单类别/长度不符/分档/阈值。
 
 全量 **2734 passed / 3 skipped**，ruff 通过。
+
+## 校准实跑 + A5 两层记忆（2026-10-28）
+
+### 校准跑出了一个真 bug：`model: null` → 422
+
+第一次真跑 `scripts/calibrate_memory_judge.py`：
+
+```
+openai.UnprocessableEntityError: 422
+Failed to deserialize the JSON body: model: invalid type: null, expected a string
+```
+
+根因：脚本直接 `import memory_eval`，**没有先导入 harness**。而 `.env` 是在
+`harness` 导入期由 `load_dotenv()` 加载的，所以 `llm_config` 读不到 provider 配置，
+`target_for()` 返回 None，`completion()` 回落到 `os.getenv('LLM_MODEL_ID')` —— 也是空，
+于是 `model: null` 被发给供应商。
+
+两处都修：
+1. 脚本先 `import harness`（并注释说明为什么必须）。
+2. `llm_route.completion()` 在没解析到模型时**显式报错**，而不是把 None 发出去：
+
+```
+no model configured for role 'memory': llm_config could not resolve a target and
+LLM_MODEL_ID is empty. If this is a script, import harness first so .env is loaded.
+```
+
+这个改动的价值在于错误信息能自我诊断——422 那个报错完全看不出是配置没加载。
+
+修完再跑，错误变成 `402 Insufficient Balance`（账号余额不足）。**校准本身仍未能完成**，
+所以现在还没有判官的 κ 数字。脚本已改成遇到这类失败时打印：
+
+> 判官本身没被验证之前，`/memories quality` 的数字只当参考。
+
+### A5 两层记忆
+
+`memory_durability.py` 做确定性 durability 判定：
+
+- **短暂措辞**（这次/本次/临时/暂时/temporarily/for now）→ `session`
+- **长期措辞**（以后/总是/每次/always/from now on）→ `global`
+- **条件性偏好**（`when X`）→ `global`（条件会重复出现）
+- 其余 → `global`（默认提升）
+
+**为什么默认提升**：漏判只是多一条冗余（合并机制会处理），误判是把有用信息丢掉。
+真正的质量把关交给异步评测的 `keep_rate`，而不是在写入时赌一把。
+
+**为什么用规则不用模型**：写入是高频操作，一次判断一次调用太贵；而且用户问
+"为什么这条没进长期记忆"时，规则给得出理由。
+
+`archive_session_scope()` 负责回收：session 层条目超过 1 天后归档（不删除）。
+与 `age_memories` **分开**——后者管"太久没用的长期记忆"，前者管"本来就不该长期
+存在的一次性上下文"，混在一起排查时分不清是被老化还是被降级。
+
+### 踩到的坑：默认值让判定失效
+
+第一版 `draft['scope'] = scope or DEFAULT_SCOPE`，于是 `memory_durability.apply()`
+看到 scope 已填就认为"调用方显式指定"，整段 durability 判定被跳过。实测：
+「这次旅行不想托运行李」写进去是 `scope: global`。
+
+修法：draft 里留空字符串，让 `apply()` 来填。注释写清了原因，免得以后有人
+"顺手补个默认值"又把判定关掉。
+
+### 验证
+
+新增 `test_memory_durability.py` (23)。全量 **2757 passed / 3 skipped**，ruff 通过。

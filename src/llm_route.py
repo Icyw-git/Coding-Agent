@@ -37,10 +37,21 @@ def client_for(role: str = 'main', target=None):
 
 
 def completion(role: str = 'main', **kwargs):
-    """按角色发起一次补全，返回 SDK 原始响应。"""
+    """按角色发起一次补全，返回 SDK 原始响应。
+
+    没解析到模型时**显式报错**：直接把 ``model=None`` 发给供应商会得到 422
+    "invalid type: null, expected a string"，那个错误看不出是配置没加载。
+    典型原因是调用方没有先导入 ``harness``（它在导入期做 load_dotenv）。
+    """
     target = target_for(role)
     if target is None:
-        kwargs.setdefault('model', os.getenv('LLM_MODEL_ID'))
+        model = os.getenv('LLM_MODEL_ID')
+        if not model:
+            raise RuntimeError(
+                f'no model configured for role {role!r}: llm_config could not '
+                'resolve a target and LLM_MODEL_ID is empty. If this is a '
+                'script, import harness first so .env is loaded.')
+        kwargs.setdefault('model', model)
         return harness().client.chat.completions.create(**kwargs)
     kwargs['model'] = target.model
     return client_for(role, target).chat.completions.create(**kwargs)

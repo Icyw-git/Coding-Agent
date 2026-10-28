@@ -37,6 +37,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'src'))
 
+# 必须先导入 harness：它在导入期做 load_dotenv()，而 llm_config 靠它读 provider
+# 配置。少了这一步，target_for() 返回 None，请求体里的 model 会是 null，
+# 供应商直接 422（实测踩到：Failed to deserialize ... model: invalid type: null）。
+import harness  # noqa: F401,E402
 import memory_eval  # noqa: E402
 
 LABELS = ROOT / 'tests' / 'fixtures' / 'memory_judge_labels.json'
@@ -87,7 +91,14 @@ def main() -> int:
     report = {}
     for kind, runner in (('recall', run_recall), ('quality', run_quality)):
         cases = data.get(kind) or []
-        human, judged = runner(cases)
+        try:
+            human, judged = runner(cases)
+        except Exception as exc:  # 网络/凭据/余额
+            print(f'{kind}: 无法完成校准 —— {type(exc).__name__}: {exc}',
+                  file=sys.stderr)
+            print('\n判官本身没被验证之前，`/memories quality` 的数字只当参考。',
+                  file=sys.stderr)
+            return 2
         report[kind] = memory_eval.validate_against_labels(human, judged)
         report[kind]['skipped'] = len(cases) - len(human)
 
