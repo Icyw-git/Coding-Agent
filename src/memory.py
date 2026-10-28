@@ -449,21 +449,151 @@ def _local_tokens(text: str) -> list[str]:
     return tokens
 
 
+#: 中英对照的开发常用词。召回是字面匹配，而记忆常被写成英文、查询常是中文
+#: （实测英文库 + 中文查询命中率只有 40%）。这里在**查询侧**做一次扩展：命中
+#: 任一方向的词就补上另一种写法，成本为零、完全确定性。
+#:
+#: 只收"一个词就能定位主题"的常见词。宁可少收——错的同义词会引入假召回，
+#: 而漏一个只是少一条命中。
+_GLOSSARY: dict[str, tuple[str, ...]] = {
+    # 工程
+    '部署': ('deploy', 'deployment', 'release'),
+    '发布': ('release', 'deploy', 'publish'),
+    '测试': ('test', 'tests', 'pytest', 'testing'),
+    '构建': ('build',),
+    '编译': ('compile', 'build'),
+    '提交': ('commit',),
+    '分支': ('branch',),
+    '合并': ('merge',),
+    '仓库': ('repo', 'repository'),
+    '目录': ('directory', 'dir', 'layout', 'folder'),
+    '文件': ('file',),
+    '配置': ('config', 'configuration', 'settings'),
+    '密钥': ('key', 'secret', 'credential'),
+    '轮换': ('rotate', 'rotation'),
+    '密码': ('password', 'passwd'),
+    '日志': ('log', 'logs', 'logging'),
+    '缓存': ('cache',),
+    '数据库': ('database', 'db'),
+    '接口': ('api', 'interface', 'endpoint'),
+    '权限': ('permission', 'access', 'auth'),
+    '错误': ('error', 'bug', 'issue'),
+    '代码': ('code',),
+    '风格': ('style', 'convention'),
+    '缩进': ('indent', 'indentation', 'tabs', 'spaces'),
+    '依赖': ('dependency', 'dependencies'),
+    '版本': ('version',),
+    '升级': ('upgrade', 'update'),
+    '安装': ('install',),
+    '启动': ('start', 'launch', 'run'),
+    '重启': ('restart', 'reboot'),
+    '停止': ('stop', 'kill'),
+    '性能': ('performance', 'perf', 'speed'),
+    '内存': ('memory', 'ram'),
+    '磁盘': ('disk', 'storage'),
+    '网络': ('network', 'net'),
+    '超时': ('timeout',),
+    '重试': ('retry', 'retries'),
+    '备份': ('backup',),
+    '恢复': ('restore', 'recover'),
+    '文档': ('doc', 'docs', 'documentation', 'readme'),
+    '注释': ('comment', 'comments'),
+    '限制': ('limit', 'quota', 'threshold'),
+    '账号': ('account',),
+    '账户': ('account',),
+    '审批': ('approval', 'approve'),
+    '允许': ('allow', 'permit'),
+    '拒绝': ('deny', 'block', 'reject'),
+    '窗口': ('window',),
+    '屏幕': ('screen', 'display'),
+    '截图': ('screenshot', 'capture'),
+    '剪贴板': ('clipboard', 'paste'),
+    '任务': ('task', 'job'),
+    '计划': ('schedule', 'plan', 'cron'),
+    '定时': ('cron', 'schedule'),
+    '记忆': ('memory', 'memories'),
+    '会话': ('session', 'conversation', 'chat'),
+    '工作区': ('workspace', 'workdir'),
+    '环境': ('environment', 'env'),
+    '沙箱': ('sandbox',),
+    '模型': ('model',),
+    '提示词': ('prompt',),
+    '上下文': ('context',),
+    '重写': ('rewrite', 'refactor'),
+    '重构': ('refactor', 'rewrite'),
+    '删除': ('delete', 'remove', 'rm'),
+    '创建': ('create', 'add', 'new'),
+    '修改': ('modify', 'edit', 'change', 'update'),
+    '查看': ('view', 'show', 'list', 'read'),
+    '搜索': ('search', 'grep', 'find'),
+    '导出': ('export',),
+    '导入': ('import',),
+    # 表达风格
+    '简短': ('brief', 'concise', 'short'),
+    '简洁': ('concise', 'brief', 'terse'),
+    '详细': ('detailed', 'verbose', 'elaborate'),
+    '中文': ('chinese', 'zh'),
+    '英文': ('english', 'en'),
+    '回复': ('reply', 'answer', 'respond', 'response'),
+    '回答': ('answer', 'reply', 'response'),
+    # 生活/偏好（记忆里常见，中文表达差异大）
+    '困': ('sleepy', 'tired', 'drowsy'),
+    '累': ('tired', 'exhausted'),
+    '茶': ('tea',),
+    '咖啡': ('coffee',),
+    '喝': ('drink', 'beverage'),
+    '吃': ('eat', 'food', 'meal'),
+    '早上': ('morning',),
+    '下午': ('afternoon',),
+    '晚上': ('evening', 'night'),
+    '周三': ('wednesday',),
+    '周末': ('weekend',),
+    '喜欢': ('prefer', 'like', 'favourite', 'favorite'),
+    '偏好': ('prefer', 'preference'),
+    '不要': ('avoid', 'never'),
+    '总是': ('always', 'usually'),
+    '平时': ('usually', 'normally'),
+}
+
+#: 反向表（英文 → 中文），由 _GLOSSARY 生成，避免手写两份。
+_GLOSSARY_REVERSE: dict[str, tuple[str, ...]] = {}
+for _zh, _en in _GLOSSARY.items():
+    for _word in _en:
+        _GLOSSARY_REVERSE.setdefault(_word, ())
+        _GLOSSARY_REVERSE[_word] += (_zh,)
+
+
+def _expand_tokens(tokens) -> set[str]:
+    """按中英术语表扩展查询词（双向）。"""
+    expanded = set(tokens)
+    for token in tokens:
+        for zh, en in _GLOSSARY.items():
+            if zh in token:
+                expanded.update(en)
+        for zh in _GLOSSARY_REVERSE.get(token, ()):
+            expanded.add(zh)
+    return expanded
+
+
 def local_relevant_memories(messages: list, files: list | None = None,
                             max_items: int = 5) -> list:
-    """本地记忆筛选：零网络往返，覆盖中英文。
+    """本地记忆筛选：零网络往返。
 
-    打分 = 2×ASCII 词命中 + 1×中文二元组命中（去重），阈值 ≥2：
-    单个英文关键词即可命中（信息量大），中文需要至少两个二元组
-    （例如「简短」+「回答」），避免常见字偶然撞车。
+    打分按**字段强度**分层，而不是数命中词个数：
 
-    schema v2 起参与打分的字段从 ``name + description`` 扩到 **+ keywords**：
-    条件性偏好的关键词往往在 keywords 里（「困了」）而不在名字里，不扩就召回
-    不到。正文仍不参与——正文长，会把稀有词权重稀释。
+    - ``keywords``/``name`` 命中 → 3 分。这两个字段是人工/抽取时精确标定的，
+      命中一个就足以说明主题相关。中文查询尤其依赖这一条：短句往往只切出一两个
+      二元组，按"命中数 ≥2"的旧规则会整条漏掉（实测「跑一下测试」召不回
+      「跑测试用 pytest」，明明关键词完全对上）。
+    - ``description`` 命中 → 英文词 2 分、中文二元组 1 分。
+
+    阈值 3：一个关键词/名字命中，或描述里两个英文词、或三个中文二元组。
 
     两个加权（对应 PAHF 的 recency correctness 与 correction 优先级）：
     - ``correction`` 类 ×1.3：用户纠正过的信息比普通偏好更重要
     - 时间衰减：每 30 天 ×0.9，旧记忆排在后面但不会消失
+
+    正文不参与：正文长，会把稀有词权重稀释，召回噪声大。
     """
     if files is None:
         files = list_memory_files()
@@ -472,17 +602,20 @@ def local_relevant_memories(messages: list, files: list | None = None,
     recent = _recent_user_text(messages)
     if not recent.strip():
         return []
-    tokens = set(_local_tokens(recent))
+    tokens = _expand_tokens(_local_tokens(recent))
     today = _date.today()
     scored = []
     for f in files:
-        haystack = ' '.join([
-            str(f.get('name') or ''), str(f.get('description') or ''),
-            ' '.join(f.get('keywords') or []),
-        ]).lower()
-        score = sum(2 if len(token) > 2 and token.isascii() else 1
-                    for token in tokens if token in haystack)
-        if score < 2:
+        strong = ' '.join([str(f.get('name') or ''),
+                           ' '.join(f.get('keywords') or [])]).lower()
+        weak = str(f.get('description') or '').lower()
+        score = 0
+        for token in tokens:
+            if token in strong:
+                score += 3
+            elif token in weak:
+                score += 2 if len(token) > 2 and token.isascii() else 1
+        if score < 3:
             continue
         if f.get('type') == 'correction':
             score *= 1.3
@@ -640,12 +773,20 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
 
     prompt = (
         "Extract user preferences, constraints, or project facts from this dialogue.\n"
-        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "Return a JSON array. Each item: "
+        "{name, type, description, body, keywords, supersedes}.\n"
         "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
-        "- type: one of 'user' (user preference), 'feedback' (guidance), "
-        "'project' (project fact), 'reference' (external pointer)\n"
-        "- description: one-line summary for index lookup\n"
+        "- type: one of 'preference', 'correction' (the user corrected the "
+        "assistant), 'fact', 'context'\n"
+        "- description: one-line summary; write conditional preferences as "
+        "'when <condition>: <preference>'\n"
         "- body: full detail in markdown\n"
+        "- keywords: 3-6 short search terms. Include BOTH the user's language and "
+        "English (e.g. '部署,发布,deploy,deployment'), plus any condition words. "
+        "Recall is lexical, so a Chinese query only finds an English memory if "
+        "the English term is also present as a keyword.\n"
+        "- supersedes: OPTIONAL. If this item corrects or replaces one of the "
+        "existing memories listed below, put that memory's name here.\n"
         "If nothing new or already covered by existing memories, return [].\n"
         "OUTPUT FORMAT (STRICT): reply with ONLY a plain JSON array. "
         "Do NOT think out loud, do NOT explain, do NOT wrap it in markdown code "
