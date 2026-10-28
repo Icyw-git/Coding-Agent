@@ -212,3 +212,26 @@ def test_only_interesting_lines_are_parsed(sessions):
     elapsed = time.perf_counter() - started
     assert stats['requests'] == 1
     assert elapsed < 1.0, f'扫描 {elapsed:.2f}s，预筛可能失效'
+
+
+def test_local_only_activity_is_not_reported_as_empty(sessions):
+    """只有工具调用、没有模型请求时不能说「没有数据」——那会让人以为统计坏了。"""
+    _session(sessions, events=[('tool_profile', _tool_batch(('bash', 10)))])
+    stats = usage_stats.collect(sessions, days=7)
+    assert stats['sessions'] == 1
+    assert stats['tools']
+    text = usage_stats.format_report(stats)
+    assert '没有可统计的会话' not in text
+    assert 'bash' in text
+
+
+def test_answers_where_the_time_went(sessions):
+    """报告要能回答「时间花在哪」：工具按耗时也排得出来。"""
+    _session(sessions, events=[
+        ('tool_profile', _tool_batch(('desktop_snapshot', 9000))),
+        ('tool_profile', _tool_batch(('read', 5))),
+    ])
+    stats = usage_stats.collect(sessions, days=7)
+    assert stats['tools']['desktop_snapshot']['total_ms'] == 9000
+    text = usage_stats.format_report(stats)
+    assert 'desktop_snapshot' in text

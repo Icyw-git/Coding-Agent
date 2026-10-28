@@ -195,7 +195,10 @@ def collect(sessions_dir, *, days: int = DEFAULT_DAYS,
 
 def format_report(stats: dict, *, top_tools: int = 8) -> str:
     """`/usage` 的文本输出。"""
-    if not stats.get('requests') and not stats.get('turns'):
+    # 只看请求和回合会漏掉「只跑了本地命令」的情况——那也有会话、也有工具调用，
+    # 报「没有数据」会让人以为统计坏了。
+    if not any(stats.get(key) for key in
+               ('requests', 'turns', 'sessions', 'tools', 'tool_batches')):
         return (f"（最近 {stats.get('window_days')} 天没有可统计的会话）\n"
                 '跑几轮对话后再看。')
 

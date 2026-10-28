@@ -28,7 +28,11 @@ def move(moves, *, cache_dir, dry_run: bool = True, runner=None,
         prepared = engine.validate_moves(moves)
     except engine.MoveError as exc:
         _notify(audit, 'move_rejected', reason=str(exc)[:200])
-        return f'Error: {exc}'
+        # 必须说清“一项都没动”：用户看到错误第一反应是“移了一半没有”？
+        # 验证是整批先做的，所以答案总是“没动”，而这句话省掉一次恐慌。
+        return (f'Error: {exc}\n\n'
+                'Nothing was moved — the whole batch is checked before anything '
+                'touches the disk. Fix that item and try again.')
 
     listing = engine.describe(prepared)
     if dry_run:

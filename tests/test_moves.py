@@ -279,3 +279,52 @@ def test_library_is_importable_without_side_effects():
     """moves 是纯逻辑模块：导入不该碰文件系统。"""
     assert callable(moves.validate_moves)
     assert callable(shutil.move)
+
+
+# ---------------------------------------------------------------- 预览可读性
+
+def test_preview_shortens_paths_to_common_base(work, cache):
+    """满屏绝对路径前缀会把预览变成不可核对——真实文件名被挤到行尾。"""
+    out = tool_move.move([{'from': str(work / 'a.txt'), 'to': str(work / 'arch' / 'a.txt')},
+                          {'from': str(work / 'b.txt'), 'to': str(work / 'arch' / 'b.txt')}],
+                         cache_dir=cache)
+    # 公共目录单独一行，条目只显示相对部分
+    assert f'in {work}' in out
+    assert 'a.txt -> arch/a.txt' in out
+    assert 'b.txt -> arch/b.txt' in out
+
+
+def test_preview_falls_back_to_absolute_without_common_base(tmp_path, cache):
+    """跨盘符/无公共目录时退回绝对路径，不能报错。"""
+    left = tmp_path / 'left'
+    left.mkdir()
+    (left / 'a.txt').write_text('x', encoding='utf-8')
+    other = tmp_path / 'right'
+    other.mkdir()
+    prepared = [{'from': left / 'a.txt', 'to': other / 'a.txt'}]
+    text = moves.describe(prepared)
+    assert 'left' in text and 'right' in text
+
+
+def test_error_says_nothing_was_moved(work, cache):
+    """用户看到错误第一反应是"移了一半没有"——必须直接回答。"""
+    out = tool_move.move([{'from': str(work / 'a.txt'), 'to': 'ok.txt'},
+                          {'from': str(work / 'missing.txt'), 'to': 'x.txt'}],
+                         cache_dir=cache, dry_run=False)
+    assert 'Nothing was moved' in out
+    assert 'whole batch is checked' in out
+    assert (work / 'a.txt').is_file()
+
+
+def test_undo_without_history_gives_next_step(cache):
+    out = tool_move.undo(cache)
+    assert 'nothing to undo' in out
+    assert 'move_paths' in out
+
+
+def test_undo_unknown_batch_lists_recent(work, cache):
+    batch = moves.move([{'from': str(work / 'a.txt'), 'to': 'a.done.txt'}],
+                       cache_dir=cache)
+    out = tool_move.undo(cache, batch_id='ghost')
+    assert 'no move batch with id ghost' in out
+    assert batch['journal_id'] in out      # 列出最近的，便于抄对 id

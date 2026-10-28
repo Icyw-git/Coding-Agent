@@ -131,13 +131,67 @@ def _is_within(child: Path, parent: Path) -> bool:
     return True
 
 
+def common_base(moves: list[dict]) -> Path | None:
+    """所有 from/to 的**最长公共父目录**。找不到（跨盘符等）返回 None。
+
+    用来把预览里的路径缩短：六个文件全是
+    ``C:\\Users\\...\\Downloads\\report-0.pdf`` 时，屏幕被前缀占满，
+    真正的文件名被挤到行尾，人根本核对不了自己批的是什么。
+    """
+    paths: list[Path] = []
+    for item in moves:
+        for key in ('from', 'to'):
+            value = item.get(key)
+            if value is not None:
+                paths.append(Path(value))
+    if not paths:
+        return None
+    try:
+        parts = [list(path.parts) for path in paths]
+    except (OSError, ValueError):
+        return None
+    if not parts:
+        return None
+    prefix = parts[0]
+    for other in parts[1:]:
+        limit = min(len(prefix), len(other))
+        index = 0
+        while index < limit and prefix[index] == other[index]:
+            index += 1
+        prefix = prefix[:index]
+        if not prefix:
+            return None
+    base = Path(*prefix) if prefix else None
+    # 只在"确实是一个目录"时用相对路径：base 恰好等于某个文件路径时不能用。
+    if base is None or not base.is_dir():
+        return None
+    return base
+
+
 def describe(moves: list[dict], *, limit: int = 20) -> str:
-    """人类可读的移动清单（预览与结果共用）。"""
+    """人类可读的移动清单（预览与结果共用）。
+
+    路径能相对化就相对化——预览的目的是让人**核对**，而满屏的绝对路径前缀
+    恰好把它变成不可核对。
+    """
+    base = common_base(moves)
+
+    def _show(value) -> str:
+        path = Path(value)
+        if base is None:
+            return str(path)
+        try:
+            return path.relative_to(base).as_posix()
+        except ValueError:
+            return str(path)
+
     lines = []
+    if base is not None:
+        lines.append(f'  in {base}')
     for item in moves[:limit]:
-        lines.append(f"  {item['from']} -> {item['to']}")
+        lines.append(f"  {_show(item['from'])} -> {_show(item['to'])}")
     if len(moves) > limit:
-        lines.append(f'  … 还有 {len(moves) - limit} 项')
+        lines.append(f'  … {len(moves) - limit} more')
     return '\n'.join(lines)
 
 
@@ -206,11 +260,16 @@ def undo(cache_dir, *, batch_id: str = '', runner=None) -> dict:
     """
     batches = recent_batches(cache_dir, limit=50)
     if not batches:
-        raise MoveError('no move batches recorded yet')
+        raise MoveError(
+            'no move batches recorded yet — nothing to undo. '
+            'Batches are recorded by move_paths.')
     if batch_id:
         batch = next((row for row in batches if row.get('id') == batch_id), None)
         if batch is None:
-            raise MoveError(f'no move batch with id {batch_id}')
+            recent = ', '.join(str(row.get('id')) for row in batches[:3])
+            raise MoveError(
+                f'no move batch with id {batch_id}. '
+                f'Recent batches: {recent or "(none)"}')
     else:
         batch = batches[0]
 

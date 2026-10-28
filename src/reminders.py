@@ -54,8 +54,10 @@ class ReminderTimeError(ValueError):
     """时间说法无法确定。文案直接给模型/用户，所以要说清可用写法。"""
 
 
-_USAGE = ('写不清的时间无法确定。可用：`2026-11-04 15:00`、`15:00`、'
-          '`in 2h`、`tomorrow 9am`、`明天下午3点`')
+#: 错误文案统一英文（与其它工具一致：模型读取更可靠），但**示例保留中文写法**
+#: ——用户是用中文说的时间，能抄的例子才叫可执行。
+_USAGE = ('Usable forms: 2026-11-04 15:00 / 15:00 / in 2h / tomorrow 9am / '
+          '明天下午3点 / 今晚8点')
 
 
 def _apply_meridiem(hour: int, word: str) -> int:
@@ -76,7 +78,7 @@ def parse_when(text: str, *, now: datetime | None = None) -> datetime:
     """
     raw = ' '.join(str(text or '').split())
     if not raw:
-        raise ReminderTimeError('缺少时间。' + _USAGE)
+        raise ReminderTimeError('missing time. ' + _USAGE)
     current = now or datetime.now()
     lowered = raw.casefold()
 
@@ -108,7 +110,7 @@ def parse_when(text: str, *, now: datetime | None = None) -> datetime:
                             int(hour if hour is not None else 9),
                             int(minute or 0))
         except ValueError as exc:
-            raise ReminderTimeError(f'日期不合法：{raw}（{exc}）') from None
+            raise ReminderTimeError(f'invalid date {raw!r}: {exc}') from None
 
     # 3) 日期词 + 时间（今天/明天/后天，today/tomorrow）
     day_offset = None
@@ -148,13 +150,13 @@ def parse_when(text: str, *, now: datetime | None = None) -> datetime:
                 elif rest in ('', ) :
                     pass
                 else:
-                    raise ReminderTimeError(f'看不懂的时间：{raw}。' + _USAGE)
+                    raise ReminderTimeError(f'cannot parse time {raw!r}. ' + _USAGE)
 
     if hour is None:
         # 只给了日期没给时间：默认当天 09:00，并在回显里说明。
         hour, minute = 9, 0
     if not 0 <= hour <= 23 or not 0 <= (minute or 0) <= 59:
-        raise ReminderTimeError(f'时间不合法：{raw}')
+        raise ReminderTimeError(f'time out of range: {raw!r}')
 
     hour = _apply_meridiem(hour, meridiem) if meridiem else hour
     base = current if day_offset is None else current + timedelta(days=day_offset)
@@ -170,6 +172,16 @@ def parse_when(text: str, *, now: datetime | None = None) -> datetime:
 def to_cron(when: datetime) -> str:
     """绝对时间 → 一次性 cron 表达式（分 时 日 月 周）。"""
     return f'{when.minute} {when.hour} {when.day} {when.month} *'
+
+
+def stamp(when: datetime) -> str:
+    """无语言的紧凑时间（给英文错误句用）。
+
+    ``describe()`` 是给用户看的中文回显；把它嵌进英文错误句会变成
+    "that time is in the past (1 月 1 日（周一）09:00（已过去）)"——两个语言
+    混在一句里，谁读都别扭。错误句用这个。
+    """
+    return when.strftime('%Y-%m-%d %H:%M')
 
 
 def describe(when: datetime, *, now: datetime | None = None) -> str:
@@ -194,4 +206,5 @@ def validate_future(when: datetime, *, now: datetime | None = None) -> None:
     current = now or datetime.now()
     if when <= current:
         raise ReminderTimeError(
-            f'这个时间已经过去了（{describe(when, now=current)}）。请给一个未来的时间。')
+            f'that time is in the past ({stamp(when)}, now '
+            f'{stamp(current)}). Give a future time.')

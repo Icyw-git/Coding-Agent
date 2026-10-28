@@ -8831,3 +8831,97 @@ if not any(marker in raw for marker in _INTERESTING):
   分组输出、无注册表时的下一步提示）
 
 全量 **2932 passed / 3 skipped**，ruff 通过。
+
+## 用户体验完善：实测四处输出后改的五个地方
+
+把四项新功能当用户实际用一遍，逐个看输出。
+
+### 1. `move_paths` 预览被绝对路径淹没（最严重）
+
+实测 6 个文件的预览：
+
+```
+  C:\Users\...\Downloads\report-2026-0.pdf -> C:\Users\...\Downloads\archive\report-0.pdf
+  C:\Users\...\Downloads\report-2026-1.pdf -> C:\Users\...\Downloads\archive\report-1.pdf
+  ...（同一行前缀重复 12 次）
+```
+
+**整个屏幕被前缀占满，真正的文件名被挤到行尾——预览的目的就是让人核对，
+而这恰好让它不可核对。**
+
+改：算所有 from/to 的**最长公共父目录**，能相对化就相对化：
+
+```
+Preview: 6 item(s) would move (nothing changed yet):
+  in C:\Users\...\Downloads
+  report-2026-0.pdf -> archive/report-0.pdf
+  ...
+```
+
+跨盘符或没有公共目录时退回绝对路径（不报错）。
+
+### 2. 错误信息没说"一项都没动"
+
+用户看到 "source does not exist" 时第一反应是**"移了一半没有"**。验证是整批
+先做的，所以答案总是"没动"——这句话省掉一次恐慌：
+
+```
+Error: item 2: source does not exist: ...
+Nothing was moved — the whole batch is checked before anything touches the disk.
+Fix that item and try again.
+```
+
+### 3. 错误文案中英混杂
+
+新工具里 `reminders.py` 用中文错误，而其它所有工具是英文
+（`validate_cron` 返回 `Expected 5 fields,got 3`）。混着来最糟。
+
+统一为英文——**但示例保留中文写法**：
+
+```
+Error: cannot parse time '晚点'. Usable forms: 2026-11-04 15:00 / 15:00 /
+in 2h / tomorrow 9am / 明天下午3点 / 今晚8点
+```
+
+理由：模型读英文更稳；而用户是用中文说的时间，**能抄的例子才叫可执行**。
+
+### 4. 错误句里嵌了中文回显
+
+原来：`that time is in the past (1 月 1 日（周一）09:00（已过去）). Give a future time.`
+——一句里两个语言，谁读都别扭。
+
+加了 `stamp()` 给错误句用中性格式：
+
+```
+that time is in the past (2020-01-01 09:00, now 2026-10-28 14:30).
+```
+
+`describe()`（中文友好回显）仍然只用于给用户的确认文案。
+
+### 5. `/usage` 把"有本地数据"误报成"没有数据"
+
+只有工具调用、没有模型请求时，首页判断 `not requests and not turns` 直接
+返回"没有可统计的会话"——**而实际有 1 个会话、1 批工具调用**。这会让用户
+以为统计坏了。
+
+改成任一维度有数据就出报告。实测现在的输出：
+
+```
+使用统计（最近 7 天）
+  会话 1 · 回合 0 · 模型请求 0
+  工具调用（1 批）：
+    bash                      1 次  均 10ms
+```
+
+### 6. 撤销失败时列出最近的批次 id
+
+`/improvements rollback` 式的体验问题：报"no move batch with id ghost"却不说
+有哪些。现在列出最近 3 个 id，用户能抄对。
+
+### 测试
+
+`test_moves.py` +5（预览相对化、无公共目录回退、整批未动声明、撤销无历史的下一步、
+未知批次列最近 id）、`test_reminders.py` +3（英文错误保留中文示例、中性时间戳、
+确认文案说明自动清理）、`test_usage_stats.py` +2（本地活动不被报成空、耗时排序）。
+
+全量 **2942 passed / 3 skipped**，ruff 通过。

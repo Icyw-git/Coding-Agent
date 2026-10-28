@@ -54,7 +54,7 @@ def test_absolute_forms(text, expected):
 
 
 def test_invalid_date_is_rejected():
-    with pytest.raises(reminders.ReminderTimeError, match='日期不合法'):
+    with pytest.raises(reminders.ReminderTimeError, match='invalid date'):
         _parse('2026-02-30 10:00')
 
 
@@ -111,13 +111,14 @@ def test_unparseable_is_rejected_with_usage(text):
     with pytest.raises(reminders.ReminderTimeError) as excinfo:
         _parse(text)
     # 必须给出可用写法，而不是只说"看不懂"
-    assert '可用' in str(excinfo.value) or '缺少时间' in str(excinfo.value)
+    text = str(excinfo.value)
+    assert 'Usable forms' in text or 'missing time' in text
 
 
 # ---------------------------------------------------------------- 未来校验
 
 def test_past_time_is_rejected():
-    with pytest.raises(reminders.ReminderTimeError, match='已经过去'):
+    with pytest.raises(reminders.ReminderTimeError, match='in the past'):
         reminders.validate_future(datetime(2020, 1, 1), now=NOW)
 
 
@@ -200,7 +201,7 @@ def test_remind_rejects_past_time(scheduled):
     calls, fake = scheduled
     out = tool_remind.remind('x', '2020-01-01 09:00', schedule=fake, now=NOW)
     assert out.startswith('Error:')
-    assert '已经过去' in out
+    assert 'in the past' in out
     assert calls == []
 
 
@@ -216,3 +217,31 @@ def test_remind_passes_delivery_target(scheduled):
     calls, fake = scheduled
     tool_remind.remind('x', '明天', schedule=fake, now=NOW, deliver_to='oc_chat')
     assert calls[0]['deliver_to'] == 'oc_chat'
+
+
+def test_errors_are_english_but_keep_chinese_examples():
+    """错误文案用英文（与其它工具一致、模型读取更可靠），
+    但示例保留中文写法——用户是用中文说的时间，能抄的例子才叫可执行。"""
+    with pytest.raises(reminders.ReminderTimeError) as excinfo:
+        _parse('晚点')
+    text = str(excinfo.value)
+    assert 'cannot parse time' in text
+    assert '明天下午3点' in text
+
+
+def test_past_time_error_uses_neutral_stamp():
+    """错误句里不能嵌中文回显：两个语言混在一句里谁读都别扭。"""
+    with pytest.raises(reminders.ReminderTimeError) as excinfo:
+        reminders.validate_future(datetime(2020, 1, 1, 9), now=NOW)
+    text = str(excinfo.value)
+    assert '2020-01-01 09:00' in text
+    assert '月' not in text
+    assert '周一' not in text
+
+
+def test_confirmation_says_it_removes_itself(scheduled):
+    """用户会担心「设了会不会一直提醒」——要主动说清。"""
+    _calls, fake = scheduled
+    out = tool_remind.remind('喝水', 'in 1h', schedule=fake, now=NOW)
+    assert 'removes itself' in out
+    assert '/crons' in out
