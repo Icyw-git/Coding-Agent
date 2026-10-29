@@ -103,11 +103,11 @@ class SessionActionsMixin:
         if not argument:
             self._notice('用法：/rename <标题>', level='error')
             return
-        import harness
-        from session_locks import SessionBusy, session_write
+        from session_locks import SessionBusy, session_write, sessions_dir_for
 
+        sessions_dir = sessions_dir_for(self._store)
         try:
-            with session_write(harness.SESSIONS_DIR, self._store.session_id,
+            with session_write(sessions_dir, self._store.session_id,
                                action='重命名会话'):
                 title = self._store.append_session_title(argument[:80], source='user')
         except SessionBusy as exc:

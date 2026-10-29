@@ -174,3 +174,26 @@ def test_shortcut_without_pending_is_normal_message(tmp_path):
         assert received == [('chat', 'session', 'y')]
     finally:
         gateway.stop()
+
+
+def test_sessions_dir_follows_the_store(tmp_path, monkeypatch):
+    """锁/回合槽的目录跟着 store 走，而不是全局 SESSIONS_DIR。
+
+    会话可以被打开在任意目录（`/resume` 指到别处、测试用临时目录）。一律用全局
+    `harness.SESSIONS_DIR` 的话，锁住的不是真正在写的文件——TUI、ANSI REPL、`/rename`
+    三处各错过一次，所以收敛成 `sessions_dir_for()` 并用这条钉住它。
+    """
+    import harness
+    import session_store
+    from session_locks import lock_path, sessions_dir_for
+
+    elsewhere = tmp_path / 'other-sessions'
+    elsewhere.mkdir()
+    store = session_store.SessionEventStore(elsewhere, session_id='abc')
+
+    assert sessions_dir_for(store) == elsewhere
+    # 会话写锁落在「会话目录的上一级/locks/sessions/<id>.lock」，与回合槽同一层
+    assert lock_path(sessions_dir_for(store), 'abc') == (
+        elsewhere.parent / 'locks' / 'sessions' / 'abc.lock')
+    # 没有 store 时回落到全局
+    assert sessions_dir_for(None) == harness.SESSIONS_DIR

@@ -25,6 +25,22 @@ class SessionBusy(RuntimeError):
     """会话正被另一个进程/入口写入。"""
 
 
+def sessions_dir_for(store=None) -> Path:
+    """``store`` 所在的会话目录；没有 store 时用全局 ``SESSIONS_DIR``。
+
+    为什么需要它：会话可以被打开在**任意目录**下（``/resume`` 指到别处、测试用
+    临时目录、将来按项目分目录）。锁和回合槽都按"会话目录的上一级"定位，如果一律
+    用全局 ``harness.SESSIONS_DIR``，锁住的就不是真正在写的那个文件——并发保护
+    形同虚设（这条在 TUI 与 ANSI REPL 里各错过一次）。
+    """
+    path = getattr(store, 'path', None)
+    if path is not None:
+        return Path(path).parent
+    import harness
+
+    return Path(harness.SESSIONS_DIR)
+
+
 def lock_path(sessions_dir, session_id: str) -> Path:
     safe = ''.join(ch if (ch.isalnum() or ch in '-_') else '_'
                    for ch in str(session_id))

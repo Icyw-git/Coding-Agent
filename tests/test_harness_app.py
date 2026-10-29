@@ -127,9 +127,15 @@ def test_turn_slot_busy_keeps_text_in_composer(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_turn_slot_released_after_turn(monkeypatch):
-    """worker 结束后释放槽：下一个提交仍能执行。"""
+def test_turn_slot_released_after_turn(tmp_path, monkeypatch):
+    """worker 结束后释放槽：下一个提交仍能执行。
+
+    回合锁跟着会话目录走（``<sessions_dir>/../locks/agent-turn.lock``）。这里用
+    tmp_path 里的 store，锁就落在临时目录——否则它和**本机正在跑的网关/TUI**
+    抢同一把真实锁，满载时会偶发失败（本机 2026-10-25、10-29 各遇到过一次）。
+    """
     calls = []
+    store = _temp_store(tmp_path)
 
     def fake_loop(messages, **kwargs):
         calls.append(len(messages))
@@ -138,19 +144,21 @@ def test_turn_slot_released_after_turn(monkeypatch):
     monkeypatch.setattr(harness, 'agent_loop', fake_loop)
 
     async def scenario():
-        app = HarnessApp([])
+        app = HarnessApp(store.rebuild_openai_history(),
+                         session_id=store.session_id, session_store=store)
         async with app.run_test(size=(80, 20)) as pilot:
             for index, text in enumerate(('one', 'two'), 1):
                 app.submit_text(text)
-                # 这里用的是真实回合锁（.cache/locks/agent-turn.lock），机器上同时跑着
-                # 网关/TUI 时可能被短暂占用；给足 10s，不用固定次数的短等待，
-                # 否则并行验收期间会偶发失败（本机 2026-10-25 实际遇到）。
                 deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and len(calls) < index:
+                # 等两件事都到位：这一回合被接受过，而且 worker 已经把槽放开。
+                # 只等 calls 会踩竞态——calls 在 worker 线程里追加，而 _busy 要等
+                # 循环返回之后才清，快机器上总能抢先、满载时就会偶发失败。
+                while time.monotonic() < deadline and (
+                        len(calls) < index or app._busy):
                     await pilot.pause()
                     await asyncio.sleep(0.02)
-                assert not app._busy, text
-                assert len(calls) == index, f'{text} 未被接受（可能被别的进程占用回合槽）'
+                assert len(calls) == index, f'{text} 未被接受'
+                assert not app._busy, f'{text} 的回合没有释放槽'
             assert len(calls) == 2
 
     asyncio.run(scenario())

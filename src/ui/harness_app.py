@@ -444,20 +444,25 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             raise
 
     def _acquire_turn(self):
-        """拿全局回合槽 + 当前会话写锁；任一竞争失败返回 None（不排队、不落消息）。"""
+        """拿全局回合槽 + 当前会话写锁；任一竞争失败返回 None（不排队、不落消息）。
+
+        锁的位置跟着**这个界面正在写的那个会话**（``self._store.path``），而不是全局
+        ``harness.SESSIONS_DIR``：两者在正常使用里相同，但如果界面打开的是别处的会话
+        （测试、或将来按项目分目录），锁落在全局目录就等于没锁住真正在写的东西。
+        """
         import contextlib
 
-        import harness
-        from session_locks import SessionBusy, session_write
+        from session_locks import SessionBusy, session_write, sessions_dir_for
         from turn_coordinator import TurnBusy, turn_slot
 
+        sessions_dir = sessions_dir_for(self._store)
         stack = contextlib.ExitStack()
         try:
-            stack.enter_context(turn_slot(harness.SESSIONS_DIR.parent))
+            stack.enter_context(turn_slot(sessions_dir.parent))
             session_id = self._store.session_id if self._store is not None else None
             if session_id is not None:
                 stack.enter_context(session_write(
-                    harness.SESSIONS_DIR, session_id, action='执行回合'))
+                    sessions_dir, session_id, action='执行回合'))
         except (TurnBusy, SessionBusy):
             stack.close()
             return None

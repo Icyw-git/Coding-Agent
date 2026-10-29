@@ -166,6 +166,7 @@ def _fork(argument: str, session_store):
 def _run_turn(line: str, messages: list, session_store) -> None:
     """把一条用户输入交给 agent_loop，并把流式文本直接写到终端。"""
     h = _h()
+    from session_locks import sessions_dir_for
     from turn_coordinator import TurnBusy, turn_slot
 
     h.ui_emit('user_message', text=line)
@@ -191,7 +192,9 @@ def _run_turn(line: str, messages: list, session_store) -> None:
 
     try:
         # CLI 直连流式：模型文本逐段上屏（栈内 gateway 早已用同一条路径）
-        with turn_slot(Path(h.SESSIONS_DIR).parent):
+        # 锁跟着**这个 REPL 正在写的会话**走，而不是全局 SESSIONS_DIR：
+        # `/resume` 可以打开别的目录下的会话，锁落在全局目录就等于没锁住它。
+        with turn_slot(sessions_dir_for(session_store).parent):
             h.agent_loop(messages, session_store=session_store,
                          on_delta=on_delta, turn_source='cli')
     except TurnBusy:
