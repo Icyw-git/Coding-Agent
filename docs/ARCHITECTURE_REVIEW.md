@@ -45,7 +45,7 @@ src/                     151 个 .py，平铺
 | `memory` | 4 | 记忆 |
 | `approval` | 4 | 审批 |
 
-### 1.2 依赖深度（自动分析 151 个文件的 import 图）
+### 1.2 依赖深度（自动分析 152 个文件的 import 图）
 
 被依赖最多 = 最底层，依赖最多 = 最顶层：
 
@@ -72,6 +72,21 @@ compaction          <-> session_store
 desktop_control_windows <-> ps_worker
 hooks               <-> tools
 ```
+
+### 1.2.1 桌面模块的拆分（2026-10）
+
+`desktop_control_windows.py` 曾 2561 行，其中 **1622 行是 PowerShell 源码文本**（63%）、
+Python 逻辑只有 939 行。已按「文本 / 逻辑」这条现成的缝拆开：
+
+| 模块 | 行数 | 内容 |
+| --- | --- | --- |
+| `desktop_scripts.py` | 1652 | 三个 PowerShell 常量（装配 / 动作分发 / 独立进程入口） |
+| `desktop_control_windows.py` | 936 | dataclass、参数校验、`_run`、四个 API |
+
+没有按功能切（`desktop_tree` / `desktop_actions` / …），因为 PowerShell 那半边是
+**同一个进程里的一段连续脚本**，函数共享 `$script:` 状态（进程名缓存、动作备注）；
+拆成多段再拼只会把"拼接顺序"变成新的隐性契约。按文本/逻辑切，拼接口只有一个，
+而且 `worker_script()` 本来就是 `PRELUDE + SETUP + BODY + LOOP` 拼出来的。
 
 其中 **`hooks <-> tools` 是真实痛点**：这轮加记忆工具时踩到了——`tools` 导入
 `tool_tasks` → `import hooks` → `from tools import tool_registry`，而 `tools` 还没

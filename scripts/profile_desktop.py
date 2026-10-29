@@ -47,10 +47,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'src'))
 
 import desktop_control_windows as desktop  # noqa: I001,E402
+import desktop_scripts  # noqa: E402
 import harness  # noqa: F401,E402  (导入期 load_dotenv + 配置)
 import tool_desktop  # noqa: E402
 
-#: 遍历片段：与被测实现共用 ``_CONTROL_SETUP``（同一套裁剪/预算/过滤逻辑），
+#: 遍历片段：与被测实现共用 ``desktop_scripts.CONTROL_SETUP``（同一套裁剪/预算逻辑），
 #: 只是把「前台窗口」换成「指定 hwnd」，好让脚本逐个进程量。
 WALK_PROBE = r'''
 $wins = @(Get-VisibleWindows)
@@ -102,7 +103,7 @@ def _run_powershell(script: str, env: dict | None = None,
 def profile_walk(repeat: int = 3) -> list[dict]:
     import ps_worker
 
-    script = (ps_worker.PRELUDE + desktop._CONTROL_SETUP + chr(10) + WALK_PROBE)
+    script = (ps_worker.PRELUDE + desktop_scripts.CONTROL_SETUP + chr(10) + WALK_PROBE)
     result = _run_powershell(script, {'PROFILE_REPEAT': str(repeat)})
     rows = []
     for line in (result.stdout or '').splitlines():
