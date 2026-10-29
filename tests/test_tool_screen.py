@@ -111,7 +111,7 @@ def test_ocr_defaults_to_latest_screenshot(tmp_path):
 def test_ocr_without_screenshots_is_an_error(tmp_path):
     result = tool_screen.ocr(directory=tmp_path)
 
-    assert result.startswith('识别失败：no screenshots yet')
+    assert result.startswith('识别失败：还没有截图')
 
 
 def test_ocr_rejects_paths_outside_screenshot_dir(tmp_path):
@@ -161,4 +161,4 @@ def test_ocr_region_outside_image_is_reported(tmp_path):
                              directory=tmp_path, runner=_ocr_runner())
 
     assert result.startswith('识别失败：')
-    assert 'exceeds image' in result
+    assert '超出图片' in result

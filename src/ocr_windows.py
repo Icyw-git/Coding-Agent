@@ -101,7 +101,7 @@ try {
         $offsetX = [int]$p[0]; $offsetY = [int]$p[1]
         $rw = [int]$p[2]; $rh = [int]$p[3]
         if ($offsetX + $rw -gt $width -or $offsetY + $rh -gt $height) {
-            throw "ocr region ${rw}x${rh}+${offsetX}+${offsetY} exceeds image ${width}x${height}"
+            throw "识别区域 ${rw}x${rh}+${offsetX}+${offsetY} 超出图片 ${width}x${height}"
         }
         $transform = [Windows.Graphics.Imaging.BitmapTransform]::new()
         $bounds = [Windows.Graphics.Imaging.BitmapBounds]::new()
@@ -126,7 +126,7 @@ try {
     }
     $limit = [int][Windows.Media.Ocr.OcrEngine]::MaxImageDimension
     if ([Math]::Max($ocrWidth, $ocrHeight) -gt $limit) {
-        throw "image ${ocrWidth}x${ocrHeight} exceeds OCR limit ${limit}; pass a smaller region"
+        throw "图片 ${ocrWidth}x${ocrHeight} 超过识别上限 ${limit}；请传更小的 region"
     }
     $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
     $lines = New-Object System.Collections.ArrayList
@@ -215,13 +215,13 @@ def recognize(path, *, lang: str = DEFAULT_LANGUAGE, region=None, runner=None,
     parsed_region = screen_capture.parse_region(region)
     source = Path(path)
     if not source.is_file():
-        raise OcrError(f'image not found: {source}')
+        raise OcrError(f'找不到这张图片：{source}')
     try:
         size = source.stat().st_size
     except OSError as exc:
-        raise OcrError(f'cannot read image: {exc}') from exc
+        raise OcrError(f'读不了这张图片：{exc}') from exc
     if size > MAX_OCR_BYTES:
-        raise OcrError(f'image is too large for OCR ({size} bytes)')
+        raise OcrError(f'图片太大，无法识别（{size} 字节）')
     runner = runner or screen_capture.run_powershell
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix='harness-ocr-') as tmp:
@@ -236,18 +236,18 @@ def recognize(path, *, lang: str = DEFAULT_LANGUAGE, region=None, runner=None,
         try:
             result = runner(OCR_SCRIPT, env, float(timeout))
         except subprocess.TimeoutExpired as exc:
-            raise OcrError(f'OCR timed out after {timeout}s') from exc
+            raise OcrError(f'文字识别超时（{timeout} 秒）') from exc
         except screen_capture.ScreenError:
             raise
         except OSError as exc:
-            raise OcrError(f'cannot start PowerShell: {exc}') from exc
+            raise OcrError(f'启动 PowerShell 失败：{exc}') from exc
         if not meta_path.is_file():
             raise OcrError(
-                f'OCR produced no output: {screen_capture.failure_text(result)}')
+                f'文字识别没有输出：{screen_capture.failure_text(result)}')
         try:
             meta = json.loads(meta_path.read_text(encoding='utf-8-sig'))
         except (OSError, ValueError) as exc:
-            raise OcrError(f'invalid OCR metadata: {exc}') from exc
+            raise OcrError(f'识别元数据不合法：{exc}') from exc
         if not isinstance(meta, dict) or not meta.get('ok'):
             error = meta.get('error') if isinstance(meta, dict) else None
             if error == 'ocr_language_unavailable':
@@ -263,13 +263,13 @@ def recognize(path, *, lang: str = DEFAULT_LANGUAGE, region=None, runner=None,
             width = int(meta['width'])
             height = int(meta['height'])
         except (KeyError, TypeError, ValueError) as exc:
-            raise OcrError('OCR metadata is missing width/height') from exc
+            raise OcrError('识别元数据缺少宽高') from exc
         if parsed_region is not None:
             x, y, region_width, region_height = parsed_region
             if x + region_width > width or y + region_height > height:
                 raise OcrError(
-                    f'ocr region {region_width}x{region_height}+{x}+{y} exceeds '
-                    f'image {width}x{height}')
+                    f'识别区域 {region_width}x{region_height}+{x}+{y} 超出'
+                    f'图片 {width}x{height}')
         lines = [line for line in
                  (_normalize_line(item) for item in meta.get('lines') or [])
                  if line is not None]

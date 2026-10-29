@@ -145,7 +145,7 @@ def test_powershell_verifies_expect_against_the_actual_control():
     """expect 的核对必须在 PowerShell 侧（模型给的名字不能自己说了算）。"""
     script = desktop.worker_script()
     assert 'element_mismatch' in script
-    assert 'not the control you named' in script
+    assert '编号和名字对不上' in script
 
 
 def test_setvalue_requires_text_and_rejects_it_for_other_operations():
@@ -453,6 +453,20 @@ def test_inspect_text_stays_quiet_for_plain_buttons(monkeypatch):
         assert mark not in text
 
 
+def test_only_the_deepest_element_is_marked_focused():
+    """只有最深的那一层算「当前焦点」。
+
+    UIA 的 HasKeyboardFocus 在祖先链上也会为真：实测 WindowsTerminal 给
+    「窗口 / 面板 / 文本」三行都打了标记。三行都写"当前焦点"，模型就不知道
+    该往哪儿输入。
+    """
+    script = desktop.worker_script()
+    walk = _ps_function(script, 'Get-UiTree')
+    assert '$lastFocused' in walk
+    # 前序：祖先先出、后代后出，所以保留最后一个
+    assert walk.index('$lastFocused = $i') < walk.index('$items[$i].focused = $false')
+
+
 def test_inspect_text_marks_disabled_and_focused(monkeypatch):
     _patch_tree(monkeypatch, _tree(
         desktop._element_info(_item(id=1, enabled=False), 1),
@@ -619,6 +633,23 @@ def test_element_action_falls_back_to_a_click_when_the_control_has_no_pattern():
     assert 'operation_unsupported' in branch
     assert 'Invoke-Step $clickStep' in branch
     assert '已改为点击它的中心' in branch
+
+
+def test_rows_without_actions_or_bounds_are_dropped():
+    """一行值得列出，是因为模型能对它做点什么：有元素级操作，或有坐标。
+
+    实测出现过「#5 面板 · 只能按坐标点」——既没坐标也没操作，"按坐标点"是空话。
+    """
+    script = desktop.worker_script()
+    node = _ps_function(script, 'Read-ElementNode')
+    assert '$patterns.Count -eq 0 -and $bounds.Count -ne 4' in node
+
+
+def test_no_coordinate_hint_without_coordinates(monkeypatch):
+    _patch_tree(monkeypatch, _tree(desktop._element_info(
+        _item(id=1, name='面板', operations=[], bounds=None), 1)))
+    text = tool_desktop.inspect()
+    assert '只能按坐标点' not in text
 
 
 def test_inspect_text_never_leaks_raw_containers(monkeypatch):
@@ -998,7 +1029,7 @@ def test_focus_reuses_the_tree_instead_of_walking_again():
 def test_invalid_operation_message_lists_every_operation():
     """新增操作后忘了更新提示，模型就只能看到「不支持」却不知道支持什么。"""
     script = desktop.worker_script()
-    tail = script.rsplit('operation must be', 1)[1]
+    tail = script.rsplit('operation 只能是', 1)[1]
     for op in ('invoke', 'setvalue', 'toggle', 'select', 'expand', 'collapse',
                'scroll', 'focus'):
         assert op in tail, op
@@ -1008,8 +1039,8 @@ def test_unsupported_message_says_what_the_control_supports():
     """报「不支持」时要顺带说「它支持什么」，否则模型只能一个个试。"""
     script = desktop.worker_script()
     assert 'function Get-OperationHint' in script
-    assert 'it supports: ' in script
-    assert 'exposes no automation operations' in script
+    assert '它支持：' in script
+    assert '没有可用的元素级操作' in script
 
 
 def test_every_element_operation_has_a_chinese_label():

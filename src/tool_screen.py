@@ -89,7 +89,7 @@ def _resolve_screenshot(path, directory) -> Path:
         latest = screen_capture.latest_png(root)
         if latest is None:
             raise ocr_windows.OcrError(
-                'no screenshots yet; call screen_capture first')
+                '还没有截图；先调一次 screen_capture')
         return latest
     candidate = Path(str(path)).expanduser()
     if not candidate.is_absolute():
@@ -100,7 +100,7 @@ def _resolve_screenshot(path, directory) -> Path:
             f'OCR is limited to screenshots captured by screen_capture '
             f'({root}); got {candidate}')
     if not candidate.is_file():
-        raise ocr_windows.OcrError(f'screenshot not found: {candidate}')
+        raise ocr_windows.OcrError(f'找不到这张截图：{candidate}')
     return candidate
 
 

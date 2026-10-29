@@ -121,20 +121,20 @@ def parse_region(region) -> tuple[int, int, int, int] | None:
     elif isinstance(region, (list, tuple)):
         parts = list(region)
     else:
-        raise ScreenError('region must be "x,y,w,h"')
+        raise ScreenError('region 必须是 "x,y,w,h"')
     if len(parts) != 4:
-        raise ScreenError('region must have 4 integers: x,y,w,h')
+        raise ScreenError('region 需要 4 个整数：x,y,w,h')
     try:
         values = tuple(int(part) for part in parts)
     except (TypeError, ValueError) as exc:
-        raise ScreenError('region must have 4 integers: x,y,w,h') from exc
+        raise ScreenError('region 需要 4 个整数：x,y,w,h') from exc
     x, y, width, height = values
     if min(x, y) < 0:
-        raise ScreenError('region x/y must not be negative')
+        raise ScreenError('region 的 x/y 不能是负数')
     if width <= 0 or height <= 0:
-        raise ScreenError('region width/height must be positive')
+        raise ScreenError('region 的宽高必须为正')
     if width * height > MAX_CAPTURE_PIXELS:
-        raise ScreenError(f'region is too large ({width}x{height})')
+        raise ScreenError(f'region 太大（{width}x{height}）')
     return values
 
 
@@ -142,9 +142,9 @@ def _delay_ms(value) -> int:
     try:
         delay = int(value or 0)
     except (TypeError, ValueError) as exc:
-        raise ScreenError('delay_ms must be an integer between 0 and 5000') from exc
+        raise ScreenError('delay_ms 必须是 0 到 5000 之间的整数') from exc
     if not 0 <= delay <= MAX_DELAY_MS:
-        raise ScreenError(f'delay_ms must be between 0 and {MAX_DELAY_MS}')
+        raise ScreenError(f'delay_ms 必须在 0 到 {MAX_DELAY_MS} 之间')
     return delay
 
 
@@ -159,7 +159,7 @@ def run_powershell(script: str, env: dict, timeout: float):
     """默认 runner：Windows PowerShell 5.1（WinRT 在 7.x 上还要额外 SDK）。"""
     executable = _powershell_exe()
     if executable is None:
-        raise ScreenError('screen capture requires Windows PowerShell')
+        raise ScreenError('截屏需要 Windows PowerShell')
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
     return subprocess.run(
         [executable, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -201,35 +201,35 @@ def capture(*, screen: str = 'primary', region=None, delay_ms=0,
         try:
             result = runner(CAPTURE_SCRIPT, env, float(timeout))
         except subprocess.TimeoutExpired as exc:
-            raise ScreenError(f'screen capture timed out after {timeout}s') from exc
+            raise ScreenError(f'截屏超时（{timeout} 秒）') from exc
         except ScreenError:
             raise
         except OSError as exc:
-            raise ScreenError(f'cannot start PowerShell: {exc}') from exc
+            raise ScreenError(f'启动 PowerShell 失败：{exc}') from exc
         meta = None
         if meta_path.is_file():
             import json
             try:
                 meta = json.loads(meta_path.read_text(encoding='utf-8-sig'))
             except (OSError, ValueError) as exc:
-                raise ScreenError(f'invalid screen metadata: {exc}') from exc
+                raise ScreenError(f'屏幕元数据不合法：{exc}') from exc
         if meta is not None and not meta.get('ok'):
             raise ScreenError(str(meta.get('message') or meta.get('error') or 'capture failed'))
         if result.returncode != 0:
-            raise ScreenError(f'screen capture failed: {failure_text(result)}')
+            raise ScreenError(f'截屏失败：{failure_text(result)}')
         if not out_path.is_file():
-            raise ScreenError('screen capture produced no image')
+            raise ScreenError('截屏没有产出图片')
         data = out_path.read_bytes()
         if not data.startswith(PNG_MAGIC):
-            raise ScreenError('screen capture did not produce a PNG')
+            raise ScreenError('截屏产出的不是 PNG')
         if len(data) > MAX_PNG_BYTES:
-            raise ScreenError(f'screenshot is too large ({len(data)} bytes)')
+            raise ScreenError(f'截图太大（{len(data)} 字节）')
         meta = meta or {}
         try:
             width = int(meta['width'])
             height = int(meta['height'])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ScreenError('screen metadata is missing width/height') from exc
+            raise ScreenError('屏幕元数据缺少宽高') from exc
         origin = (0, 0)
         rect = meta.get('rect')
         if isinstance(rect, (list, tuple)) and len(rect) >= 2:

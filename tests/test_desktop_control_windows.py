@@ -169,7 +169,7 @@ def test_powershell_script_contract_covers_fixed_output_and_dpi():
 def test_powershell_timeout_is_reported():
     def timed_out(*args):
         raise subprocess.TimeoutExpired('powershell', 1)
-    with pytest.raises(desktop.DesktopControlError, match='timed out'):
+    with pytest.raises(desktop.DesktopControlError, match='超时'):
         desktop.snapshot(runner=timed_out)
 
 
@@ -230,7 +230,7 @@ def test_invalid_combos_clicks_and_waits_rejected(kwargs):
 
 
 def test_wait_step_is_sequence_only_and_extends_timeout():
-    with pytest.raises(desktop.DesktopControlError, match='action must be'):
+    with pytest.raises(desktop.DesktopControlError, match='action 只能是'):
         desktop.validate_action('wait', expected_pid=1, expected_window_id='A')
     seen = {}
     desktop.action('sequence', expected_pid=1, expected_window_id='A',

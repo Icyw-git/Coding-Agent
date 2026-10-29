@@ -110,13 +110,13 @@ def test_region_outside_image_is_rejected_after_metadata(tmp_path):
             'text': '', 'lines': []}
     runner, _ = _ocr_runner(meta)
 
-    with pytest.raises(ocr_windows.OcrError, match='exceeds image'):
+    with pytest.raises(ocr_windows.OcrError, match='超出图片'):
         ocr_windows.recognize(
             _image(tmp_path), region='50,50,60,60', runner=runner)
 
 
 def test_missing_image_fails_before_runner(tmp_path):
-    with pytest.raises(ocr_windows.OcrError, match='not found'):
+    with pytest.raises(ocr_windows.OcrError, match='找不到这张图片'):
         ocr_windows.recognize(tmp_path / 'missing.png')
 
 

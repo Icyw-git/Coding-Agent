@@ -305,9 +305,6 @@ $script:CONTROL_LABELS = @{
     'ToolTip'='提示'; 'TitleBar'='标题栏'; 'AppBar'='应用栏'
     'Paragraph'='段落'; 'Sound'='声音'; 'SemanticZoom'='缩放视图'
 }
-# 纯容器：没有名字就不单独占一行，但里面的控件要继续往下看。
-$script:TREE_CONTAINERS = @('Pane','Group','Custom','Window','List','Tree','Table',
-    'DataGrid','Menu','MenuBar','ToolBar','StatusBar','TitleBar')
 # 纯噪声：既不可交互也不提供信息，连子树一起跳过。
 $script:TREE_NOISE = @('ScrollBar','Separator','ToolTip')
 # 叶子类型：不会包含值得看的子控件，不必再花一次跨进程调用去问它的子节点。
@@ -397,7 +394,8 @@ function Read-ElementNode($el, $cache) {
     try {
         $type = [string]$c.ControlType.ProgrammaticName
         if ($type -like 'ControlType.*') { $type = $type.Substring(12) }
-        $name = [string]$c.Name
+        # 只有空格的名字在输出里看着是空的，但 `-ne ''` 会把它当"有名字"放进来。
+        $name = ([string]$c.Name).Trim()
         $password = [bool]$c.IsPassword
         $offscreen = [bool]$c.IsOffscreen
         $enabled = [bool]$c.IsEnabled
@@ -475,18 +473,27 @@ function Read-ElementNode($el, $cache) {
         }
     }
 
-    $isContainer = $script:TREE_CONTAINERS -contains $type
     $leaf = $script:TREE_LEAVES -contains $type
-    $interesting = ($name -ne '') -or (-not $isContainer) -or $focusable -or
-                   ($patterns.Count -gt 0) -or ($value -ne '')
+    # 一行值得列出来，是因为模型能对它做点什么：有元素级操作，或者有坐标可以点。
+    # 两者都没有的行是纯噪声——实测出现过「#5 面板 · 只能按坐标点」这种既没坐标
+    # 也没操作的条目，"只能按坐标点"纯属空话。
+    if ($patterns.Count -eq 0 -and $bounds.Count -ne 4) {
+        return @{ info = $null; descend = $true; doc = ($type -eq 'Document') }
+    }
+    # 光有坐标还不够：无名、无操作、不可聚焦的容器（实测「自绘控件」占满整屏）
+    # 列出来只是占位。要有名字/值/操作/可聚焦之一才值得占一行。
+    $interesting = ($name -ne '') -or ($value -ne '') -or
+                   ($patterns.Count -gt 0) -or $focusable
     $isDoc = ($type -eq 'Document')
     if (-not $interesting) { return @{ info = $null; descend = (-not $leaf); doc = $isDoc } }
 
-    # 坐标离谱的节点通常是虚拟化容器的占位（实测见过 top=-470309），
-    # 给了也没法点，还占掉一次工具调用的名额。
-    if ($bounds.Count -eq 4 -and ([Math]::Abs([int]$bounds[1]) -gt 100000 -or
-                                  [Math]::Abs([int]$bounds[0]) -gt 100000)) {
-        return @{ info = $null; descend = $true; doc = ($type -eq 'Document') }
+    # 坐标离谱的节点通常是虚拟化容器的占位（实测见过 top=-470309、
+    # 高 55340 的"聊天记录"容器）。给了模型也没法点，还占掉一个名额。
+    if ($bounds.Count -eq 4 -and (
+            [Math]::Abs([int]$bounds[0]) -gt 20000 -or
+            [Math]::Abs([int]$bounds[1]) -gt 20000 -or
+            [int]$bounds[2] -gt 20000 -or [int]$bounds[3] -gt 20000)) {
+        $bounds = @()
     }
     $info = [ordered]@{
         label = (Get-ControlLabel $type)
@@ -626,6 +633,19 @@ function Get-UiTree($hwnd, $maxNodes, $maxDepth, $maxMs) {
         $truncated = $true
     } finally {
         try { $activation.Dispose() } catch { }
+    }
+    # 只保留最深的那个「当前焦点」。
+    # UIA 的 HasKeyboardFocus 在祖先链上也会为真（实测 WindowsTerminal 给
+    # 窗口/面板/文本三行都打了标记），模型会以为窗口本身有焦点、不知道该往哪儿输入。
+    # 前序遍历里祖先先出、后代后出，所以最后一个带标记的就是最深的那层。
+    $lastFocused = -1
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i].focused) { $lastFocused = $i }
+    }
+    if ($lastFocused -ge 0) {
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            if ($i -ne $lastFocused -and $items[$i].focused) { $items[$i].focused = $false }
+        }
     }
     return @{
         items = $items
@@ -838,8 +858,8 @@ function Get-FreshElement($hwnd, $node, $budget) {
 function Get-OperationHint($node) {
     # 「它其实支持什么」——比一句"不支持"有用得多。
     $ops = @($node.operations)
-    if ($ops.Count -eq 0) { return 'it exposes no automation operations; click it by coordinates' }
-    return 'it supports: ' + ($ops -join ', ')
+    if ($ops.Count -eq 0) { return '它没有可用的元素级操作，请按坐标点' }
+    return '它支持：' + ($ops -join ', ')
 }
 
 function Find-ScrollablePattern($el) {
@@ -885,25 +905,25 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
     # 先确认元素还活着：控件在遍历之后被销毁时，下面的 GetCurrentPattern 会抛异常，
     # 被吞掉之后报成"这个控件不支持该操作"——方向完全错了，模型会去试别的操作。
     try { $null = $el.Current.ControlType } catch {
-        $why = 'that control no longer exists (the window changed); '
-        $why += 'run desktop_inspect again'
+        $why = '这个控件已经不在了（界面变了）；'
+        $why += '重新调 desktop_inspect'
         return [ordered]@{ code = 'element_gone'; message = $why }
     }
     if ($operation -eq 'setvalue') {
         if ([bool]$node.password) {
-            $why = 'refusing to write into a password field; that must be typed by the user'
+            $why = '拒绝写入密码框；这类输入必须用户自己敲'
             return [ordered]@{ code = 'password_field'; message = $why }
         }
         $pattern = Get-LivePattern $el ([System.Windows.Automation.ValuePattern]::Pattern)
         if ($null -eq $pattern) {
-            $why = 'that control does not accept a value; ' + (Get-OperationHint $node)
+            $why = '这个控件不接受写入内容；' + (Get-OperationHint $node)
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         $readOnly = $false
         try { $readOnly = [bool]$pattern.Current.IsReadOnly } catch { }
         if ($readOnly) {
             return [ordered]@{ code = 'operation_unsupported';
-                message = 'that control is read-only' }
+                message = '这个控件是只读的' }
         }
         try { $pattern.SetValue([string]$text) } catch {
             return [ordered]@{ code = 'operation_failed'; message = $_.Exception.Message }
@@ -913,7 +933,7 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
     if ($operation -eq 'invoke') {
         $pattern = Get-LivePattern $el ([System.Windows.Automation.InvokePattern]::Pattern)
         if ($null -eq $pattern) {
-            $why = 'that control is not clickable; ' + (Get-OperationHint $node)
+            $why = '这个控件不能点击；' + (Get-OperationHint $node)
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         try { $pattern.Invoke() } catch {
@@ -924,7 +944,7 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
     if ($operation -eq 'toggle') {
         $pattern = Get-LivePattern $el ([System.Windows.Automation.TogglePattern]::Pattern)
         if ($null -eq $pattern) {
-            $why = 'that control cannot be toggled; ' + (Get-OperationHint $node)
+            $why = '这个控件不能切换；' + (Get-OperationHint $node)
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         try { $pattern.Toggle() } catch {
@@ -935,7 +955,7 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
     if ($operation -eq 'select') {
         $pattern = Get-LivePattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern)
         if ($null -eq $pattern) {
-            $why = 'that control cannot be selected; ' + (Get-OperationHint $node)
+            $why = '这个控件不能选中；' + (Get-OperationHint $node)
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         try { $pattern.Select() } catch {
@@ -946,7 +966,7 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
     if ($operation -eq 'expand' -or $operation -eq 'collapse') {
         $pattern = Get-LivePattern $el ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
         if ($null -eq $pattern) {
-            $why = 'that control has nothing to expand; ' + (Get-OperationHint $node)
+            $why = '这个控件没有可展开的内容；' + (Get-OperationHint $node)
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         try {
@@ -963,8 +983,8 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
         $pattern = $found.pattern
         $script:OperationNote = [string]$found.note
         if ($null -eq $pattern) {
-            $why = 'that control has nothing to scroll; ' + (Get-OperationHint $node)
-            $why += ' (to scroll the window use action=scroll)'
+            $why = '这个控件没有可滚动的内容；' + (Get-OperationHint $node)
+            $why += '；要滚窗口请用 action=scroll'
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         # 参数名是 $amount（第五个位置参数）。写成 $step 时它在函数作用域里
@@ -1020,8 +1040,8 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
         }
         return $null
     }
-    $why = 'operation must be invoke, setvalue, toggle, select, expand, '
-    $why += 'collapse, scroll, or focus'
+    $why = 'operation 只能是 invoke/setvalue/toggle/select/expand/'
+    $why += 'collapse/scroll/focus'
     return [ordered]@{ code = 'invalid_operation'; message = $why }
 }
 
@@ -1035,11 +1055,11 @@ function Invoke-Step($step, $state) {
         if ($null -eq $rect -or $x -lt [int]$rect[0] -or $y -lt [int]$rect[1] -or
             $x -ge ([int]$rect[0]+[int]$rect[2]) -or
             $y -ge ([int]$rect[1]+[int]$rect[3])) {
-            return [ordered]@{ code='out_of_window'; message='coordinates are outside the target window' }
+            return [ordered]@{ code='out_of_window'; message='坐标落在目标窗口之外' }
         }
         $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen
         if ($x -lt $vs.X -or $y -lt $vs.Y -or $x -ge ($vs.X+$vs.Width) -or $y -ge ($vs.Y+$vs.Height)) {
-            return [ordered]@{ code='out_of_bounds'; message='coordinates are outside the virtual screen' }
+            return [ordered]@{ code='out_of_bounds'; message='坐标超出虚拟桌面范围' }
         }
         if (-not [HarnessDesktopNative]::SetCursorPos($x,$y)) {
             return [ordered]@{ code='input_failed'; message='SetCursorPos failed' }
@@ -1054,12 +1074,12 @@ function Invoke-Step($step, $state) {
             if ($button -eq 'right') { $down = 0x0008; $up = 0x0010 }
             elseif ($button -eq 'middle') { $down = 0x0020; $up = 0x0040 }
             elseif ($button -ne 'left') {
-                return [ordered]@{ code='invalid_button'; message='button must be left, right, or middle' }
+                return [ordered]@{ code='invalid_button'; message='button 只能是 left、right 或 middle' }
             }
             $count = 1
             if ($null -ne $step.count) { $count = [int]$step.count }
             if ($count -lt 1 -or $count -gt 2) {
-                return [ordered]@{ code='invalid_count'; message='click count must be 1 or 2' }
+                return [ordered]@{ code='invalid_count'; message='点击次数只能是 1 或 2' }
             }
             for ($i = 0; $i -lt $count; $i++) {
                 [HarnessDesktopNative]::mouse_event($down,0,0,0,[UIntPtr]::Zero)
@@ -1070,7 +1090,7 @@ function Invoke-Step($step, $state) {
     } elseif ($action -eq 'scroll') {
         $amount=[int]$step.amount
         if ([Math]::Abs($amount) -gt 20 -or $amount -eq 0) {
-            return [ordered]@{ code='invalid_amount'; message='scroll amount must be between -20 and 20' }
+            return [ordered]@{ code='invalid_amount'; message='滚动格数必须在 -20 到 20 之间' }
         }
         # Wheel events land on the window under the cursor, not necessarily the
         # identity-checked foreground window: clamp the cursor into its rect first.
@@ -1089,7 +1109,7 @@ function Invoke-Step($step, $state) {
     } elseif ($action -eq 'type') {
         $text=[string]$step.text
         if ($text.Length -gt 1000) {
-            return [ordered]@{ code='text_too_long'; message='typed text exceeds 1000 characters' }
+            return [ordered]@{ code='text_too_long'; message='输入文本超过 1000 个字符' }
         }
         foreach ($ch in $text.ToCharArray()) {
             [HarnessDesktopNative]::Unicode([uint16][char]$ch,$false)
@@ -1107,10 +1127,10 @@ function Invoke-Step($step, $state) {
         if ($base -match '^f([1-9]|1[0-2])$') { $vk=111+[int]$Matches[1] }
         elseif ($map.ContainsKey($base)) { $vk=$map[$base] }
         elseif ($base.Length -eq 1 -and [int][char]$base -lt 128) { $vk=[int][char]$base.ToUpperInvariant() }
-        else { return [ordered]@{ code='invalid_key'; message='unsupported key name' } }
+        else { return [ordered]@{ code='invalid_key'; message='不认识的键名' } }
         foreach ($mod in $mods) {
             if (-not $modMap.ContainsKey($mod)) {
-                return [ordered]@{ code='invalid_key'; message="unsupported modifier: $mod" }
+                return [ordered]@{ code='invalid_key'; message="不认识的修饰键：$mod" }
             }
             [HarnessDesktopNative]::VirtualKey([uint16]$modMap[$mod],$false)
         }
@@ -1122,11 +1142,11 @@ function Invoke-Step($step, $state) {
     } elseif ($action -eq 'wait') {
         $ms=[int]$step.ms
         if ($ms -lt 50 -or $ms -gt 3000) {
-            return [ordered]@{ code='invalid_wait'; message='wait must be 50-3000 ms' }
+            return [ordered]@{ code='invalid_wait'; message='wait 步骤必须是 50-3000 毫秒' }
         }
         Start-Sleep -Milliseconds $ms
     } else {
-        return [ordered]@{ code='invalid_action'; message='unsupported desktop action' }
+        return [ordered]@{ code='invalid_action'; message='不支持的动作' }
     }
     return $null
 }
@@ -1138,24 +1158,24 @@ function Invoke-ElementAction($payload, $state) {
     # 病灶进程名单同样生效：它拒绝的是「进入这个进程的无障碍树」，
     # 而不是某一种读法——只对 inspect/wait 生效等于留了个后门。
     if (Test-ExcludedProcess $state $payload.exclude) {
-        $why = "reading the accessibility tree of $($state.process) is disabled "
-        $why += '(HARNESS_DESKTOP_EXCLUDE_PROCESSES) because it can hang'
+        $why = "$($state.process) 在排除名单里，读取无障碍树被禁用"
+        $why += '（HARNESS_DESKTOP_EXCLUDE_PROCESSES），因为它可能卡住'
         Fail 'process_excluded' $why $state
     }
     $budget = Get-TreeBudget $payload
     $target = [IntPtr][Convert]::ToInt64([string]$state.window_id, 16)
     $tree = Get-UiTree $target $budget.nodes $budget.depth $budget.ms
     if ($null -eq $tree) {
-        Fail 'tree_unavailable' 'could not read the UI tree of that window' $state
+        Fail 'tree_unavailable' '读不到这个窗口的界面结构' $state
     }
     if ([string]$tree.fingerprint -ne [string]$payload.tree) {
-        $why = 'the window changed since that inspection; call desktop_inspect '
-        $why += 'again and use the new numbers'
+        $why = '界面在那次检查之后变了；重新调 desktop_inspect '
+        $why += '再用新的编号'
         Fail 'tree_changed' $why $state
     }
     $index = [int]$payload.element - 1
     if ($index -lt 0 -or $index -ge $tree.items.Count) {
-        Fail 'element_missing' "that window now lists $($tree.items.Count) controls" $state
+        Fail 'element_missing' "那个窗口现在只列出 $($tree.items.Count) 个控件" $state
     }
     $node = $tree.items[$index]
     $el = $tree.elements[$index]
@@ -1174,9 +1194,9 @@ function Invoke-ElementAction($payload, $state) {
                        [bool]([string]$node.label -match $expr)
             } catch { $hit = $false }
             if ($hit) {
-                $why = 'that control belongs to a task only the user can do '
-                $why += '(password, verification, payment, or permissions); '
-                $why += 'tell them what to click and stop'
+                $why = '这个控件属于只能用户自己做的事'
+                $why += '（密码、验证码、支付或权限）；'
+                $why += '告诉他点什么，然后停下'
                 Fail 'must_do_self' $why $state
             }
         }
@@ -1187,8 +1207,8 @@ function Invoke-ElementAction($payload, $state) {
         $want = ([string]$payload.expect).ToLowerInvariant()
         $actual = (([string]$node.name) + ' ' + ([string]$node.value)).ToLowerInvariant()
         if (-not $actual.Contains($want)) {
-            $why = "that is not the control you named: #$($payload.element) is "
-            $why += "'$($node.name)', not '$($payload.expect)'. Re-run desktop_inspect."
+            $why = "编号和名字对不上：#" + $payload.element + " 是 "
+            $why += "「" + $node.name + "」，不是「" + $payload.expect + "」；重新调 desktop_inspect"
             Fail 'element_mismatch' $why $state
         }
     }
@@ -1459,12 +1479,12 @@ function Invoke-HarnessOp($req) {
         # 切窗口改变的是「后续动作打在哪」，属于输入操作：要求显式 expected_*。
         $target = [IntPtr][Convert]::ToInt64([string]$payload.expected_window_id, 16)
         if ($target -eq [IntPtr]::Zero) {
-            return New-Failure 'invalid_window' 'expected_window_id must be a window id' $state
+            return New-Failure 'invalid_window' 'expected_window_id 必须是一个窗口号' $state
         }
         $procId = [uint32]0
         [HarnessDesktopNative]::GetWindowThreadProcessId($target, [ref]$procId) | Out-Null
         if ([int]$procId -ne [int]$payload.expected_pid) {
-            return New-Failure 'window_gone' 'that window no longer belongs to the expected process' $state
+            return New-Failure 'window_gone' '那个窗口已经不属于这个进程了' $state
         }
         if ([HarnessDesktopNative]::IsIconic($target)) {
             [HarnessDesktopNative]::ShowWindow($target, 9) | Out-Null   # SW_RESTORE
@@ -1492,7 +1512,7 @@ function Invoke-HarnessOp($req) {
             }
         }
         if (-not $placed) {
-            $why = 'Windows refused to raise that window. Click it once '
+            $why = 'Windows 拒绝把这个窗口切到前台。'
             $why += 'yourself, then retry (foreground lock blocks background processes).'
             return New-Failure 'focus_failed' $why $state
         }
@@ -1520,24 +1540,24 @@ function Invoke-HarnessOp($req) {
             return [ordered]@{ ok = $true; result = $result }
         }
         if (-not $state.available) {
-            return New-Failure 'no_foreground_window' 'no foreground window' $state
+            return New-Failure 'no_foreground_window' '当前没有可用的前台窗口' $state
         }
         if ($null -ne $payload.expected_pid -and
             ([int]$state.pid -ne [int]$payload.expected_pid -or
              [string]$state.window_id -ne [string]$payload.expected_window_id)) {
-            Fail 'foreground_changed' 'foreground window changed before waiting' $state
+            Fail 'foreground_changed' '前台窗口在开始等待之前就变了' $state
         }
         if (Test-ExcludedProcess $state $payload.exclude) {
-            $why = "reading the accessibility tree of $($state.process) is disabled "
-            $why += '(HARNESS_DESKTOP_EXCLUDE_PROCESSES) because it can hang'
+            $why = "$($state.process) 在排除名单里，读取无障碍树被禁用"
+            $why += '（HARNESS_DESKTOP_EXCLUDE_PROCESSES），因为它可能卡住'
             return New-Failure 'process_excluded' $why $state
         }
         # 和 inspect 同一条防线：敏感窗口连控件名都不给（名字本身也是隐私）。
         # 实测踩过：这里漏掉判断，就能用「猜名字 + 等它出现」把密码窗口里的
         # 输入框内容原样读出来，绕过 inspect 的拒绝。
         if ($state.sensitive_target) {
-            $why = 'this window looks like a password, payment, or verification '
-            $why += 'screen, so its controls are withheld; ask the user to handle it'
+            $why = '这个窗口看起来是密码、支付或验证码页面，'
+            $why += '所以不提供控件信息；请让用户自己操作'
             return New-Failure 'sensitive_target' $why $state
         }
         # 轮询用缩小预算（等待要跑很多轮），命中后再按完整预算走一遍，
@@ -1556,23 +1576,23 @@ function Invoke-HarnessOp($req) {
         # 只读：给模型一份裁剪过的控件清单。敏感窗口连结构都拒绝——「支付密码」
         # 「验证码」这些字段名本身也是隐私，不是只有值才算。
         if (-not $state.available) {
-            return New-Failure 'no_foreground_window' 'no foreground window' $state
+            return New-Failure 'no_foreground_window' '当前没有可用的前台窗口' $state
         }
         if ($state.sensitive_target) {
-            $why = 'this window looks like a password, payment, or verification '
-            $why += 'screen, so its structure is withheld; ask the user to handle it'
+            $why = '这个窗口看起来是密码、支付或验证码页面，'
+            $why += '所以不提供界面结构；请让用户自己操作'
             return New-Failure 'sensitive_target' $why $state
         }
         if (Test-ExcludedProcess $state $payload.exclude) {
-            $why = "reading the accessibility tree of $($state.process) is disabled "
-            $why += '(HARNESS_DESKTOP_EXCLUDE_PROCESSES) because it can hang'
+            $why = "$($state.process) 在排除名单里，读取无障碍树被禁用"
+            $why += '（HARNESS_DESKTOP_EXCLUDE_PROCESSES），因为它可能卡住'
             return New-Failure 'process_excluded' $why $state
         }
         $budget = Get-TreeBudget $payload
         $target = [IntPtr][Convert]::ToInt64([string]$state.window_id, 16)
         $tree = Get-UiTree $target $budget.nodes $budget.depth $budget.ms
         if ($null -eq $tree) {
-            return New-Failure 'tree_unavailable' 'could not read the UI tree of that window' $state
+            return New-Failure 'tree_unavailable' '读不到这个窗口的界面结构' $state
         }
         return [ordered]@{
             ok = $true
@@ -1585,13 +1605,13 @@ function Invoke-HarnessOp($req) {
             duration_ms = $tree.duration_ms
         }
     }
-    if (-not $state.available) { Fail 'no_foreground_window' 'no foreground window' $state }
+    if (-not $state.available) { Fail 'no_foreground_window' '当前没有可用的前台窗口' $state }
     if ([int]$state.pid -ne [int]$payload.expected_pid -or
         [string]$state.window_id -ne [string]$payload.expected_window_id) {
-        Fail 'foreground_changed' 'foreground window changed since the snapshot; take a new desktop_snapshot' $state
+        Fail 'foreground_changed' '前台窗口和快照时不一样了；重新调一次 desktop_snapshot' $state
     }
     if ($state.sensitive_target) {
-        Fail 'sensitive_target' 'desktop input is blocked on a password or sensitive window' $state
+        Fail 'sensitive_target' '这是密码或支付类敏感窗口，桌面输入被拒绝' $state
     }
     # 终端窗口：只有 type/key（会变成命令）需要拦；move/click/scroll 和纯 wait
     # 序列不受影响——点一下终端去选中文字是正常需求。
@@ -1605,8 +1625,8 @@ function Invoke-HarnessOp($req) {
         }
     }
     if ($state.is_terminal -and $inputAction -and -not [bool]$payload.allow_terminal) {
-        $why = 'typing into a terminal window would run commands; re-send with '
-        $why += 'allow_terminal=true after confirming the window'
+        $why = '往终端窗口键入等于执行命令；确认窗口后带上 '
+        $why += 'allow_terminal=true 再试'
         Fail 'terminal_input' $why $state
     }
     if ($payload.action -eq 'element') {
@@ -1627,7 +1647,7 @@ function Invoke-HarnessOp($req) {
             }
             if ([int]$current.pid -ne [int]$payload.expected_pid -or
                 [string]$current.window_id -ne [string]$payload.expected_window_id) {
-                Fail 'foreground_changed' "$label`: foreground window changed; re-snapshot" $current $index $done
+                Fail 'foreground_changed' "$label`: 前台窗口变了；重新快照" $current $index $done
             }
             if ($current.sensitive_target) {
                 Fail 'sensitive_target' "$label`: input blocked on a password or sensitive window" $current $index $done

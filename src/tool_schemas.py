@@ -633,11 +633,13 @@ TOOL_SCHEMAS = [{'type': 'function',
  {'type': 'function',
   'function': {'name': 'desktop_inspect',
                'description': 'List the interactive controls of the foreground window '
-                              'with stable numbers, their type, label, current value and '
-                              'screen rectangle. Read-only. Use this instead of guessing '
-                              'coordinates: find the control, then act on its number. The '
-                              'list is capped and may be truncated. Requires '
-                              'HARNESS_DESKTOP_CONTROL=1 and explicit approval.',
+                              'with stable numbers, their type, label, current value, '
+                              'screen rectangle, current state (checked/expanded/selected/'
+                              'read-only) and which element operations each one accepts. '
+                              'Read-only. Use this instead of guessing coordinates: find '
+                              'the control, then act on its number. The list is capped '
+                              'and may be truncated. Requires HARNESS_DESKTOP_CONTROL=1 '
+                              'and explicit approval.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_displays',
@@ -699,17 +701,21 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_action',
-               'description': 'Perform approved mouse or keyboard input in the '
-                              'foreground desktop: either one action, or a '
+               'description': 'Act on the foreground desktop, in one of two modes: '
+                              'by control number (action=element, using the numbers '
+                              'desktop_inspect returned) or with raw mouse/keyboard '
+                              'input. Mouse/keyboard mode takes either one action, or a '
                               'deliberate sequence of steps (action=sequence) '
                               'executed left to right under a single approval — '
                               'use it to combine click, typing, and keys into one '
                               'plan. Requires HARNESS_DESKTOP_CONTROL=1 and '
                               'explicit approval every time. First call '
-                              'desktop_snapshot; expected_pid and expected_window_id '
-                              'must match that window. Every step re-checks the '
-                              'foreground window; the run stops at the first change '
-                              'or sensitive window. Sensitive windows are blocked.',
+                              'desktop_snapshot or desktop_inspect; expected_pid and '
+                              'expected_window_id must match that window (element '
+                              'mode also needs the tree fingerprint). Every step '
+                              're-checks the foreground window; the run stops at the '
+                              'first change or sensitive window. Sensitive windows '
+                              'are blocked.',
                'parameters': {'type': 'object',
                               'properties': {
                                   'action': {'type': 'string',

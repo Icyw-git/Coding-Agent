@@ -161,8 +161,9 @@ _STATE_MARKS = {
 def _operation_marks(item) -> list[str]:
     operations = set(getattr(item, 'operations', ()) or ())
     if not operations:
-        # 没有可用模式：只能按坐标点，告诉模型别浪费一次调用。
-        return ['只能按坐标点']
+        # 没有可用模式时，只有"有坐标"才算一条可执行的退路；没坐标就什么都不说，
+        # 别写一句做不到的"只能按坐标点"。
+        return ['只能按坐标点'] if getattr(item, 'bounds', None) else []
     state = set(getattr(item, 'state', ()) or ())
     marks = []
     for name in ('setvalue', 'toggle', 'select', 'expand', 'collapse', 'scroll'):

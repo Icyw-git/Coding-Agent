@@ -183,7 +183,7 @@ def _powershell_exe() -> str | None:
 def run_powershell(script: str, env: dict, timeout: float):
     executable = _powershell_exe()
     if executable is None:
-        raise DesktopControlError('desktop control requires Windows PowerShell')
+        raise DesktopControlError('桌面控制需要 Windows PowerShell')
     import ps_worker
 
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
@@ -351,11 +351,11 @@ def _run_standalone(payload: dict, *, runner=None, timeout: float = DEFAULT_TIME
     try:
         result = runner(CONTROL_SCRIPT, {'HARNESS_DESKTOP_PAYLOAD': data}, timeout)
     except subprocess.TimeoutExpired as exc:
-        raise DesktopControlError(f'desktop control timed out after {timeout:g}s') from exc
+        raise DesktopControlError(f'桌面控制超时（{timeout:g} 秒）') from exc
     except DesktopControlError:
         raise
     except OSError as exc:
-        raise DesktopControlError(f'desktop control unavailable: {exc}') from exc
+        raise DesktopControlError(f'桌面控制不可用：{exc}') from exc
     stdout = getattr(result, 'stdout', b'') or b''
     if isinstance(stdout, bytes):
         stdout = stdout.decode('ascii', 'replace')
@@ -368,7 +368,7 @@ def _run_standalone(payload: dict, *, runner=None, timeout: float = DEFAULT_TIME
     except (TypeError, ValueError):
         record = None
     if not isinstance(record, dict):
-        raise DesktopControlError(f'unexpected desktop control output: {str(stderr).strip()[-300:]}')
+        raise DesktopControlError(f'桌面控制返回了看不懂的内容：{str(stderr).strip()[-300:]}')
     if getattr(result, 'returncode', 0) or not record.get('ok'):
         raise DesktopControlError(str(record.get('message') or record.get('error') or 'desktop control failed'))
     return record
@@ -388,7 +388,7 @@ def list_windows(*, limit: int = 20, runner=None,
     try:
         limit = max(1, min(int(limit), MAX_WINDOWS))
     except (TypeError, ValueError) as exc:
-        raise DesktopControlError('limit must be an integer') from exc
+        raise DesktopControlError('limit 必须是整数') from exc
     reply = _run({'action': 'list', 'limit': limit}, runner=runner,
                  timeout=timeout)
     windows = []
@@ -425,23 +425,23 @@ def focus_window(*, expected_pid=None, expected_window_id=None, runner=None,
 def _validated_key(key) -> str:
     """Normalize one key or a modifier combo such as ``ctrl+shift+s``."""
     if not isinstance(key, str) or not key.strip() or len(key) > 30:
-        raise DesktopControlError('key requires a short key name or combo')
+        raise DesktopControlError('key 需要键名或组合键')
     parts = [part.strip().casefold() for part in key.strip().split('+')]
     if any(not part for part in parts):
-        raise DesktopControlError('key combo has an empty part')
+        raise DesktopControlError('组合键里有空的一段')
     *modifiers, base = parts
     if len(modifiers) > 4:
-        raise DesktopControlError('key combo allows at most four modifiers')
+        raise DesktopControlError('组合键最多四个修饰键')
     for modifier in modifiers:
         if modifier not in KEY_MODIFIERS:
-            raise DesktopControlError(f'unsupported modifier: {modifier}')
+            raise DesktopControlError(f'不认识的修饰键：{modifier}')
     if len(set(modifiers)) != len(modifiers):
-        raise DesktopControlError('key combo repeats a modifier')
+        raise DesktopControlError('组合键里重复了同一个修饰键')
     if base not in SUPPORTED_KEYS and not (
             len(base) == 1 and base.isascii() and base.isalnum()) and not (
             base.startswith('f') and base[1:].isdigit()
             and 1 <= int(base[1:]) <= 12):
-        raise DesktopControlError('unsupported key name')
+        raise DesktopControlError('不认识的键名')
     return '+'.join([*modifiers, base])
 
 
@@ -449,20 +449,20 @@ def _validated_click(x_value, y_value, button, count) -> dict:
     try:
         coords = {'x': int(x_value), 'y': int(y_value)}
     except (TypeError, ValueError) as exc:
-        raise DesktopControlError('click requires integer x and y') from exc
+        raise DesktopControlError('click 需要整数 x 和 y') from exc
     normalized = {'action': 'click', **coords}
     button = 'left' if button is None else str(button).strip().casefold()
     if button not in CLICK_BUTTONS:
-        raise DesktopControlError('button must be left, right, or middle')
+        raise DesktopControlError('button 只能是 left、right 或 middle')
     if button != 'left':
         normalized['button'] = button
     count = 1 if count is None else count
     try:
         count = int(count)
     except (TypeError, ValueError) as exc:
-        raise DesktopControlError('click count must be 1 or 2') from exc
+        raise DesktopControlError('点击次数只能是 1 或 2') from exc
     if count not in (1, 2):
-        raise DesktopControlError('click count must be 1 or 2')
+        raise DesktopControlError('点击次数只能是 1 或 2')
     if count != 1:
         normalized['count'] = count
     return normalized
@@ -471,11 +471,11 @@ def _validated_click(x_value, y_value, button, count) -> dict:
 def _validated_step(step) -> dict:
     """Validate one sequence step; returns the normalized payload for it."""
     if not isinstance(step, dict):
-        raise DesktopControlError('each sequence step must be an object')
+        raise DesktopControlError('sequence 的每一步都必须是对象')
     action = str(step.get('action') or '').strip().casefold()
     if action not in STEP_FIELDS:
         raise DesktopControlError(
-            'each step needs action: move, click, type, key, scroll, or wait')
+            '每一步都要有 action：move/click/type/key/scroll/wait')
     unknown = set(step) - STEP_FIELDS[action]
     if unknown:
         raise DesktopControlError(
@@ -487,13 +487,13 @@ def _validated_step(step) -> dict:
         try:
             coords = {'x': int(step['x']), 'y': int(step['y'])}
         except (KeyError, TypeError, ValueError) as exc:
-            raise DesktopControlError('move step requires integer x and y') from exc
+            raise DesktopControlError('move 步骤需要整数 x 和 y') from exc
         return {'action': action, **coords}
     if action == 'type':
         text = step.get('text')
         if not isinstance(text, str) or len(text) > MAX_TYPE_CHARS:
             raise DesktopControlError(
-                f'type step text must be a string of at most {MAX_TYPE_CHARS} characters')
+                f'type 步骤的文本最多 {MAX_TYPE_CHARS} 个字符')
         return {'action': action, 'text': text}
     if action == 'key':
         return {'action': action, 'key': _validated_key(step.get('key'))}
@@ -501,19 +501,19 @@ def _validated_step(step) -> dict:
         try:
             ms = int(step.get('ms'))
         except (TypeError, ValueError) as exc:
-            raise DesktopControlError('wait step requires integer ms') from exc
+            raise DesktopControlError('wait 步骤需要整数 ms') from exc
         if not MIN_WAIT_MS <= ms <= MAX_WAIT_MS:
             raise DesktopControlError(
-                f'wait ms must be between {MIN_WAIT_MS} and {MAX_WAIT_MS}')
+                f'wait 的毫秒数必须在 {MIN_WAIT_MS} 到 {MAX_WAIT_MS} 之间')
         return {'action': action, 'ms': ms}
     try:
         amount = int(step.get('amount'))
     except (TypeError, ValueError) as exc:
         raise DesktopControlError(
-            'scroll step requires a non-zero integer amount') from exc
+            'scroll 步骤需要非零整数 amount') from exc
     if amount == 0 or abs(amount) > MAX_SCROLL:
         raise DesktopControlError(
-            f'scroll amount must be between -{MAX_SCROLL} and {MAX_SCROLL}, excluding 0')
+            f'滚动格数必须在 -{MAX_SCROLL} 到 {MAX_SCROLL} 之间，不能为 0')
     return {'action': action, 'amount': amount}
 
 
@@ -527,16 +527,16 @@ def _validated_identity(expected_pid, expected_window_id) -> tuple[int, str]:
         pid = int(expected_pid)
     except (TypeError, ValueError) as exc:
         raise DesktopControlError(
-            'expected_pid is required; get it from desktop_snapshot') from exc
+            '缺少 expected_pid；它来自 desktop_snapshot') from exc
     if pid <= 0:
-        raise DesktopControlError('expected_pid must be a positive process id')
+        raise DesktopControlError('expected_pid 必须是正整数')
     if not isinstance(expected_window_id, str) or not expected_window_id.strip():
         raise DesktopControlError(
-            'expected_window_id is required; get it from desktop_snapshot')
+            '缺少 expected_window_id；它来自 desktop_snapshot')
     window_id = expected_window_id.strip().upper()
     if len(window_id) > 32 or any(ch not in '0123456789ABCDEF' for ch in window_id):
         raise DesktopControlError(
-            'expected_window_id must be the hexadecimal id from desktop_snapshot')
+            'expected_window_id 必须是 desktop_snapshot 给的十六进制窗口号')
     return pid, window_id
 
 
@@ -556,26 +556,26 @@ def validate_element_action(operation, element, tree, *,
     expected = ' '.join(str(expect or '').split())
     if len(expected) > MAX_ELEMENT_EXPECT_CHARS:
         raise DesktopControlError(
-            f'expect must be at most {MAX_ELEMENT_EXPECT_CHARS} characters')
+            f'expect 最多 {MAX_ELEMENT_EXPECT_CHARS} 个字符')
     pid, window_id = _validated_identity(expected_pid, expected_window_id)
     op = str(operation or '').strip().casefold() or 'invoke'
     if op not in ELEMENT_OPERATIONS:
         raise DesktopControlError(
-            'operation must be invoke, setvalue, toggle, select, expand, '
-            'collapse, scroll, or focus')
+            'operation 只能是 invoke/setvalue/toggle/select/expand/'
+            'collapse/scroll/focus')
     try:
         index = int(element)
     except (TypeError, ValueError) as exc:
         raise DesktopControlError(
-            'element must be the number from desktop_inspect') from exc
+            'element 必须是 desktop_inspect 给的编号') from exc
     if index < 1 or index > MAX_ELEMENT_INDEX:
-        raise DesktopControlError('element must be between 1 and '
-                                  f'{MAX_ELEMENT_INDEX}')
+        raise DesktopControlError('element 必须在 1 到 '
+                                  f'{MAX_ELEMENT_INDEX} 之间')
     fingerprint = str(tree or '').strip().lower()
     if len(fingerprint) < 8 or len(fingerprint) > 64 or any(
             ch not in '0123456789abcdef' for ch in fingerprint):
         raise DesktopControlError(
-            'tree must be the fingerprint desktop_inspect returned')
+            'tree 必须是 desktop_inspect 返回的结构指纹')
     # 遍历预算必须和 desktop_inspect 完全一致：指纹是「编号 -> 类型/名字/位置」
     # 的哈希，节点数或深度不同哈希就不同。不带这几个值的话，用户调过
     # HARNESS_DESKTOP_TREE_NODES 之后，动作会一直误报 tree_changed。
@@ -595,26 +595,25 @@ def validate_element_action(operation, element, tree, *,
     payload['allow_terminal'] = bool(allow_terminal)
     if op == 'setvalue':
         if not isinstance(text, str) or not text:
-            raise DesktopControlError('setvalue requires text')
+            raise DesktopControlError('setvalue 需要 text')
         if len(text) > MAX_TYPE_CHARS:
             raise DesktopControlError(
-                f'setvalue text must be at most {MAX_TYPE_CHARS} characters')
+                f'setvalue 的文本最多 {MAX_TYPE_CHARS} 个字符')
         payload['text'] = text
     elif text is not None:
-        raise DesktopControlError('text is only valid with operation=setvalue')
+        raise DesktopControlError('text 只在 operation=setvalue 时有意义')
     if op == 'scroll':
         try:
             steps = int(amount)
         except (TypeError, ValueError) as exc:
             raise DesktopControlError(
-                'operation=scroll requires amount (positive scrolls down)') from exc
+                'operation=scroll 需要 amount（正数向下）') from exc
         if steps == 0 or abs(steps) > MAX_SCROLL:
             raise DesktopControlError(
-                f'scroll amount must be between -{MAX_SCROLL} and {MAX_SCROLL}, '
-                'excluding 0')
+                f'滚动格数必须在 -{MAX_SCROLL} 到 {MAX_SCROLL} 之间，不能为 0')
         payload['amount'] = steps
     elif amount is not None:
-        raise DesktopControlError('amount is only valid with operation=scroll')
+        raise DesktopControlError('amount 只在 operation=scroll 时有意义')
     return payload
 
 
@@ -628,33 +627,32 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
     if action == 'sequence':
         if any(value is not None for value in (x, y, text, key, amount, button, count)):
             raise DesktopControlError(
-                'sequence takes steps only; put x/y/text/key/amount/button/count '
-                'inside each step')
+                'sequence 只接受 steps；把 x/y/text/key/amount/button/count 放进每一步')
         if not isinstance(steps, (list, tuple)) or not steps:
-            raise DesktopControlError('sequence requires a non-empty steps list')
+            raise DesktopControlError('sequence 需要非空的 steps 列表')
         if len(steps) > MAX_SEQUENCE_STEPS:
-            raise DesktopControlError(f'sequence is limited to {MAX_SEQUENCE_STEPS} steps')
+            raise DesktopControlError(f'sequence 最多 {MAX_SEQUENCE_STEPS} 步')
         return {'action': 'sequence', 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
                 'steps': [_validated_step(step) for step in steps]}
     if steps is not None:
-        raise DesktopControlError("steps is only valid with action='sequence'")
+        raise DesktopControlError("steps 只在 action='sequence' 时有效")
     if action == 'focus':
         # 切窗口只需要双因子身份，没有坐标/文本参数。
         return {'action': 'focus', 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id}
     if action not in SINGLE_ACTIONS:
         raise DesktopControlError(
-            'action must be move, click, type, key, scroll, sequence, or focus')
+            'action 只能是 move/click/type/key/scroll/sequence/focus')
     # 显式放行终端输入必须由调用方逐次声明，不能隐式带上。
     terminal_ok = bool(allow_terminal)
     if action != 'click' and (button is not None or count is not None):
-        raise DesktopControlError('button and count are only valid with click')
+        raise DesktopControlError('button 和 count 只在 click 时有效')
     if action == 'move':
         try:
             coords = {'x': int(x), 'y': int(y)}
         except (TypeError, ValueError) as exc:
-            raise DesktopControlError('move requires integer x and y') from exc
+            raise DesktopControlError('move 需要整数 x 和 y') from exc
         return {'action': action, 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
                 'allow_terminal': terminal_ok, **coords}
@@ -664,7 +662,7 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
                 **_validated_click(x, y, button, count)}
     if action == 'type':
         if not isinstance(text, str) or len(text) > MAX_TYPE_CHARS:
-            raise DesktopControlError(f'type text must be a string of at most {MAX_TYPE_CHARS} characters')
+            raise DesktopControlError(f'type 的文本最多 {MAX_TYPE_CHARS} 个字符')
         return {'action': action, 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
                 'allow_terminal': terminal_ok, 'text': text}
@@ -675,9 +673,9 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
     try:
         amount = int(amount)
     except (TypeError, ValueError) as exc:
-        raise DesktopControlError('scroll requires a non-zero integer amount') from exc
+        raise DesktopControlError('scroll 需要非零整数 amount') from exc
     if amount == 0 or abs(amount) > MAX_SCROLL:
-        raise DesktopControlError(f'scroll amount must be between -{MAX_SCROLL} and {MAX_SCROLL}, excluding 0')
+        raise DesktopControlError(f'滚动格数必须在 -{MAX_SCROLL} 到 {MAX_SCROLL} 之间，不能为 0')
     return {'action': action, 'expected_pid': expected_pid,
             'expected_window_id': expected_window_id,
             'allow_terminal': terminal_ok, 'amount': amount}
@@ -791,24 +789,24 @@ def validate_wait(target='control', text=None, state='present', timeout_ms=None,
     kind = str(target or 'control').strip().casefold()
     if kind not in WAIT_TARGETS:
         raise DesktopControlError(
-            "target must be 'control', 'window', or 'foreground'")
+            "target 只能是 control、window 或 foreground")
     desired = str(state or 'present').strip().casefold()
     if desired not in WAIT_STATES:
-        raise DesktopControlError("state must be 'present' or 'absent'")
+        raise DesktopControlError("state 只能是 present 或 absent")
     needle = ' '.join(str(text or '').split())
     if not needle:
-        raise DesktopControlError('text is required: say what to wait for')
+        raise DesktopControlError('缺少 text：要说清等什么')
     if len(needle) > MAX_WAIT_TEXT:
         raise DesktopControlError(
-            f'text must be at most {MAX_WAIT_TEXT} characters')
+            f'text 最多 {MAX_WAIT_TEXT} 个字符')
     try:
         wait_ms = int(timeout_ms if timeout_ms is not None
                       else TOOL_WAIT_DEFAULT_MS)
     except (TypeError, ValueError) as exc:
-        raise DesktopControlError('timeout_ms must be an integer') from exc
+        raise DesktopControlError('timeout_ms 必须是整数') from exc
     if wait_ms < TOOL_WAIT_MIN_MS or wait_ms > TOOL_WAIT_MAX_MS:
         raise DesktopControlError(
-            f'timeout_ms must be between {TOOL_WAIT_MIN_MS} and {TOOL_WAIT_MAX_MS}')
+            f'timeout_ms 必须在 {TOOL_WAIT_MIN_MS} 到 {TOOL_WAIT_MAX_MS} 之间')
     payload = {'action': 'wait', 'target': kind, 'state': desired,
                'text': needle, 'timeout_ms': wait_ms, **tree_limits()}
     if expected_pid is not None or expected_window_id is not None:
