@@ -66,11 +66,30 @@ function Write-Reply($obj) {
 }
 
 function Read-Request {
+    # 请求行是 base64(UTF-8 JSON)，不是明文 JSON。
+    #
+    # 为什么必须这样：stdin 被重定向时，`[Console]::In.ReadLine()` 按**控制台的
+    # 输入代码页**解码（中文系统上就是 GBK），而不是 UTF-8。于是「记事本」的
+    # UTF-8 字节被当成 GBK 读成「璁颁簨錄」，某些字节序列还会吞掉后面的引号，
+    # 整个 JSON 直接解析失败：
+    #
+    #   传入的对象无效，应为":"或"}"。
+    #
+    # 受影响的是**所有非 ASCII 参数**：输入中文、等一个中文控件名、剪贴板写中文。
+    # base64 只含 ASCII，绕开代码页问题；顺带让协议不再依赖任何编码设置。
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { return $null }
     $line = $line.Trim()
     if (-not $line) { return @{} }
-    return $line | ConvertFrom-Json
+    $text = $line
+    try {
+        $bytes = [Convert]::FromBase64String($line)
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        # 兼容明文行（手工调试时方便）。
+        $text = $line
+    }
+    return $text | ConvertFrom-Json
 }
 '''
 
@@ -189,7 +208,7 @@ class Worker:
             return
         try:
             if proc.poll() is None:
-                proc.stdin.write(json.dumps({'op': '__quit__'}) + '\n')
+                proc.stdin.write(self._encode({'op': '__quit__'}))
                 proc.stdin.flush()
                 proc.wait(timeout=3)
         except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -250,12 +269,23 @@ class Worker:
 
     # ---------- 请求 ----------
 
+    @staticmethod
+    def _encode(request: dict) -> str:
+        """请求行：base64(UTF-8 JSON) + 换行。
+
+        不能直接发明文 JSON：重定向的 stdin 在 PowerShell 里按控制台代码页
+        （中文系统为 GBK）解码，中文参数会被读成乱码并破坏 JSON 结构。
+        实测 text='记事本' 会变成乱码并吞掉闭合引号。
+        """
+        raw = json.dumps(request, ensure_ascii=False).encode('utf-8')
+        return base64.b64encode(raw).decode('ascii') + chr(10)
+
     def _roundtrip(self, request: dict, *, timeout: float,
                    kill_on_timeout: bool = True) -> dict:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.stdout is None:
             raise WorkerError(f'{self.name} worker is not running')
-        payload = json.dumps(request, ensure_ascii=False) + '\n'
+        payload = self._encode(request)
         try:
             proc.stdin.write(payload)
             proc.stdin.flush()

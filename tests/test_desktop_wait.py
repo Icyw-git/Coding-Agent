@@ -302,6 +302,81 @@ def test_wait_is_forbidden_in_scheduled_turns():
     assert 'desktop_wait' in hooks.SCHEDULED_FORBIDDEN_TOOLS
 
 
+def test_wait_refuses_sensitive_windows_like_inspect():
+    """敏感窗口上不能按控件等待——否则等于绕过 inspect 的拒绝。
+
+    实测过：这里漏掉判断，就能用「猜名字 + 等它出现」把密码窗口里的
+    输入框内容原样读出来（value 一起返回），而 inspect 对同一窗口是拒绝的。
+    """
+    script = desktop.worker_script()
+    # 目标为 control 的分支里必须同时有 sensitive 判断和 exclude 判断。
+    control_branch = script.split("$payload.action -eq 'wait'", 1)[1]
+    control_branch = control_branch.split("$payload.action -eq 'inspect'", 1)[0]
+    assert 'sensitive_target' in control_branch
+    assert 'process_excluded' in control_branch
+
+
+def test_wait_honours_the_timeout_budget():
+    """每次遍历的预算不能超过剩余时间，否则「等 600ms」会跑成 4.4 秒。
+
+    实测过：deadline 只在两轮之间检查，而单次遍历能烧 900ms，
+    于是短预算被无限放大。两处都要收紧：poll 的遍历预算、窗口等待的 sleep。
+    """
+    script = desktop.worker_script()
+    assert '$remaining' in script and 'pollMs' in script
+    window_wait = script.split('function Wait-ForWindow', 1)[1].split('function ', 1)[0]
+    assert '$left' in window_wait
+
+
+def test_wait_text_tells_the_model_how_to_act(monkeypatch):
+    """命中后的文案要带 pid / 窗口号——element 模式的必填参数就是它们。"""
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=True, target='control', desired='present', elapsed_ms=300,
+        polls=1, state=desktop._state(_state(pid=23844, window_id='60D5E')),
+        element=desktop._element_info(_element(), 3),
+        fingerprint='a1b2c3d4e5f60718', elements=5))
+    text = tool_desktop.wait(text='已保存')
+    assert 'pid 23844' in text
+    assert '60D5E' in text
+    assert 'expected_pid 填 23844' in text
+    text.encode('gbk')
+
+
+def test_inspect_text_carries_the_identity_for_element_actions(monkeypatch):
+    """inspect 的指引必须可执行：pid 和窗口号要在输出里。"""
+    tree = desktop.UiTree(
+        items=(desktop._element_info(_element(id=3, name='提交'), 3),),
+        truncated=False, fingerprint='a1b2c3d4e5f60718',
+        state=desktop._state(_state(pid=23844, window_id='60D5E')), duration_ms=9)
+    monkeypatch.setattr(desktop, 'inspect', lambda **kw: tree)
+    text = tool_desktop.inspect()
+    assert 'pid 23844' in text and '60D5E' in text
+    assert 'expected_pid 填 23844' in text
+    assert 'expected_window_id 填 60D5E' in text
+
+
+def test_wait_reports_authoritative_walk():
+    """命中后要用「和 inspect 相同」的预算再走一遍，指纹才有同样的含义。
+
+    实测过：wait 用 80 节点/900ms 轮询、inspect 用 120/2500，同一窗口
+    （83 个控件）指纹分别是 7e9c15ec… 和 4b16b723…，模型照 wait 的指纹操作
+    必然撞 tree_changed，然后陷入 wait→act→tree_changed 的死循环。
+    """
+    script = desktop.worker_script()
+    assert 'fullBudget' in script
+    assert 'authoritative' in script
+
+
+def test_wait_parses_authoritative_flag(monkeypatch):
+    monkeypatch.setattr(desktop, '_run', lambda payload, **kw: {
+        'ok': True, 'result': _result(matched=True, element=None,
+                                      fingerprint='', authoritative=False)})
+    result = desktop.wait('control', '已保存', 'present', 3000)
+    assert result.authoritative is False
+    text = tool_desktop.wait(text='已保存')
+    assert '编号不可用' in text
+
+
 def test_powershell_never_casts_a_bool_to_string_in_a_condition():
     """`if ([string]$x.Contains(...))` 永远为真。
 

@@ -54,7 +54,7 @@ def capture(screen: str = 'primary', region=None, delay_ms=0, *,
             'origin': list(shot.origin),
         })
     except screen_capture.ScreenError as exc:
-        return f'Error: {exc}'
+        return f'截屏失败：{exc}'
     except OSError as exc:
         return f'截图存不下来：{exc}'
     region_text = (','.join(str(part) for part in shot.region)
@@ -134,7 +134,7 @@ def ocr(path=None, lang: str = ocr_windows.DEFAULT_LANGUAGE, region=None, *,
         result = ocr_windows.recognize(
             target, lang=lang, region=region, runner=runner)
     except (ocr_windows.OcrError, screen_capture.ScreenError) as exc:
-        return f'Error: {exc}'
+        return f'识别失败：{exc}'
     _notify(audit, 'screen_ocr', path=str(target), chars=len(result.text),
             lang=result.language, region=list(result.region) if result.region else None,
             lines=len(result.lines), duration_ms=result.duration_ms)

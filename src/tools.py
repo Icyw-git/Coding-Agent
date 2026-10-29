@@ -244,17 +244,21 @@ def run_desktop_action(action: str, x: int | None = None, y: int | None = None,
                        expected_window_id: str | None = None,
                        steps: list | None = None, element: int | None = None,
                        operation: str | None = None,
-                       tree: str | None = None) -> str:
+                       tree: str | None = None,
+                       expect: str | None = None,
+                       allow_terminal: bool | None = None) -> str:
     if str(action or '').strip().casefold() == 'element':
         return _desktop_element_tool(
             operation=operation or 'invoke', element=element, tree=tree,
-            text=text, expected_pid=expected_pid,
+            text=text, expect=expect, amount=amount,
+            allow_terminal=allow_terminal,
+            expected_pid=expected_pid,
             expected_window_id=expected_window_id, audit=_screen_audit)
     return _desktop_action_tool(
         action, x=x, y=y, text=text, key=key, amount=amount, button=button,
         count=count, steps=steps,
         expected_pid=expected_pid, expected_window_id=expected_window_id,
-        audit=_screen_audit)
+        allow_terminal=allow_terminal, audit=_screen_audit)
 
 
 def run_view_image(path: str, cwd: str = None):

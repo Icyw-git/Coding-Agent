@@ -17,17 +17,42 @@ def _audit(audit, event: str, **payload) -> None:
         pass
 
 
+#: 控件类型的中文名。焦点控件没有名字时用它兜底——直接把
+#: `ControlType.Menu` 打给用户等于暴露内部枚举（`_state_text` 以前就这么干的）。
+_FOCUS_TYPE_LABELS = {
+    'ControlType.Button': '按钮', 'ControlType.Edit': '输入框',
+    'ControlType.ComboBox': '下拉框', 'ControlType.CheckBox': '复选框',
+    'ControlType.RadioButton': '单选框', 'ControlType.Hyperlink': '链接',
+    'ControlType.List': '列表', 'ControlType.ListItem': '列表项',
+    'ControlType.Tree': '树', 'ControlType.TreeItem': '树项',
+    'ControlType.Tab': '选项卡栏', 'ControlType.TabItem': '选项卡',
+    'ControlType.Menu': '菜单', 'ControlType.MenuItem': '菜单项',
+    'ControlType.MenuBar': '菜单栏', 'ControlType.Document': '文档',
+    'ControlType.Pane': '面板', 'ControlType.Group': '分组',
+    'ControlType.Text': '文本', 'ControlType.Table': '表格',
+    'ControlType.ToolBar': '工具栏', 'ControlType.Window': '窗口',
+    'ControlType.Custom': '自绘控件', 'ControlType.Slider': '滑块',
+}
+
+
+def _focus_text(state) -> str:
+    name = _clip(state.focused_name, 40)
+    if name:
+        return f'「{name}」'
+    kind = _FOCUS_TYPE_LABELS.get(str(state.focused_control_type or '').strip())
+    return f'（{kind}）' if kind else '（未知控件）'
+
+
 def _state_text(state) -> str:
     if not state.available:
         detail = f'（{state.error}）' if state.error else ''
         return f'当前没有可用的前台窗口{detail}'
     title = _clip(state.title, 60) or '(未命名窗口)'
     process = _clip(state.process, 40) or '未知进程'
-    focused = (_clip(state.focused_name, 40)
-               or _clip(state.focused_control_type, 40) or '未知控件')
+    focused = _focus_text(state)
     rect = ','.join(str(value) for value in state.rect) if state.rect else '未知'
     return (f'前台窗口：{title}（{process}，pid {state.pid}，'
-            f'窗口 {state.window_id}）· 位置 {rect} · 焦点「{focused}」')
+            f'窗口 {state.window_id}）· 位置 {rect} · 焦点{focused}')
 
 
 _ACTION_VERBS = {
@@ -69,15 +94,16 @@ def snapshot(*, runner=None, audit=None) -> str:
         return f'读不到前台窗口：{exc}。'
     _audit(audit, 'desktop_snapshot', process=state.process, pid=state.pid,
            window_id=state.window_id,
-           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
+           title_sha1=_title_sha1(state),
            sensitive_target=state.sensitive_target)
     return _state_text(state)
 
 
-_ELEMENT_VERBS = {
-    'invoke': '点击', 'setvalue': '写入', 'toggle': '切换', 'select': '选中',
-    'expand': '展开', 'collapse': '收起', 'focus': '聚焦',
-}
+def _element_verbs() -> dict:
+    # 中文文案统一放 approval_view，别在这里再抄一份（抄了就会漏改）。
+    import approval_view
+
+    return approval_view.ELEMENT_OPERATION_LABELS
 _MAX_NAME_CHARS = 60
 _MAX_VALUE_CHARS = 60
 
@@ -115,6 +141,62 @@ def _clip(text, limit: int) -> str:
     return text[:limit - 1] + '~'
 
 
+#: 能用哪些操作。只列「不是默认点击」的那些：
+#: 纯按钮的 invoke 是模型本来就假定有的，写出来只是烧 token；
+#: 而「能写入 / 能切换 / 能展开」不写，模型就得靠试错（一次失败的调用
+#: 比这几个字贵得多）。
+_OPERATION_MARKS = {
+    'setvalue': '可写入', 'toggle': '可切换', 'select': '可选中',
+    'expand': '可展开', 'collapse': '可收起', 'scroll': '可滚动',
+}
+
+#: 控件的当前状态。勾没勾、开没开、选中了哪个——这些不说，模型只能靠截图判断。
+_STATE_MARKS = {
+    'checked': '已勾选', 'unchecked': '未勾选', 'indeterminate': '部分勾选',
+    'expanded': '已展开', 'collapsed': '已收起', 'partially_expanded': '部分展开',
+    'selected': '已选中', 'readonly': '只读',
+}
+
+
+def _operation_marks(item) -> list[str]:
+    operations = set(getattr(item, 'operations', ()) or ())
+    if not operations:
+        # 没有可用模式：只能按坐标点，告诉模型别浪费一次调用。
+        return ['只能按坐标点']
+    state = set(getattr(item, 'state', ()) or ())
+    marks = []
+    for name in ('setvalue', 'toggle', 'select', 'expand', 'collapse', 'scroll'):
+        if name not in operations:
+            continue
+        # 展开/收起二选一：状态已经说清了方向，再标一个只会重复。
+        if name == 'expand' and 'collapsed' in state:
+            continue
+        if name == 'collapse' and 'expanded' in state:
+            continue
+        if name == 'expand' and 'expanded' in state:
+            continue
+        if name == 'collapse' and 'collapsed' in state:
+            continue
+        marks.append(_OPERATION_MARKS[name])
+    return marks
+
+
+def _action_audit(audit, action: str, state, *, duration_ms: int, **extra) -> None:
+    """两条动作路径（物理输入 / 元素动作）的审计载荷。
+
+    字段名只写一遍：audit 是按字段白名单落盘的，两处各写一份迟早漂移。
+    """
+    _audit(audit, 'desktop_action', action=action, process=state.process,
+           pid=state.pid, window_id=state.window_id,
+           duration_ms=duration_ms, title_sha1=_title_sha1(state),
+           sensitive_target=state.sensitive_target, **extra)
+
+
+def _title_sha1(state) -> str:
+    # 审计只记标题的哈希，不记标题本身。原先五处各算一遍，抽出来。
+    return hashlib.sha1(state.title.encode('utf-8')).hexdigest()
+
+
 def _element_line(item) -> str:
     parts = [f'#{item.id}', item.label]
     name = _clip(item.name, _MAX_NAME_CHARS)
@@ -133,6 +215,9 @@ def _element_line(item) -> str:
         marks.append('当前焦点')
     if not item.enabled:
         marks.append('不可用')
+    marks.extend(_STATE_MARKS[name] for name in getattr(item, 'state', ()) or ()
+                 if name in _STATE_MARKS)
+    marks.extend(_operation_marks(item))
     line = ' '.join(parts)
     if marks:
         line += ' · ' + ' · '.join(marks)
@@ -153,13 +238,16 @@ def inspect(*, runner=None, audit=None) -> str:
     state = tree.state
     _audit(audit, 'desktop_inspect', process=state.process, pid=state.pid,
            window_id=state.window_id,
-           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
+           title_sha1=_title_sha1(state),
            sensitive_target=state.sensitive_target,
            elements=len(tree.items), truncated=tree.truncated,
            duration_ms=tree.duration_ms)
     title = _clip(state.title, 80) or '(未命名窗口)'
     process = _clip(state.process, 40) or '未知进程'
-    header = f'前台窗口：{title}（{process}）'
+    # pid 和窗口号必须在这里给：元素动作的必填参数就是它们，不给的话模型只能
+    # 再调一次 desktop_snapshot（另一次审批）才凑齐——等于把一次点击拆成三步。
+    header = (f'前台窗口：{title}（{process}，pid {state.pid}，'
+              f'窗口 {state.window_id}）')
     if not tree.items:
         return (header + chr(10)
                 + '这个窗口没有可读的控件（可能是自绘界面或游戏）。'
@@ -172,9 +260,12 @@ def inspect(*, runner=None, audit=None) -> str:
                      f'desktop_action 用同一套。')
     lines.extend(_element_line(item) for item in tree.items)
     lines.append(f'结构指纹：{tree.fingerprint}')
-    lines.append('要操作其中某个控件，用 desktop_action：action 填 element，'
-                 'element 填上面的编号，tree 原样回传这个指纹。'
-                 '编号在界面变化后会失效，届时重新 desktop_inspect。')
+    lines.append(f'要操作其中某个控件，用 desktop_action：action 填 element，'
+                 f'element 填上面的编号，tree 原样回传这个指纹，'
+                 f'expect 填那个控件的名字（审批时会显示给人看，对不上会被拒），'
+                 f'expected_pid 填 {state.pid}，'
+                 f'expected_window_id 填 {state.window_id}。'
+                 f'编号在界面变化后会失效，届时重新 desktop_inspect。')
     if len(tree.items) <= 2:
         # 实测：走旧式无障碍桥的应用（部分 WinForms / 老程序 / 部分 Explorer
         # 视图）只暴露一两个节点。总得告诉模型“不是你没看懂，是它就这么多”。
@@ -236,12 +327,25 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
     head = (f'等到了：控件「{_clip(needle, 60)}」{label}出现了，'
             f'{_wait_elapsed(result)}（轮询 {result.polls} 次）。')
     if not item:
-        return head
+        # 出现了但没拿到控件本身（落在完整遍历的预算之外，或名字只在值里匹配到）。
+        return (head + chr(10)
+                + '这个控件没落在这次遍历的范围里，编号不可用。'
+                  '要操作它先 desktop_inspect 拿编号。')
     lines = [head, _element_line(item).strip()]
+    state = result.state
+    if state.available and state.pid and state.window_id:
+        lines.append(f'窗口：{_clip(state.title, 40) or "(未命名)"}'
+                     f'（pid {state.pid}，窗口 {state.window_id}）')
+    if result.truncated:
+        # 遍历被截断时编号仍然可用（指纹是同一次遍历算的），但要让模型知道
+        # 列表不完整，别以为「没列出来的就不存在」。
+        lines.append('（这次遍历被截断了，上面的编号只对已列出的控件有效。）')
     if result.fingerprint:
         lines.append(f'结构指纹：{result.fingerprint}')
-        lines.append('要操作这个控件，用 desktop_action 的 element 模式，'
-                     'element 填上面的编号、tree 回传这个指纹。')
+        lines.append('要操作这个控件，用 desktop_action 的 element 模式：'
+                     'element 填上面的编号、tree 回传这个指纹、expect 填控件名'
+                     + (f'、expected_pid 填 {state.pid}、expected_window_id 填 '
+                        f'{state.window_id}' if state.pid else '') + '。')
     return chr(10).join(lines)
 
 
@@ -267,14 +371,16 @@ def _wait_window_text(result, needle: str, verb: str) -> str:
 
 
 def element_action(*, operation, element, tree, expected_pid, expected_window_id,
-                   text=None, runner=None, audit=None) -> str:
+                   text=None, expect=None, amount=None, allow_terminal=None,
+                   runner=None, audit=None) -> str:
     """按编号操作控件。走 UIA 的元素动作，不移动鼠标。"""
     import never_do
 
     try:
         result = desktop_control_windows.element_action(
             operation, element, tree, expected_pid=expected_pid,
-            expected_window_id=expected_window_id, text=text,
+            expected_window_id=expected_window_id, text=text, expect=expect,
+            amount=amount, allow_terminal=allow_terminal,
             forbidden=never_do.ui_forbidden_patterns(), runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action='element',
@@ -283,20 +389,95 @@ def element_action(*, operation, element, tree, expected_pid, expected_window_id
     state = result.state
     target = result.target
     label = (target.name or target.label) if target else ''
-    verb = _ELEMENT_VERBS.get(operation, operation)
-    _audit(audit, 'desktop_action', action='element', operation=operation,
-           element=element, process=state.process, pid=state.pid,
-           window_id=state.window_id, duration_ms=result.duration_ms,
-           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
-           sensitive_target=state.sensitive_target)
-    if label:
-        return f'已完成{verb}「{_clip(label, _MAX_NAME_CHARS)}」。{_state_text(state)}'
-    return f'已完成{verb}。{_state_text(state)}'
+    verb = _element_verbs().get(operation, operation)
+    _action_audit(audit, 'element', state, duration_ms=result.duration_ms,
+                  operation=operation, element=element)
+    head = (f'已完成{verb}「{_clip(label, _MAX_NAME_CHARS)}」。'
+            if label else f'已完成{verb}。')
+    return head + _after_action_text(result)
+
+
+def _state_change(before, after) -> str:
+    """「勾选状态变了」这类回执：只有变化才写，没变不啰嗦。"""
+    if before is None or after is None:
+        return ''
+    old = set(getattr(before, 'state', ()) or ())
+    new = set(getattr(after, 'state', ()) or ())
+    changed = [name for name in _STATE_MARKS if (name in new) != (name in old)]
+    if not changed:
+        return ''
+    marks = [_STATE_MARKS[name] for name in changed if name in new]
+    if not marks:
+        return ''
+    return '现在是' + '、'.join(marks) + '。'
+
+
+def _window_switch_text(result) -> str:
+    """前台窗口换掉了没有。
+
+    点一下按钮弹出对话框是最常见的一种；这时下面列出的编号属于**新**窗口，
+    拿旧的 pid / 窗口号去操作一定撞 foreground_changed。
+    """
+    before = getattr(result, 'before', None)
+    after = result.state
+    if before is None or not before.available or not after.available:
+        return ''
+    if not before.window_id or before.window_id == after.window_id:
+        return ''
+    title = _clip(after.title, 40) or '(未命名窗口)'
+    return (f'前台窗口换成了「{title}」（pid {after.pid}，窗口 {after.window_id}）。'
+            '下面的编号属于新窗口，后续操作要用这个 pid 和窗口号。')
+
+
+def _after_action_text(result) -> str:
+    """动作之后的界面变化：省掉"再 inspect 一次看看"的往返与审批。"""
+    state_text = _state_change(result.target, result.target_after)
+    if (result.operation == 'setvalue'
+            and result.target_after is not None
+            and result.target_after.value):
+        # 写入之后读回实际值：界面对输入做格式化/截断/校验时，这是唯一可靠的确认。
+        readback = _clip(result.target_after.value, _MAX_VALUE_CHARS)
+        state_text = (state_text + chr(10) if state_text else '') + f'读回内容 "{readback}"。'
+    parts = [state_text] if state_text else []
+    added = result.items_added
+    removed = result.items_removed
+    if added or removed:
+        summary = []
+        if added:
+            summary.append(f'多出 {len(added)} 个控件')
+        if removed:
+            summary.append(f'少了 {removed} 个')
+        parts.append('界面变化：' + '、'.join(summary) + '。')
+        for item in added[:8]:
+            parts.append(_element_line(item).strip())
+        if len(added) > 8:
+            parts.append(f'  …… 还有 {len(added) - 8} 个新控件')
+        if result.items_after_truncated:
+            parts.append('（这次的控件列表被截断了，可能还有没列出来的。）')
+    elif result.fingerprint_after and result.fingerprint_after != result.fingerprint_before:
+        parts.append('界面已变化（控件数量不变）。')
+    elif result.fingerprint_after and not state_text:
+        # 状态变了就别再说"界面没有变化"——两句话会互相打架。
+        parts.append('界面没有变化。')
+    elif not result.fingerprint_after:
+        # 读不到界面（窗口关了/遍历失败）：别编一句"没有变化"。
+        parts.append('这次读不到界面状态，动作是否生效需要 desktop_inspect 确认。')
+    if result.note:
+        parts.append(result.note + '。')
+    if result.fingerprint_after:
+        parts.append(f'结构指纹：{result.fingerprint_after}')
+        parts.append('要继续操作，用上面的编号配这个指纹；'
+                     '连续操作同一个控件时编号不变。')
+    switch = _window_switch_text(result)
+    if switch:
+        parts.insert(0, switch)
+    lines = [part for part in parts if part]
+    return chr(10) + chr(10).join(lines)
 
 
 def action(action_name: str, *, x=None, y=None, text=None, key=None,
            amount=None, button=None, count=None, steps=None,
-           expected_pid=None, expected_window_id=None,
+           expected_pid=None, expected_window_id=None, allow_terminal=None,
            runner=None, audit=None) -> str:
     try:
         result = desktop_control_windows.action(
@@ -304,22 +485,17 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
             button=button, count=count, steps=steps,
             expected_pid=expected_pid,
             expected_window_id=expected_window_id,
+            allow_terminal=allow_terminal,
             runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action=str(action_name)[:30],
                reason=str(exc)[:120])
-        return f'Error: desktop action failed: {exc}'
+        return f'操作没做成：{exc}'
     state = result.state
     step_records = getattr(result, 'steps', ()) or ()
-    audit_payload = {
-        'action': result.action, 'process': state.process, 'pid': state.pid,
-        'window_id': state.window_id, 'duration_ms': result.duration_ms,
-        'title_sha1': hashlib.sha1(state.title.encode('utf-8')).hexdigest(),
-        'sensitive_target': state.sensitive_target,
-    }
-    if result.action == 'sequence':
-        audit_payload['steps'] = len(step_records)
-    _audit(audit, 'desktop_action', **audit_payload)
+    extra = {'steps': len(step_records)} if result.action == 'sequence' else {}
+    _action_audit(audit, result.action, state,
+                  duration_ms=result.duration_ms, **extra)
     if result.action == 'sequence':
         lines = [f'已执行 {len(step_records)} 个步骤：']
         for index, step in enumerate(step_records, 1):
@@ -430,5 +606,5 @@ def focus(action_args: dict, *, runner=None, audit=None) -> str:
         return f'切不到那个窗口：{exc}'
     _audit(audit, 'desktop_focus', process=state.process, pid=state.pid,
            window_id=state.window_id,
-           title_sha1=hashlib.sha1(state.title.encode('utf-8')).hexdigest())
+           title_sha1=_title_sha1(state))
     return f'已切到那个窗口。{_state_text(state)}'

@@ -724,7 +724,7 @@ TOOL_SCHEMAS = [{'type': 'function',
                                   'operation': {'type': 'string',
                                                 'enum': ['invoke', 'setvalue', 'toggle',
                                                          'select', 'expand', 'collapse',
-                                                         'focus'],
+                                                         'scroll', 'focus'],
                                                 'description': 'For action=element: what to do '
                                                                'with it (default invoke)'},
                                   'tree': {'type': 'string',
@@ -732,6 +732,25 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                           'fingerprint desktop_inspect '
                                                           'returned. If the window changed '
                                                           'since then the action is refused.'},
+                                  'allow_terminal': {'type': 'boolean',
+                                                     'description': 'Required only '
+                                                                    'when typing or '
+                                                                    'writing into a '
+                                                                    'window owned by '
+                                                                    'a shell process '
+                                                                    '(powershell/cmd); '
+                                                                    'confirm with the '
+                                                                    'user first. Not '
+                                                                    'needed for '
+                                                                    'clicking.'},
+                                  'expect': {'type': 'string',
+                                             'description': 'For action=element: the label of '
+                                                            'the control you intend to act on, '
+                                                            'copied from desktop_inspect. It '
+                                                            'is shown to the user in the '
+                                                            'approval prompt, and the action is '
+                                                            'refused if that number is not that '
+                                                            'control.'},
                                   'expected_pid': {'type': 'integer',
                                                    'description': 'PID from desktop_snapshot'},
                                   'expected_window_id': {'type': 'string',
@@ -751,7 +770,13 @@ TOOL_SCHEMAS = [{'type': 'function',
                                                          'or a combo joined with + such as '
                                                          'ctrl+v, ctrl+shift+s, alt+f4'},
                                   'amount': {'type': 'integer',
-                                             'description': 'Scroll notches from -20 to 20, excluding 0'},
+                                             'description': 'Scroll notches from -20 to 20, '
+                                                            'excluding 0. For '
+                                                            'action=element with '
+                                                            'operation=scroll it '
+                                                            'scrolls that control '
+                                                            '(e.g. one long list) '
+                                                            'instead of the window'},
                                   'button': {'type': 'string',
                                              'enum': ['left', 'right', 'middle'],
                                              'description': 'Mouse button for click (default left)'},

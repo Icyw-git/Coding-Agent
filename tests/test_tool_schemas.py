@@ -27,7 +27,7 @@ ORDER = [
     'remember', 'forget', 'recall',
 ]
 
-SCHEMA_SHA1 = '76e47d6dd2817ab30ab0b4feed9463d92baf4923'
+SCHEMA_SHA1 = '6ceb8c4d4813f7542afd76b7008ff584ef1f72b3'
 
 
 def test_tool_order_is_stable():

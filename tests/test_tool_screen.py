@@ -71,7 +71,7 @@ def test_capture_returns_error_text_on_failure(tmp_path):
 
     result = tool_screen.capture(directory=tmp_path, runner=runner)
 
-    assert result.startswith('Error:')
+    assert result.startswith('截屏失败：')
     assert 'powershell missing' in result
 
 
@@ -111,7 +111,7 @@ def test_ocr_defaults_to_latest_screenshot(tmp_path):
 def test_ocr_without_screenshots_is_an_error(tmp_path):
     result = tool_screen.ocr(directory=tmp_path)
 
-    assert result.startswith('Error: no screenshots yet')
+    assert result.startswith('识别失败：no screenshots yet')
 
 
 def test_ocr_rejects_paths_outside_screenshot_dir(tmp_path):
@@ -160,5 +160,5 @@ def test_ocr_region_outside_image_is_reported(tmp_path):
     result = tool_screen.ocr('shot.png', region='700,500,200,200',
                              directory=tmp_path, runner=_ocr_runner())
 
-    assert result.startswith('Error:')
+    assert result.startswith('识别失败：')
     assert 'exceeds image' in result

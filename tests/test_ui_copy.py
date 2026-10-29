@@ -181,6 +181,10 @@ def test_field_names_are_not_used_as_labels(name):
         stripped = line.strip()
         if stripped.startswith('#'):
             continue
+        # 这一行本身含中文，说明它是「字段名 -> 中文标签」的翻译表，
+        # 不是在把字段名当标签显示（`'session_id': '会话'`）。
+        if _CJK.search(line):
+            continue
         match = _FIELD_AS_LABEL.search(line) or _KV_IN_TEXT.search(line)
         if not match:
             continue
@@ -192,6 +196,123 @@ def test_field_names_are_not_used_as_labels(name):
         problems.append(f'{name}:{lineno}  {stripped[:70]}')
     assert not problems, ('internal field name used as a user-facing label:\n  '
                           + '\n  '.join(problems))
+
+
+#: 审批面会把 detail() 的每一行**直接打给用户**（控制台提示 + 飞书卡片）。
+#: 这里逐个工具给一份代表性参数，验证渲染出来的文案是给人看的中文。
+#: 一个真实形状的补丁，好走「摘要」而不是「原文预览」分支。
+_PATCH = chr(10).join([
+    '*** Begin Patch', '*** Update File: a.txt', '@@', '-x', '+y',
+    '*** End Patch'])
+
+_DETAIL_CASES = {
+    'bash': {'command': 'rm -rf build'},
+    'write': {'path': 'a.txt', 'content': 'x'},
+    'edit': {'path': 'a.txt', 'old_text': 'a', 'new_text': 'b'},
+    'apply_patch': {'patch': _PATCH},
+    'read': {'path': 'a.txt'},
+    'glob': {'pattern': '*.py'},
+    'grep': {'pattern': 'x'},
+    'ls': {'path': '.'},
+    'web_fetch': {'url': 'https://example.com'},
+    'delete_paths': {'paths': ['a.txt', 'b.txt']},
+    'move_paths': {'moves': [{'from': 'a.txt', 'to': 'b.txt'}]},
+    'undo_moves': {'batch_id': 'b1'},
+    'remind': {'text': '喝水', 'when': '明天 9 点'},
+    'remember': {'type': 'preference', 'name': 'n', 'text': 'x'},
+    'forget': {'name': 'n'},
+    'recall': {'query': 'x'},
+    'screen_capture': {'screen': 'all', 'region': '0,0,10,10', 'delay_ms': 100},
+    'screen_ocr': {'path': 'x.png', 'lang': 'zh-Hans-CN'},
+    'clipboard_read': {},
+    'clipboard_write': {'text': 'abc'},
+    'desktop_snapshot': {},
+    'desktop_inspect': {},
+    'desktop_displays': {},
+    'desktop_wait': {'text': '保存', 'state': 'present'},
+    'desktop_windows': {'limit': 5},
+    'desktop_action': {'action': 'click', 'x': 1, 'y': 2,
+                       'expected_pid': 9, 'expected_window_id': 'AB'},
+    'desktop_action#sequence': {'action': 'sequence', 'expected_pid': 9,
+                                'expected_window_id': 'AB',
+                                'steps': [{'action': 'click', 'x': 1, 'y': 2},
+                                          {'action': 'type', 'text': 'hi'}]},
+    'desktop_action#element': {'action': 'element', 'element': 3,
+                               'operation': 'invoke', 'expect': '提交',
+                               'expected_pid': 9, 'expected_window_id': 'AB'},
+    'task': {'description': 'x'},
+    'schedule_cron': {'schedule': '* * * * *', 'prompt': 'x'},
+    'create_task': {'subject': 'x', 'description': 'y'},
+    'cancel_cron': {'id': 'j1'},
+    'checkpoint': {'label': 'l'},
+    'compact': {},
+    'check_inbox': {},
+    'list_crons': {},
+    'revoke_permissions': {},
+    'send_message': {'to': 'a', 'message': 'b'},
+    'spawn_teammate': {'name': 'n', 'task': 't'},
+    'create_worktree': {'name': 'n'},
+    'rename_session': {'title': 't'},
+    'find_sessions': {'query': 'q'},
+    'load_skill': {'name': 'n'},
+    'todo_write': {'todos': [{'content': 'x', 'status': 'pending'}]},
+    'todo_read': {},
+}
+
+#: 这些工具的 detail 本来就是内容本身（命令、路径），不要求中文。
+_RAW_DETAIL = {'bash', 'read', 'glob', 'grep', 'ls', 'write'}
+
+
+@pytest.mark.parametrize('key', sorted(_DETAIL_CASES))
+def test_approval_detail_is_human_readable_chinese(key):
+    """审批提示必须是给用户看的中文，不能是英文 + key=value。
+
+    踩过：`_desktop_detail` / `_screen_detail` / `_clipboard_detail` /
+    `_delete_detail` 一直是 `action=type, foreground pid=1, text length=3`
+    这种形态。前几轮的守卫扫的是「传给 _notice/render 的字符串」，
+    而 detail() 返回的是函数里的字面量，一直漏到现在。
+    """
+    import approval_view
+
+    tool, _, variant = key.partition('#')
+    text = approval_view.detail(tool, dict(_DETAIL_CASES[key]))
+    # 空白的审批提示等于让用户盲签：必须写出「会做什么」。
+    assert text.strip(), f'{tool} 的审批提示是空的'
+    text.encode('gbk')          # GBK 不安全会在真实控制台打成转义串
+    if tool in _RAW_DETAIL and not variant:
+        return
+    assert re.search(r'[一-鿿]', text), f'{tool} 的审批文案没有中文: {text!r}'
+    leftover = re.findall(r'[a-z_]{2,}=(?=\S)', text)
+    assert not leftover, f'{tool} 的审批文案还在用 key=value: {leftover} in {text!r}'
+
+
+@pytest.mark.parametrize('key', sorted(_DETAIL_CASES))
+def test_approval_detail_accepts_display_forms(key):
+    """detail() 必须能用「中文标签」或「标签 (原名)」调用。
+
+    踩过：飞书审批卡把 `tool_label()` 的结果传给了 `detail()`，而 detail() 按
+    原始工具名分支渲染——于是卡片上显示的是 `action=click, x=10, y=20`
+    这种参数对，前十二轮的中文化全被绕过去。现在三种形态都能还原。
+    """
+    import approval_view
+
+    tool = key.partition('#')[0]
+    args = dict(_DETAIL_CASES[key])
+    raw = approval_view.detail(tool, args)
+    assert approval_view.detail(approval_view.tool_label(tool), args) == raw
+    label = approval_view._TOOL_LABELS.get(tool)
+    if label:   # 没登记标签的工具（如 checkpoint）只有原名一种形态
+        assert approval_view.detail(label, args) == raw
+
+
+def test_approval_detail_shows_which_control_by_name():
+    """按编号操作时必须显示控件名：只给编号等于没有知情同意。"""
+    import approval_view
+
+    text = approval_view.detail('desktop_action', {
+        'action': 'element', 'element': 3, 'operation': 'invoke',
+        'expect': '提交按钮', 'expected_pid': 9, 'expected_window_id': 'AB'})
+    assert '#3' in text and '提交按钮' in text
 
 
 def test_cli_and_tui_command_sets_match():

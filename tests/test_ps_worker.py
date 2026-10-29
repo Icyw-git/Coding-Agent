@@ -1,4 +1,5 @@
 """常驻 PowerShell worker：协议、复用、失败降级。"""
+import base64
 import sys
 
 import pytest
@@ -51,6 +52,35 @@ def test_resident_calls_are_fast(worker):
         times.append((time.perf_counter() - started) * 1000)
     # 保守阈值：独立进程要 260ms+，这里必须远低于它
     assert sum(times) / len(times) < 100
+
+
+def test_non_ascii_arguments_survive_the_protocol(worker):
+    """中文参数必须原样到达 PowerShell。
+
+    踩过：请求行原来发明文 JSON，而重定向的 stdin 在 PowerShell 里按控制台
+    代码页（中文系统 = GBK）解码，`记事本` 被读成 `璁颁簨鏈` 并吞掉闭合引号，
+    整个 JSON 解析失败：
+
+        传入的对象无效，应为":"或"}"。
+
+    受影响的是所有非 ASCII 参数：输入中文、等一个中文控件名、写剪贴板。
+    现在请求行是 base64(UTF-8 JSON)，只含 ASCII。
+    """
+    reply = worker.call({'op': 'echo', 'value': '记事本 · 中文 ✓ 日本語'})
+    assert reply['ok'] is True
+    assert reply['value'] == '记事本 · 中文 ✓ 日本語'
+
+
+def test_request_line_is_ascii_only():
+    """协议行只能有 ASCII：任何非 ASCII 都会重新引入代码页问题。"""
+    import json
+
+    for request in ({'op': 'echo', 'value': '中文'},
+                    {'action': 'wait', 'text': '保存', 'timeout_ms': 500}):
+        line = ps_worker.Worker._encode(request)
+        assert line.endswith(chr(10))
+        line.encode('ascii')
+        assert json.loads(base64.b64decode(line.strip()).decode('utf-8')) == request
 
 
 def test_exception_becomes_error_reply_without_killing_worker(worker):
