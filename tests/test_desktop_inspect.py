@@ -4,6 +4,7 @@
 真实 UIA 行为靠 e2e 脚本验证（见 docs/DESKTOP_CONTROL_RESEARCH.md）。
 """
 import re
+from pathlib import Path
 
 import pytest
 
@@ -146,6 +147,17 @@ def test_powershell_verifies_expect_against_the_actual_control():
     script = desktop.worker_script()
     assert 'element_mismatch' in script
     assert '编号和名字对不上' in script
+
+
+def test_inspect_says_unnamed_controls_may_skip_expect():
+    """无名控件的出路要写在 inspect 里，别等模型踩一次坑再告诉它。
+
+    图标按钮常常没有名字；报错里虽然有「expect 可以留空」，但那已经是第二次调用了。
+    """
+    script = desktop.worker_script()
+    assert 'expect 可以留空' in script      # 兜底：报错里仍要说
+    source = Path(tool_desktop.__file__).read_text(encoding='utf-8')
+    assert '没有名字的控件可以不填' in source
 
 
 def test_unnamed_control_mismatch_says_expect_may_be_empty():

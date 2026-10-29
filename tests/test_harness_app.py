@@ -1927,7 +1927,11 @@ def test_archive_command_picker_and_confirmation(tmp_path, monkeypatch):
             for _ in range(100):
                 await pilot.pause()
                 await asyncio.sleep(0.02)
-                if type(app.screen).__name__ == 'CleanupPickerModal':
+                if (type(app.screen).__name__ == 'CleanupPickerModal'
+                        and getattr(app.screen, '_visible', None)):
+                    # 屏幕名到位 ≠ 候选渲染好了：action_select_all 读的是
+                    # _visible，由 on_mount 里的 _render_rows 填。只等屏幕名
+                    # 会撞上空窗，全选变成"没有匹配的会话"。
                     break
             assert type(app.screen).__name__ == 'CleanupPickerModal'
             picker = app.screen
@@ -1970,7 +1974,8 @@ def test_delete_requires_typed_confirmation(tmp_path, monkeypatch):
             for _ in range(100):
                 await pilot.pause()
                 await asyncio.sleep(0.02)
-                if type(app.screen).__name__ == 'CleanupPickerModal':
+                if (type(app.screen).__name__ == 'CleanupPickerModal'
+                        and getattr(app.screen, '_visible', None)):
                     break
             assert type(app.screen).__name__ == 'CleanupPickerModal'
             app.screen.action_select_all()

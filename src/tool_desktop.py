@@ -280,7 +280,8 @@ def inspect(*, runner=None, audit=None) -> str:
     lines.append(f'结构指纹：{tree.fingerprint}')
     lines.append(f'要操作其中某个控件，用 desktop_action：action 填 element，'
                  f'element 填上面的编号，tree 原样回传这个指纹，'
-                 f'expect 填那个控件的名字（审批时会显示给人看，对不上会被拒），'
+                 f'expect 填那个控件的名字（审批时会显示给人看，对不上会被拒；'
+                 f'没有名字的控件可以不填），'
                  f'expected_pid 填 {state.pid}，'
                  f'expected_window_id 填 {state.window_id}。'
                  f'编号在界面变化后会失效，届时重新 desktop_inspect。')
@@ -365,6 +366,7 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
         lines.append(f'结构指纹：{result.fingerprint}')
         lines.append('要操作这个控件，用 desktop_action 的 element 模式：'
                      'element 填上面的编号、tree 回传这个指纹、expect 填控件名'
+                     '（没名字的可以不填）'
                      + (f'、expected_pid 填 {state.pid}、expected_window_id 填 '
                         f'{state.window_id}' if state.pid else '') + '。')
     return chr(10).join(lines)
