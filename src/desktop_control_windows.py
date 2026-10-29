@@ -374,7 +374,8 @@ def _run_standalone(payload: dict, *, runner=None, timeout: float = DEFAULT_TIME
     if not isinstance(record, dict):
         raise DesktopControlError(f'桌面控制返回了看不懂的内容：{str(stderr).strip()[-300:]}')
     if getattr(result, 'returncode', 0) or not record.get('ok'):
-        raise DesktopControlError(str(record.get('message') or record.get('error') or 'desktop control failed'))
+        import ps_worker
+        raise DesktopControlError(ps_worker.failure_text(record))
     return record
 
 

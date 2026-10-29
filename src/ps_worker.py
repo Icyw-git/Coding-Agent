@@ -409,11 +409,16 @@ def run(name: str, script, request: dict, *, fallback=None,
         # 失败回包带的不只是 error 代码：能力模块还会给 message（含 step i/total
         # 之类的重试提示）与 steps_done。只把代码抛给上层，模型就只能看到
         # 「out_of_window」这种没法照做的词，所以这里把可读信息拼进去。
-        raise WorkerError(_failure_text(reply))
+        raise WorkerError(failure_text(reply))
     return reply
 
 
-def _failure_text(reply: dict) -> str:
+def failure_text(reply: dict) -> str:
+    """把失败回包压成一句可读的话：``code: message``。
+
+    常驻 worker 与独立进程两条传输都用它——同一个拒绝对模型应当是同一句话，
+    否则上游按前缀分流（如"拒绝"与"失败"）时会在其中一条路上失效。
+    """
     message = str(reply.get('message') or '').strip()
     code = str(reply.get('error') or '').strip()
     if message and code and code not in message:

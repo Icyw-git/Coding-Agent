@@ -108,6 +108,23 @@ def test_timeout_stops_the_worker(worker):
     assert worker.stats['restarts'] >= 2
 
 
+def test_failure_text_is_shared_by_both_transports():
+    """常驻 worker 与独立进程必须给出同一句话。
+
+    上游按前缀分流（"拒绝" vs "没做成"）：`sensitive_target: …` 是拒绝，
+    「读不到…」是失败。两条传输的格式不一致时，其中一条上就会判错。
+    """
+    reply = {'ok': False, 'error': 'sensitive_target',
+             'message': '这是密码窗口'}
+    assert ps_worker.failure_text(reply) == 'sensitive_target: 这是密码窗口'
+    # message 里已经含 code 时不重复拼
+    assert ps_worker.failure_text(
+        {'error': 'sensitive_target',
+         'message': 'sensitive_target: 已包含'}) == 'sensitive_target: 已包含'
+    assert ps_worker.failure_text({'error': 'unknown'}) == 'unknown'
+    assert ps_worker.failure_text({}) == 'worker reported failure'
+
+
 def test_repeated_failures_break_the_worker():
     instance = ps_worker.Worker('test-broken', ECHO_SCRIPT)
     instance._broken = True

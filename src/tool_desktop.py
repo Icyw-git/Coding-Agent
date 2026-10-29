@@ -5,6 +5,17 @@ import hashlib
 
 import desktop_control_windows
 
+#: 这些 code 表示"按策略不做"，不是"做失败了"。
+#: 拒绝要原样转述（里面已经写清原因和"请用户自己操作"），
+#: 套一层「读不到 / 失败」再补一句"换个办法试试"，会引导模型重试同一件事。
+_REFUSAL_CODES = ('sensitive_target', 'process_excluded', 'must_do_self',
+                  'password_field', 'terminal_input')
+
+
+def _is_refusal(error: str) -> bool:
+    head = str(error or '').split(':', 1)[0].strip()
+    return head in _REFUSAL_CODES
+
 
 def _audit(audit, event: str, **payload) -> None:
     if audit is None:
@@ -236,6 +247,8 @@ def inspect(*, runner=None, audit=None) -> str:
         tree = desktop_control_windows.inspect(runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_inspect_failed', reason=str(exc)[:120])
+        if _is_refusal(str(exc)):
+            return str(exc)
         return (f'读不到这个窗口的界面结构：{exc}。'
                 '可以先让用户切到目标窗口，或改用 desktop_snapshot 看前台窗口。')
     state = tree.state
@@ -297,7 +310,7 @@ def wait(*, target='control', text=None, state='present', timeout_ms=None,
             expected_window_id=expected_window_id, runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_wait_failed', reason=str(exc)[:120])
-        return f'等待失败：{exc}'
+        return str(exc) if _is_refusal(str(exc)) else f'等待失败：{exc}'
     _audit(audit, 'desktop_wait', target=result.target, desired=result.desired,
            matched=result.matched, elapsed_ms=result.elapsed_ms,
            polls=result.polls, process=result.state.process,
@@ -388,7 +401,7 @@ def element_action(*, operation, element, tree, expected_pid, expected_window_id
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action='element',
                reason=str(exc)[:120])
-        return f'{exc}'
+        return str(exc)
     state = result.state
     target = result.target
     label = (target.name or target.label) if target else ''
@@ -494,7 +507,7 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action=str(action_name)[:30],
                reason=str(exc)[:120])
-        return f'操作没做成：{exc}'
+        return str(exc) if _is_refusal(str(exc)) else f'操作没做成：{exc}'
     state = result.state
     step_records = getattr(result, 'steps', ()) or ()
     extra = {'steps': len(step_records)} if result.action == 'sequence' else {}

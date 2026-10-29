@@ -209,6 +209,21 @@ def test_wait_text_reports_window_timeout(monkeypatch):
     assert '可见窗口 5 个' in text
 
 
+def test_refusals_are_reported_as_refusals(monkeypatch):
+    """拒绝 ≠ 失败。
+
+    「这个窗口是密码页面，不提供控件信息」被套成「等待失败：…」再附一句
+    「换个办法试试」，等于教模型重试同一件事——它该做的是请用户自己操作。
+    """
+    def boom(*_a, **_kw):
+        raise desktop.DesktopControlError(
+            'sensitive_target: 这个窗口看起来是密码页面，不提供控件信息')
+    monkeypatch.setattr(desktop, "wait", boom)
+    text = tool_desktop.wait(text='输入框', timeout_ms=200)
+    assert text.startswith('sensitive_target:')
+    assert '等待失败' not in text
+
+
 def test_wait_matching_ignores_the_control_type_label():
     """等待按「名字 + 值」匹配，和 expect 核对同一套判据。
 
