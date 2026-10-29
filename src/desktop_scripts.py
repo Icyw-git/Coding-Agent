@@ -1212,6 +1212,9 @@ function Invoke-ElementAction($payload, $state) {
             Fail 'element_mismatch' $why $state
         }
     }
+    # 记录"这次没按批准的方式做完"：元素动作降级成物理点击时，用户批的
+    # 「按控件编号操作」与实际发生的「动鼠标」不是一回事，审计要留痕。
+    $degraded = ''
     $problem = Invoke-ElementOperation $el $node ([string]$payload.operation) `
         ([string]$payload.text) $payload.amount $payload.max_scroll
     if ($null -ne $problem -and $problem.code -eq 'operation_unsupported' -and
@@ -1225,6 +1228,7 @@ function Invoke-ElementAction($payload, $state) {
                 ([string]$payload.text) $payload.amount $payload.max_scroll
             if ($null -eq $problem) {
                 $script:OperationNote = '控件被界面重建过，已重新定位后执行'
+                $degraded = 'relocated'
             }
         }
     }
@@ -1240,6 +1244,7 @@ function Invoke-ElementAction($payload, $state) {
         if ($null -eq $clickError) {
             $problem = $null
             $script:OperationNote = '这个控件不支持元素级操作，已改为点击它的中心'
+            $degraded = 'click'
         }
     }
     if ($null -ne $problem) { Fail $problem.code $problem.message $state }
@@ -1363,6 +1368,7 @@ function Invoke-ElementAction($payload, $state) {
         items_removed = [int]$removed
         target_after = $targetAfter
         note = [string]$script:OperationNote
+        degraded = [string]$degraded
     }
 }
 

@@ -187,10 +187,12 @@ def _action_audit(audit, action: str, state, *, duration_ms: int, **extra) -> No
 
     字段名只写一遍：audit 是按字段白名单落盘的，两处各写一份迟早漂移。
     """
+    # 空值不落盘：`degraded=''` 这种字段只会让台账多一列噪音。
+    fields = {key: value for key, value in extra.items() if value not in (None, '', 0)}
     _audit(audit, 'desktop_action', action=action, process=state.process,
            pid=state.pid, window_id=state.window_id,
            duration_ms=duration_ms, title_sha1=_title_sha1(state),
-           sensitive_target=state.sensitive_target, **extra)
+           sensitive_target=state.sensitive_target, **fields)
 
 
 def _title_sha1(state) -> str:
@@ -392,7 +394,8 @@ def element_action(*, operation, element, tree, expected_pid, expected_window_id
     label = (target.name or target.label) if target else ''
     verb = _element_verbs().get(operation, operation)
     _action_audit(audit, 'element', state, duration_ms=result.duration_ms,
-                  operation=operation, element=element)
+                  operation=operation, element=element,
+                  degraded=result.degraded)
     head = (f'已完成{verb}「{_clip(label, _MAX_NAME_CHARS)}」。'
             if label else f'已完成{verb}。')
     return head + _after_action_text(result)

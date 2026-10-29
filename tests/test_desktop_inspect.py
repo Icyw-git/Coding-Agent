@@ -627,6 +627,36 @@ def test_one_container_cannot_eat_the_whole_budget():
     assert '$truncated = $true' in walk
 
 
+def test_degraded_element_actions_are_audited(monkeypatch):
+    """元素动作降级成物理点击时，审计要留痕。
+
+    用户批的是「按控件编号操作」，实际动了鼠标——台账上只写 action=element、
+    operation=invoke 看不出这件事。
+    """
+    _patch_element(monkeypatch, _result(degraded='click',
+                                        fingerprint_before=FP,
+                                        fingerprint_after=FP))
+    events = []
+    tool_desktop.element_action(
+        operation='invoke', element=3, tree=FP, expected_pid=123,
+        expected_window_id='ABCD',
+        audit=lambda event, **payload: events.append((event, payload)))
+    assert events[0][0] == 'desktop_action'
+    assert events[0][1]['degraded'] == 'click'
+
+
+def test_audit_drops_empty_extra_fields(monkeypatch):
+    """没有降级时不要写一个空字段，台账多一列噪音。"""
+    _patch_element(monkeypatch, _result(fingerprint_before=FP,
+                                        fingerprint_after=FP))
+    events = []
+    tool_desktop.element_action(
+        operation='invoke', element=3, tree=FP, expected_pid=123,
+        expected_window_id='ABCD',
+        audit=lambda event, **payload: events.append((event, payload)))
+    assert 'degraded' not in events[0][1]
+
+
 def test_element_action_falls_back_to_a_click_when_the_control_has_no_pattern():
     """WPF 的 ComboBox 弹出项不支持 SelectionItem，用户就是点它一下。"""
     branch = _ps_function(desktop.worker_script(), 'Invoke-ElementAction')

@@ -110,6 +110,10 @@ class ActionResult:
     target_after: ElementInfo | None = None
     #: 动作的补充说明（例如"滚动的是外层容器 X"）。
     note: str = ''
+    #: 这次动作没按批准的方式做完时的原因：``click``（降级成物理点击）/
+    #: ``relocated``（控件被重建，重新定位后才执行）。审计要留痕——用户批的是
+    #: "按控件编号操作"，实际却动了鼠标，台账上不能看不出来。
+    degraded: str = ''
     operation: str = ''
     #: 动作之前的窗口状态。工具层用它算「到底变了什么」——只报动作已发出，
     #: 模型无法判断这一步是否生效。
@@ -779,6 +783,7 @@ def element_action(operation, element, tree, *, expected_pid=None,
         target_after=(_element_info(reply['target_after'], 0)
                       if isinstance(reply.get('target_after'), dict) else None),
         note=str(reply.get('note') or ''),
+        degraded=str(reply.get('degraded') or ''),
         operation=str(reply.get('operation') or ''),
     )
 
