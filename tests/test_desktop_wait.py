@@ -209,6 +209,29 @@ def test_wait_text_reports_window_timeout(monkeypatch):
     assert '可见窗口 5 个' in text
 
 
+def test_wait_matching_ignores_the_control_type_label():
+    """等待按「名字 + 值」匹配，和 expect 核对同一套判据。
+
+    以前还搜类型标签，于是 `wait(text='按钮')` 会命中任意一个按钮——而 schema 里
+    写的是「控件名或值」。两边口径不一致时，模型只能靠猜。
+    """
+    script = desktop.worker_script()
+    body = script.split('function Find-TreeMatch', 1)[1].split(chr(10) + 'function ', 1)[0]
+    assert 'item.name' in body and 'item.value' in body
+    assert 'item.label' not in body
+
+
+def test_wait_text_is_cleaned_before_printing(monkeypatch):
+    """等待的目标文本也可能带零宽字符（控件名里实测有），统一清洗一次。"""
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=False, target='control', desired='present', elapsed_ms=300,
+        polls=2, state=desktop._state(_state()), elements=3))
+    text = tool_desktop.wait(text='保存​按钮')
+    text.encode('gbk')
+    assert '​' not in text
+    assert '保存按钮' in text
+
+
 def test_wait_failure_is_actionable(monkeypatch):
     def boom(*args, **kwargs):
         raise desktop.DesktopControlError('no_foreground_window: no foreground window')

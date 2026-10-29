@@ -289,7 +289,7 @@ def wait(*, target='control', text=None, state='present', timeout_ms=None,
          expected_pid=None, expected_window_id=None, runner=None,
          audit=None) -> str:
     """轮询等待一个条件成立。只读，但每次轮询都要读界面结构。"""
-    needle = ' '.join(str(text or '').split())
+    needle = ' '.join(_clean(text).split())
     desired = str(state or 'present').strip().casefold()
     try:
         result = desktop_control_windows.wait(
@@ -312,7 +312,7 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
     if not result.matched:
         state = result.state
         title = _clip(state.title, 60) or '(未定)'
-        text = (f'{_wait_elapsed(result)}内没等到「{needle}」{verb}。'
+        text = (f'{_wait_elapsed(result)}内没等到「{_clip(needle, 60)}」{verb}。'
                 f'当前前台窗口是「{title}」，可读控件 {result.elements} 个。')
         if result.truncated:
             # 遍历被节点/时间预算截断时，「没看到」不等于「不存在」。
@@ -467,7 +467,7 @@ def _after_action_text(result) -> str:
         # 读不到界面（窗口关了/遍历失败）：别编一句"没有变化"。
         parts.append('这次读不到界面状态，动作是否生效需要 desktop_inspect 确认。')
     if result.note:
-        parts.append(result.note + '。')
+        parts.append(_clean(result.note) + '。')
     if result.fingerprint_after:
         parts.append(f'结构指纹：{result.fingerprint_after}')
         parts.append('要继续操作，用上面的编号配这个指纹；'

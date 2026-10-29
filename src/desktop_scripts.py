@@ -674,12 +674,13 @@ function Get-TreeBudget($payload) {
 }
 
 function Find-TreeMatch($tree, $needle) {
-    # 按名字 / 值 / 类型标签找子串。返回值本身用于告诉模型「等到的是哪个控件」。
+    # 按名字 / 值找子串，和元素动作的 expect 核对用同一套判据。
+    # 刻意**不搜类型标签**：那样 `wait(text='按钮')` 会命中任意一个按钮，
+    # 而 schema 里写的是「控件名或值」。两边口径不一致时，模型的猜测成本最高。
     if ($null -eq $tree) { return $null }
     $lower = $needle.ToLowerInvariant()
     foreach ($item in $tree.items) {
-        $haystack = ([string]$item.name + ' ' + [string]$item.value + ' ' +
-                     [string]$item.label).ToLowerInvariant()
+        $haystack = ([string]$item.name + ' ' + [string]$item.value).ToLowerInvariant()
         if ($haystack.Contains($lower)) { return $item }
     }
     return $null
