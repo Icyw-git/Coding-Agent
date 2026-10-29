@@ -1208,8 +1208,19 @@ function Invoke-ElementAction($payload, $state) {
         $want = ([string]$payload.expect).ToLowerInvariant()
         $actual = (([string]$node.name) + ' ' + ([string]$node.value)).ToLowerInvariant()
         if (-not $actual.Contains($want)) {
-            $why = "编号和名字对不上：#" + $payload.element + " 是 "
-            $why += "「" + $node.name + "」，不是「" + $payload.expect + "」；重新调 desktop_inspect"
+            # 报错要说出"那个编号到底是什么"。名字为空时报值（有值的控件不少），
+            # 名字和值都没有——图标按钮常见——就说明 expect 可以留空：
+            # 让它反复试名字是死路，inspect 也拿不到名字。
+            $shown = ([string]$node.name).Trim()
+            if (-not $shown) { $shown = ([string]$node.value).Trim() }
+            $why = "编号和名字对不上：#" + $payload.element + " 是"
+            if ($shown) {
+                $why += "「" + $shown + "」，不是「" + $payload.expect
+                $why += "」；重新调 desktop_inspect"
+            } else {
+                $why += "一个没有名字的控件（" + $node.label + "）；"
+                $why += "expect 可以留空，指纹已经说明结构没变"
+            }
             Fail 'element_mismatch' $why $state
         }
     }

@@ -148,6 +148,16 @@ def test_powershell_verifies_expect_against_the_actual_control():
     assert '编号和名字对不上' in script
 
 
+def test_unnamed_control_mismatch_says_expect_may_be_empty():
+    """图标按钮常常没名字也没值。
+
+    这时"编号和名字对不上，重新调 inspect" 是死路：inspect 也拿不到名字，
+    模型只能反复试。直接告诉它这条可以留空——指纹已经排除了结构变动。
+    """
+    script = desktop.worker_script()
+    assert 'expect 可以留空' in script
+
+
 def test_setvalue_requires_text_and_rejects_it_for_other_operations():
     with pytest.raises(desktop.DesktopControlError):
         desktop.validate_element_action('setvalue', 1, FP, **IDENTITY)

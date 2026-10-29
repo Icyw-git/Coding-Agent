@@ -53,7 +53,9 @@ def _desktop_summary(name: str, arguments: dict) -> str:
     if action == 'key':
         return f'按键 {arguments.get("key")}'
     if action == 'scroll':
-        return f'滚动 {arguments.get("amount")} 格'
+        # amount 是可选参数（默认 3 格）：没给时别把 None 端到用户面前。
+        amount = arguments.get('amount')
+        return f'滚动 {amount} 格' if amount not in (None, '') else '滚动'
     if action == 'focus':
         return '切到前台'
     return _DESKTOP_ACTIONS.get(action, '')

@@ -96,6 +96,17 @@ def test_desktop_action_activity_says_what_it_did(args, fragment):
     line.encode('gbk')
 
 
+def test_desktop_scroll_without_amount_shows_no_none():
+    """amount 是可选参数：没给时整行不能出现 `None`。
+
+    活动行是给用户看的一行字，`滚动 None 格` 是内部默认值漏了出来。
+    """
+    line = tool_activity.format_line(
+        'desktop_action', {'action': 'scroll', 'x': 100, 'y': 200}, 0.42)
+    assert 'None' not in line
+    assert '滚动' in line
+
+
 @pytest.mark.parametrize('name,args,fragment', [
     ('desktop_wait', {'text': '已保存'}, '等「已保存」出现'),
     ('desktop_wait', {'text': '加载中', 'state': 'absent'}, '等「加载中」消失'),
