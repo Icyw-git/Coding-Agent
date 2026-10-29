@@ -454,6 +454,15 @@ function Read-ElementNode($el, $cache) {
     }
     $value = ''
     $readOnly = $false
+    $value = ''
+    $readOnly = $false
+    # 只对输入类控件（Edit/ComboBox/Spinner）用 ValuePattern。
+    #
+    # Document 也有 ValuePattern，但它的 SetValue 是**整篇替换**：一次调用就把
+    # 打开的那份文件内容换掉，而且没有撤销（实测把用户打开的 auth.json 全换成
+    # 了一个短字符串，只留在记事本的编辑缓冲里，没落盘算是侥幸）。所以：
+    # 内容不读（几 MB 的全文）、写入也不给（那不是"填一个字段"，是"覆盖整个文件"）。
+    # 文档要输入就用 action=type 逐字敲，至少是增量、可 Ctrl+Z。
     if ($script:TREE_VALUE_TYPES -contains $type) {
         $valuePattern = Get-CachedPattern $cached ([System.Windows.Automation.ValuePattern]::Pattern)
         if ($null -ne $valuePattern) {
@@ -915,9 +924,23 @@ function Invoke-ElementOperation($el, $node, $operation, $text, $amount, $scroll
             $why = '拒绝写入密码框；这类输入必须用户自己敲'
             return [ordered]@{ code = 'password_field'; message = $why }
         }
+        # Document 的 SetValue 是整篇替换（一次调用覆盖全文、没有撤销）。
+        # 实测踩过：对着用户打开的 auth.json 执行 setvalue，整个编辑缓冲被换成
+        # 一个短字符串——文件没落盘算侥幸，但这不是"填一个字段"该有的破坏力。
+        # 文档输入请用 action=type：增量、能 Ctrl+Z。
+        $controlType = ''
+        try { $controlType = [string]$el.Current.ControlType.ProgrammaticName } catch { }
+        if ($controlType -eq 'ControlType.Document') {
+            $why = '这是文档控件：写入会整篇替换（覆盖全文，撤不回来）；'
+            $why += '改用 action=type 逐字键入'
+            return [ordered]@{ code = 'operation_unsupported'; message = $why }
+        }
         $pattern = Get-LivePattern $el ([System.Windows.Automation.ValuePattern]::Pattern)
         if ($null -eq $pattern) {
+            # 记事本的编辑器（Document）没有 ValuePattern，"它支持：scroll"
+            # 等于没说——模型真正该做的是用键盘敲进去。
             $why = '这个控件不接受写入内容；' + (Get-OperationHint $node)
+            $why += '。可以改用 action=type 敲进去（先 focus 它，或直接敲给当前焦点）'
             return [ordered]@{ code = 'operation_unsupported'; message = $why }
         }
         $readOnly = $false

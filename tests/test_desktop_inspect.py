@@ -500,6 +500,25 @@ def test_inspect_text_marks_disabled_and_focused(monkeypatch):
     assert '当前焦点' in text
 
 
+def test_documents_are_neither_readable_nor_replaceable():
+    """文档控件两头都要堵：内容不读，整篇也不许替换。
+
+    Notepad 的编辑器是 ControlType.Document，带 ValuePattern，而它的 SetValue
+    是**整篇替换**（一次调用覆盖全文，没有撤销）。实测踩过：对着用户打开的
+    auth.json 执行 setvalue，整个编辑缓冲被换成一个短字符串。
+
+    所以 TREE_VALUE_TYPES 里不能有 Document（几 MB 的全文不能进输出），
+    setvalue 那条路径也要明确拒绝——文档输入走 action=type，增量且可撤销。
+    """
+    script = desktop.worker_script()
+    values = script.split('TREE_VALUE_TYPES = @(', 1)[1].split(')', 1)[0]
+    assert 'Document' not in values
+    action = script.split('function Invoke-ElementOperation', 1)[1].split(
+        chr(10) + 'function ', 1)[0]
+    assert "ControlType.Document" in action
+    assert 'action=type' in action
+
+
 def test_inspect_text_reports_truncation(monkeypatch):
     _patch_tree(monkeypatch, _tree(desktop._element_info(_item(), 1),
                                    truncated=True))
