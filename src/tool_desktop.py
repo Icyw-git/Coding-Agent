@@ -236,8 +236,11 @@ def _element_line(item) -> str:
     if marks:
         line += ' · ' + ' · '.join(marks)
     if item.bounds:
+        # 写成「左,上 宽x高」而不是四个裸数字：模型要按坐标点时必须自己算中心，
+        # 顺序弄反就点到窗口边上去了（实测我把 (x,y,w,h) 当成 (x1,y1,x2,y2)，
+        # 点到标题栏上）。
         left, top, width, height = item.bounds
-        line += f' ({left},{top},{width},{height})'
+        line += f' ({left},{top} {width}x{height})'
     return '  ' + line
 
 
@@ -272,8 +275,7 @@ def inspect(*, runner=None, audit=None) -> str:
              + ('（已按上限截断）' if tree.truncated else '')]
     if state.dpi and state.dpi != 96:
         percent = int(round(state.dpi / 96.0 * 100))
-        lines.append(f'这块屏是 {percent}% 缩放；下面的坐标是物理像素，'
-                     f'desktop_action 用同一套。')
+        lines.append(f'这块屏是 {percent}% 缩放。')
     lines.extend(_element_line(item) for item in tree.items)
     lines.append(f'结构指纹：{tree.fingerprint}')
     lines.append(f'要操作其中某个控件，用 desktop_action：action 填 element，'
@@ -282,6 +284,9 @@ def inspect(*, runner=None, audit=None) -> str:
                  f'expected_pid 填 {state.pid}，'
                  f'expected_window_id 填 {state.window_id}。'
                  f'编号在界面变化后会失效，届时重新 desktop_inspect。')
+    if any(item.bounds for item in tree.items):
+        lines.append('括号里是「左,上 宽x高」，物理像素，和截图、desktop_action 的 '
+                     'x/y 同一套；要按坐标点就点 左+宽/2, 上+高/2。')
     if len(tree.items) <= 2:
         # 实测：走旧式无障碍桥的应用（部分 WinForms / 老程序 / 部分 Explorer
         # 视图）只暴露一两个节点。总得告诉模型“不是你没看懂，是它就这么多”。

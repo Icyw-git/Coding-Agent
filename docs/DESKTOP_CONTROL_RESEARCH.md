@@ -140,6 +140,12 @@
 | `desktop_action` | move/click/type/key/scroll/sequence/focus | 绝对屏幕坐标，校验落在窗口 rect + 虚拟屏内 |
 | `focus` | 切前台 | pid+hwnd 双因子 |
 
+`desktop_inspect` 的控件坐标写成 `(左,上 宽x高)`，并在输出里说明"按坐标点就点
+左+宽/2, 上+高/2"。最初是四个裸数字 `(左,上,宽,高)`，我自己按 `(x1,y1,x2,y2)`
+读成了中心，点到标题栏上——模型没有理由比我更懂这个顺序。实测 150% 缩放下按
+物理像素算出的中心点能精确命中控件（点复选框中心的焦点就是那个 CheckBox），
+说明 worker 的 DPI 感知与截图/OCR 是同一套坐标空间。
+
 另有 `screen_capture`（PNG 存 cache 并附到下一轮）和 `screen_ocr`（WinRT OCR，
 **带每行 bbox**，图像像素坐标）。
 

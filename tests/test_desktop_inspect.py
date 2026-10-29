@@ -426,6 +426,20 @@ def test_inspect_text_lists_controls_with_fingerprint(monkeypatch):
     text.encode('gbk')
 
 
+def test_coordinates_are_grouped_and_explained(monkeypatch):
+    """四个裸数字没人看得出顺序，模型要按坐标点时必须自己算中心。
+
+    我自己就按 (x1,y1,x2,y2) 读成了中心 (372,91)，点到标题栏上去了。所以：
+    1. 分组写成「左,上 宽x高」；2. 输出里说明怎么算中心。
+    """
+    _patch_tree(monkeypatch, _tree(desktop._element_info(
+        _item(id=1, name='提交', bounds=[100, 200, 60, 30]), 1)))
+    text = tool_desktop.inspect()
+    assert '(100,200 60x30)' in text
+    assert '左,上 宽x高' in text
+    assert '左+宽/2' in text
+
+
 def test_inspect_text_hides_password_value(monkeypatch):
     """密码框的值一个字符都不能出现在输出里。"""
     _patch_tree(monkeypatch, _tree(desktop._element_info(
