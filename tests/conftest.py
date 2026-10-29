@@ -47,6 +47,28 @@ def _isolate_cron_durable_path(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_rules_file(tmp_path, monkeypatch):
+    """把规则文件指到临时目录。
+
+    规则文件（`.cache/rules.yaml`）是**活配置**：exec_policy 每次判定都会读它。
+    原来有测试直接 `rules.write(...)` 到真实路径，于是：
+    - 测试跑完会在工作区留下一堆 `allow npm test` 之类的规则，影响真实的自动放行；
+    - `test_rules_integration` 为了测"文件损坏"会把真实文件写成 `rules: [`，
+      一旦中途失败就留在那里；
+    - 上一次运行留下的规则还会让下一次的断言时好时坏（`add_same_rule` 曾
+      一半概率失败）。
+    """
+    import rules
+
+    monkeypatch.setattr(rules, 'DURABLE_PATH', tmp_path / 'rules.yaml')
+    rules._CACHE.clear()
+    try:
+        yield
+    finally:
+        rules._CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _block_unstubbed_llm_calls(monkeypatch):
     """测试默认禁止真实模型请求：没打桩就失败，而不是悄悄产生费用。
 

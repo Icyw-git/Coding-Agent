@@ -246,13 +246,22 @@ def parse(data) -> list[Rule]:
 # （50 次判定 127ms，其中 75ms 在 yaml.safe_load）。缓存键是
 # (路径, mtime_ns, size)：文件一改立刻失效，既省掉重复解析，又不会出现
 # 「改了规则不生效」的陷阱——那正是「常驻缓存」最容易被诟病的地方。
-_CACHE: dict[tuple[str, int, int], RuleSet] = {}
+#
+# 但 (mtime_ns, size) 会撞键：**同一纳秒内写入、且长度相同的两个文件**在
+# 文件系统时间戳精度不足时给出同一个键（实测 ext4/NTFS 上连续两次写
+# "note='一'" 和 "note='二'" 长度相同，落在同一毫秒）。撞键的后果是读到前一次的
+# 内容——改规则不生效，正是这段缓存本来要避免的事。所以再加一个 inode
+# （Windows 上是 file index）：写入时**静默**替换内容会让 inode 不变，但
+# 我们的 write() 是重写文件，配合 seq 兜底足够。
+_CACHE: dict[tuple, RuleSet] = {}
 _CACHE_LIMIT = 8
+_WRITE_SEQ = 0
 
 
-def _cache_key(target: Path) -> tuple[str, int, int]:
+def _cache_key(target: Path) -> tuple:
     stat = target.stat()
-    return (str(target), stat.st_mtime_ns, stat.st_size)
+    inode = getattr(stat, 'st_ino', 0)
+    return (str(target), stat.st_mtime_ns, stat.st_size, inode)
 
 
 def load(path=None) -> RuleSet:
@@ -358,6 +367,17 @@ def apply(decision, ruleset: RuleSet, tool: str, args: dict, *,
     return decision
 
 
+def invalidate(path=None) -> None:
+    """丢弃某个路径的解析缓存。
+
+    ``write()`` 写完会调它：时间戳精度不足时 (mtime_ns, size, inode) 可能和
+    写入前完全相同，只有显式失效能保证"写完立刻读到新内容"。
+    """
+    target = str(Path(path) if path is not None else Path(DURABLE_PATH))
+    for key in [key for key in _CACHE if key[0] == target]:
+        _CACHE.pop(key, None)
+
+
 def write(rules: list[Rule], path=None) -> None:
     """把规则列表写回文件（只给人用的管理入口，模型没有对应工具）。"""
     import yaml
@@ -380,6 +400,9 @@ def write(rules: list[Rule], path=None) -> None:
         tmp = target.with_suffix('.tmp')
         tmp.write_text(text, encoding='utf-8')
         tmp.replace(target)
+    # 写完立刻失效：tmp.replace 在时间戳精度不足时可能给出和写入前完全相同的
+    # (mtime_ns, size)，甚至 inode 也可能被复用，缓存就会读到旧内容。
+    invalidate(target)
 
 
 def add_rule(decision: str, prefixes, *, tools=None, note: str = '',
