@@ -639,6 +639,7 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
             raise DesktopControlError(f'sequence 最多 {MAX_SEQUENCE_STEPS} 步')
         return {'action': 'sequence', 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
+                'allow_terminal': bool(allow_terminal),
                 'steps': [_validated_step(step) for step in steps]}
     if steps is not None:
         raise DesktopControlError("steps 只在 action='sequence' 时有效")
@@ -674,7 +675,7 @@ def validate_action(action: str, *, expected_pid=None, expected_window_id=None,
     if action == 'key':
         return {'action': action, 'expected_pid': expected_pid,
                 'expected_window_id': expected_window_id,
-                'key': _validated_key(key)}
+                'allow_terminal': terminal_ok, 'key': _validated_key(key)}
     try:
         amount = int(amount)
     except (TypeError, ValueError) as exc:

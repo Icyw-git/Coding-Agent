@@ -517,7 +517,16 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
         return str(exc) if _is_refusal(str(exc)) else f'操作没做成：{exc}'
     state = result.state
     step_records = getattr(result, 'steps', ()) or ()
-    extra = {'steps': len(step_records)} if result.action == 'sequence' else {}
+    # 坐标和键名要进台账：只记「点了一次」没法回答「点在哪儿」。
+    # 它们不是输入内容，没有隐私问题（键入的文本仍然一个字都不记）。
+    extra = {}
+    if result.action == 'sequence':
+        extra['steps'] = len(step_records)
+    else:
+        if x is not None and y is not None:
+            extra['x'], extra['y'] = int(x), int(y)
+        if key:
+            extra['key'] = str(key)[:40]
     _action_audit(audit, result.action, state,
                   duration_ms=result.duration_ms, **extra)
     if result.action == 'sequence':

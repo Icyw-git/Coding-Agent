@@ -12074,3 +12074,64 @@ assert set() == {'old-one'}
 
 > **偶发失败先分两类：是"测太早"还是"碰了真实资源"。** 这次是前者，
 > 改测试；上次（rules 缓存撞键）是后者，改产品。
+
+---
+
+# 第 62 部分：一条永远做不到的建议（allow_terminal 漏了两个分支）
+
+查"台账能不能回答点在哪儿"时顺手验按键，撞到这件事：
+
+```
+操作没做成：terminal_input: 往终端窗口键入等于执行命令；确认窗口后带上 allow_terminal=true 再试
+```
+
+照做，还是同一句。原因在 `validate_action`：
+
+| 动作 | 带 allow_terminal |
+| --- | --- |
+| move | 有 |
+| type | 有 |
+| scroll | 有 |
+| **key** | **没有** |
+| **sequence** | **没有** |
+
+而 PS 侧的判定是 `$inputAction = ($payload.action -in @('type','key'))`，序列还要
+再看每一步。于是终端窗口里：
+
+- 按一次 `escape` / `enter`：**永远被拒**，提示让人带 `allow_terminal=true`，
+  带了也不生效；
+- 含 type/key 的序列：同样永远被拒。
+
+这不是绕过了什么防线，是**防线把正确操作也挡住了，还教用户做一件没用的事**。
+`enter` 在终端里就是执行命令，所以这道门本身是对的——错的是它没留正确的钥匙孔。
+
+## 改法
+
+`key` 与 `sequence` 两个分支补上 `'allow_terminal': terminal_ok`，与其他动作对齐。
+
+真机验证（用自己的 WinForms 测试窗口，它由 powershell 托管，所以 `is_terminal`
+为真，正好落在这道门上）：
+
+```
+不带 allow_terminal：terminal_input: …带上 allow_terminal=true 再试
+带上 allow_terminal：已完成按键。前台窗口：Harness UI Test Window…
+序列带 allow_terminal：已执行 1 个步骤
+```
+
+新增守卫：`key` / `type` / `sequence` 三个动作的 payload 都必须原样带上
+allow_terminal（True 和 False 两种）。
+
+## 收获
+
+> **凡是错误消息里给出"照这个再做一次"，那条路必须真的通。** 一条做不到的建议
+> 比没有建议更坏：用户会反复尝试，最后以为工具坏了。
+
+> **同类参数要逐个动作核对，别只验一个。** 我上一轮验的是 `type`（还验过一个
+> 用 `setvalue` 的元素动作），两个都通过，就以为"allow_terminal 通了"。
+> 五个动作里漏了两个，最常用的 `key` 恰好在里面。
+
+## 顺带：台账现在记得住"点在哪儿"
+
+`desktop_action` 的审计字段加了 `x` / `y` / `key`。之前只记 `action=click`，
+事后没法回答"点在哪"；坐标和键名不是输入内容，没有隐私问题——键入的**文本**
+仍然一个字都不记（这条也有实测：`type` 一段"机密内容ABC"，事件里搜不到）。

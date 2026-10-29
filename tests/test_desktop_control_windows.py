@@ -316,6 +316,27 @@ def test_allow_terminal_is_part_of_the_payload():
     assert payload['allow_terminal'] is True
 
 
+@pytest.mark.parametrize('action,kwargs', [
+    ('key', {'key': 'enter'}),
+    ('type', {'text': 'x'}),
+    ('sequence', {'steps': [{'action': 'key', 'key': 'enter'}]}),
+])
+def test_allow_terminal_reaches_every_input_action(action, kwargs):
+    """每一种"能变成命令"的动作都要把 allow_terminal 带上。
+
+    漏了的话，终端窗口里按一次 enter 会被拒，而提示写的是「带上
+    allow_terminal=true 再试」——照做还是不通过，这条建议就成了死路。
+    实测 key 和 sequence 都漏过。
+    """
+    payload = desktop.validate_action(action, expected_pid=1,
+                                      expected_window_id='AB',
+                                      allow_terminal=True, **kwargs)
+    assert payload['allow_terminal'] is True
+    payload = desktop.validate_action(action, expected_pid=1,
+                                      expected_window_id='AB', **kwargs)
+    assert payload['allow_terminal'] is False
+
+
 def test_terminal_flag_does_not_affect_move():
     """点一下终端选中文字是正常需求：只有 type/key 受终端保护影响。"""
     script = desktop.CONTROL_SCRIPT
