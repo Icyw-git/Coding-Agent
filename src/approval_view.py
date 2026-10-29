@@ -413,9 +413,15 @@ def _desktop_detail(tool: str, args: dict) -> str:
             amount = args.get('amount')
             if isinstance(amount, int) and amount:
                 verb += f"（{'向下' if amount > 0 else '向上'} {abs(amount)} 格）"
-        fields.append(verb)
-        if isinstance(args.get('text'), str):
-            fields.append(f"写入 {len(args['text'])} 个字符")
+        text = args.get('text')
+        if isinstance(text, str) and operation == 'setvalue':
+            # 和 action=type 用同一套说法：字数 + 内容开头。写在输入框里的东西
+            # 审批人要能看见——「写入」两个字配一个数字，等于让人闭着眼睛批。
+            fields.append(f'写入 {len(text)} 个字符')
+            if text:
+                fields.append('内容：' + ' '.join(text[:80].split()))
+        else:
+            fields.append(verb)
     return '桌面操作：' + '，'.join(fields)
 
 

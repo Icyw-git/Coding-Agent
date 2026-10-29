@@ -264,6 +264,31 @@ def test_new_tools_do_not_leak_raw_kwargs():
         assert 'batch_id=' not in text, tool
 
 
+def test_element_write_shows_what_will_be_written():
+    """写入控件的审批要给出内容，不能只有「写入 N 个字符」。
+
+    和 action=type 用同一套说法：字数 + 内容开头。只给数字等于让人闭着眼睛批。
+    """
+    text = approval_view.detail('desktop_action', {
+        'action': 'element', 'element': 2, 'operation': 'setvalue',
+        'expect': '文件名', 'text': '季度报告 2026Q3.docx'})
+    assert '「文件名」' in text
+    assert '写入 16 个字符' in text
+    assert '内容：季度报告 2026Q3.docx' in text
+    assert '写入，写入' not in text
+    text.encode('gbk')
+
+
+def test_element_non_write_operations_keep_the_short_verb():
+    """没写内容的操作不该被拼成「点击 0 个字符」这种话。"""
+    for operation, verb in (('invoke', '点击该控件'), ('toggle', '切换开关')):
+        text = approval_view.detail('desktop_action', {
+            'action': 'element', 'element': 3, 'operation': operation,
+            'expect': '记住我'})
+        assert verb in text
+        assert '个字符' not in text
+
+
 def test_detail_accepts_the_display_label_too():
     """`detail()` 按原始工具名分支渲染，但传中文标签也得到同样的结果。
 
