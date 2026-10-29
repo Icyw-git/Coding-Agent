@@ -24,7 +24,9 @@ READ_ONLY_TOOLS = frozenset({
     'glob', 'grep', 'ls', 'web_fetch', 'load_skill',
     'todo_read', 'list_tasks', 'get_task', 'list_crons', 'background_output',
     'find_sessions', 'screen_ocr', 'clipboard_read', 'desktop_snapshot',
-    'desktop_windows',
+    'desktop_inspect', 'desktop_displays', 'desktop_wait', 'desktop_windows',
+    # 记忆召回只读磁盘，重试没有副作用。
+    'recall',
 })
 
 # Repeating converges to the same state or is refused by a status guard.
@@ -32,6 +34,8 @@ IDEMPOTENT_TOOLS = frozenset({
     'write', 'todo_write', 'claim_task', 'complete_task',
     'cancel_cron', 'kill_background', 'keep_worktree',
     'rename_session', 'revoke_permissions', 'clipboard_write',
+    # 同名写入走合并、删除已删的等价于无事发生、撤销已撤销的也会被拒。
+    'remember', 'forget', 'undo_moves', 'move_paths',
 })
 
 # Repeating may duplicate, consume, or apply twice; inspect state first.
@@ -42,7 +46,10 @@ DESTRUCTIVE_TOOLS = frozenset({
     'edit', 'apply_patch', 'create_task', 'schedule_cron',
     'spawn_teammate', 'send_message', 'check_inbox', 'request_shutdown',
     'request_plan', 'review_plan', 'create_worktree', 'remove_worktree',
-    'screen_capture', 'desktop_action', 'delete_paths',
+    'screen_capture', 'desktop_action', 'delete_paths', 'remind',
+    # harness.py 在导入期把它们注册进来（不在 tools.py 的静态表里）：
+    # `task` 起子代理、`checkpoint` 生成新快照，重复都会留下东西。
+    'task', 'checkpoint',
 })
 
 # Category order is the order used in recovery text: least to most careful.

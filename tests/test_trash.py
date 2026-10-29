@@ -167,9 +167,9 @@ def test_approval_detail_lists_every_target():
     import approval_view
 
     single = approval_view.detail('delete_paths', {'paths': ['D:/a.txt']})
-    assert 'recycle bin' in single and 'D:/a.txt' in single
+    assert '回收站' in single and 'D:/a.txt' in single
 
     many = approval_view.detail('delete_paths',
                                 {'paths': [f'D:/f{i}.txt' for i in range(25)]})
-    assert 'move 25 item(s)' in many
-    assert '5 more' in many      # 只列前 20 条
+    assert '把 25 项移到回收站' in many
+    assert '还有 5 项' in many      # 只列前 20 条

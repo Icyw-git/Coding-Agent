@@ -39,14 +39,15 @@ def _clip(text: str, limit: int) -> str:
 
 def _request_block(req: dict, index: int, budget: int) -> tuple[str, list[dict]]:
     """单条请求的正文与按钮；预算用于控制整卡长度。"""
-    tool = approval_view.safe_text(
-        approval_view.tool_label(req.get('tool')))
+    # 显示用中文标签，但 detail() 按**原始工具名**渲染：传标签会退化成 key=value。
+    raw_tool = str(req.get('tool') or '')
+    tool = approval_view.safe_text(approval_view.tool_label(raw_tool))
     # 按 code 给中文解释：req['reason'] 是写给模型的英文
     # （"moves or renames files (reversible via undo_moves...)"）。
     reason = _clip(approval_view.safe_text(
         approval_view.reason_zh(req.get('code'), req.get('reason'))),
         MAX_REASON_CHARS)
-    detail = approval_view.detail(tool, req.get('args') or {})
+    detail = approval_view.detail(raw_tool, req.get('args') or {})
     if detail and len(detail) > budget:
         detail = _clip(detail, budget)
     req_id = req['req_id']

@@ -1,4 +1,6 @@
 """tool_activity：活动行摘要、截断与失败标记。"""
+import pytest
+
 import tool_activity
 
 
@@ -71,3 +73,41 @@ def test_preview_lines_keeps_short_output_intact():
     lines, hidden = tool_activity.preview_lines('a\nb')
 
     assert lines == ['a', 'b'] and hidden == 0
+
+
+# ---------- 桌面工具的活动行 ----------
+
+@pytest.mark.parametrize('args,fragment', [
+    ({'action': 'click', 'x': 10, 'y': 20}, '点击 (10,20)'),
+    ({'action': 'type', 'text': '你好世界'}, '输入 4 字'),
+    ({'action': 'key', 'key': 'ctrl+v'}, '按键 ctrl+v'),
+    ({'action': 'scroll', 'amount': -3}, '滚动 -3 格'),
+    ({'action': 'focus'}, '切到前台'),
+    ({'action': 'sequence', 'steps': [{}, {}]}, '组合 2 步'),
+    ({'action': 'element', 'element': 3, 'operation': 'invoke',
+      'expect': '提交按钮'}, '控件 #3「提交按钮」 点击'),
+    ({'action': 'element', 'element': 7, 'operation': 'setvalue',
+      'expect': '搜索框'}, '控件 #7「搜索框」 写入'),
+])
+def test_desktop_action_activity_says_what_it_did(args, fragment):
+    """活动行每次调用都打印，只写 `操作键鼠` 等于没写。"""
+    line = tool_activity.format_line('desktop_action', args, 0.42)
+    assert fragment in line
+    line.encode('gbk')
+
+
+@pytest.mark.parametrize('name,args,fragment', [
+    ('desktop_wait', {'text': '已保存'}, '等「已保存」出现'),
+    ('desktop_wait', {'text': '加载中', 'state': 'absent'}, '等「加载中」消失'),
+])
+def test_desktop_wait_activity_shows_the_condition(name, args, fragment):
+    assert fragment in tool_activity.format_line(name, args, 0.42)
+
+
+@pytest.mark.parametrize('name', ['desktop_inspect', 'desktop_displays',
+                                  'desktop_snapshot', 'desktop_windows'])
+def test_read_only_desktop_tools_have_no_detail(name):
+    """只读工具没有"做了什么"可言，多写反而是噪声。"""
+    line = tool_activity.format_line(name, {}, 0.42)
+    assert line.count('  ') >= 2
+    assert 'action' not in line

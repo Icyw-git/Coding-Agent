@@ -69,8 +69,21 @@ _COMMAND_RULES: tuple[tuple[re.Pattern, str], ...] = (
 
 #: 需要「工具 + 参数」联合判断的规则（单看命令词会误伤）。
 _ARG_RULES: tuple[tuple[str, re.Pattern, str], ...] = (
-    # 往密码框里打字：desktop_action 的 type 动作
-    ('desktop_action', re.compile(r'(?i)\b(password|passwd|passcode|otp|2fa|验证码)\b'),
+    # 往密码框 / 验证码框里打字：desktop_action 的 type 动作。
+    #
+    # 中文**不能**用 `\b` 包：中文没有词边界，`\b验证码\b` 在
+    # 「请输入验证码1234」里永远不匹配（两个汉字都是 word 字符），
+    # 这条规则曾经因此静默失效（实测 `otp 1234` 被拦、`验证码123456` 放行）。
+    # 所以英文用 `\b`、中文用裸词；`密码是/密码：` 只收显式的凭据陈述，
+    # 不拦单写的「密码」（否则「写一段密码学的说明」会被误伤）。
+    ('desktop_action', re.compile(
+        r'(?i)\b(password|passwd|passcode|otp|2fa)\b'
+        r'|验证码|短信码|动态码|校验码|密码[是为:：]'
+        # 凭据「形状」比词更可靠：sk-xxx / ghp_xxx / AKIAxxx / 私钥块。
+        # 不按 `token` 这个词猜——「加一个 token 字段」这种正常输入会被误伤，
+        # 而 `token 1234567890` 和任意一个数字串没办法区分。
+        r'|sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}'
+        r'|-----BEGIN [A-Z ]*PRIVATE KEY-----'),
      'typing a password or verification code'),
     # 把凭据复制到剪贴板给别的程序用
     ('clipboard_write', re.compile(

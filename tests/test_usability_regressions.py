@@ -21,7 +21,7 @@ def test_patch_detail_shows_touched_paths_and_stats():
         '*** End Patch',
     ])
     text = av.detail('apply_patch', {'patch': patch})
-    assert 'patch touches 3 path(s)' in text
+    assert '补丁涉及 3 个路径' in text
     assert 'add a.txt' in text
     assert 'update b.py' in text
     assert 'delete c.md' in text

@@ -13,9 +13,57 @@ _PRIORITY = (
 )
 
 
+#: 桌面动作的单行摘要。这一行每次调用都会打印，必须短到能塞进一行，
+#: 同时说清"点了什么/打了什么"——只给 `操作键鼠` 等于没写。
+_DESKTOP_ACTIONS = {
+    'move': '移动', 'click': '点击', 'type': '输入', 'key': '按键',
+    'scroll': '滚动', 'sequence': '组合', 'focus': '切窗口',
+    'element': '控件操作',
+}
+
+
+
+def _desktop_summary(name: str, arguments: dict) -> str:
+    if name in ('desktop_inspect', 'desktop_displays', 'desktop_snapshot',
+                'desktop_windows'):
+        return ''
+    if name == 'desktop_wait':
+        needle = ' '.join(str(arguments.get('text') or '').split())[:24]
+        absent = str(arguments.get('state') or '') == 'absent'
+        return f'等「{needle}」{"消失" if absent else "出现"}' if needle else ''
+    action = str(arguments.get('action') or '').strip().casefold()
+    if action == 'element':
+        control = arguments.get('element')
+        name_hint = ' '.join(str(arguments.get('expect') or '').split())[:20]
+        import approval_view
+
+        verb = approval_view.ELEMENT_OPERATION_LABELS.get(
+            str(arguments.get('operation') or 'invoke').casefold(), '操作')
+        text = f'#{control if control is not None else "?"}'
+        return f'控件 {text}' + (f'「{name_hint}」' if name_hint else '') + f' {verb}'
+    if action == 'sequence':
+        steps = arguments.get('steps')
+        return f'组合 {len(steps)} 步' if isinstance(steps, list) else '组合动作'
+    if action in ('click', 'move'):
+        return (f'{_DESKTOP_ACTIONS[action]} '
+                f'({arguments.get("x")},{arguments.get("y")})')
+    if action == 'type':
+        text = arguments.get('text')
+        return f'输入 {len(text)} 字' if isinstance(text, str) else '输入'
+    if action == 'key':
+        return f'按键 {arguments.get("key")}'
+    if action == 'scroll':
+        return f'滚动 {arguments.get("amount")} 格'
+    if action == 'focus':
+        return '切到前台'
+    return _DESKTOP_ACTIONS.get(action, '')
+
+
 def summarize(name: str, arguments: dict | None) -> str:
     """从参数里挑最能说明意图的字段，压缩成一行。"""
     arguments = arguments or {}
+    if str(name or '').startswith('desktop_'):
+        return _desktop_summary(str(name), arguments)
     for key in _PRIORITY:
         value = arguments.get(key)
         if value in (None, '', [], {}):

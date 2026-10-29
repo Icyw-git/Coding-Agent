@@ -221,33 +221,113 @@ def tool_label(tool: str) -> str:
     return name or '工具'
 
 
+#: 通用兜底用的人话字段名。没有登记的工具（含 MCP 工具）会走这里，
+#: 直接打 `url=https://…` 对用户等于没写，所以能翻的先翻。
+_ARG_LABELS = {
+    'url': '网址', 'path': '路径', 'command': '命令', 'cwd': '工作目录',
+    'text': '内容', 'content': '内容', 'query': '查询', 'pattern': '模式',
+    'subject': '主题', 'description': '描述', 'title': '标题', 'name': '名称',
+    'prompt': '指令', 'schedule': '时间表', 'when': '时间', 'type': '类型',
+    'scope': '范围', 'limit': '上限', 'region': '区域', 'screen': '屏幕',
+    'lang': '语言', 'delay_ms': '延迟', 'moves': '移动', 'paths': '路径',
+    'steps': '步骤', 'element': '控件编号', 'operation': '操作',
+    'expected_pid': '目标进程', 'expected_window_id': '目标窗口',
+    'batch_id': '批次', 'session_id': '会话', 'deliver_to': '投递到',
+    'label': '标签', 'to': '收件人', 'message': '消息', 'id': '任务编号',
+    'name_or_id': '名称或编号', 'task': '任务', 'reason': '原因',
+}
+
+#: 无参数工具也要说一句「会做什么」：审批提示里什么都不写，等于让用户盲签。
+_NO_ARG_DETAILS = {
+    'compact': '压缩当前会话的上下文（旧消息会被摘要替换）',
+    'check_inbox': '取走队友发来的消息（取走即清空）',
+    'list_crons': '列出定时任务（只读）',
+    'revoke_permissions': '撤销本会话的全部免审授权，之后的调用都要重新问',
+    'todo_read': '查看当前待办清单（只读）',
+    'checkpoint': '给当前会话与工作区打一个可回退的检查点',
+}
+
+
+def _todo_detail(args: dict) -> str:
+    """待办的审批提示要逐条列出：用户批的是「这份清单」，不是「一次写入」。"""
+    import tool_todos
+
+    try:
+        items, error = tool_todos.normalize_todos(args.get('todos'))
+    except Exception:
+        return '更新待办清单'
+    if error or items is None:
+        # 参数不合法时审批提示不能说「清空清单」——那是错的。
+        return '更新待办清单（参数不合法，执行时会被拒绝）'
+    if not items:
+        return '清空待办清单'
+    lines = [f'把待办清单改成 {len(items)} 项：']
+    marks = {'pending': '未开始', 'in_progress': '进行中', 'completed': '已完成'}
+    for item in items[:20]:
+        content = ' '.join(str(item.get('content') or '').split())[:60]
+        status = marks.get(str(item.get('status') or ''), '')
+        lines.append(f'  - {content}' + (f'（{status}）' if status else ''))
+    if len(items) > 20:
+        lines.append(f'  …… 还有 {len(items) - 20} 项')
+    return chr(10).join(lines)
+
+
 def _pairs(args: dict) -> str:
-    return ', '.join(f'{key}={value}' for key, value in args.items()
-                     if value not in (None, ''))
+    parts = []
+    for key, value in args.items():
+        if value in (None, '', [], {}):
+            continue
+        parts.append(f'{_ARG_LABELS.get(key, key)}：{value}')
+    return '，'.join(parts)
 
 
 def _screen_detail(tool: str, args: dict) -> str:
     if tool == 'screen_capture':
-        screen = args.get('screen') or 'primary'
-        region = args.get('region') or 'full screen'
+        screen = '主屏' if (args.get('screen') or 'primary') == 'primary' else '全部屏幕'
+        region = args.get('region')
+        where = f'，区域 {region}' if region else '，整屏'
         delay = args.get('delay_ms')
-        suffix = f' after {delay}ms' if delay else ''
-        return f'capture the local {screen} screen ({region}){suffix}'
-    path = args.get('path') or 'the latest screenshot'
+        suffix = f'，等 {delay} 毫秒后截' if delay else ''
+        return f'截取本机{screen}{where}{suffix}'
+    path = args.get('path') or '最近一张截图'
     language = args.get('lang') or 'zh-Hans-CN'
     region = args.get('region')
-    suffix = f', region {region}' if region else ''
-    return f'run local OCR on {path} (lang={language}{suffix})'
+    suffix = f'，区域 {region}' if region else ''
+    return f'识别截图文字：{path}（语言 {language}{suffix}）。只在本机用系统自带的识别引擎，不联网'
 
 
 def _clipboard_detail(tool: str, args: dict) -> str:
     if tool == 'clipboard_read':
-        return 'read the current local clipboard text'
+        return '读取本机剪贴板当前内容'
     text = args.get('text')
     chars = len(text) if isinstance(text, str) else 0
     preview = ' '.join(text[:80].split()) if isinstance(text, str) else ''
-    suffix = f' — starts with: {preview}' if preview else ''
-    return f'replace the local clipboard with {chars} chars{suffix}'
+    suffix = f'，开头是：{preview}' if preview else ''
+    return f'用 {chars} 个字符覆盖本机剪贴板（会冲掉你现在复制的内容）{suffix}'
+
+
+_DESKTOP_ACTION_LABELS = {
+    'move': '移动鼠标', 'click': '点击', 'type': '输入文字', 'key': '按键',
+    'scroll': '滚动', 'sequence': '组合动作', 'focus': '切换窗口',
+    'element': '按控件操作',
+}
+
+#: 元素操作的中文说法，**唯一来源**。
+#:
+#: 短动词给活动行与动作回执（一行里要塞下别的信息），完整说法给审批卡
+#: （用户要看清"要对这个控件做什么"）。两张表都必须覆盖
+#: ``desktop_control_windows.ELEMENT_OPERATIONS``——有守卫测试盯着，
+#: 因为新增操作时漏改一处会让文案静默退化成英文枚举（`scroll` 就漏过）。
+ELEMENT_OPERATION_LABELS = {
+    'invoke': '点击', 'setvalue': '写入', 'toggle': '切换', 'select': '选中',
+    'expand': '展开', 'collapse': '收起', 'focus': '聚焦', 'scroll': '滚动',
+}
+
+_ELEMENT_OPERATION_LABELS = {
+    'invoke': '点击该控件', 'setvalue': '写入内容', 'toggle': '切换开关',
+    'select': '选中', 'expand': '展开', 'collapse': '收起', 'focus': '聚焦',
+    'scroll': '滚动该控件',
+}
 
 
 def _desktop_step_summary(step) -> str:
@@ -255,73 +335,88 @@ def _desktop_step_summary(step) -> str:
         return '?'
     action = step.get('action') or '?'
     if action == 'move':
-        return f"move({step.get('x')},{step.get('y')})"
+        return f"移动到 ({step.get('x')},{step.get('y')})"
     if action == 'click':
-        button = step.get('button') or 'left'
+        button = {'right': '右键', 'middle': '中键'}.get(
+            str(step.get('button') or 'left'), '左键')
         count = step.get('count') or 1
-        label = f'{button} ' if button != 'left' else ''
-        label += 'double click' if count == 2 else 'click'
-        return f"{label}({step.get('x')},{step.get('y')})"
+        return f"{button}{'双击' if count == 2 else '单击'} ({step.get('x')},{step.get('y')})"
     if action == 'type':
         text = step.get('text') if isinstance(step.get('text'), str) else ''
         preview = ' '.join(text[:40].split())
-        return f'type len={len(text)}' + (f' "{preview}"' if preview else '')
+        return f'输入 {len(text)} 个字符' + (f'：{preview}' if preview else '')
     if action == 'key':
-        return f"key={step.get('key', '')}"
+        return f"按键 {step.get('key', '')}"
     if action == 'scroll':
-        return f"scroll={step.get('amount', '')}"
+        return f"滚动 {step.get('amount', '')} 格"
     if action == 'wait':
-        return f"wait {step.get('ms', '')}ms"
+        return f"等 {step.get('ms', '')} 毫秒"
     return str(action)
 
 
 def _desktop_detail(tool: str, args: dict) -> str:
     if tool == 'desktop_snapshot':
-        return 'inspect foreground window metadata and focused UI control'
+        return '查看前台窗口信息与当前焦点控件（只读）'
     if tool == 'desktop_inspect':
-        return 'list the interactive controls of the foreground window (read-only)'
+        return '列出前台窗口的可交互控件（只读）'
     if tool == 'desktop_wait':
-        return 'wait for a control or window to appear or disappear (read-only)'
+        return '等待某个控件或窗口出现/消失（只读，会轮询一段时间）'
     if tool == 'desktop_displays':
-        return 'list monitors with bounds, work area and DPI scale (read-only)'
+        return '查看显示器大小、工作区与缩放比例（只读）'
     if tool == 'desktop_windows':
-        return 'list visible top-level windows (read-only)'
+        return '列出可见窗口（只读）'
     action = args.get('action') or 'unknown'
-    fields = [f'action={action}']
+    fields = [_DESKTOP_ACTION_LABELS.get(action, action)]
     if args.get('expected_pid') is not None:
-        fields.append(f"foreground pid={args['expected_pid']}")
+        fields.append(f"目标进程 {args['expected_pid']}")
     if args.get('expected_window_id'):
-        fields.append(f"window id={args['expected_window_id']}")
+        fields.append(f"目标窗口 {args['expected_window_id']}")
     steps = args.get('steps')
     if action == 'sequence' and isinstance(steps, list) and steps:
-        rendered = ' '.join(
-            f'{index}.{_desktop_step_summary(step)}'
-            for index, step in enumerate(steps, 1))
-        fields.append(f'steps ({len(steps)})={rendered}')
-    elif action in ('move', 'click'):
-        fields.append(f"coordinates=({args.get('x')},{args.get('y')})")
+        head = '桌面操作：' + '，'.join(fields)
+        lines = [head, f'依次执行 {len(steps)} 步：']
+        for index, step in enumerate(steps, 1):
+            lines.append(f'  {index}. {_desktop_step_summary(step)}')
+        return chr(10).join(lines)
+    if action in ('move', 'click'):
+        fields.append(f"坐标 ({args.get('x')},{args.get('y')})")
         if action == 'click':
-            fields.append(f"button={args.get('button') or 'left'}")
-            if args.get('count') not in (None, 1):
-                fields.append(f'count={args["count"]}')
+            button = {'right': '右键', 'middle': '中键'}.get(
+                str(args.get('button') or 'left'), '左键')
+            count = args.get('count')
+            fields.append(button + ('双击' if count == 2 else '单击'))
     elif action == 'type':
         text = args.get('text') if isinstance(args.get('text'), str) else ''
-        fields.append(f'text length={len(text)}')
+        fields.append(f'输入 {len(text)} 个字符')
         if text:
-            fields.append('text=' + ' '.join(text[:80].split()))
+            fields.append('内容：' + ' '.join(text[:80].split()))
     elif action == 'key':
-        fields.append(f"key={args.get('key', '')}")
+        fields.append(f"按键 {args.get('key', '')}")
     elif action == 'scroll':
-        fields.append(f"amount={args.get('amount', '')}")
+        fields.append(f"滚动 {args.get('amount', '')} 格")
     elif action == 'focus':
-        fields.append('bring that window to the foreground')
+        fields.append('把那个窗口切到前台')
     elif action == 'element':
         control = args.get('element')
-        fields.append(f"control #{control if control is not None else '?'}")
-        fields.append(f"operation {args.get('operation') or 'invoke'}")
+        # 控件名要显示出来：只给一个编号，用户没法判断自己在批准什么。
+        name = args.get('expect')
+        label = f" #{control if control is not None else '?'}"
+        if isinstance(name, str) and name.strip():
+            label += f' 「{name.strip()[:40]}」'
+        else:
+            # 没有控件名时要说清，否则用户看到一个编号以为自己看懂了。
+            label += '（未注明是哪个控件）'
+        fields.append(f'控件{label}')
+        operation = str(args.get('operation') or 'invoke')
+        verb = _ELEMENT_OPERATION_LABELS.get(operation, '操作')
+        if operation == 'scroll':
+            amount = args.get('amount')
+            if isinstance(amount, int) and amount:
+                verb += f"（{'向下' if amount > 0 else '向上'} {abs(amount)} 格）"
+        fields.append(verb)
         if isinstance(args.get('text'), str):
-            fields.append(f"text length={len(args['text'])}")
-    return 'desktop input: ' + ', '.join(fields)
+            fields.append(f"写入 {len(args['text'])} 个字符")
+    return '桌面操作：' + '，'.join(fields)
 
 
 def _delete_detail(args: dict) -> str:
@@ -331,12 +426,12 @@ def _delete_detail(args: dict) -> str:
         paths = [paths]
     items = [str(item) for item in (paths or []) if str(item).strip()]
     if not items:
-        return 'move nothing to the recycle bin (no paths)'
-    head = (f'move {len(items)} item(s) to the recycle bin (restorable):'
-            if len(items) > 1 else 'move to the recycle bin (restorable):')
+        return '没有要删除的路径'
+    head = (f'把 {len(items)} 项移到回收站（可还原）：'
+            if len(items) > 1 else '移到回收站（可还原）：')
     lines = [head] + [f'  {item}' for item in items[:20]]
     if len(items) > 20:
-        lines.append(f'  … {len(items) - 20} more')
+        lines.append(f'  …… 还有 {len(items) - 20} 项')
     return chr(10).join(lines)
 
 
@@ -424,11 +519,11 @@ def _patch_summary(patch: str) -> tuple[list[str], str]:
 def _apply_patch_detail(args: dict) -> str:
     patch = args.get('patch')
     if not isinstance(patch, str) or not patch.strip():
-        return 'no patch content'
+        return '补丁内容是空的'
     summary, stats = _patch_summary(patch)
     if not summary:
         return _content_preview(patch, limit=400)
-    head = f'patch touches {len(summary)} path(s):' + stats
+    head = f'补丁涉及 {len(summary)} 个路径：' + stats
     return head + chr(10) + chr(10).join(summary)
 
 
@@ -480,6 +575,31 @@ def _memory_detail(tool: str, args) -> str:
     return head + chr(10) + text[:300]
 
 
+#: 中文标签 -> 原始工具名。`detail()` 按**原始工具名**分支渲染，但调用方很
+#: 容易顺手传显示用的中文标签（飞书审批卡就这么错过一次）——那会让整段文案
+#: 退化成 `key=value`。这里兜一层，让两种输入都能正确渲染。
+_RAW_TOOL_BY_LABEL = {}
+
+
+def _raw_tool_name(tool: str) -> str:
+    """把「显示形态」还原成原始工具名。
+
+    `tool_label()` 产出的是 ``操作键鼠 (desktop_action)`` 这种「中文名 (原名)」，
+    调用方也可能只传中文名。三种形态都要能还原，否则文案会静默退化成 key=value。
+    """
+    text = str(tool or '')
+    if text in _TOOL_LABELS:
+        return text
+    if text.endswith(')') and '(' in text:
+        inner = text[text.rindex('(') + 1:-1].strip()
+        if inner in _TOOL_LABELS:
+            return inner
+    if not _RAW_TOOL_BY_LABEL:
+        _RAW_TOOL_BY_LABEL.update(
+            {label: name for name, label in _TOOL_LABELS.items()})
+    return _RAW_TOOL_BY_LABEL.get(text, text)
+
+
 def detail(tool: str, args) -> str:
     """审批面上给人看的操作内容：命令独占整段，其余按 key=value 摘要。
 
@@ -487,6 +607,7 @@ def detail(tool: str, args) -> str:
     内容，只换写法）。
     """
     args = args if isinstance(args, dict) else {}
+    tool = _raw_tool_name(tool)
     if tool in ('screen_capture', 'screen_ocr'):
         return safe_text(_screen_detail(tool, args))
     if tool in ('clipboard_read', 'clipboard_write'):
@@ -515,6 +636,19 @@ def detail(tool: str, args) -> str:
         return safe_text(_apply_patch_detail(args))
     command = args.get('command') if tool == 'bash' else None
     if not isinstance(command, str):
+        if tool in _NO_ARG_DETAILS and not _pairs(args):
+            return safe_text(_NO_ARG_DETAILS[tool])
+        if tool == 'checkpoint':
+            label = str(args.get('label') or '').strip()
+            return safe_text('打检查点' + (f'：{label}' if label else ''))
+        if tool == 'cancel_cron':
+            return safe_text(f"取消定时任务：{args.get('id', '')}")
+        if tool == 'send_message':
+            to = str(args.get('to') or '').strip()
+            body = str(args.get('message') or '')
+            return safe_text(f'给队友 {to} 发消息：' + ' '.join(body[:200].split()))
+        if tool == 'todo_write':
+            return safe_text(_todo_detail(args))
         return safe_text(_pairs(args))
     rest = _pairs({key: value for key, value in args.items() if key != 'command'})
     return safe_text(f'{command}\n{rest}' if rest else command)

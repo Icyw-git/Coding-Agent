@@ -165,3 +165,64 @@ def test_enforce_refuses_in_background_turns(permissive):
 def test_enforce_still_allows_normal_commands(permissive):
     hooks, _gate = permissive
     assert hooks.enforce('bash', {'command': 'ls'}, interactive=True) is None
+
+
+# ---------- 中文凭据 ----------
+
+@pytest.mark.parametrize('text', [
+    '验证码123456',
+    '请输入验证码',
+    '短信验证码 8899',
+    '动态码 5566',
+    '我的密码是abc',
+    '密码：hunter2',
+    'otp 1234',
+    'password: x',
+    'sk-abcdefghijklmnop1234',
+    'ghp_abcdefghijklmnopqrstuvwxyz01',
+    'AKIAIOSFODNN7EXAMPLE',
+])
+def test_typing_credentials_is_refused(text):
+    """往输入框里打凭据属于第四档。
+
+    踩过：规则原样是 `\b(...|验证码)\b`，而**中文没有词边界**——
+    `\b验证码\b` 在「请输入验证码1234」里永远不匹配（两个汉字都是 word
+    字符）。于是 `otp 1234` 被拦、`验证码123456` 放行，规则看起来还在。
+    """
+    assert never_do.check('desktop_action',
+                          {'action': 'type', 'text': text})
+
+
+@pytest.mark.parametrize('text', [
+    '帮我写一段密码学的说明',
+    '解释一下二次验证的原理',
+    '加一个 token 字段到配置里',
+    '今天天气不错',
+])
+def test_typing_ordinary_text_is_allowed(text):
+    """不按词猜：单写「密码」「token」不该误伤正常输入。"""
+    assert never_do.check('desktop_action',
+                          {'action': 'type', 'text': text}) == ''
+
+
+def test_credential_patterns_do_not_use_cjk_word_boundaries():
+    """守护：不允许用 \b 包住中文（那等于这条规则不存在）。
+
+    中文没有词边界，`\b验证码\b` 在「请输入验证码」里永远不匹配。
+    直接看字符相邻关系，不用正则——用正则写这个检查本身就会踩同一个坑。
+    """
+    boundary = chr(92) + 'b'
+    patterns = [pattern.pattern for pattern, _what in never_do._COMMAND_RULES]
+    patterns += [pattern.pattern for _tool, pattern, _what in never_do._ARG_RULES]
+    for pattern in patterns:
+        index = pattern.find(boundary)
+        while index != -1:
+            before = pattern[index - 1] if index else ''
+            after = pattern[index + 2] if index + 2 < len(pattern) else ''
+            for neighbour in (before, after):
+                assert not _is_cjk(neighbour), f'{boundary} 挨着中文: {pattern}'
+            index = pattern.find(boundary, index + 2)
+
+
+def _is_cjk(char: str) -> bool:
+    return bool(char) and '一' <= char <= '鿿'

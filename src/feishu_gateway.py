@@ -146,7 +146,8 @@ def format_permission_prompt(req: dict, index: int | None = None) -> str:
     审批人看不到重定向目标，就等于盲批。命令按代码块完整显示，卡片支持代码块。
     """
     tool = str(req.get('tool', '?'))
-    head = '⚠ 需要审批' + (f' #{index}' if index else '') + f' · {tool}'
+    head = ('⚠ 需要审批' + (f' #{index}' if index else '')
+            + f" · {approval_view.tool_label(tool)}")
     reason = approval_view.safe_text(req.get('reason', ''))
     detail = approval_view.detail(tool, req.get('args') or {})
     if index in (None, 1):
