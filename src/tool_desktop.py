@@ -342,8 +342,16 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
             text += '可以把 timeout_ms 调大，或先 desktop_inspect 看看现在有什么。'
         return text
     if result.desired == 'absent':
-        return (f'等到了：「{needle}」已消失，{_wait_elapsed(result)}'
-                f'（轮询 {result.polls} 次）。')
+        elapsed = f'{_wait_elapsed(result)}（轮询 {result.polls} 次）'
+        if result.authoritative:
+            return (f'等到了：「{_clip(needle, 60)}」已消失，{elapsed}。')
+        head = f'「{_clip(needle, 60)}」没再出现，{elapsed}。'
+        # 「没找到」只在遍历完整时等于「不在了」。轮询用缩小预算（80 个控件），
+        # 大窗口会被截断；读不到树时更是只能说明"看不见"。
+        detail = ('这次没读到界面结构' if not result.elements
+                  else f'这次遍历只列出 {result.elements} 个控件、被截断了')
+        return (head + chr(10) + f'注意：{detail}，所以「没找到」不等于它不在了；'
+                '先用 desktop_inspect 确认一下。')
     item = result.element
     label = f'（{item.label}）' if item else ''
     head = (f'等到了：控件「{_clip(needle, 60)}」{label}出现了，'

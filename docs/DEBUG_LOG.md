@@ -12191,3 +12191,65 @@ ERROR tests/test_workspace_diff.py::... subprocess.CalledProcessError:
 已经是 6 个工具、约 1700 行；`desktop_windows` 标注的"只读，免审批"也是错的
 （桌面工具**全部**逐次审批，`approval_class` 故意不给同类免审键）。一并改掉，
 并补上 `HARNESS_DESKTOP_CONTROL` 总开关的说明。
+
+---
+
+# 第 64 部分：「没找到」被说成了「已消失」
+
+`desktop_wait` 的 `state='absent'` 分支原来直接返回：
+
+```
+等到了：「正在加载」已消失，0.8 秒（轮询 4 次）。
+```
+
+但 PS 侧判定"消失"的写法是：
+
+```powershell
+$last = Get-UiTree $hwnd $budget.nodes $budget.depth $pollMs
+$lastMatch = Find-TreeMatch $last ([string]$payload.text)
+$hit = ($null -ne $lastMatch)
+if ($wantAbsent) { $hit = (-not $hit) }     # 没找到 = 消失
+```
+
+问题在 `$last` 有两种"找不到"：
+
+1. **遍历被截断**。轮询刻意用缩小预算（80 个控件 / 900ms），而 Edge、Excel
+   这类窗口动辄几百个控件。目标没落在前 80 个里 → 返回"没找到" → 报告"已消失"。
+2. **`$last` 是 `$null`**（遍历失败、窗口正在关）。`Find-TreeMatch $null` 返回
+   `$null` → 同样报告"已消失"。
+
+这不是措辞问题：模型会据此认为"加载框没了"，接着去点被那个加载框挡住的按钮。
+
+## 改法
+
+PS 侧不要再把这类结果压平成"命中"：
+
+```powershell
+$absentReadable  = ($null -ne $last)
+$absentTruncated = $absentReadable -and [bool]$last.truncated
+# 只有"读到了、且没被截断"才算确认它真的不在。
+authoritative = ($absentReadable -and (-not $absentTruncated))
+```
+
+工具层据此分两种说法：
+
+```
+# 确认（遍历完整）
+等到了：「正在加载」已消失，0.8 秒（轮询 4 次）。
+
+# 不确认（截断 / 读不到）
+「结果」没再出现，0.1 秒（轮询 1 次）。
+注意：这次遍历只列出 5 个控件、被截断了，所以「没找到」不等于它不在了；
+先用 desktop_inspect 确认一下。
+```
+
+真机两态都验了：完整遍历（30 个控件）走"已消失"，把
+`HARNESS_DESKTOP_TREE_NODES=5` 之后走对冲文案。
+
+## 收获
+
+> **"阴性结果"的门槛要比"阳性结果"高。** 看到目标 = 它确实在；没看到目标
+> 只说明"这次没看见"。把两者写成同一句话，等于让模型在不完整的信息上下判断。
+
+> **压缩预算的地方要重新审一遍判定语义。** 这个 bug 是"把轮询预算从 900ms 收到
+> 80 个控件"那次优化的副作用：省下的时间变成了"看起来消失"。

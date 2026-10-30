@@ -157,6 +157,32 @@ def test_wait_text_reports_disappeared(monkeypatch):
     assert '0.8 秒' in text
 
 
+def test_absent_wait_is_hedged_when_the_tree_was_incomplete(monkeypatch):
+    """「没找到」只有在遍历完整时等于「不在了」。
+
+    轮询用缩小预算（80 个控件），大窗口会被截断；读不到树时更只能说明"看不见"。
+    这时说一句「已消失」，模型就会当成对话框没了，接着去点被它挡住的东西。
+    """
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=True, target='control', desired='absent', elapsed_ms=800,
+        polls=4, state=desktop._state(_state()), elements=80, truncated=True,
+        authoritative=False))
+    text = tool_desktop.wait(text='正在加载', state='absent')
+    assert '已消失' not in text
+    assert '没再出现' in text
+    assert '不等于它不在了' in text
+    text.encode('gbk')
+
+    # 读不到界面（遍历失败 / 窗口刚关）时的说法
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=True, target='control', desired='absent', elapsed_ms=300,
+        polls=2, state=desktop._state(_state()), elements=0,
+        authoritative=False))
+    text = tool_desktop.wait(text='正在加载', state='absent')
+    assert '没读到界面结构' in text
+    assert '已消失' not in text
+
+
 def test_wait_text_reports_timeout_with_current_state(monkeypatch):
     _patch_wait(monkeypatch, desktop.WaitResult(
         matched=False, target='control', desired='present', elapsed_ms=5000,

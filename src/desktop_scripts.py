@@ -728,15 +728,22 @@ function Wait-ForControl($payload, $state, $budget, $fullBudget, $deadline) {
         if ($hit) {
             $elapsed = [int](([DateTime]::UtcNow - $started).TotalMilliseconds)
             if ($wantAbsent) {
+                # 「没找到」只有在「这次遍历完整且读得到」时才等于「不在了」。
+                # 轮询用缩小预算（80 个控件），大窗口（Edge / Excel 动辄几百个）
+                # 会被截断——那时没找到只说明它没落在前 80 个里。
+                # 读不到树（遍历失败 / 窗口刚关）同理，不能直接说"消失了"。
+                $absentReadable = ($null -ne $last)
+                $absentTruncated = $absentReadable -and [bool]$last.truncated
                 return [ordered]@{
                     matched = $true
                     polls = $polls
                     elapsed_ms = $elapsed
                     element = $null
                     fingerprint = ''
-                    elements = 0
-                    tree_truncated = $false
-                    authoritative = $false
+                    elements = $(if ($absentReadable) { $last.items.Count } else { 0 })
+                    tree_truncated = $absentTruncated
+                    # 只有"读到了、且没被截断"才算确认它真的不在。
+                    authoritative = ($absentReadable -and (-not $absentTruncated))
                 }
             }
             $final = Get-UiTree $hwnd $fullBudget.nodes $fullBudget.depth $fullBudget.ms
