@@ -27,8 +27,6 @@ _ICONS = {
     'desktop_wait': '⏳',
     'desktop_wait_failed': '⚠️',
     'desktop_list_windows': '🗂️',
-    'desktop_focus': '🎯',
-    'desktop_focus_failed': '⚠️',
     'desktop_snapshot_failed': '⚠️',
     'desktop_action': '🖱️',
     'desktop_action_failed': '⚠️',

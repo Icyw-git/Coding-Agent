@@ -51,7 +51,11 @@ def test_capture_saves_png_and_returns_image_result(tmp_path):
 
     assert isinstance(result, tool_documents.ImageResult)
     assert '截图已保存：' in result.text
-    assert '200x100' not in result.text  # 尺寸来自后端，不是请求区域
+    # 尺寸来自后端，不是请求区域（原来断言的是「200x100 不出现」，区域改成
+    # 「0,0 200x100」之后会把请求区域也匹配进去，这里改成只校验尺寸那一行）
+    assert '尺寸 800x600px' in result.text
+    assert '尺寸 200x100' not in result.text
+    assert '区域 0,0 200x100' in result.text
     assert '800x600px' in result.text
     attachment = result.images[0]
     saved = Path(attachment['path'])

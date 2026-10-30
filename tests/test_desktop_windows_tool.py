@@ -57,26 +57,15 @@ def test_list_windows_rejects_bad_limit():
 
 
 def test_focus_requires_both_identifiers():
+    """切窗口只有一条路：desktop_action(action='focus')。双因子校验在 validate_action。"""
     with pytest.raises(desktop.DesktopControlError, match='expected_pid'):
-        desktop.focus_window(expected_window_id='AB12')
+        desktop.validate_action('focus', expected_window_id='AB12')
     with pytest.raises(desktop.DesktopControlError, match='expected_window_id'):
-        desktop.focus_window(expected_pid=42)
-
-
-def test_focus_passes_both_identifiers(monkeypatch):
-    seen = {}
-
-    def fake(payload, **kwargs):
-        seen.update(payload)
-        return {'ok': True, 'state_after': {'available': True,
-                                            'process': 'notepad',
-                                            'pid': 42, 'window_id': 'AB12'}}
-
-    monkeypatch.setattr(desktop, '_run', fake)
-    state = desktop.focus_window(expected_pid=42, expected_window_id='ab12')
-    assert seen == {'action': 'focus', 'expected_pid': 42,
-                    'expected_window_id': 'AB12'}
-    assert state.process == 'notepad'
+        desktop.validate_action('focus', expected_pid=42)
+    payload = desktop.validate_action('focus', expected_pid=42,
+                                      expected_window_id='ab12')
+    assert payload == {'action': 'focus', 'expected_pid': 42,
+                       'expected_window_id': 'AB12'}
 
 
 def test_focus_rejects_invalid_window_id():

@@ -86,6 +86,20 @@ def test_state_carries_dpi(monkeypatch):
 
 # ---------- 文案 ----------
 
+def test_coordinate_tuples_are_grouped_the_same_way(monkeypatch):
+    """四个裸数字没人看得出顺序：屏幕、工作区、窗口矩形都用「左,上 宽x高」。
+
+    同一行里两种写法（`0,0 1920x1080` 与 `0,0,1920,1040`）尤其糟——读者会以为
+    它们含义不同。窗口矩形那个坑在 inspect 上踩过一次（按 x1,y1,x2,y2 读，
+    中心算到标题栏上去了）。
+    """
+    _patch(monkeypatch, _reply())
+    text = tool_desktop.displays()
+    assert '工作区 0,0 1920x1040' in text
+    assert '工作区 0,0,1920,1040' not in text
+    text.encode('gbk')
+
+
 def test_displays_text_lists_each_monitor(monkeypatch):
     _patch(monkeypatch, _reply())
     text = tool_desktop.displays()

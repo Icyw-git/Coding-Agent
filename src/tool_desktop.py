@@ -61,7 +61,9 @@ def _state_text(state) -> str:
     title = _clip(state.title, 60) or '(未命名窗口)'
     process = _clip(state.process, 40) or '未知进程'
     focused = _focus_text(state)
-    rect = ','.join(str(value) for value in state.rect) if state.rect else '未知'
+    # 同样的「左,上 宽x高」写法：四个裸数字没人看得出顺序（inspect 那处踩过）。
+    rect = (f'{state.rect[0]},{state.rect[1]} {state.rect[2]}x{state.rect[3]}'
+            if state.rect else '未知')
     return (f'前台窗口：{title}（{process}，pid {state.pid}，'
             f'窗口 {state.window_id}）· 位置 {rect} · 焦点{focused}')
 
@@ -539,14 +541,14 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
     state = result.state
     step_records = getattr(result, 'steps', ()) or ()
     # 坐标和键名要进台账：只记「点了一次」没法回答「点在哪儿」。
-    # 它们不是输入内容，没有隐私问题（键入的文本仍然一个字都不记）。
+    # 但"输入了一个字符"的键（`key='a'`）等同于键入内容，和 type 的文本一样不记。
     extra = {}
     if result.action == 'sequence':
         extra['steps'] = len(step_records)
     else:
         if x is not None and y is not None:
             extra['x'], extra['y'] = int(x), int(y)
-        if key:
+        if key and not desktop_control_windows.is_single_character(key):
             extra['key'] = str(key)[:40]
     _action_audit(audit, result.action, state,
                   duration_ms=result.duration_ms, **extra)
@@ -598,7 +600,7 @@ def displays(*, runner=None, audit=None) -> str:
         mark = '（主屏）' if item.primary else ''
         lines.append(
             f'  #{index} {_clip(item.name, 24)}{mark} {left},{top} {width}x{height}'
-            f' · 工作区 {work_left},{work_top},{work_width},{work_height}'
+            f' · 工作区 {work_left},{work_top} {work_width}x{work_height}'
             f' · {_scale_text(item.scale)}')
     foreground = result.foreground_index
     target = None
@@ -648,17 +650,3 @@ def list_windows(*, limit: int = 20, runner=None, audit=None) -> str:
     return chr(10).join(lines)
 
 
-def focus(action_args: dict, *, runner=None, audit=None) -> str:
-    """把窗口切到前台；仍要 pid + window_id 双因子。"""
-    try:
-        state = desktop_control_windows.focus_window(
-            expected_pid=action_args.get('expected_pid'),
-            expected_window_id=action_args.get('expected_window_id'),
-            runner=runner)
-    except desktop_control_windows.DesktopControlError as exc:
-        _audit(audit, 'desktop_focus_failed', reason=str(exc)[:120])
-        return f'切不到那个窗口：{exc}'
-    _audit(audit, 'desktop_focus', process=state.process, pid=state.pid,
-           window_id=state.window_id,
-           title_sha1=_title_sha1(state))
-    return f'已切到那个窗口。{_state_text(state)}'

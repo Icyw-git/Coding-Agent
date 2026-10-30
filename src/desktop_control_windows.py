@@ -418,13 +418,16 @@ def list_windows(*, limit: int = 20, runner=None,
             'windows': windows}
 
 
-def focus_window(*, expected_pid=None, expected_window_id=None, runner=None,
-                 timeout: float = DEFAULT_TIMEOUT) -> WindowState:
-    """把指定窗口切到前台。仍需 expected_pid 双因子，避免打到刚被复用的窗口 ID。"""
-    payload = validate_action('focus', expected_pid=expected_pid,
-                              expected_window_id=expected_window_id)
-    reply = _run(payload, runner=runner, timeout=timeout)
-    return _state(reply.get('state_after'))
+def is_single_character(key) -> bool:
+    """这个键是不是"敲一个字符"（``a`` / ``1``），而不是命令（``enter`` / ``ctrl+v``）。
+
+    无修饰键的单字符键等同于键入内容：审计不能记它，否则逐字敲一条密码就等于
+    把密码写进台账。校验与审计共用这一个判据，避免两处各写一遍后悄悄漂开。
+    """
+    text = str(key or '').strip()
+    if '+' in text:
+        return False
+    return len(text) == 1 and text.isascii() and text.isalnum()
 
 
 def _validated_key(key) -> str:
@@ -442,8 +445,7 @@ def _validated_key(key) -> str:
             raise DesktopControlError(f'不认识的修饰键：{modifier}')
     if len(set(modifiers)) != len(modifiers):
         raise DesktopControlError('组合键里重复了同一个修饰键')
-    if base not in SUPPORTED_KEYS and not (
-            len(base) == 1 and base.isascii() and base.isalnum()) and not (
+    if base not in SUPPORTED_KEYS and not is_single_character(base) and not (
             base.startswith('f') and base[1:].isdigit()
             and 1 <= int(base[1:]) <= 12):
         raise DesktopControlError('不认识的键名')

@@ -155,11 +155,9 @@ def test_api_requires_token(client):
     assert client.get('/v1/audit').status_code == 401
 
 
-def test_desktop_list_and_focus_are_audited():
+def test_desktop_list_is_audited():
     """新增的桌面事件必须登记进白名单，否则审计里看不到「它列过哪些窗口」。"""
-    for kind in ('desktop_list_windows', 'desktop_focus',
-                 'desktop_focus_failed'):
-        assert kind in audit.AUDIT_EVENTS, kind
+    assert 'desktop_list_windows' in audit.AUDIT_EVENTS
 
 
 def test_desktop_list_projection_keeps_only_counts():

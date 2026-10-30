@@ -57,8 +57,10 @@ def capture(screen: str = 'primary', region=None, delay_ms=0, *,
         return f'截屏失败：{exc}'
     except OSError as exc:
         return f'截图存不下来：{exc}'
-    region_text = (','.join(str(part) for part in shot.region)
-                   if shot.region else 'full')
+    # 和 inspect 的控件坐标保持同一种写法：四个裸数字看不出哪两个是宽高。
+    region_text = (f'{shot.region[0]},{shot.region[1]} '
+                   f'{shot.region[2]}x{shot.region[3]}'
+                   if shot.region else '整屏')
     text = (
         f'截图已保存：{target}\n'
         f'尺寸 {shot.width}x{shot.height}px，{len(shot.png)} 字节\n'

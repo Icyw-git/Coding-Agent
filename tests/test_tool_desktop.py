@@ -20,6 +20,22 @@ def test_snapshot_audit_does_not_store_window_title(monkeypatch):
     assert events[0][1]['title_sha1']
 
 
+def test_snapshot_rect_is_grouped_not_a_bare_tuple(monkeypatch):
+    """窗口矩形也用「左,上 宽x高」。
+
+    四个裸数字（`90,90,690,630`）看不出哪两个是宽高；inspect 的控件坐标改成
+    分组写法时漏了这一处，同一次对话里出现两种格式只会让模型更迷惑。
+    """
+    monkeypatch.setattr(desktop_control_windows, 'snapshot', lambda **kw:
+                        desktop_control_windows.WindowState(
+                            available=True, title='Notepad', process='notepad',
+                            pid=42, window_id='ABCD', rect=(90, 90, 690, 630)))
+    text = tool_desktop.snapshot()
+    assert '位置 90,90 690x630' in text
+    assert '位置 90,90,690,630' not in text
+    text.encode('gbk')
+
+
 def test_action_audit_omits_typed_text(monkeypatch):
     monkeypatch.setattr(desktop_control_windows, 'action', lambda *args, **kwargs:
                        SimpleNamespace(
@@ -35,6 +51,35 @@ def test_action_audit_omits_typed_text(monkeypatch):
     assert 'private text' not in repr(events)
     assert events[0][0] == 'desktop_action'
     assert events[0][1]['action'] == 'type'
+
+
+def test_action_audit_omits_typed_characters(monkeypatch):
+    """单字符键等于键入内容，和 type 的文本一样不能进台账。
+
+    `key` 允许 `a` / `1`。逐字敲一条密码，台账里就等于存了密码；命名键
+    （enter / tab / ctrl+v）不涉及内容，可以记。
+    """
+    monkeypatch.setattr(desktop_control_windows, 'action', lambda *args, **kwargs:
+                       SimpleNamespace(
+                           action='key', duration_ms=5,
+                           state=desktop_control_windows.WindowState(
+                               available=True, title='Notepad', process='notepad',
+                               pid=42, window_id='ABCD')))
+    for key, recorded in (('a', False), ('1', False), ('enter', True),
+                          ('ctrl+v', True)):
+        events = []
+
+        def collect(event, _events=events, **payload):
+            _events.append(payload)
+
+        tool_desktop.action('key', key=key, expected_pid=42,
+                            expected_window_id='ABCD', audit=collect)
+        assert ('key' in events[0]) is recorded, key
+    # 判据只有一处：校验放行的单字符和审计跳过的单字符必须是同一批
+    for single in ('a', '1', 'z'):
+        assert desktop_control_windows.is_single_character(single)
+    for named in ('enter', 'tab', 'ctrl+v', 'F5', 'space'):
+        assert not desktop_control_windows.is_single_character(named)
 
 
 def test_sequence_output_lists_steps_and_audit_counts_them(monkeypatch):
