@@ -548,7 +548,9 @@ def test_nearly_empty_list_after_truncation_does_not_blame_the_provider(monkeypa
         desktop._element_info(_item(id=1, name='窗口'), 1), truncated=True))
     text = tool_desktop.inspect()
     assert '遍历被截断了' in text
-    assert 'HARNESS_DESKTOP_TREE_MS' in text
+    assert 'screen_capture' in text
+    # 不给"调大预算就好"这种实测不成立的建议
+    assert 'HARNESS_DESKTOP_TREE_MS' not in text
     assert '可能不支持无障碍接口' not in text
     assert '再调一次' not in text
     text.encode('gbk')
@@ -715,6 +717,20 @@ def test_degraded_element_actions_are_audited(monkeypatch):
         audit=lambda event, **payload: events.append((event, payload)))
     assert events[0][0] == 'desktop_action'
     assert events[0][1]['degraded'] == 'click'
+
+
+def test_audit_keeps_zero_coordinates(monkeypatch):
+    """坐标 0 是合法值（屏幕边缘），不能当成空值过滤掉。
+
+    台账要回答「点在哪」：把 x=0 丢掉只留 y，事后看就是一条不完整的记录。
+    """
+    _patch_element(monkeypatch, _result(fingerprint_before=FP,
+                                        fingerprint_after=FP))
+    seen = []
+    tool_desktop._action_audit(
+        lambda event, **payload: seen.append(payload), 'click',
+        desktop._state(_state()), duration_ms=5, x=0, y=300)
+    assert seen[0]['x'] == 0 and seen[0]['y'] == 300
 
 
 def test_audit_drops_empty_extra_fields(monkeypatch):

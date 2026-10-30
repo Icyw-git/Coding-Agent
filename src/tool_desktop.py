@@ -199,7 +199,9 @@ def _action_audit(audit, action: str, state, *, duration_ms: int, **extra) -> No
     字段名只写一遍：audit 是按字段白名单落盘的，两处各写一份迟早漂移。
     """
     # 空值不落盘：`degraded=''` 这种字段只会让台账多一列噪音。
-    fields = {key: value for key, value in extra.items() if value not in (None, '', 0)}
+    # 注意别把 0 也算成空——坐标 0 是合法的（屏幕边缘），过滤掉就丢了"点在哪"。
+    fields = {key: value for key, value in extra.items()
+              if value is not None and value != ''}
     _audit(audit, 'desktop_action', action=action, process=state.process,
            pid=state.pid, window_id=state.window_id,
            duration_ms=duration_ms, title_sha1=_title_sha1(state),
@@ -294,9 +296,10 @@ def inspect(*, runner=None, audit=None) -> str:
         # 实测一个 200 个子控件的 WinForms 面板：遍历超时（7.7s，预算 2.5s）、
         # 只拿到 2 个，重试仍是 2 个。所以这里只陈述事实与可选做法，不承诺重试
         # 一定有效。
+        # 只给"确定有效"的那条：实测这个窗口调大预算（20s/400 节点）也只拿到
+        # 8 个、仍然截断，所以不能推荐"调大预算就好"。
         lines.append('这次遍历被截断了，只列出这么多，不代表窗口里只有这些。'
-                     '可以调大 HARNESS_DESKTOP_TREE_MS 重试，'
-                     '或用 screen_capture + 坐标点击。')
+                     '目标不在上面的话，用 screen_capture 看一眼再点坐标。')
     elif len(tree.items) <= 2:
         # 实测：走旧式无障碍桥的应用（部分 WinForms / 老程序 / 部分 Explorer
         # 视图）只暴露一两个节点。总得告诉模型“不是你没看懂，是它就这么多”。
@@ -360,7 +363,8 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
         detail = ('这次没读到界面结构' if not result.elements
                   else f'这次遍历只列出 {result.elements} 个控件、被截断了')
         return (head + chr(10) + f'注意：{detail}，所以「没找到」不等于它不在了；'
-                '先用 desktop_inspect 确认一下。')
+                '等待时的轮询预算比 desktop_inspect 小，'
+                '要确认就用 desktop_inspect 再看一次。')
     item = result.element
     label = f'（{item.label}）' if item else ''
     head = (f'等到了：控件「{_clip(needle, 60)}」{label}出现了，'
