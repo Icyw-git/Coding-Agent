@@ -288,7 +288,16 @@ def inspect(*, runner=None, audit=None) -> str:
     if any(item.bounds for item in tree.items):
         lines.append('括号里是「左,上 宽x高」，物理像素，和截图、desktop_action 的 '
                      'x/y 同一套；要按坐标点就点 左+宽/2, 上+高/2。')
-    if len(tree.items) <= 2:
+    if len(tree.items) <= 2 and tree.truncated:
+        # 截断时"只列出一两个"说明**没读完**，不能套下面那句"可能不支持无障碍
+        # 接口"——那是另一个原因，会让模型直接放弃控件树去截屏点坐标。
+        # 实测一个 200 个子控件的 WinForms 面板：遍历超时（7.7s，预算 2.5s）、
+        # 只拿到 2 个，重试仍是 2 个。所以这里只陈述事实与可选做法，不承诺重试
+        # 一定有效。
+        lines.append('这次遍历被截断了，只列出这么多，不代表窗口里只有这些。'
+                     '可以调大 HARNESS_DESKTOP_TREE_MS 重试，'
+                     '或用 screen_capture + 坐标点击。')
+    elif len(tree.items) <= 2:
         # 实测：走旧式无障碍桥的应用（部分 WinForms / 老程序 / 部分 Explorer
         # 视图）只暴露一两个节点。总得告诉模型“不是你没看懂，是它就这么多”。
         lines.append('这个窗口能读到的控件很少，可能不支持无障碍接口。'

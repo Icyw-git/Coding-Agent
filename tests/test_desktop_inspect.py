@@ -537,6 +537,23 @@ def test_inspect_text_reports_truncation(monkeypatch):
     assert '已按上限截断' in tool_desktop.inspect()
 
 
+def test_nearly_empty_list_after_truncation_does_not_blame_the_provider(monkeypatch):
+    """截断时「只列出一两个」说明没读完，不能套「可能不支持无障碍接口」。
+
+    那是另一个原因，会让模型直接放弃控件树去截屏点坐标。实测一个 200 个子控件
+    的 WinForms 面板：遍历超时（7.7s，预算 2.5s）只拿到 2 个，重试仍是 2 个——
+    所以文案只陈述事实，不承诺重试一定有效。
+    """
+    _patch_tree(monkeypatch, _tree(
+        desktop._element_info(_item(id=1, name='窗口'), 1), truncated=True))
+    text = tool_desktop.inspect()
+    assert '遍历被截断了' in text
+    assert 'HARNESS_DESKTOP_TREE_MS' in text
+    assert '可能不支持无障碍接口' not in text
+    assert '再调一次' not in text
+    text.encode('gbk')
+
+
 def test_inspect_text_explains_empty_tree(monkeypatch):
     _patch_tree(monkeypatch, _tree())
     text = tool_desktop.inspect()
