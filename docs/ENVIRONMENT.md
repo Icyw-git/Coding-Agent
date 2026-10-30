@@ -94,6 +94,7 @@
 | `HARNESS_DESKTOP_TREE_DEPTH` | `12` | 界面结构遍历的最大层级（2~40） |
 | `HARNESS_DESKTOP_TREE_MS` | `2500` | 单次遍历的时间预算（毫秒），超了就返回已采集部分；`desktop_wait` 复用这三个值，但每轮最多 80 个控件 / 900ms |
 | `HARNESS_DESKTOP_EXCLUDE_PROCESSES` | — | 逗号分隔的进程名；`desktop_inspect` / `desktop_wait` / 元素动作在**进入该进程的无障碍树之前**就跳过（病灶 provider 会卡住遍历） |
+| `HARNESS_DESKTOP_CONTROL` | — | 桌面控制的**总开关**，`=1` 才启用；未设时 6 个桌面工具一律 DENY |
 
 ## 6. PowerShell worker（性能）
 

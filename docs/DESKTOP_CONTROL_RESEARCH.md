@@ -131,14 +131,17 @@
 > 详见第 8 节。下面这段是补齐之前的基线，保留它才能看出改了什么。**
 
 
-4 个工具，930 行 PowerShell + UIA：
+6 个工具，约 1700 行 PowerShell + UIA（`src/desktop_scripts.py`，常驻 worker 里跑）：
 
 | 工具 | 返回 | 备注 |
 | --- | --- | --- |
 | `desktop_snapshot` | 前台窗口 title/process/pid/window_id/rect + **焦点元素** name/ControlType/IsPassword | 只有焦点元素，没有树 |
-| `desktop_windows` | 顶层窗口列表（pid、hwnd、标题、是否前台/最小化） | 只读，免审批 |
-| `desktop_action` | move/click/type/key/scroll/sequence/focus | 绝对屏幕坐标，校验落在窗口 rect + 虚拟屏内 |
-| `focus` | 切前台 | pid+hwnd 双因子 |
+| `desktop_inspect` | 前台窗口的可交互控件（编号、类型、名字、状态、可用操作、坐标）+ 结构指纹 | 三预算裁剪，50–200 tokens |
+| `desktop_wait` | 等控件/窗口出现或消失，命中后给指纹 | 轮询在一次调用内完成 |
+| `desktop_displays` | 显示器尺寸、工作区、缩放比例、前台窗口在哪块屏 | 坐标是物理像素 |
+| `desktop_windows` | 顶层窗口列表（pid、hwnd、标题、是否前台/最小化） | 只读，但仍逐次审批 |
+| `desktop_action` | move/click/type/key/scroll/sequence/focus；`action=element` 时按控件编号走 UIA | 绝对屏幕坐标，校验落在窗口 rect + 虚拟屏内；切前台走 pid+hwnd 双因子 |
+| （全部 6 个） | —— | **每次调用都要审批**，且不给「同会话同类免审」的键：`approval_class` 对桌面工具返回空串 |
 
 `desktop_inspect` 的控件坐标写成 `(左,上 宽x高)`，并在输出里说明"按坐标点就点
 左+宽/2, 上+高/2"。最初是四个裸数字 `(左,上,宽,高)`，我自己按 `(x1,y1,x2,y2)`

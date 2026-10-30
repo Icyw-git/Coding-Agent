@@ -12135,3 +12135,59 @@ allow_terminal（True 和 False 两种）。
 `desktop_action` 的审计字段加了 `x` / `y` / `key`。之前只记 `action=click`，
 事后没法回答"点在哪"；坐标和键名不是输入内容，没有隐私问题——键入的**文本**
 仍然一个字都不记（这条也有实测：`type` 一段"机密内容ABC"，事件里搜不到）。
+
+---
+
+# 第 63 部分：一次"26 个失败"的假警报，和一小时的浪费
+
+这轮我先跑全量，得到：
+
+```
+26 failed, 3294 passed, 11 skipped, 14 errors in 338.02s
+ERROR tests/test_workspace_diff.py::... subprocess.CalledProcessError:
+    Command '['git', 'init', '-q']' returned non-zero exit status 3221225794
+```
+
+`3221225794` = `0xC00000E9`？不是，是 `STATUS_DLL_INIT_FAILED`（`0xC0000142`
+的十进制写法是 3221225794）。**这是"新进程起不来"**，不是断言失败。
+
+## 判断过程
+
+1. 看失败形态：`git init`、`subprocess.CalledProcessError`、`subprocess.Timeout`……
+   **全是"起进程"这一件事**，没有一条是逻辑断言错。
+2. 看进程数：405 个，但按名字分组主要是用户自己的应用（Chrome 21、Edge 19、
+   ChatGPT 15、Qoder 14……），powershell 只有 3 个。
+3. 结论：我这轮连续跑了 10+ 次全量（每次 3~5 分钟、会拉起成百上千个子进程），
+   瞬时把桌面堆的句柄/桌面堆用掉了。**是我自己造成的，不是代码。**
+
+## 代价
+
+我因为这份报告怀疑了 `test_gateway_sim`（它确实有个真实的等待竞态，顺手修了），
+但另外 25 条我花了时间逐条看——全都是同一个原因。
+
+## 教训
+
+> **先看失败的形状，再逐条读。** 26 条失败里 25 条都带 `subprocess` + 一个
+> Windows 状态码，那是系统级信号；逐条读是在为同一个根因付 26 次成本。
+
+> **高频率跑全量会污染观测。** 连续 10+ 次全量之后，任何失败都要先问"是不是
+> 我刚跑太多"。停一会儿、重跑一次，比读 26 条栈快得多。
+
+重跑（间隔后）结果：**3342 passed / 3 skipped**。
+
+## 顺带修的真问题
+
+`test_restarting_stream_closes_old_reader` 确实有竞态：它 `for _ in range(100)`
+等 `responses[0]` 就绪，每次 `wait(0.01)`，总共最多 1 秒——而线程要先把 HTTP
+请求发出去才会进 `iter_lines`。满载时 1 秒不够，`responses` 还是空的，于是
+`IndexError`。
+
+改成 15 秒 deadline + 明确的失败信息（"流线程在 15 秒内没有发出请求"），
+把 IndexError 换成一句能读懂的话。连跑三次稳定。
+
+## 文档纠偏
+
+`DESKTOP_CONTROL_RESEARCH.md` 里"4 个工具，930 行"是**三个月前的快照**，实际
+已经是 6 个工具、约 1700 行；`desktop_windows` 标注的"只读，免审批"也是错的
+（桌面工具**全部**逐次审批，`approval_class` 故意不给同类免审键）。一并改掉，
+并补上 `HARNESS_DESKTOP_CONTROL` 总开关的说明。

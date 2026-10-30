@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from unittest.mock import Mock
 
 import httpx
@@ -104,9 +105,14 @@ def test_restarting_stream_closes_old_reader(monkeypatch):
     try:
         assert client.start_stream()
         first = client._stream_thread
-        for _ in range(100):
+        # 等的是"流真的开始读了"，而不是"线程起来了"：线程要把请求发出去才会
+        # 进 iter_lines。1 秒的固定上限在满载时会不够（全量跑里偶发 IndexError：
+        # responses 还是空的）。
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             if responses and responses[0].reading.wait(0.01):
                 break
+        assert responses, '流线程在 15 秒内没有发出请求'
         assert responses[0].reading.is_set()
         client.session_id = 'second'
         assert client.start_stream()
