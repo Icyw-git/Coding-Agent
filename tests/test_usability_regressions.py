@@ -22,9 +22,9 @@ def test_patch_detail_shows_touched_paths_and_stats():
     ])
     text = av.detail('apply_patch', {'patch': patch})
     assert '补丁涉及 3 个路径' in text
-    assert 'add a.txt' in text
-    assert 'update b.py' in text
-    assert 'delete c.md' in text
+    assert '新增 a.txt' in text
+    assert '修改 b.py' in text
+    assert '删除 c.md' in text
     # +hello、+world、+x = 2 三行新增，-x = 1 一行删除
     assert '+3/-1' in text
 
@@ -33,7 +33,7 @@ def test_patch_detail_handles_move():
     patch = '\n'.join(['*** Begin Patch', '*** Update File: old.py',
                        '*** Move to: new.py', '+x', '*** End Patch'])
     text = av.detail('apply_patch', {'patch': patch})
-    assert 'rename to new.py' in text
+    assert '重命名为 new.py' in text
 
 
 def test_patch_detail_without_recognisable_headers_falls_back():

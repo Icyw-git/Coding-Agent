@@ -70,8 +70,8 @@ def _state_text(state) -> str:
 
 _ACTION_VERBS = {
     'move': '移动鼠标', 'click': '点击', 'type': '输入文字', 'key': '按键',
-    'scroll': '滚动', 'sequence': '组合动作', 'focus': '切换窗口',
-    'element': '元素操作',
+    'scroll': '滚动', 'wait': '等待', 'sequence': '组合动作',
+    'focus': '切换窗口', 'element': '元素操作',
 }
 
 

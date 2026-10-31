@@ -20,6 +20,31 @@ def test_snapshot_audit_does_not_store_window_title(monkeypatch):
     assert events[0][1]['title_sha1']
 
 
+def test_sequence_output_names_every_step_kind(monkeypatch):
+    """每个步骤都要说清自己在干什么。
+
+    `_ACTION_VERBS` 漏了 `wait`，于是「3. 操作 完成」——等于什么都没说，
+    而 wait 恰恰是模型最容易怀疑"到底等了没有"的那一步。
+    """
+    steps = ({'action': 'move', 'ok': True}, {'action': 'wait', 'ok': True},
+             {'action': 'click', 'ok': True}, {'action': 'type', 'ok': True})
+    monkeypatch.setattr(desktop_control_windows, 'action', lambda *a, **kw:
+                        SimpleNamespace(
+                            action='sequence', duration_ms=9, steps=steps,
+                            before=desktop_control_windows.WindowState(
+                                available=True, title='Notepad', process='notepad',
+                                pid=42, window_id='ABCD'),
+                            state=desktop_control_windows.WindowState(
+                                available=True, title='Notepad', process='notepad',
+                                pid=42, window_id='ABCD')))
+    text = tool_desktop.action('sequence', expected_pid=42,
+                               expected_window_id='ABCD')
+    for verb in ('移动鼠标', '等待', '点击', '输入文字'):
+        assert verb in text, verb
+    assert '操作 完成' not in text
+    text.encode('gbk')
+
+
 def test_window_list_says_when_it_is_truncated(monkeypatch):
     """limit 截断要说清楚。
 

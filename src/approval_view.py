@@ -44,7 +44,7 @@ def _compact_value(value, depth: int):
     if isinstance(value, str):
         if len(value) <= PREVIEW_CHARS:
             return value
-        return value[:PREVIEW_CHARS] + f'… ({len(value)} chars)'
+        return value[:PREVIEW_CHARS] + f'…（共 {len(value)} 字）'
     if depth <= 0:
         return '…'
     if isinstance(value, dict):
@@ -52,13 +52,13 @@ def _compact_value(value, depth: int):
         compacted = {str(key): _compact_value(item, depth - 1)
                      for key, item in items[:MAX_ITEMS]}
         if len(items) > MAX_ITEMS:
-            compacted['…'] = f'{len(items) - MAX_ITEMS} more keys'
+            compacted['…'] = f'还有 {len(items) - MAX_ITEMS} 项'
         return compacted
     if isinstance(value, (list, tuple)):
         compacted = [_compact_value(item, depth - 1)
                      for item in value[:MAX_ITEMS]]
         if len(value) > MAX_ITEMS:
-            compacted.append(f'… ({len(value)} items)')
+            compacted.append(f'…（还有 {len(value)} 项）')
         return compacted
     return value
 
@@ -460,19 +460,19 @@ def _content_preview(text, limit: int = 300) -> str:
 
 
 def _write_detail(tool: str, args: dict) -> str:
-    path = args.get('path') or '(no path)'
+    path = args.get('path') or '（未给路径）'
     content = args.get('content')
     if not isinstance(content, str):
         return f'{path}（无内容摘要）'
-    verb = 'append to' if args.get('append') else 'write'
+    verb = '追加到' if args.get('append') else '写入'
     preview = _content_preview(content)
     fence = chr(10) + '```' + chr(10)
-    return (f'{verb} {path} ({len(content)} chars):'
+    return (f'{verb} {path}（{len(content)} 字）：'
             + fence + preview + chr(10) + '```')
 
 
 def _edit_detail(args: dict) -> str:
-    path = args.get('path') or '(no path)'
+    path = args.get('path') or '（未给路径）'
     old = args.get('old_text')
     new = args.get('new_text')
     if not isinstance(old, str) or not isinstance(new, str):
@@ -483,8 +483,8 @@ def _edit_detail(args: dict) -> str:
     removed = chr(10).join(f'- {line}' for line in old_lines)
     added = chr(10).join(f'+ {line}' for line in new_lines)
     return (f'{path}{replace_all}' + chr(10)
-            + f'--- 原内容 ({len(old)} chars)' + chr(10) + removed + chr(10)
-            + f'+++ 新内容 ({len(new)} chars)' + chr(10) + added)
+            + f'--- 原内容（{len(old)} 字）' + chr(10) + removed + chr(10)
+            + f'+++ 新内容（{len(new)} 字）' + chr(10) + added)
 
 
 def _patch_summary(patch: str) -> tuple[list[str], str]:
@@ -494,10 +494,10 @@ def _patch_summary(patch: str) -> tuple[list[str], str]:
     直接甩一份 20KB 的 diff 上去，既看不到影响面，也超出卡片长度。
     """
     actions = {
-        '*** Add File:': 'add',
-        '*** Update File:': 'update',
-        '*** Delete File:': 'delete',
-        '*** Move to:': 'move',
+        '*** Add File:': '新增',
+        '*** Update File:': '修改',
+        '*** Delete File:': '删除',
+        '*** Move to:': '重命名',
     }
     summary = []
     total_add = total_del = 0
@@ -505,8 +505,8 @@ def _patch_summary(patch: str) -> tuple[list[str], str]:
         for marker, verb in actions.items():
             if line.startswith(marker):
                 path = line[len(marker):].strip()
-                if verb == 'move':
-                    summary.append(f'  → rename to {path}')
+                if verb == '重命名':
+                    summary.append(f'  → 重命名为 {path}')
                 else:
                     summary.append(f'  {verb} {path}')
                 break
@@ -518,7 +518,8 @@ def _patch_summary(patch: str) -> tuple[list[str], str]:
                 total_add += 1
             elif line.startswith('-'):
                 total_del += 1
-    stats = f'  (+{total_add}/-{total_del} lines)' if (total_add or total_del) else ''
+    # 单个空格：head 已经以「：」结尾，两个空格会渲染成「：  （…」
+    stats = f' （+{total_add}/-{total_del} 行）' if (total_add or total_del) else ''
     return summary, stats
 
 

@@ -126,7 +126,7 @@ def test_write_detail_shows_content_preview():
     text = detail('write', {'path': 'D:/out.txt', 'content': 'hello world'})
     assert 'D:/out.txt' in text
     assert 'hello world' in text
-    assert '11 chars' in text
+    assert '（11 字）' in text
 
 
 def test_write_detail_truncates_large_content_keeping_both_ends():

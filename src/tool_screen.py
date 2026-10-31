@@ -99,8 +99,8 @@ def _resolve_screenshot(path, directory) -> Path:
     candidate = candidate.resolve()
     if not _inside(candidate, root):
         raise ocr_windows.OcrError(
-            f'OCR is limited to screenshots captured by screen_capture '
-            f'({root}); got {candidate}')
+            f'只能识别 screen_capture 存下来的截图（目录 {root}）；'
+            f'这张不在里面：{candidate}')
     if not candidate.is_file():
         raise ocr_windows.OcrError(f'找不到这张截图：{candidate}')
     return candidate

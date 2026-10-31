@@ -126,7 +126,7 @@ def test_ocr_rejects_paths_outside_screenshot_dir(tmp_path):
 
     result = tool_screen.ocr(str(outside), directory=shots)
 
-    assert 'OCR is limited to screenshots' in result
+    assert '只能识别 screen_capture 存下来的截图' in result
     assert str(outside) in result
     outside.unlink()
 
