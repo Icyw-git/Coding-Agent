@@ -111,6 +111,10 @@ def test_ocr_adds_screen_coordinates_when_sidecar_exists(tmp_path):
     assert '@(180,109)' in result
     assert '截图原点 (120,80)' in result
     assert 'desktop_action' in result
+    # 只说"可以直接当 x/y 用"是不够的：desktop_action 还要 pid 和窗口号，
+    # 不提醒的话模型会拿坐标直接点，吃一次「缺少 expected_pid」。
+    assert 'expected_pid' in result
+    assert 'desktop_snapshot' in result and 'desktop_inspect' in result
     result.encode('gbk')
 
 

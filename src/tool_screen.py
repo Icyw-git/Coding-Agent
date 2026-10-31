@@ -160,8 +160,10 @@ def ocr(path=None, lang: str = ocr_windows.DEFAULT_LANGUAGE, region=None, *,
     if result.lines:
         if origin is not None:
             lead = (f'每行的 @(x,y) 是该行中心点的屏幕坐标，'
-                    f'可以直接给 desktop_action 当 x/y 用；方括号里是图像内的 '
-                    f'bbox x,y,w,h。截图原点 ({origin[0]},{origin[1]})。')
+                    f'可以直接给 desktop_action 当 x/y 用（它还要 expected_pid 与 '
+                    f'expected_window_id，从 desktop_snapshot 或 desktop_inspect 拿）；'
+                    f'方括号里是图像内的 bbox x,y,w,h。'
+                    f'截图原点 ({origin[0]},{origin[1]})。')
             blocks.append(lead + '\n' + _format_lines(result.lines, origin))
         else:
             blocks.append('这张截图没有留下坐标信息（不是 screen_capture 生成的），'
