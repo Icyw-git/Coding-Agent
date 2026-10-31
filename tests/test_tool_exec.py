@@ -85,3 +85,49 @@ def test_fetch_url_truncates_and_reports_headers(tmp_path, monkeypatch):
 def test_background_output_validates_id():
     assert tool_exec.run_background_output('') == 'Error: bg_id must be a non-empty string'
     assert tool_exec.run_kill_background('  ') == 'Error: bg_id must be a non-empty string'
+
+
+# ---------- 输出截断 ----------
+
+def test_truncate_output_keeps_the_marker():
+    """截断必须说出来。
+
+    同步 bash 原来静默截到 5 万字，同一文件的 background_output 却会标记；
+    模型拿到 5 万字当成完整输出，末尾那行报错就看不见了。
+    """
+    text = 'x' * (tool_exec.MAX_OUTPUT_CHARS + 120)
+    out = tool_exec._truncate_output(text)
+    assert len(out) > tool_exec.MAX_OUTPUT_CHARS
+    assert '已截断' in out and str(len(text)) in out
+    out.encode('gbk')
+
+
+def test_truncate_output_leaves_short_text_alone():
+    assert tool_exec._truncate_output('abc') == 'abc'
+    edge = 'y' * tool_exec.MAX_OUTPUT_CHARS
+    assert tool_exec._truncate_output(edge) == edge
+
+
+def test_bash_marks_truncated_output(tmp_path, monkeypatch):
+    """走真实的 bash 路径确认标记会出现（不是只有辅助函数会）。"""
+    class FakeProc:
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    def fake_spawn(command, *, cwd, stdout, workspace):
+        stdout.write(b'z' * (tool_exec.MAX_OUTPUT_CHARS + 50))
+        stdout.flush()
+        return FakeProc()
+
+    monkeypatch.setattr(tool_exec.sandbox, 'spawn_shell', fake_spawn)
+    monkeypatch.setattr(tool_exec, 'close_process', lambda proc: None)
+    gate, _ = _gate()
+
+    result = tool_exec.bash('echo hi', cwd=str(tmp_path),
+                            **_bash_kwargs(tmp_path, gate))
+
+    assert '已截断' in result
+    result.encode('gbk')

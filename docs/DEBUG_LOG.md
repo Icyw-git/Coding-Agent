@@ -12626,3 +12626,52 @@ OCR 把中文按字拆开并加空格：
 
 > **改动会牵动断言时，先确认断言守的是什么。** 如果它守的就是那句文案，直接改断言；
 > 如果它守的是信息本身（比如"尺寸来自后端"），就要把断言写得更精确而不是更松。
+
+---
+
+# 第 71 部分：同一个文件里，两条输出路径一个标记截断、一个不标记
+
+`tool_exec.py` 有两处会截到 5 万字：
+
+| 路径 | 原来 |
+| --- | --- |
+| 同步 `bash` | `out[:50000]`，**一个字都不说** |
+| `run_background_output` | `text[:50000] + '\n... (truncated)'` |
+
+同一个文件、同一个上限、两种行为。前者的后果不只是"少看一点"：模型会把 5 万字
+当成完整输出，而命令的报错通常在**末尾**——它看到的是一份"看起来正常"的截断结果。
+
+改成一个函数：
+
+```python
+MAX_OUTPUT_CHARS = 50000
+
+def _truncate_output(text, limit=MAX_OUTPUT_CHARS):
+    if len(text) <= limit:
+        return text
+    return text[:limit] + chr(10) + f'...（已截断，共 {len(text)} 字）'
+```
+
+标记里带上总字数——只说"截断了"，模型还是不知道丢了多少；"共 123456 字"能帮它
+判断要不要换个更窄的命令（grep / head）。
+
+顺带修了一个拼写：`except (FileNotFoundError, OSError)` 那条返回 `f'Error:{e}'`，
+比同函数其它分支少一个空格，渲染成 `Error:[WinError 2] …`。
+
+## 查过、明确不改的两处
+
+1. **`bash(..., run_in_background=...)` 这个参数在函数体里没用到。** 一开始以为
+   是 bug——模型传 `run_in_background=true` 却阻塞执行。查下来它由
+   `tool_dispatch` 在**调用之前**处理（`should_run_background` → `start_background_task`），
+   `run_bash` 只是把它吸收掉，避免 `**args` 展开失败。不是 bug。
+2. **`tool_files` / `tool_patch` / `tool_exec` 的成功消息是英文**
+   （`Wrote N bytes to …`、`Applied patch: 2 updated…`、`No output`）。和 clipboard
+   一样：这一族内部自洽，`Error:` 前缀也全族通用。单独翻其中一句只会制造新的不一致。
+
+## 收获
+
+> **同一个上限出现在两处，就要检查两处的"告知"是否一致。** 这次的差别不在数字
+> （都是 50000），而在"说不说"。静默截断比截断本身更危险——它让不完整看起来像完整。
+
+> **看到"没被使用的参数"先别急着删。** `run_in_background` 在函数体里是死的，但
+> 在调用链上一层是活的；删掉它会当场 TypeError。先查调用方，再动手。

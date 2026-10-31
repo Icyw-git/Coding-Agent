@@ -14,6 +14,16 @@ import sandbox
 from exec_policy import resolve_tool_path
 from process_utils import close_process, kill_process_tree
 
+#: 单次输出上限。超过就截断，而且**必须标记** —— 不标记的话模型会把 5 万字
+#: 当成完整输出，末尾那行报错就看不见了。
+MAX_OUTPUT_CHARS = 50000
+
+
+def _truncate_output(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + chr(10) + f'...（已截断，共 {len(text)} 字）'
+
 
 def bash_timeout(timeout, *, default: float, background: float,
                  maximum: float) -> float:
@@ -82,13 +92,15 @@ def bash(command: str, cwd: str = None, timeout=None,
         out = out.strip()
         # PS Get-Content 误读 UTF-8 产生的替换符，GBK 控制台打印会崩
         out = out.replace('\ufffd', '?')
-        return out[:50000] if out else "No output"
+        if not out:
+            return "No output"
+        return _truncate_output(out)
     except sandbox.SandboxUnavailable as e:
         return f'Error: {e}'
     except subprocess.TimeoutExpired:
         return 'Error: Timed out while terminating command; process state unknown.'
     except (FileNotFoundError, OSError) as e:
-        return f'Error:{e}'
+        return f'Error: {e}'
     finally:
         if proc is not None:
             try:
@@ -124,8 +136,8 @@ def run_background_output(bg_id: str, wait: bool = False,
     if task is None:
         return f'Error: unknown background task {bg_id}'
     text = str(output if output is not None else task.get('result', ''))
-    if len(text) > 50000:
-        text = text[:50000] + '\n... (truncated)'
+    text = _truncate_output(
+        str(output if output is not None else task.get('result', '')))
     return (f'[{bg_id}] {status}\nCommand: {task.get("command", "")}\n'
             f'Output:\n{text or "(no output)"}')
 
