@@ -154,6 +154,8 @@ class WaitResult:
     fingerprint: str = ''
     elements: int = 0
     windows: int = 0
+    #: 可见顶层窗口总数（``windows`` 可能被 pid / 前台条件过滤过）。
+    windows_total: int = 0
     truncated: bool = False
     #: 命中的控件是否出现在「完整预算」的那次遍历里。为假说明它落在预算之外，
     #: 编号不能直接拿去做动作（要先 desktop_inspect）。
@@ -859,6 +861,7 @@ def wait(target='control', text=None, state='present', timeout_ms=None, *,
         fingerprint=str(result.get('fingerprint') or ''),
         elements=int(result.get('elements') or 0),
         windows=int(result.get('windows') or 0),
+        windows_total=int(result.get('windows_total') or 0),
         authoritative=bool(result.get('authoritative', True)),
         truncated=bool(result.get('tree_truncated')),
     )

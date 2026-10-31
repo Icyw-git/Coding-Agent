@@ -397,9 +397,16 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
 
 def _wait_window_text(result, needle: str, verb: str) -> str:
     if not result.matched:
-        return (f'{_wait_elapsed(result)}内没等到标题含「{needle}」的窗口{verb}。'
-                f'当前可见窗口 {result.windows} 个；'
-                '可以 desktop_windows 看看都有什么。')
+        # result.windows 被 pid / 前台条件过滤过：target=foreground 时它恒为
+        # 0 或 1，只说这个数会让模型以为桌面上只有一个窗口。
+        if result.windows_total > result.windows:
+            inventory = (f'当前可见窗口 {result.windows_total} 个，'
+                         f'其中符合条件（pid / 前台）的 {result.windows} 个；')
+        else:
+            inventory = f'当前可见窗口 {result.windows} 个；'
+        return (f'{_wait_elapsed(result)}内没等到标题含「{_clip(needle, 40)}」的'
+                f'窗口{verb}。' + inventory
+                + '可以 desktop_windows 看看都有什么。')
     if result.desired == 'absent':
         return (f'等到了：标题含「{needle}」的窗口已消失，'
                 f'{_wait_elapsed(result)}（轮询 {result.polls} 次）。')
@@ -633,7 +640,13 @@ def list_windows(*, limit: int = 20, runner=None, audit=None) -> str:
            total=result['total'])
     if not windows:
         return '当前没有可见的顶层窗口。'
-    lines = [f"可见窗口 {len(windows)} 个（共 {result['total']} 个）："]
+    # 「可见窗口 1 个（共 18 个）」会被读成"只看到 1 个窗口、另外 17 个是别的"，
+    # 实际是 limit 截断。和 inspect 一样把"截断"说清楚。
+    if result['total'] > len(windows):
+        lines = [f"可见窗口 {result['total']} 个，下面是前 {len(windows)} 个"
+                 f"（limit={limit}）："]
+    else:
+        lines = [f"可见窗口 {len(windows)} 个："]
     for index, item in enumerate(windows, 1):
         marks = []
         if item['foreground']:

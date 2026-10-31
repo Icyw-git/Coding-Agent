@@ -827,12 +827,18 @@ function Wait-ForWindow($payload, $deadline, $foregroundOnly) {
         if ($left -le 0) { break }
         if ($left -lt 100) { Start-Sleep -Milliseconds $left } else { Start-Sleep -Milliseconds 100 }
     }
+    # 超时时要报"当前有多少窗口"，而 $lastCount 是被 pid / 前台**过滤后**的数量：
+    # target=foreground 时它恒为 0 或 1，模型会以为桌面上只有一个窗口。
+    # 这里补一次全量枚举（只在超时路径跑一次，~40ms）。
+    $visibleTotal = 0
+    try { $visibleTotal = @(Get-VisibleWindows).Count } catch { }
     return [ordered]@{
         matched = $false
         polls = $polls
         elapsed_ms = [int](([DateTime]::UtcNow - $started).TotalMilliseconds)
         window = $lastHit
         windows = $lastCount
+        windows_total = $visibleTotal
     }
 }
 

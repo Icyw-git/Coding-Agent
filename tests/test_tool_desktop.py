@@ -20,6 +20,28 @@ def test_snapshot_audit_does_not_store_window_title(monkeypatch):
     assert events[0][1]['title_sha1']
 
 
+def test_window_list_says_when_it_is_truncated(monkeypatch):
+    """limit 截断要说清楚。
+
+    「可见窗口 1 个（共 18 个）」会被读成"只看到 1 个窗口、另 17 个是别的窗口"，
+    实际是 limit 截断——模型据此会以为桌面很空。
+    """
+    windows = [{'pid': 1, 'window_id': 'A1', 'title': '记事本',
+                'process': 'notepad', 'foreground': True, 'minimized': False}]
+    monkeypatch.setattr(desktop_control_windows, 'list_windows',
+                        lambda **kw: {'total': 18, 'windows': windows})
+    text = tool_desktop.list_windows(limit=1)
+    assert '可见窗口 18 个' in text
+    assert '前 1 个' in text
+    text.encode('gbk')
+
+    monkeypatch.setattr(desktop_control_windows, 'list_windows',
+                        lambda **kw: {'total': 1, 'windows': windows})
+    text = tool_desktop.list_windows(limit=20)
+    assert '可见窗口 1 个：' in text
+    assert '前 1 个' not in text
+
+
 def test_snapshot_rect_is_grouped_not_a_bare_tuple(monkeypatch):
     """窗口矩形也用「左,上 宽x高」。
 

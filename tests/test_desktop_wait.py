@@ -148,6 +148,28 @@ def test_wait_text_reports_control_found(monkeypatch):
     text.encode('gbk')
 
 
+def test_window_wait_timeout_reports_both_counts(monkeypatch):
+    """超时提示里的"可见窗口 N 个"不能是被过滤后的数字。
+
+    target=foreground 时列表先被筛成 1 个，只说这个数会让模型以为桌面只有一个窗口。
+    """
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=False, target='foreground', desired='present', elapsed_ms=600,
+        polls=3, state=desktop._state(_state()), windows=1, windows_total=14))
+    text = tool_desktop.wait(text='保存', target='foreground', timeout_ms=600)
+    assert '可见窗口 14 个' in text
+    assert '符合条件' in text and '1 个' in text
+    text.encode('gbk')
+
+    # 没有过滤时只说一个数字，不要多出半句话
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=False, target='window', desired='present', elapsed_ms=600,
+        polls=3, state=desktop._state(_state()), windows=9, windows_total=9))
+    text = tool_desktop.wait(text='保存', target='window', timeout_ms=600)
+    assert '可见窗口 9 个' in text
+    assert '符合条件' not in text
+
+
 def test_wait_text_reports_disappeared(monkeypatch):
     _patch_wait(monkeypatch, desktop.WaitResult(
         matched=True, target='control', desired='absent', elapsed_ms=800,
