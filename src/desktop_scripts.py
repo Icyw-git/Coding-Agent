@@ -1635,7 +1635,9 @@ function Invoke-HarnessOp($req) {
         if ($null -ne $payload.expected_pid -and
             ([int]$state.pid -ne [int]$payload.expected_pid -or
              [string]$state.window_id -ne [string]$payload.expected_window_id)) {
-            Fail 'foreground_changed' '前台窗口在开始等待之前就变了' $state
+            $why = '前台窗口在开始等待之前就变了；'
+            $why += '重新调一次 desktop_snapshot 再用新的 pid 和窗口号'
+            Fail 'foreground_changed' $why $state
         }
         if (Test-ExcludedProcess $state $payload.exclude) {
             $why = "$($state.process) 在排除名单里，读取无障碍树被禁用"
@@ -1698,7 +1700,9 @@ function Invoke-HarnessOp($req) {
     if (-not $state.available) { Fail 'no_foreground_window' '当前没有可用的前台窗口' $state }
     if ([int]$state.pid -ne [int]$payload.expected_pid -or
         [string]$state.window_id -ne [string]$payload.expected_window_id) {
-        Fail 'foreground_changed' '前台窗口和快照时不一样了；重新调一次 desktop_snapshot' $state
+        $why = '前台窗口在开始操作之前就变了；'
+        $why += '重新调一次 desktop_snapshot 再用新的 pid 和窗口号'
+        Fail 'foreground_changed' $why $state
     }
     if ($state.sensitive_target) {
         Fail 'sensitive_target' '这是密码或支付类敏感窗口，桌面输入被拒绝' $state
@@ -1737,7 +1741,9 @@ function Invoke-HarnessOp($req) {
             }
             if ([int]$current.pid -ne [int]$payload.expected_pid -or
                 [string]$current.window_id -ne [string]$payload.expected_window_id) {
-                Fail 'foreground_changed' "$label`: 前台窗口变了；重新快照" $current $index $done
+                $why = "$label`: 前台窗口变了；"
+                $why += '重新调一次 desktop_snapshot 再用新的 pid 和窗口号'
+                Fail 'foreground_changed' $why $current $index $done
             }
             if ($current.sensitive_target) {
                 Fail 'sensitive_target' "$label`: 这是密码或支付类敏感窗口，输入被拒绝" $current $index $done

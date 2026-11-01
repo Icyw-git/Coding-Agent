@@ -581,8 +581,13 @@ def validate_element_action(operation, element, tree, *,
         raise DesktopControlError(
             'element 必须是 desktop_inspect 给的编号') from exc
     if index < 1 or index > MAX_ELEMENT_INDEX:
-        raise DesktopControlError('element 必须在 1 到 '
-                                  f'{MAX_ELEMENT_INDEX} 之间')
+        # 给出的是"编号从哪儿来、你传了什么"，而不是一个看起来像范围的预算上限：
+        # 400 是遍历节点的最大预算，实际树常常只有几十个，说"1 到 400 之间"
+        # 会让模型以为范围内的编号都合法，然后一次次被拒。
+        raise DesktopControlError(
+            f'element 写的是 desktop_inspect 列出的编号，你传的是 {index}；'
+            f'它必须是 1 到 {MAX_ELEMENT_INDEX} 之间，且以最近一次 '
+            'desktop_inspect 的实际列表为准')
     fingerprint = str(tree or '').strip().lower()
     if len(fingerprint) < 8 or len(fingerprint) > 64 or any(
             ch not in '0123456789abcdef' for ch in fingerprint):

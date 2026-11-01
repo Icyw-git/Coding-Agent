@@ -1345,3 +1345,32 @@ def test_tool_registry_keeps_physical_action_path(monkeypatch):
     tools.run_desktop_action('click', x=1, y=2, expected_pid=123,
                              expected_window_id='ABCD')
     assert seen['x'] == 1 and seen['y'] == 2
+
+
+# ---------- P0-3：错误的下一步必须走得通 ----------
+
+def test_element_out_of_range_points_at_inspect():
+    """越界提示要指向模型手上真实存在的信息源。
+
+    原来只说「element 必须在 1 到 400 之间」——400 是 `MAX_ELEMENT_INDEX`（预算上限），
+    而实际树常常只有 30 个，模型会以为 400 以内都合法，然后一次次被拒。
+    """
+    with pytest.raises(desktop.DesktopControlError) as excinfo:
+        desktop.validate_element_action('invoke', 999, FP, **IDENTITY)
+    message = str(excinfo.value)
+    assert 'desktop_inspect' in message      # 编号从哪儿来
+    assert '999' in message                  # 你传了什么
+    message.encode('gbk')
+
+
+def test_every_foreground_changed_message_says_what_to_do():
+    """同一个条件三种说法，最需要动作的那条（等待）原来没说动作。
+
+    PS 侧一共三处抛 `foreground_changed`：等待、元素动作、序列逐步复核。
+    三处统一带上「重新调 desktop_snapshot」，否则模型只能猜。
+    """
+    script = desktop.worker_script()
+    assert script.count("Fail 'foreground_changed'") == 3
+    # 同一句、同一个动作：模型不该为同一个条件学三种说法。
+    # 按出现次数断言（不按行）——断言是要钉住"三处都带动作"，不是"写在同一行"。
+    assert script.count('重新调一次 desktop_snapshot 再用新的 pid 和窗口号') == 3
