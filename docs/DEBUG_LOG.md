@@ -12903,3 +12903,88 @@ assert script.count('重新调一次 desktop_snapshot 再用新的 pid 和窗口
 ## 结果
 
 全量 3366 passed / 3 skipped（P0-1 后 3364，本轮 +2）。
+
+---
+
+# 第 76 部分：P0-2 —— 测了 40 分钟，修了一个，撤回一个
+
+计划里 P0-2 写的是"限时 30 分钟定位 B1/B2（预算超 3 倍 + 大窗口只返回 2 个控件）"。
+实际花了约 40 分钟，结论是：**现象真实，但根因没能确定性复现**，于是给了一个**撤回了
+改动**的结论——这比留下一个说不清为什么有效的补丁好。
+
+## 测到的
+
+用 `.test-tmp/probe_p02*.py`（8 个探针）在 200 子控件的 WinForms 窗口上分段计时：
+
+| 步骤 | 耗时 |
+| --- | --- |
+| `FromHandle` | 44ms |
+| `Read-ElementNode(root)` | 65ms |
+| `root.FindAll(Children)` | 19ms |
+| `panel.FindAll(Children)` → 200 个 | 75–348ms |
+| `Read-ElementNode(child)` ×20 | **1–2ms** |
+| `Get-UiTree(120/12/2500)`（同一进程、不走 action） | **184–311ms，items=15** |
+
+也就是说：**单个 UIA 调用都不慢**。但同一窗口走 `d.inspect()`（action 路径）时：
+
+```
+worker 模式:      4198 / 2980 / 3301 / 3514 / 3413 ms，items=2
+独立进程模式:     4183 / 4227 / 4174 ms，items=2
+```
+
+两条路径的差别只在"先调了 `Get-WindowState`"，于是我做了 A/B/C：
+
+```
+A) WindowState 先 → walk        4328ms items=2
+B) walk 先 → walk               330ms / 112ms items=15
+C) walk 热身 → WindowState → walk  384 / 35 / 301ms items=15
+```
+
+看着像"进程内第一次 UIA 调用是 `FocusedElement` 就会让后续 FindAll 慢 10~20 倍"。
+我据此加了一行预热（`FromHandle($hwnd)`），实测确实恢复：
+
+```
+修后连续 4 次 inspect: 262 / 121 / 136 / 183 ms，items=15
+```
+
+## 为什么还是撤回了
+
+再往后测，**不加预热也快**了：
+
+```
+X) WS 后预热 → walk    387ms items=15
+Y) WS 不预热 → walk    291ms items=15   ← 对照组自己也快了
+Z) 先预热再 WS → walk  247ms items=15
+```
+
+而且预热有代价：首次 `snapshot()` 从 ~150ms 变成 **2276ms**（对一个重窗口做
+`FromHandle` 本身就是冷启动那一下）。
+
+结论：**"慢"是一种应用/窗口状态，不是代码路径问题**。我的 A/B 恰好和状态变化重合，
+把它当因果就是又一次"一次观测当成规律"（第 65 节刚犯过）。按计划的纪律——
+**没有确定性复现的修复不做**——撤回那一行。
+
+留下的可复用信息：慢的**形态**是"每个子节点约 0.5 秒"，正常形态是"每节点 1–2 毫秒"。
+下次再遇到，先用 `probe_p02.py` 量 `Read-ElementNode(child)` 的单步耗时，一步就能分清
+是 provider 问题还是我们的代码问题。
+
+## 顺带修掉一个确定的 bug（B17）
+
+探针跑不动时暴露出来的：`focus_failed` 的消息是**半句话被翻译过**——
+
+```powershell
+$why =  'Windows 拒绝把这个窗口切到前台。'
+$why += 'yourself, then retry (foreground lock blocks background processes).'
+```
+
+模型读到的是「…切到前台。yourself, then retry (foreground lock bl…」。整句重写：
+
+```
+Windows 拒绝把这个窗口切到前台（后台进程受前台锁限制）；请自己点一下那个窗口，再让我重试
+```
+
+**守卫**：逐行扫描抓不到这种错（中英在两行上），所以新测试先把相邻的
+`$why =` / `$why +=` 拼成整句，再判断"是否既有中文又有英文句子"。用旧文本验证过它
+确实会红——守卫必须先能失败，才算守卫。
+
+全量 3367 passed / 3 skipped。

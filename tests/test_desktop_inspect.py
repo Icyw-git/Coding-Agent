@@ -1374,3 +1374,50 @@ def test_every_foreground_changed_message_says_what_to_do():
     # 同一句、同一个动作：模型不该为同一个条件学三种说法。
     # 按出现次数断言（不按行）——断言是要钉住"三处都带动作"，不是"写在同一行"。
     assert script.count('重新调一次 desktop_snapshot 再用新的 pid 和窗口号') == 3
+
+
+def test_ps_messages_are_not_half_translated():
+    """PowerShell 里用 `$why =` / `$why +=` 拼起来的消息，不能中英各半。
+
+    实测踩到：`focus_failed` 的原文是
+
+        $why =  'Windows 拒绝把这个窗口切到前台。'
+        $why += 'yourself, then retry (foreground lock blocks background processes).'
+
+    翻译只翻了第一句，模型读到的是一句被截断的混合语。**逐行扫描抓不到它**——
+    中英在两行上，只有拼起来才看得见。所以这里先把连续赋值拼成整句再判断。
+    """
+    script = desktop.worker_script()
+    messages = _joined_why_messages(script)
+    assert messages, '没解析到任何 $why 消息，守卫失效'
+    for text in messages:
+        assert not (_has_cjk(text) and _has_english_sentence(text)), text
+
+
+def _joined_why_messages(script: str) -> list[str]:
+    """把相邻的 `$why = '...'` / `$why += '...'` 拼成一个完整消息。"""
+    literals: list[str] = []
+    messages: list[str] = []
+    for line in script.splitlines():
+        stripped = line.strip()
+        matched = re.match(r"\$why\s*\+?=\s*'(.*)'\s*$", stripped)
+        if matched is None:
+            if literals:
+                messages.append(''.join(literals))
+                literals = []
+            continue
+        if stripped.startswith('$why =') and literals:
+            messages.append(''.join(literals))
+            literals = []
+        literals.append(matched.group(1))
+    if literals:
+        messages.append(''.join(literals))
+    return messages
+
+
+def _has_cjk(text: str) -> bool:
+    return any('\u4e00' <= char <= '\u9fff' for char in text)
+
+
+def _has_english_sentence(text: str) -> bool:
+    return bool(re.search(r'[a-z]{3,}[ ,]+[a-z]{2,}[ ,]+[a-z]{2,}', text.lower()))

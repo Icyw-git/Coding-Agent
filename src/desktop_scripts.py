@@ -1602,8 +1602,10 @@ function Invoke-HarnessOp($req) {
             }
         }
         if (-not $placed) {
-            $why = 'Windows 拒绝把这个窗口切到前台。'
-            $why += 'yourself, then retry (foreground lock blocks background processes).'
+            # 这条消息原来是「中文句 + 英文后半句」拼起来的（翻译只翻了第一句），
+            # 模型读到的是一句被截断的混合语。整句重写，并给出人能做的动作。
+            $why = 'Windows 拒绝把这个窗口切到前台（后台进程受前台锁限制）；'
+            $why += '请自己点一下那个窗口，再让我重试'
             return New-Failure 'focus_failed' $why $state
         }
         # 轮询而不是固定 sleep：多数切换 10-30ms 就到位，固定等 120ms 等于每次
