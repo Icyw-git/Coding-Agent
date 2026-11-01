@@ -40,8 +40,7 @@ def bash_timeout(timeout, *, default: float, background: float,
     return value
 
 
-def bash(command: str, cwd: str = None, timeout=None,
-         run_in_background: bool = False, *, workdir, gate,
+def bash(command: str, cwd: str = None, timeout=None, *, workdir, gate,
          default_timeout: float, background_timeout: float,
          max_timeout: float) -> str:
     # 判定只有一处（策略层），第三份黑名单已删：teammate / 后台 worker / 任务 runner

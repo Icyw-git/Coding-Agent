@@ -93,8 +93,10 @@ BASH_MAX_TIMEOUT = 3600
 
 def run_bash(command: str, cwd: str = None, timeout=None,
              run_in_background: bool = False) -> str:
+    # `run_in_background` 只是吸收模型传来的字段：要不要转后台由
+    # tool_dispatch 在**调用之前**用 should_run_background 决定，`bash()` 不参与。
+    _ = run_in_background
     return bash(command, cwd=cwd, timeout=timeout,
-                run_in_background=run_in_background,
                 workdir=_h().get_workdir(),
                 gate=_gate().enforce_headless,
                 default_timeout=BASH_TIMEOUT,

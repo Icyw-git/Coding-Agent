@@ -179,3 +179,34 @@ def test_click_options_reach_the_capability_layer(monkeypatch):
                         expected_pid=42, expected_window_id='ABCD')
     assert seen['button'] == 'right'
     assert seen['count'] == 2
+
+
+# ---------- P1 清账：B12 序列回执要能核对每一步做了什么 ----------
+
+def test_sequence_receipt_includes_each_step_parameters():
+    """回执要能回答"第 3 步等了多少毫秒"。
+
+    原来每步只有 `{action, ok}`，输出是「3. 等待 完成」——等于什么都没说。
+    参数取自 PowerShell 侧（它已经带着这些值），并且**不含键入的文本**。
+    """
+    step = {'action': 'wait', 'ok': True, 'ms': 120}
+    assert '120' in tool_desktop._step_line(2, step)
+    assert tool_desktop._step_line(2, step).startswith('  2. ')
+
+    assert '(30,40)' in tool_desktop._step_line(1, {'action': 'click', 'ok': True,
+                                                    'x': 30, 'y': 40})
+    line = tool_desktop._step_line(3, {'action': 'type', 'ok': True, 'chars': 5})
+    assert '5' in line and '字' in line
+    assert 'ctrl+v' in tool_desktop._step_line(1, {'action': 'key', 'ok': True,
+                                                   'key': 'ctrl+v'})
+    assert '3 格' in tool_desktop._step_line(1, {'action': 'scroll', 'ok': True,
+                                                 'amount': 3})
+
+
+def test_sequence_step_record_never_carries_typed_text():
+    """参数可以带，键入的文本不能带（和 `type` 的审计一致）。"""
+    script = tool_desktop.desktop_control_windows.worker_script()
+    body = script.split('function Get-StepRecord', 1)[1].split(
+        chr(10) + 'function ', 1)[0]
+    assert 'text.Length' in body or '.Length' in body   # 只记长度
+    assert '$record.text' not in body

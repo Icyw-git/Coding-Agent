@@ -318,16 +318,28 @@ _DESKTOP_ACTION_LABELS = {
 #: （用户要看清"要对这个控件做什么"）。两张表都必须覆盖
 #: ``desktop_control_windows.ELEMENT_OPERATIONS``——有守卫测试盯着，
 #: 因为新增操作时漏改一处会让文案静默退化成英文枚举（`scroll` 就漏过）。
+#: 元素操作的中文说法：一张表，两种读法（短：活动行；长：审批卡）。
+#: 原来这里是两张同键的表，加一个操作要改两处——漏一处只会被守卫拦下，
+#: 那等于让守卫替重复买单。
 ELEMENT_OPERATION_LABELS = {
-    'invoke': '点击', 'setvalue': '写入', 'toggle': '切换', 'select': '选中',
-    'expand': '展开', 'collapse': '收起', 'focus': '聚焦', 'scroll': '滚动',
+    'invoke': ('点击', '点击该控件'),
+    'setvalue': ('写入', '写入内容'),
+    'toggle': ('切换', '切换开关'),
+    'select': ('选中', '选中'),
+    'expand': ('展开', '展开'),
+    'collapse': ('收起', '收起'),
+    'focus': ('聚焦', '聚焦'),
+    'scroll': ('滚动', '滚动该控件'),
 }
 
-_ELEMENT_OPERATION_LABELS = {
-    'invoke': '点击该控件', 'setvalue': '写入内容', 'toggle': '切换开关',
-    'select': '选中', 'expand': '展开', 'collapse': '收起', 'focus': '聚焦',
-    'scroll': '滚动该控件',
-}
+
+def element_operation_label(operation, *, long: bool = False) -> str:
+    """元素操作的中文说法。``long`` 用于审批卡（要读得完整），否则给活动行用。"""
+    key = str(operation or 'invoke').strip().casefold()
+    pair = ELEMENT_OPERATION_LABELS.get(key)
+    if pair is None:
+        return '操作'
+    return pair[1] if long else pair[0]
 
 
 def _desktop_step_summary(step) -> str:
@@ -408,7 +420,7 @@ def _desktop_detail(tool: str, args: dict) -> str:
             label += '（未注明是哪个控件）'
         fields.append(f'控件{label}')
         operation = str(args.get('operation') or 'invoke')
-        verb = _ELEMENT_OPERATION_LABELS.get(operation, '操作')
+        verb = element_operation_label(operation, long=True)
         if operation == 'scroll':
             amount = args.get('amount')
             if isinstance(amount, int) and amount:

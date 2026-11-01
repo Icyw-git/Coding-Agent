@@ -1185,9 +1185,10 @@ def test_every_element_operation_has_a_chinese_label():
 
     for operation in desktop.ELEMENT_OPERATIONS:
         assert operation in approval_view.ELEMENT_OPERATION_LABELS, operation
-        assert operation in approval_view._ELEMENT_OPERATION_LABELS, operation
-        assert re.search(r'[一-鿿]',
-                         approval_view.ELEMENT_OPERATION_LABELS[operation]), operation
+        # 两种说法（活动行短、审批卡长）都必须是中文
+        for long in (False, True):
+            label = approval_view.element_operation_label(operation, long=long)
+            assert re.search(r'[一-鿿]', label), (operation, long, label)
 
 
 def test_scroll_has_a_chinese_verb_everywhere():
@@ -1421,3 +1422,22 @@ def _has_cjk(text: str) -> bool:
 
 def _has_english_sentence(text: str) -> bool:
     return bool(re.search(r'[a-z]{3,}[ ,]+[a-z]{2,}[ ,]+[a-z]{2,}', text.lower()))
+
+
+# ---------- P1 清账：B10 一个判据、两种文案 ----------
+
+def test_window_switch_predicate_is_shared_by_both_paths():
+    """「前台窗口换了」这个判断只写一次。
+
+    物理动作的回执和元素动作的回执都要说这件事，之前各判一次（各自检查
+    available / window_id），措辞已经开始漂。现在共用一个谓词，各自只决定
+    "要不要额外给 pid 和窗口号"。
+    """
+    same = desktop._state(_state())
+    moved = desktop._state(_state(window_id='FFF0', pid=999))
+    assert tool_desktop._window_switched(same, same) is False
+    assert tool_desktop._window_switched(same, moved) is True
+    # 读不到状态时不能自称"换窗口了"
+    gone = desktop._state(_state(available=False))
+    assert tool_desktop._window_switched(same, gone) is False
+    assert tool_desktop._window_switched(None, moved) is False

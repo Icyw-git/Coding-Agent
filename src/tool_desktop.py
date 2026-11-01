@@ -8,8 +8,11 @@ import desktop_control_windows
 #: 这些 code 表示"按策略不做"，不是"做失败了"。
 #: 拒绝要原样转述（里面已经写清原因和"请用户自己操作"），
 #: 套一层「读不到 / 失败」再补一句"换个办法试试"，会引导模型重试同一件事。
-_REFUSAL_CODES = ('sensitive_target', 'process_excluded', 'must_do_self',
-                  'password_field', 'terminal_input')
+#:
+#: 只列**这三条调用点真的会收到**的 code：`inspect` / `wait` / 物理动作。
+#: 元素动作那条整段 `return str(exc)`，不经过这个判定，所以 `must_do_self`、
+#: `password_field` 不放进来——列了也不会生效，只会让人以为它在这里把关。
+_REFUSAL_CODES = ('sensitive_target', 'process_excluded', 'terminal_input')
 
 
 def _is_refusal(error: str) -> bool:
@@ -75,6 +78,21 @@ _ACTION_VERBS = {
 }
 
 
+def _window_switched(before, after) -> bool:
+    """前台窗口是否换掉了。两条回执路径（物理动作 / 元素动作）共用这一个判据。
+
+    读不到状态（窗口刚关、遍历失败）时一律返回 False——那时"换了"和"没换"都无从
+    判断，说"换了"是编的。
+    """
+    if before is None or after is None:
+        return False
+    if not getattr(before, 'available', False) or not after.available:
+        return False
+    if not getattr(before, 'window_id', ''):
+        return False
+    return before.window_id != after.window_id
+
+
 def _change_text(before, after) -> str:
     """动作前后的差异：只报能确定看到的三个信号。
 
@@ -85,7 +103,7 @@ def _change_text(before, after) -> str:
         return ''
     if not before.available or not after.available:
         return ''
-    if before.window_id and after.window_id and before.window_id != after.window_id:
+    if _window_switched(before, after):
         title = _clip(after.title, 40) or '另一个窗口'
         return f'前台窗口换成了「{title}」。'
     if (before.focused_name or '') != (after.focused_name or ''):
@@ -112,11 +130,11 @@ def snapshot(*, runner=None, audit=None) -> str:
     return _state_text(state)
 
 
-def _element_verbs() -> dict:
+def _element_verb(operation) -> str:
     # 中文文案统一放 approval_view，别在这里再抄一份（抄了就会漏改）。
     import approval_view
 
-    return approval_view.ELEMENT_OPERATION_LABELS
+    return approval_view.element_operation_label(operation)
 _MAX_NAME_CHARS = 60
 _MAX_VALUE_CHARS = 60
 
@@ -441,7 +459,7 @@ def element_action(*, operation, element, tree, expected_pid, expected_window_id
     state = result.state
     target = result.target
     label = (target.name or target.label) if target else ''
-    verb = _element_verbs().get(operation, operation)
+    verb = _element_verb(operation)
     _action_audit(audit, 'element', state, duration_ms=result.duration_ms,
                   operation=operation, element=element,
                   degraded=result.degraded)
@@ -473,9 +491,7 @@ def _window_switch_text(result) -> str:
     """
     before = getattr(result, 'before', None)
     after = result.state
-    if before is None or not before.available or not after.available:
-        return ''
-    if not before.window_id or before.window_id == after.window_id:
+    if not _window_switched(before, after):
         return ''
     title = _clip(after.title, 40) or '(未命名窗口)'
     return (f'前台窗口换成了「{title}」（pid {after.pid}，窗口 {after.window_id}）。'
@@ -528,6 +544,28 @@ def _after_action_text(result) -> str:
     return chr(10) + chr(10).join(lines)
 
 
+def _step_line(index: int, step) -> str:
+    """序列里一步的回执：动词 + 这一步的关键参数。
+
+    参数由 PowerShell 侧回传（`Get-StepRecord`），这里只负责措辞——两处各写一遍
+    中文，迟早会漂。键入的文本只以字数出现。
+    """
+    action = str(step.get('action') or '')
+    verb = _ACTION_VERBS.get(action, action or '操作')
+    detail = ''
+    if action in ('move', 'click') and step.get('x') is not None:
+        detail = f" ({step.get('x')},{step.get('y')})"
+    elif action == 'type' and step.get('chars') is not None:
+        detail = f" {step.get('chars')} 字"
+    elif action == 'key' and step.get('key'):
+        detail = f" {step.get('key')}"
+    elif action == 'scroll' and step.get('amount') is not None:
+        detail = f" {step.get('amount')} 格"
+    elif action == 'wait' and step.get('ms') is not None:
+        detail = f" {step.get('ms')} 毫秒"
+    return f'  {index}. {verb}{detail} 完成'
+
+
 def action(action_name: str, *, x=None, y=None, text=None, key=None,
            amount=None, button=None, count=None, steps=None,
            expected_pid=None, expected_window_id=None, allow_terminal=None,
@@ -561,8 +599,7 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
     if result.action == 'sequence':
         lines = [f'已执行 {len(step_records)} 个步骤：']
         for index, step in enumerate(step_records, 1):
-            verb = _ACTION_VERBS.get(str(step.get('action')), '操作')
-            lines.append(f'  {index}. {verb} 完成')
+            lines.append(_step_line(index, step))
         lines.append(_state_text(state))
         change = _change_text(getattr(result, 'before', None), state)
         if change:

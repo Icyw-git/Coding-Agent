@@ -12988,3 +12988,67 @@ Windows 拒绝把这个窗口切到前台（后台进程受前台锁限制）；
 确实会红——守卫必须先能失败，才算守卫。
 
 全量 3367 passed / 3 skipped。
+
+---
+
+# 第 77 部分：P1 一致性清账（B8–B12）
+
+一次只动一类：**全是"同一件事写了两遍/写错了地方"，行为不变**。每条都先写测试。
+
+## B8 `_REFUSAL_CODES` 里有两个永远不生效的 code
+
+它只服务 `inspect` / `wait` / 物理动作三条路径的"拒绝 vs 失败"分流；元素动作那条
+整段 `return str(exc)`，根本不经过这个判定。列表里留着 `must_do_self` /
+`password_field`，读代码的人会以为它们在把关。
+
+收紧成三条真的会到达的：`sensitive_target` / `process_excluded` / `terminal_input`，
+并在注释里写清"元素动作不走这里"。
+
+## B11 `bash()` 假装自己管前后台
+
+`run_in_background` 在 `bash()` 的函数体里一次都没用过——转后台是
+`tool_dispatch.should_run_background` 在**调用之前**决定的。删掉这个参数；
+`run_bash()` 留着它（模型会传，得有人吸收），但写明"只是吸收，不参与决策"。
+
+## B9 两张同键的标签表
+
+`ELEMENT_OPERATION_LABELS`（短：点击）与 `_ELEMENT_OPERATION_LABELS`（长：点击该控件）
+键完全一样。加一个操作要改两处，漏一处只被覆盖率守卫拦下——**那是让守卫替重复买单**。
+
+合并成一张表 + 一个读法：
+
+```python
+ELEMENT_OPERATION_LABELS = {'invoke': ('点击', '点击该控件'), ...}
+
+def element_operation_label(operation, *, long=False) -> str: ...
+```
+
+三个消费方（活动行、元素动作回执、审批卡）都改用它。
+
+## B10 「前台窗口换了」判了两次
+
+物理动作的回执和元素动作的回执各自检查 `available` / `window_id`，措辞已经开始漂。
+抽出一个谓词 `_window_switched(before, after)`，两条路径共用；它们各自只决定
+"要不要额外给 pid 和窗口号"。
+
+顺带把"读不到状态"的情况钉住：那时既不能说换了、也不能说没换，谓词返回 False。
+
+## B12 序列回执只有 `{action, ok}`
+
+输出是「3. 等待 完成」——等于什么都没说，而等待恰恰是模型最怀疑"到底等了没有"的一步。
+
+- PowerShell 新增 `Get-StepRecord`：`action` + `ok` + 该步关键参数
+  （`x/y`、`chars`、`key`、`amount`、`ms`）。**键入的文本只给长度**，与 `type` 的审计口径一致。
+- 工具层新增 `_step_line(index, step)`：按 action 拼措辞（中文只在 Python 侧写）。
+
+真机字段核对（直接调 PS 函数，不依赖前台）：
+
+```
+{"action":"type","ok":true,"chars":4}     ← 有长度、没有 text
+{"action":"wait","ok":true,"ms":120}
+{"action":"click","ok":true,"x":10,"y":20}
+```
+
+## 全量
+
+3374 passed / 3 skipped（上一轮 3367，本轮 +7 用例）。

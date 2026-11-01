@@ -305,3 +305,28 @@ def test_detail_accepts_the_display_label_too():
     assert '移动 1 项' in expected
     assert approval_view.detail(label, args) == expected
     assert approval_view.detail(bare, args) == expected
+
+
+# ---------- P1 清账：B9 一张表两种说法 ----------
+
+def test_element_operation_labels_come_from_one_table():
+    """元素操作的中文说法只有一张表，长短两种读法。
+
+    原来 `ELEMENT_OPERATION_LABELS`（短）和 `_ELEMENT_OPERATION_LABELS`（长）是两张
+    同键的表，加一个操作要改两处，漏了就会被覆盖率守卫拦下——守卫能兜住，但那是
+    在替重复买单。
+    """
+    for operation in ('invoke', 'setvalue', 'toggle', 'select', 'expand',
+                      'collapse', 'focus', 'scroll'):
+        short = approval_view.element_operation_label(operation)
+        long = approval_view.element_operation_label(operation, long=True)
+        assert short and long
+        assert short != long or operation in ('select', 'expand', 'collapse', 'focus')
+    assert not hasattr(approval_view, '_ELEMENT_OPERATION_LABELS')
+    approval_view.element_operation_label('invoke').encode('gbk')
+
+
+def test_unknown_operation_falls_back_without_crashing():
+    assert approval_view.element_operation_label('nope') == '操作'
+    assert approval_view.element_operation_label('nope', long=True) == '操作'
+    assert approval_view.element_operation_label(None) == '点击'   # 默认 invoke

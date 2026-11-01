@@ -37,8 +37,8 @@ def _desktop_summary(name: str, arguments: dict) -> str:
         name_hint = ' '.join(str(arguments.get('expect') or '').split())[:20]
         import approval_view
 
-        verb = approval_view.ELEMENT_OPERATION_LABELS.get(
-            str(arguments.get('operation') or 'invoke').casefold(), '操作')
+        verb = approval_view.element_operation_label(
+            arguments.get('operation') or 'invoke')
         text = f'#{control if control is not None else "?"}'
         return f'控件 {text}' + (f'「{name_hint}」' if name_hint else '') + f' {verb}'
     if action == 'sequence':

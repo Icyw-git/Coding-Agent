@@ -131,3 +131,36 @@ def test_bash_marks_truncated_output(tmp_path, monkeypatch):
 
     assert '已截断' in result
     result.encode('gbk')
+
+
+# ---------- P1 清账：B8 / B11 ----------
+
+def test_refusal_codes_only_list_what_these_paths_can_raise():
+    """`_REFUSAL_CODES` 要名副其实。
+
+    它只服务 inspect / wait / 物理动作三条路径的"拒绝 vs 失败"分流。元素动作那条
+    整段 `return str(exc)`，不经这个判定——列表里留着 `must_do_self` /
+    `password_field` 会让读代码的人以为它们在这里生效。
+    """
+    assert tool_desktop_refusal_codes() == {
+        'sensitive_target', 'process_excluded', 'terminal_input'}
+
+
+def tool_desktop_refusal_codes():
+    import tool_desktop
+    return set(tool_desktop._REFUSAL_CODES)
+
+
+def test_bash_does_not_pretend_to_handle_run_in_background(tmp_path, monkeypatch):
+    """`bash()` 不管前后台：转后台由 dispatch 的 should_run_background 决定。
+
+    参数留在 `bash()` 里会让读者以为它负责转后台（实际函数体一次都没用到）。
+    保留在 `run_bash()` 里是必要的：模型会传这个字段，得有人吸收掉。
+    """
+    import inspect
+
+    import tools
+
+    params = inspect.signature(tool_exec.bash).parameters
+    assert 'run_in_background' not in params
+    assert 'run_in_background' in inspect.signature(tools.run_bash).parameters

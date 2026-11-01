@@ -1519,6 +1519,26 @@ function Fail($code, $message, $state, $step = 0, $done = $null) {
 '''
 
 CONTROL_BODY = r'''
+function Get-StepRecord($step) {
+    # 序列每步的回执：action + ok + 这一步的关键参数。
+    # **不含键入的文本**（和 type 的审计口径一致），只给长度。
+    $action = [string]$step.action
+    $record = [ordered]@{ action = $action; ok = $true }
+    if ($action -eq 'move' -or $action -eq 'click') {
+        if ($null -ne $step.x) { $record.x = [int]$step.x }
+        if ($null -ne $step.y) { $record.y = [int]$step.y }
+    } elseif ($action -eq 'type') {
+        $record.chars = ([string]$step.text).Length
+    } elseif ($action -eq 'key') {
+        $record.key = [string]$step.key
+    } elseif ($action -eq 'scroll') {
+        if ($null -ne $step.amount) { $record.amount = [int]$step.amount }
+    } elseif ($action -eq 'wait') {
+        if ($null -ne $step.ms) { $record.ms = [int]$step.ms }
+    }
+    return $record
+}
+
 function Invoke-HarnessOp($req) {
     # worker 是常驻进程：每个请求开始前把「上一轮遗留的说明」清掉，
     # 否则一次滚动留下的 note 会挂到后面某次点击的回执上。
@@ -1754,7 +1774,7 @@ function Invoke-HarnessOp($req) {
             if ($null -ne $err) {
                 Fail $err.code "$label`: $($err.message)" $current $index $done
             }
-            $done.Add([ordered]@{ action=[string]$step.action; ok=$true }) | Out-Null
+            $done.Add((Get-StepRecord $step)) | Out-Null
             if ($index -lt $total) { Start-Sleep -Milliseconds 50 }
         }
         Start-Sleep -Milliseconds 30
