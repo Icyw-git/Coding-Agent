@@ -156,6 +156,9 @@ class WaitResult:
     windows: int = 0
     #: 可见顶层窗口总数（``windows`` 可能被 pid / 前台条件过滤过）。
     windows_total: int = 0
+    #: `desired='absent'` 时：这次扫描里**没看到**目标。它不等于"目标不在了"——
+    #: 遍历可能被预算截断，或者根本读不到树。`matched` 才表示"已确认"。
+    absent_observed: bool = False
     truncated: bool = False
     #: 命中的控件是否出现在「完整预算」的那次遍历里。为假说明它落在预算之外，
     #: 编号不能直接拿去做动作（要先 desktop_inspect）。
@@ -849,8 +852,15 @@ def wait(target='control', text=None, state='present', timeout_ms=None, *,
     result = result if isinstance(result, dict) else {}
     element = result.get('element')
     window = result.get('window')
+    absent_observed = bool(result.get('absent_observed'))
+    authoritative = bool(result.get('authoritative', True))
+    # 去程的 `matched` 只表示"循环因条件成立而结束"。absent 方向还要再多一个条件：
+    # 这次扫描本身可信（读到了、且没被截断）。否则"没看到"会被当成"不在了"。
+    matched = bool(result.get('matched')) and (
+        payload['state'] != 'absent' or authoritative)
     return WaitResult(
-        matched=bool(result.get('matched')),
+        matched=matched,
+        absent_observed=absent_observed,
         target=str(result.get('target') or payload['target']),
         desired=payload['state'],
         elapsed_ms=int(result.get('elapsed_ms') or 0),
@@ -862,7 +872,7 @@ def wait(target='control', text=None, state='present', timeout_ms=None, *,
         elements=int(result.get('elements') or 0),
         windows=int(result.get('windows') or 0),
         windows_total=int(result.get('windows_total') or 0),
-        authoritative=bool(result.get('authoritative', True)),
+        authoritative=authoritative,
         truncated=bool(result.get('tree_truncated')),
     )
 

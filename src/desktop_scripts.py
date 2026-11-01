@@ -705,6 +705,8 @@ function Wait-ForControl($payload, $state, $budget, $fullBudget, $deadline) {
     # 120/2500 得 4b16b723…，80/900 得 7e9c15ec…）。
     $hwnd = [IntPtr][Convert]::ToInt64([string]$state.window_id, 16)
     $wantAbsent = ([string]$payload.state -eq 'absent')
+    # absent 方向是否已经用完整体预算复核过一次（只一次）。
+    $absentRuled = $false
     $polls = 0
     $last = $null
     $lastMatch = $null
@@ -729,36 +731,62 @@ function Wait-ForControl($payload, $state, $budget, $fullBudget, $deadline) {
             $elapsed = [int](([DateTime]::UtcNow - $started).TotalMilliseconds)
             if ($wantAbsent) {
                 # 「没找到」只有在「这次遍历完整且读得到」时才等于「不在了」。
-                # 轮询用缩小预算（80 个控件），大窗口（Edge / Excel 动辄几百个）
-                # 会被截断——那时没找到只说明它没落在前 80 个里。
-                # 读不到树（遍历失败 / 窗口刚关）同理，不能直接说"消失了"。
+                # 轮询用缩小预算（80 个控件 / 900ms），大窗口会被截断——那时
+                # 没找到只说明它没落在前 N 个里。读不到树同理。
                 $absentReadable = ($null -ne $last)
                 $absentTruncated = $absentReadable -and [bool]$last.truncated
+                # poll 被截断时先按完整预算复核一次（对称于 present 命中后的
+                # 做法：那边也是为了拿到可信的遍历结果）。只复核一次：若目标
+                # 其实还在，后来几轮只当作「这不是它消失的证据」继续等，
+                # 不再每轮多走一遍大树。
+                if ($absentTruncated -and -not $absentRuled) {
+                    $absentRuled = $true
+                    $confirm = Get-UiTree $hwnd $fullBudget.nodes $fullBudget.depth $fullBudget.ms
+                    if ($null -ne $confirm -and
+                        $null -ne (Find-TreeMatch $confirm ([string]$payload.text))) {
+                        $hit = $false    # 目标还在，只是这轮 poll 没看见
+                    } else {
+                        $last = $confirm
+                        $absentReadable = ($null -ne $confirm)
+                        $absentTruncated = $absentReadable -and [bool]$confirm.truncated
+                    }
+                }
+                if ($hit) {
+                    return [ordered]@{
+                        matched = $true
+                        # 这一轮确实没看到目标。是否算「确认」由 authoritative
+                        # 决定，两边分开报，不在这里合并。
+                        absent_observed = $true
+                        polls = $polls
+                        elapsed_ms = $elapsed
+                        element = $null
+                        fingerprint = ''
+                        elements = $(if ($absentReadable) { $last.items.Count } else { 0 })
+                        tree_truncated = $absentTruncated
+                        # 只有「读到了、且没被截断」才算确认它真的不在。
+                        authoritative = ($absentReadable -and (-not $absentTruncated))
+                    }
+                }
+            } else {
+                # present：命中后再按完整预算走一遍，保证返回的指纹和
+                # desktop_inspect 的含义一致（节点数不同哈希就不同）。
+                $final = Get-UiTree $hwnd $fullBudget.nodes $fullBudget.depth $fullBudget.ms
+                $finalMatch = $null
+                if ($null -ne $final) {
+                    $finalMatch = Find-TreeMatch $final ([string]$payload.text)
+                }
                 return [ordered]@{
                     matched = $true
+                    absent_observed = $false
                     polls = $polls
                     elapsed_ms = $elapsed
-                    element = $null
-                    fingerprint = ''
-                    elements = $(if ($absentReadable) { $last.items.Count } else { 0 })
-                    tree_truncated = $absentTruncated
-                    # 只有"读到了、且没被截断"才算确认它真的不在。
-                    authoritative = ($absentReadable -and (-not $absentTruncated))
+                    element = $finalMatch
+                    fingerprint = $(if ($null -ne $final) { $final.fingerprint } else { '' })
+                    elements = $(if ($null -ne $final) { $final.items.Count } else { 0 })
+                    tree_truncated = $(if ($null -ne $final) { $final.truncated } else { $false })
+                    # 权威遍历里没找到 = 它落在这轮预算之外，编号不可用于动作。
+                    authoritative = ($null -ne $finalMatch)
                 }
-            }
-            $final = Get-UiTree $hwnd $fullBudget.nodes $fullBudget.depth $fullBudget.ms
-            $finalMatch = $null
-            if ($null -ne $final) { $finalMatch = Find-TreeMatch $final ([string]$payload.text) }
-            return [ordered]@{
-                matched = $true
-                polls = $polls
-                elapsed_ms = $elapsed
-                element = $finalMatch
-                fingerprint = $(if ($null -ne $final) { $final.fingerprint } else { '' })
-                elements = $(if ($null -ne $final) { $final.items.Count } else { 0 })
-                tree_truncated = $(if ($null -ne $final) { $final.truncated } else { $false })
-                # 权威遍历里没找到 = 它落在这轮预算之外，编号不可用于动作。
-                authoritative = ($null -ne $finalMatch)
             }
         }
         if ([DateTime]::UtcNow -ge $deadline) { break }

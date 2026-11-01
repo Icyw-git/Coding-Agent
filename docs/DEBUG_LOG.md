@@ -12787,3 +12787,63 @@ if ($state.sensitive_target) {
 
 > **能被审批放行的东西，不能只靠审批当防线。** 审批卡的语义是"我认了这一下"，
 > 不是"我知道这一下发生在支付页上"。卡上没写的事实，用户等于没同意。
+
+---
+
+# 第 74 部分：P0-1 —— `wait(absent)` 的返回值不再说谎
+
+按 `IMPROVEMENT_PLAN.md` 的 P0-1 落地。先写失败测试（4 条红），再改代码。
+
+## 改了什么
+
+**语义分开**：`matched` 只表示"**已确认**"，新增 `absent_observed` 表示"这一轮确实没看到"。
+
+| 结局 | matched | absent_observed | 文案 |
+| --- | --- | --- | --- |
+| 完整扫描后确实不在 | True | True | 「已消失」 |
+| 没看到，但扫描被截断/读不到 | **False** | True | 「没再出现」+ 为什么不算确认 |
+| 全程都看得到 | False | False | 「没等到消失」 |
+
+回包里的 `matched` 由 Python 侧按 `desired == 'absent' and authoritative` 收紧——**只在这一处
+合并**，PowerShell 只报事实（`matched` = 循环因条件成立而结束，`absent_observed` = 没看到）。
+
+## 顺带修掉同一功能里的第二个错
+
+实测案例暴露出来的：这个窗口的遍历比轮询预算（900ms）还慢，**第一次 poll 就被截断**，
+于是"没看到"发生在一次不可信的扫描上，`absent` 立刻返回（0.06s），说目标不在了。
+
+对称修法（present 命中后本来就会按完整预算重走一遍拿可信指纹）：**poll 被截断时，先用
+`$fullBudget` 复核一次**。
+
+- 复核发现目标其实还在 → `$hit = $false`，不算命中，继续等到 deadline；
+- 复核确实找不到 → 报"没看到"，`authoritative` 按复核那次扫描算。
+
+复核只做一次（`$absentRuled` 守着）：目标还在的话，后面几轮只当"这不是它消失的证据"，
+不再每轮多走一遍大树。
+
+真机三态：
+
+```
+A) 完整扫描，等不存在的控件   → matched=True  observed=True  author=True   "已消失"
+B) 强制截断(NODES=5)，等存在的 → matched=False observed=True  elements=5    "没再出现"+注意
+C) 默认预算，等存在的「结果」  → matched=False observed=False 用时 0.93s    "没等到消失"
+```
+
+修前 C 会走 B 那条（0.06s 就说"没再出现"）——一个在屏幕上好好的控件，被报告成消失。
+
+## 一次事故（记下来）
+
+改这个 PowerShell 函数时，我的补丁脚本在 Python 单引号字符串里写了 PowerShell 的空串 `''`，
+用 `''''` 硬拼，结果**把补丁脚本自己的源码写进了 `desktop_scripts.py`**（少了半个引号，
+后面的行被当成 Python 表达式）。
+
+处理：`git checkout -- src/desktop_scripts.py` 恢复，**重新用"逐行列表 + 双引号"的方式写补丁**，
+并且每步都跑 `ParseFile` 复验。
+
+> 教训有两条：① 在 Python 字符串里嵌套另一种语言的引号，**换引号种类，不要加倍**；
+> ② 改大段 PowerShell 之前先确认工作区干净——这次正是因为文件已提交，`checkout` 才救得回来。
+
+## 守卫
+
+`test_absent_wait_confirms_with_the_full_budget_when_the_poll_truncates()`：按函数名取
+`Wait-ForControl` 的函数体，断言 absent 分支里同时有"截断时复核"和"复核发现它还在就不算命中"。

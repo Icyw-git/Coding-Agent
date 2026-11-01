@@ -173,7 +173,8 @@ def test_window_wait_timeout_reports_both_counts(monkeypatch):
 def test_wait_text_reports_disappeared(monkeypatch):
     _patch_wait(monkeypatch, desktop.WaitResult(
         matched=True, target='control', desired='absent', elapsed_ms=800,
-        polls=4, state=desktop._state(_state())))
+        polls=4, state=desktop._state(_state()),
+        absent_observed=True, authoritative=True))
     text = tool_desktop.wait(text='正在加载', state='absent')
     assert '已消失' in text
     assert '0.8 秒' in text
@@ -186,9 +187,9 @@ def test_absent_wait_is_hedged_when_the_tree_was_incomplete(monkeypatch):
     这时说一句「已消失」，模型就会当成对话框没了，接着去点被它挡住的东西。
     """
     _patch_wait(monkeypatch, desktop.WaitResult(
-        matched=True, target='control', desired='absent', elapsed_ms=800,
+        matched=False, target='control', desired='absent', elapsed_ms=800,
         polls=4, state=desktop._state(_state()), elements=80, truncated=True,
-        authoritative=False))
+        authoritative=False, absent_observed=True))
     text = tool_desktop.wait(text='正在加载', state='absent')
     assert '已消失' not in text
     assert '没再出现' in text
@@ -197,9 +198,9 @@ def test_absent_wait_is_hedged_when_the_tree_was_incomplete(monkeypatch):
 
     # 读不到界面（遍历失败 / 窗口刚关）时的说法
     _patch_wait(monkeypatch, desktop.WaitResult(
-        matched=True, target='control', desired='absent', elapsed_ms=300,
+        matched=False, target='control', desired='absent', elapsed_ms=300,
         polls=2, state=desktop._state(_state()), elements=0,
-        authoritative=False))
+        authoritative=False, absent_observed=True))
     text = tool_desktop.wait(text='正在加载', state='absent')
     assert '没读到界面结构' in text
     assert '已消失' not in text
@@ -482,3 +483,94 @@ def test_wait_audit_and_labels():
 
     assert 'desktop_wait' in audit.AUDIT_EVENTS
     assert audit.EVENT_LABELS['desktop_wait'] == '等界面变化'
+
+
+# ---------- P0-1：absent 的返回值必须区分"确认"与"没看到" ----------
+
+def _wait_reply(**over):
+    """PowerShell 侧 wait 回包的最小形状。"""
+    base = {'matched': True, 'target': 'control', 'desired': 'absent',
+            'elapsed_ms': 500, 'polls': 3,
+            'state': {'available': True, 'title': 'Notepad', 'process': 'notepad',
+                      'pid': 1, 'window_id': 'AB'},
+            'absent_observed': True, 'authoritative': True,
+            'tree_truncated': False, 'elements': 12}
+    base.update(over)
+    return {'ok': True, 'result': base}
+
+
+def _parse_wait(monkeypatch, reply):
+    monkeypatch.setattr(desktop, '_run', lambda payload, **kw: reply)
+    return desktop.wait('control', '正在加载', 'absent', 500)
+
+
+def test_absent_is_only_matched_when_the_scan_could_confirm_it(monkeypatch):
+    """`matched` 的含义是"已确认"，不是"这次没看到"。
+
+    实测过：控件确实存在，但轮询预算被截断，`wait(absent)` 返回 matched=True。
+    上层读到 True 会当成"对话框没了"，接着去点被它挡住的东西。
+    """
+    confirmed = _parse_wait(monkeypatch, _wait_reply(authoritative=True))
+    assert confirmed.matched is True
+    assert confirmed.absent_observed is True
+
+    unconfirmed = _parse_wait(monkeypatch, _wait_reply(
+        authoritative=False, tree_truncated=True, elements=2))
+    assert unconfirmed.matched is False          # 没确认，就不能说"等到了"
+    assert unconfirmed.absent_observed is True   # 但确实没看到
+    assert unconfirmed.truncated is True
+
+    unreadable = _parse_wait(monkeypatch, _wait_reply(
+        authoritative=False, elements=0))
+    assert unreadable.matched is False
+    assert unreadable.absent_observed is True
+
+
+def test_present_wait_is_unaffected_by_the_new_flag(monkeypatch):
+    """present 的 matched 语义不变：找到了就是找到了。"""
+    reply = _wait_reply(desired='present', matched=True, absent_observed=False,
+                        authoritative=True, elements=7,
+                        element={'label': '按钮', 'name': '保存', 'id': 3})
+    result = _parse_wait(monkeypatch, reply)
+    assert result.matched is True
+    assert result.absent_observed is False
+
+
+def test_unconfirmed_absent_is_reported_as_unconfirmed(monkeypatch):
+    """未确认时必须走对冲文案，不能出现「已消失」。"""
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=False, target='control', desired='absent', elapsed_ms=400,
+        polls=2, state=desktop._state(_state()), elements=2, truncated=True,
+        authoritative=False, absent_observed=True))
+    text = tool_desktop.wait(text='正在加载', state='absent', timeout_ms=500)
+    assert '已消失' not in text
+    assert '没再出现' in text
+    assert '不等于它不在了' in text
+    text.encode('gbk')
+
+
+def test_absent_timeout_still_says_it_never_left(monkeypatch):
+    """一直看得到目标 → 是真的超时，措辞要和"没确认"分开。"""
+    _patch_wait(monkeypatch, desktop.WaitResult(
+        matched=False, target='control', desired='absent', elapsed_ms=500,
+        polls=5, state=desktop._state(_state()), elements=30,
+        absent_observed=False, authoritative=True))
+    text = tool_desktop.wait(text='正在加载', state='absent', timeout_ms=500)
+    assert '没等到' in text
+    assert '没再出现' not in text
+
+
+def test_absent_wait_confirms_with_the_full_budget_when_the_poll_truncates():
+    """poll 被截断时，"没找到"不可信：要用完整预算复核一次。
+
+    实测：窗口遍历比轮询预算（900ms）慢时，第一次 poll 就只列出 11 个控件并截断，
+    于是"目标没出现"其实只是"没看到"。修前它会立刻返回，说目标不在了。
+    复核只做一次（`$absentRuled` 守着），否则每轮都多走一遍大树。
+    """
+    script = desktop.worker_script()
+    body = script.split('function Wait-ForControl', 1)[1].split(
+        chr(10) + 'function ', 1)[0]
+    absent = body.split('if ($wantAbsent) {', 1)[1]
+    assert '$absentTruncated -and -not $absentRuled' in absent
+    assert '$fullBudget' in absent
+    assert '$hit = $false' in absent          # 复核发现它还在 → 不算命中

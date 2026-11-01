@@ -342,6 +342,17 @@ def wait(*, target='control', text=None, state='present', timeout_ms=None,
 
 
 def _wait_control_text(result, needle: str, verb: str) -> str:
+    # absent 有三种结局，措辞必须分开：确认消失 / 没看到但没法确认 / 一直看得到。
+    if result.desired == 'absent' and result.absent_observed:
+        elapsed = f'{_wait_elapsed(result)}（轮询 {result.polls} 次）'
+        if result.matched:
+            return (f'等到了：「{_clip(needle, 60)}」已消失，{elapsed}。')
+        detail = ('这次没读到界面结构' if not result.elements
+                  else f'这次遍历只列出 {result.elements} 个控件、被截断了')
+        return (f'「{_clip(needle, 60)}」没再出现，{elapsed}。' + chr(10)
+                + f'注意：{detail}，所以「没找到」不等于它不在了；'
+                  '等待时的轮询预算比 desktop_inspect 小，'
+                  '要确认就用 desktop_inspect 再看一次。')
     if not result.matched:
         state = result.state
         title = _clip(state.title, 60) or '(未定)'
@@ -355,18 +366,6 @@ def _wait_control_text(result, needle: str, verb: str) -> str:
         else:
             text += '可以把 timeout_ms 调大，或先 desktop_inspect 看看现在有什么。'
         return text
-    if result.desired == 'absent':
-        elapsed = f'{_wait_elapsed(result)}（轮询 {result.polls} 次）'
-        if result.authoritative:
-            return (f'等到了：「{_clip(needle, 60)}」已消失，{elapsed}。')
-        head = f'「{_clip(needle, 60)}」没再出现，{elapsed}。'
-        # 「没找到」只在遍历完整时等于「不在了」。轮询用缩小预算（80 个控件），
-        # 大窗口会被截断；读不到树时更是只能说明"看不见"。
-        detail = ('这次没读到界面结构' if not result.elements
-                  else f'这次遍历只列出 {result.elements} 个控件、被截断了')
-        return (head + chr(10) + f'注意：{detail}，所以「没找到」不等于它不在了；'
-                '等待时的轮询预算比 desktop_inspect 小，'
-                '要确认就用 desktop_inspect 再看一次。')
     item = result.element
     label = f'（{item.label}）' if item else ''
     head = (f'等到了：控件「{_clip(needle, 60)}」{label}出现了，'
