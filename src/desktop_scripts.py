@@ -1199,6 +1199,14 @@ function Invoke-ElementAction($payload, $state) {
         $why += '（HARNESS_DESKTOP_EXCLUDE_PROCESSES），因为它可能卡住'
         Fail 'process_excluded' $why $state
     }
+    # 敏感窗口：inspect / wait / 物理输入三条都拒绝，这条**唯一会动手**的
+    # 入口原本没有检查。正常流程碰不到它（拿不到指纹：inspect 在敏感窗口上
+    # 就拒绝了），但「检查时还不敏感、动手前变了」的时序缝隙能走到这里——
+    # 而元素动作正是最不该在支付/密码页上生效的那一种。
+    if ($state.sensitive_target) {
+        $why = '这是密码或支付类敏感窗口，控件动作被拒绝；请让用户自己操作'
+        Fail 'sensitive_target' $why $state
+    }
     $budget = Get-TreeBudget $payload
     $target = [IntPtr][Convert]::ToInt64([string]$state.window_id, 16)
     $tree = Get-UiTree $target $budget.nodes $budget.depth $budget.ms
@@ -1697,14 +1705,14 @@ function Invoke-HarnessOp($req) {
             $label = "step $index/$total ($([string]$step.action))"
             $current = Get-WindowState
             if (-not $current.available) {
-                Fail 'no_foreground_window' "$label`: no foreground window" $current $index $done
+                Fail 'no_foreground_window' "$label`: 当前没有可用的前台窗口" $current $index $done
             }
             if ([int]$current.pid -ne [int]$payload.expected_pid -or
                 [string]$current.window_id -ne [string]$payload.expected_window_id) {
                 Fail 'foreground_changed' "$label`: 前台窗口变了；重新快照" $current $index $done
             }
             if ($current.sensitive_target) {
-                Fail 'sensitive_target' "$label`: input blocked on a password or sensitive window" $current $index $done
+                Fail 'sensitive_target' "$label`: 这是密码或支付类敏感窗口，输入被拒绝" $current $index $done
             }
             $err = Invoke-Step $step $current
             if ($null -ne $err) {

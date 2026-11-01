@@ -85,3 +85,28 @@ def test_edit_only_captures_after_match(tmp_path):
                        capture=capture)
     assert edited == 'Edited a.txt'
     assert target.read_text(encoding='utf-8') == 'beta\n'
+
+
+def test_write_reports_real_byte_count(tmp_path):
+    """报的是字节数就得是字节数。
+
+    原来用 `len(content)`（字符数）：写「张三」报 "Wrote 2 bytes"，实际 6 字节。
+    模型会据此判断文件大小，也会拿它跟 diff/统计对照，单位错了就是错的事实。
+    """
+    resolve, gate, _ = _access(tmp_path)
+    output = write_file('a.txt', '张三', resolve=resolve, gate=gate,
+                        capture=lambda path: None)
+    actual = (tmp_path / 'a.txt').stat().st_size
+    assert actual == 6
+    assert f'Wrote {actual} bytes' in output
+
+
+def test_write_byte_count_matches_the_encoding(tmp_path):
+    """GBK 文件按原编码写回，报的字节数也要跟着变。"""
+    target = tmp_path / 'gbk.txt'
+    target.write_bytes('旧内容'.encode('gbk'))
+    resolve, gate, _ = _access(tmp_path)
+    output = write_file('gbk.txt', '新内容', resolve=resolve, gate=gate,
+                        capture=lambda path: None)
+    assert target.read_bytes() == '新内容'.encode('gbk')
+    assert f'Wrote {len("新内容".encode("gbk"))} bytes' in output

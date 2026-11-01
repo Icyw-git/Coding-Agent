@@ -142,6 +142,20 @@ def test_element_action_rejects_overlong_expect():
             **IDENTITY)
 
 
+def test_element_action_refuses_sensitive_windows():
+    """元素动作是四个入口里唯一"动手"的那个，敏感窗口上必须拒绝。
+
+    inspect / wait(control) / 物理输入三条都拒绝，只有这条原本没有检查。
+    正常流程碰不到（拿不到指纹：inspect 在敏感窗口上就拒绝了），但「检查时
+    还不敏感、动手前变了」的时序缝隙能走到这里——而它是最不该在支付/密码页
+    上生效的那一种。
+    """
+    script = desktop.worker_script()
+    body = _ps_function(script, 'Invoke-ElementAction')
+    assert 'sensitive_target' in body
+    assert 'sensitive_target' in _ps_function(script, 'Invoke-HarnessOp')
+
+
 def test_powershell_verifies_expect_against_the_actual_control():
     """expect 的核对必须在 PowerShell 侧（模型给的名字不能自己说了算）。"""
     script = desktop.worker_script()

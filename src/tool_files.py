@@ -93,10 +93,13 @@ def write_file(path: str, content: str, *, resolve, gate, capture,
                 _text, encoding, newline = read_text_file(file_path)
             except BinaryFileError:
                 return f'Error: refusing to overwrite binary file: {path}'
+        # 先编码再写：`len(content)` 是字符数，中文一个字 3 字节，
+        # 报 "Wrote 2 bytes" 而实际写了 6 字节（实测）。报表要报真实字节数。
+        data = encode_text(content, encoding, newline)
         capture(file_path)   # 写盘前保存 pre-image，供 /rewind 回滚
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(encode_text(content, encoding, newline))
-        return f"Wrote {len(content)} bytes to {path}"
+        file_path.write_bytes(data)
+        return f"Wrote {len(data)} bytes to {path}"
     except Exception as e:
         return _fs_error(e, action='writing', path=path)
 
