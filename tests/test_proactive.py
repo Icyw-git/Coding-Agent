@@ -160,12 +160,13 @@ def test_scan_sources_survives_missing_dirs(tmp_path):
 def test_prompt_says_read_only():
     text = proactive.prompt({'workspace': 'w', 'todos': 2,
                              'recent_sessions': []})
-    assert 'READ-ONLY' in text
+    assert '只读' in text
     assert 'NONE' in text
+    text.encode('gbk')
 
 
 def test_prompt_limits_count():
-    assert 'at most 2' in proactive.prompt({'workspace': 'w'}, limit=2)
+    assert '最多给 2 条' in proactive.prompt({'workspace': 'w'}, limit=2)
 
 
 def test_parse_plain_lines():
@@ -201,3 +202,188 @@ def test_state_roundtrip(tmp_path, monkeypatch):
     data = json.loads((tmp_path / proactive.STATE_NAME).read_text(encoding='utf-8'))
     assert data['last_run'] == 1000.0
     assert data['last_count'] == 3
+
+
+# ---------- B18 接线：可注入的只读建议回合 ----------
+
+def test_read_only_schemas_match_the_whitelist():
+    """喂给模型的工具面必须就是白名单本身——多一个都算越权。
+
+    提示词挡不住工具，白名单才能。所以这里断言"schema 集合 == 白名单"，
+    而不是"包含"：哪天有人往白名单里加写工具，这里会红。
+    """
+    import proactive
+
+    names = {schema['function']['name'] for schema in proactive.read_only_schemas()}
+    assert names == set(proactive.READ_ONLY_TOOLS)
+
+
+def test_run_turn_feeds_state_and_parses_suggestions(tmp_path, monkeypatch):
+    import proactive
+
+    asked = {}
+
+    def ask(text):
+        asked['text'] = text
+        return '1. 把未完成的迁移脚本跑通\n2. 清掉 .test-tmp 里的旧日志\n'
+
+    run = proactive.run_turn(workdir=tmp_path, sessions_dir=tmp_path / 'sessions',
+                             cache_dir=tmp_path / '.cache', ask=ask, limit=2)
+
+    assert run.suggestions == ['把未完成的迁移脚本跑通', '清掉 .test-tmp 里的旧日志']
+    assert str(tmp_path) in asked['text'], '提示里要带上工作区，否则模型无从谈起'
+    assert 'NONE' in asked['text'], '没东西可说时要允许它什么都不建议'
+
+
+def test_run_turn_records_the_run_for_the_auto_interval(tmp_path):
+    import proactive
+
+    cache = tmp_path / '.cache'
+    proactive.run_turn(workdir=tmp_path, sessions_dir=tmp_path / 'sessions',
+                       cache_dir=cache, ask=lambda text: '一条建议', limit=1)
+    state = proactive._read_state(cache)
+    assert state.get('last_run'), '手动跑过也要记，自动档的间隔靠它'
+    assert state.get('last_count') == 1
+
+
+def test_run_turn_reports_an_error_without_raising(tmp_path):
+    """入口的回合可能抛（网络/取消）：命令层要能给出人话，而不是栈。"""
+    import proactive
+
+    def boom(text):
+        raise RuntimeError('network down')
+
+    run = proactive.run_turn(workdir=tmp_path, sessions_dir=tmp_path / 'sessions',
+                             cache_dir=tmp_path / '.cache', ask=boom)
+    assert run.suggestions == []
+    assert 'network down' in run.error
+
+
+def test_run_turn_treats_none_as_no_suggestions(tmp_path):
+    import proactive
+
+    run = proactive.run_turn(workdir=tmp_path, sessions_dir=tmp_path / 'sessions',
+                             cache_dir=tmp_path / '.cache',
+                             ask=lambda text: 'NONE', limit=3)
+    assert run.suggestions == []
+    assert run.error == ''
+
+
+# ---------- /suggest 的接线（不启动 TUI，直接测混入的两段逻辑） ----------
+
+def test_suggest_builds_a_read_only_turn(tmp_path, monkeypatch):
+    """`/suggest` 排的是一个**只读**回合：工具面子集 + proactive 标记。
+
+    只看"调了 start_suggestions"不够——要断言它交给回合的东西真的被裁过。
+    """
+
+    import proactive
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    captured = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def _notice(self, text, **kwargs):
+            captured['notice'] = text
+
+        def _begin_turn(self, request, *, echo_text=True):
+            captured['request'] = request
+            captured['echo'] = echo_text
+            return True
+
+    import harness
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+
+    Fake().start_suggestions()
+
+    request = captured['request']
+    assert request.proactive is True
+    assert {schema['function']['name'] for schema in request.tools} == set(
+        proactive.READ_ONLY_TOOLS)
+    assert captured['echo'] is False, '那一大段提示不该出现在聊天区'
+    assert '只读' in captured['notice']
+
+
+def test_suggest_refuses_while_a_turn_is_running():
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    seen = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = True
+
+        def _notice(self, text, **kwargs):
+            seen['notice'] = text
+
+        def _begin_turn(self, request, *, echo_text=True):     # pragma: no cover
+            raise AssertionError('忙的时候不能开新回合')
+
+    Fake().start_suggestions()
+    assert '等这一回合结束' in seen['notice']
+
+
+def test_record_proactive_run_writes_the_interval_state(tmp_path, monkeypatch):
+    import harness
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+
+    ProactiveActionsMixin().record_proactive_run('1. 甲\n2. 乙')
+
+    import proactive
+    state = proactive._read_state(tmp_path / 'cache')
+    assert state.get('last_count') == 2
+
+
+def test_slash_suggest_runs_one_read_only_turn(monkeypatch, tmp_path):
+    """端到端：敲 `/suggest` → 一个只读回合，且钩子在那一轮里按白名单拒绝。
+
+    这条测的是**接线**：命令分发 → TurnRequest → worker → agent_loop 的 tools
+    与 hooks.proactive_scope。任一处没接上，这里都会红。
+    """
+    pytest.importorskip('textual')
+    import asyncio
+
+    import harness
+    import hooks
+    from ui.harness_app import HarnessApp
+
+    seen = {}
+
+    def fake_loop(messages, **kwargs):
+        import proactive
+        seen['tools'] = kwargs.get('tools')
+        seen['proactive'] = hooks.proactive_turn()
+        # 只读白名单在钩子里真的生效
+        seen['write_blocked'] = hooks.permission_hook('write', {'path': 'x', 'content': 'y'})
+        seen['read_allowed'] = hooks.permission_hook('read', {'path': 'x'})
+        return '1. 一条建议'
+
+    monkeypatch.setattr(harness, 'agent_loop', fake_loop)
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+
+    async def scenario():
+        app = HarnessApp([])
+        async with app.run_test(size=(90, 26)) as pilot:
+            app.submit_text('/suggest')
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if 'tools' in seen:
+                    break
+            app._exiting = True
+            app._pending.put(None)
+
+    asyncio.run(scenario())
+
+    import proactive
+    assert {schema['function']['name'] for schema in seen['tools']} == set(
+        proactive.READ_ONLY_TOOLS)
+    assert seen['proactive'] is True, '只读回合没有打开 proactive_scope'
+    assert seen['write_blocked'], '白名单之外的 tool 必须被拒'
+    assert seen['read_allowed'] is None, '读工具应当放行'

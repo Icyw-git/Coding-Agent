@@ -106,7 +106,7 @@ def test_cleanup_serializes_tasks_and_drains_followup(tmp_path, monkeypatch, fai
 
     async def scenario():
         app = HarnessApp([], session_store=store, session_id=store.session_id)
-        monkeypatch.setattr(app, '_start_worker', lambda: started.extend(app._pending.drain()))
+        monkeypatch.setattr(app, '_start_worker', lambda: started.extend(app._pending.texts()))
         async with app.run_test() as pilot:
             try:
                 app._execute_cleanup(True, object(), [{'id': 'other'}], 'archive')
@@ -116,8 +116,8 @@ def test_cleanup_serializes_tasks_and_drains_followup(tmp_path, monkeypatch, fai
                         break
                 assert entered.is_set() and app._busy
                 app.submit_text('run after cleanup')
-                assert app._steering.snapshot() == []
-                assert app._pending.snapshot() == ['run after cleanup']
+                assert app._steering.texts() == []
+                assert app._pending.texts() == ['run after cleanup']
                 assert started == []
                 app.submit_text('/new')
                 assert app._store is store
@@ -138,7 +138,7 @@ def test_local_operation_messages_are_followups(monkeypatch):
     async def scenario():
         app = HarnessApp([])
         started = []
-        monkeypatch.setattr(app, '_start_worker', lambda: started.extend(app._pending.drain()))
+        monkeypatch.setattr(app, '_start_worker', lambda: started.extend(app._pending.texts()))
         async with app.run_test() as pilot:
             app._busy = True
             app._operation = 'compact'

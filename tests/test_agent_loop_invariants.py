@@ -70,9 +70,11 @@ class _Scripted:
     def __init__(self, items):
         self.items = list(items)
         self.requests = []
+        self.tools = []
 
     def create(self, **kwargs):
         self.requests.append(copy.deepcopy(kwargs.get('messages', [])))
+        self.tools.append(copy.deepcopy(kwargs.get('tools')))
         item = self.items.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -264,3 +266,24 @@ def test_cancelled_turn_records_a_cancelled_terminal(tmp_path, monkeypatch):
     assert terminal['type'] == 'turn_terminal'
     assert terminal['status'] == 'cancelled'
     assert terminal['turn_id']
+
+
+def test_agent_loop_can_run_with_a_tool_subset(tmp_path, monkeypatch):
+    """建议回合只给只读工具面：模型看不到写工具，指纹也按实际用的表算。
+
+    裁剪只改"模型看到什么"。真正的拦截仍在 hooks 的白名单（两条腿都要有）。
+    """
+    store = SessionEventStore(tmp_path / 'sessions', session_id='subset')
+    scripted = _Scripted([_response(content='ok', usage=_usage())])
+    monkeypatch.setattr(harness.client.chat.completions, 'create', scripted.create)
+
+    subset = [schema for schema in harness.TOOLS
+              if schema['function']['name'] in {'read', 'ls'}]
+    assert harness.agent_loop([{'role': 'user', 'content': 'go'}],
+                              session_store=store, housekeeping=False,
+                              tools=subset) == 'ok'
+
+    sent = scripted.tools[0]
+    assert {schema['function']['name'] for schema in sent} == {'read', 'ls'}
+    # 指纹：默认表与实际表必须能区分开，否则归因会误判成"工具表变了"
+    assert harness._tools_fingerprint(subset) != harness._tools_fingerprint()

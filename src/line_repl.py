@@ -163,8 +163,24 @@ def _fork(argument: str, session_store):
     return forked.rebuild_openai_history(), forked
 
 
-def _run_turn(line: str, messages: list, session_store) -> None:
-    """把一条用户输入交给 agent_loop，并把流式文本直接写到终端。"""
+def _proactive_scope(flag: bool):
+    """建议回合里打开只读白名单；其余回合是空操作。"""
+    import contextlib
+
+    if not flag:
+        return contextlib.nullcontext()
+    from hooks import proactive_scope
+
+    return proactive_scope()
+
+
+def _run_turn(line: str, messages: list, session_store, *,
+              tools=None, proactive: bool = False) -> None:
+    """把一条用户输入交给 agent_loop，并把流式文本直接写到终端。
+
+    ``tools`` / ``proactive`` 只给 `/suggest` 用：那一轮是只读建议回合，
+    工具面裁成读工具、钩子里再按白名单硬拒。
+    """
     h = _h()
     from session_locks import sessions_dir_for
     from turn_coordinator import TurnBusy, turn_slot
@@ -195,8 +211,19 @@ def _run_turn(line: str, messages: list, session_store) -> None:
         # 锁跟着**这个 REPL 正在写的会话**走，而不是全局 SESSIONS_DIR：
         # `/resume` 可以打开别的目录下的会话，锁落在全局目录就等于没锁住它。
         with turn_slot(sessions_dir_for(session_store).parent):
-            h.agent_loop(messages, session_store=session_store,
-                         on_delta=on_delta, turn_source='cli')
+            kwargs = {}
+            if tools is not None:
+                kwargs['tools'] = list(tools)
+            with _proactive_scope(proactive):
+                answer = h.agent_loop(messages, session_store=session_store,
+                                      on_delta=on_delta, turn_source='cli',
+                                      **kwargs)
+        if proactive:
+            import proactive as proactive_mod
+            try:
+                proactive_mod.record_answer(h.CACHE_DIR, answer)
+            except Exception:
+                pass    # 记账失败不该影响已经给出的建议
     except TurnBusy:
         h.ui_emit('error', msg='另一个入口正在执行回合，本条未发送')
         print('\n[busy] 另一个入口正在执行回合，本条未发送。')
@@ -211,6 +238,25 @@ def _run_turn(line: str, messages: list, session_store) -> None:
             ticker.stop()
             h.ACTIVE_TICKER = None
     messages[:] = session_store.rebuild_openai_history(recover_pending=True)
+
+
+def _suggest(messages: list, session_store) -> None:
+    """`/suggest`：跑一轮只读建议回合，回答直接打印（和普通回答一样进会话）。"""
+    h = _h()
+    import proactive
+
+    try:
+        material = proactive.scan_sources(workdir=h.get_workdir(),
+                                          sessions_dir=h.SESSIONS_DIR)
+        text = proactive.prompt(material, limit=proactive.max_suggestions())
+        tools = proactive.read_only_schemas()
+    except Exception as exc:
+        print(f'  要建议失败：{type(exc).__name__}: {exc}')
+        return
+    print('  只读建议回合：这次只给读工具，不会改动任何文件。')
+    messages.append({'role': 'user', 'content': text})
+    session_store.append_message(messages[-1])
+    _run_turn(text, messages, session_store, tools=tools, proactive=True)
 
 
 def run_line_repl(messages: list, session_store) -> None:
@@ -291,6 +337,9 @@ def run_line_repl(messages: list, session_store) -> None:
                     forked = _fork(argument, session_store)
                     if forked is not None:
                         messages, session_store = forked
+                    continue
+                if command == '/suggest':
+                    _suggest(messages, session_store)
                     continue
                 h.handle_command(line, messages, session_store)
                 continue

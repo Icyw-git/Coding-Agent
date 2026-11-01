@@ -24,6 +24,7 @@ from ui.chrome.status import StatusMixin
 from ui.command_actions import CommandActionsMixin
 from ui.composer.suggestions import SuggestionsMixin
 from ui.event_reduction import EventReductionMixin
+from ui.proactive_actions import ProactiveActionsMixin
 from ui.queue_actions import QueueActionsMixin
 from ui.renderers.tools import TOOL_MORE_LINES, TOOL_PREVIEW_LINES, tool_view
 from ui.rendering import _render_lines, _render_markdown, _streaming_markdown_source
@@ -31,7 +32,7 @@ from ui.search_actions import SearchActionsMixin
 from ui.session_actions import SessionActionsMixin
 from ui.session_admin_actions import SessionAdminActionsMixin
 from ui.transcript import ConversationModel, TranscriptLayout
-from ui.widgets import CompletionPopup, Composer, PendingQueue, Transcript
+from ui.widgets import CompletionPopup, Composer, PendingQueue, Transcript, TurnRequest
 from ui_events import bus
 
 FOLLOW_END = True
@@ -41,9 +42,24 @@ STREAM_MIN_INTERVAL = 0.05
 STREAM_MAX_INTERVAL = 0.30
 STREAM_DEFAULT_INTERVAL = 0.12
 
+def proactive_run(flag: bool):
+    """只在建议回合里打开只读白名单；其余回合是空操作。
+
+    白名单拦截（hooks.proactive_scope）与工具面裁剪（TurnRequest.tools）是两条腿：
+    前者是强制，后者是让模型不必先撞墙。缺一个都不算"只读"。
+    """
+    import contextlib
+
+    if not flag:
+        return contextlib.nullcontext()
+    from hooks import proactive_scope
+
+    return proactive_scope()
+
+
 class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                  SearchActionsMixin, CommandActionsMixin, EventReductionMixin,
-                 QueueActionsMixin,
+                 QueueActionsMixin, ProactiveActionsMixin,
                  SuggestionsMixin, BackgroundActionsMixin, FooterMixin,
                  StatusMixin, App):
     """行模型驱动的 TUI：聊天区只有一个自绘视口。"""
@@ -417,7 +433,7 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             mode = 'followup'
         if self._busy and mode != 'followup':
             # Alt+Enter 的 steer：先只进队列；agent_loop 注入时再由 user_message 落块。
-            self._steering.put(text)
+            self._steering.put(TurnRequest(text=text))
             self._refresh_queue()
             return
         if self._busy:
@@ -425,20 +441,30 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
             self.model.append('user', {'text': text})
             self._mark_dirty()
             self._flush_layout(force=True)
-            self._pending.put(text)
+            self._pending.put(TurnRequest(text=text))
             self._refresh_queue()
             return
+        if not self._begin_turn(TurnRequest(text=text)):
+            self._restore_unsent([text])
+
+    def _begin_turn(self, request: TurnRequest, *, echo_text: bool = True) -> bool:
+        """占回合槽并把 request 交给 worker。返回是否真的开跑。
+
+        ``echo_text=False`` 用于程序生成的回合（`/suggest`）：那一大段提示对用户
+        没有意义，只显示它后面的回答。
+        """
         turn = self._acquire_turn()
         if turn is None:
-            self._restore_unsent([text])
-            return
+            return False
         try:
-            self.model.append('user', {'text': text})
-            self._mark_dirty()
-            self._flush_layout(force=True)  # 先画出用户消息，不必等 50ms 定时器
-            self._pending.put(text)
+            if echo_text:
+                self.model.append('user', {'text': request.text})
+                self._mark_dirty()
+                self._flush_layout(force=True)  # 先画出用户消息，不必等 50ms 定时器
+            self._pending.put(request)
             self._refresh_queue()
             self._start_worker(turn)
+            return True
         except BaseException:
             turn.close()
             raise
@@ -519,7 +545,7 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         if turn is None:
             turn = self._acquire_turn()
             if turn is None:
-                self._restore_unsent(self._pending.drain())
+                self._restore_unsent([entry.text for entry in self._pending.drain()])
                 return
         self._operation = 'agent'
         self._busy = True
@@ -541,9 +567,10 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         import turn_control
         try:
             while not self._exiting:
-                text = self._pending.get()
-                if text is None:
+                item = self._pending.get()
+                if item is None:
                     break
+                text = item.text
                 self._messages.append({'role': 'user', 'content': text})
                 self._ui_call(self._refresh_queue)
                 answer = None
@@ -554,18 +581,25 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                         # 这些写入会盖住 UI 并拖慢重绘，全部收进内存。
                         with contextlib.redirect_stdout(io.StringIO()):
                             kwargs = {
-                                'steer_provider': self._steering.drain,
+                                'steer_provider': lambda: [
+                                    entry.text for entry in self._steering.drain()],
                             }
                             if self._store is not None:
                                 kwargs['session_store'] = self._store
-                            answer = harness.agent_loop(
-                                self._messages, turn_source='tui', **kwargs)
+                            if item.tools is not None:
+                                # 只读建议回合：模型只看得到读工具
+                                kwargs['tools'] = list(item.tools)
+                            with proactive_run(item.proactive):
+                                answer = harness.agent_loop(
+                                    self._messages, turn_source='tui', **kwargs)
                 except KeyboardInterrupt:
                     pass
                 except Exception as exc:
                     answer = f'Error: {type(exc).__name__}: {exc}'
                 finally:
                     harness.permission_gate.use_ui = False
+                if item.proactive:
+                    self.record_proactive_run(answer)
                 try:
                     self.call_from_thread(self._sync_final_answer, answer)
                 except Exception:

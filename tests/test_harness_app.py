@@ -1666,8 +1666,8 @@ def test_steering_queue_and_dequeue_all(monkeypatch):
             app.submit_text('steer me', mode='steer')
             app.submit_text('follow up', mode='followup')
             await pilot.pause()
-            assert app._steering.snapshot() == ['steer me']
-            assert app._pending.snapshot() == ['follow up']
+            assert app._steering.texts() == ['steer me']
+            assert app._pending.texts() == ['follow up']
             # 多条时 Alt+Up 打开选择器，Ctrl+R 取回全部
             await pilot.press('alt+up')
             await pilot.pause()
@@ -1727,7 +1727,7 @@ def test_steering_does_not_render_until_agent_consumes_it():
             app._busy = True
             app.submit_text('steer now', mode='steer')
             await pilot.pause()
-            assert app._steering.snapshot() == ['steer now']
+            assert app._steering.texts() == ['steer now']
             assert not any(block.kind == 'user' for block in app.model.snapshot())
             app._apply(UIEvent('user_message', {'text': 'steer now'}))
             await pilot.pause()

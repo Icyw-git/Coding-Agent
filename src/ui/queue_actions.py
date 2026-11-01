@@ -15,9 +15,10 @@ class QueueActionsMixin:
     """把两条队列映射到编辑器与选择器；不拥有队列本身。"""
 
     def take_last_queued(self) -> None:
-        item = self._pending.take_last()
-        if item is None or self._composer is None:
+        entry = self._pending.take_last()
+        if entry is None or self._composer is None:
             return
+        item = entry.text
         self._programmatic_text = item
         self._composer.text = item
         self._composer.cursor_location = (0, len(item))
@@ -27,7 +28,8 @@ class QueueActionsMixin:
         """Esc / 选择器 Ctrl+R：把 steering 和 follow-up 全部取回输入框。"""
         if self._composer is None:
             return
-        items = self._steering.drain() + self._pending.drain()
+        items = [entry.text for entry in self._steering.drain()] + [
+            entry.text for entry in self._pending.drain()]
         items = [item for item in items if item]
         if not items:
             self._notice('没有可取回的排队消息。')
@@ -55,7 +57,8 @@ class QueueActionsMixin:
         for name, pending, prefix in (
                 ('steer', self._steering, 'steer'),
                 ('next', self._pending, 'next')):
-            for index, text in enumerate(pending.snapshot()):
+            for index, entry in enumerate(pending.snapshot()):
+                text = entry.text
                 preview = text.replace(chr(10), ' ')[:60]
                 rows.append({
                     'value': f'{name}:{index}', 'queue': name,
@@ -81,11 +84,11 @@ class QueueActionsMixin:
         return self._steering if row['queue'] == 'steer' else self._pending
 
     def _restore_queue_row(self, row: dict) -> None:
-        text = self._queue_for(row).take_at(row['index'], expected=row['text'])
-        if text is None:
+        entry = self._queue_for(row).take_at(row['index'], expected=row['text'])
+        if entry is None:
             self._notice('队列已变化（消息可能已被消费），请重新打开。')
             return
-        self._restore_to_composer([text])
+        self._restore_to_composer([entry.text])
         self._notice('已取回 1 条排队消息到输入框。')
 
     def _on_queue_action(self, result) -> None:
@@ -112,20 +115,20 @@ class QueueActionsMixin:
     def _delete_queue_row(self, confirmed, row: dict) -> None:
         if not confirmed:
             return
-        text = self._queue_for(row).take_at(row['index'], expected=row['text'])
-        if text is None:
+        entry = self._queue_for(row).take_at(row['index'], expected=row['text'])
+        if entry is None:
             self._notice('队列已变化（消息可能已被消费），请重新打开。')
             return
         self._refresh_queue()
+        text = entry.text
         preview = text.replace(chr(10), ' ')[:40]
         self._notice(f'已删除排队消息：{preview}')
 
     def _refresh_queue(self) -> None:
         if self._queue_widget is None:
             return
-        steering = self._steering.snapshot()
-        followup = self._pending.snapshot()
-        items = steering + followup
+        steering = self._steering.texts()
+        items = steering + self._pending.texts()
         if not items:
             self._queue_widget.display = False
             self._queue_widget.update('')

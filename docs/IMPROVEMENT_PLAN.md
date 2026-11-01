@@ -31,7 +31,7 @@
 | P0-5 B13 偶发 | ⚠️ 单测连跑 20/20 通过，**未复现**；按纪律不改代码，保持记录 |
 | B17 半翻译消息（新增） | ✅ 已修 + 守卫（第 76 节） |
 | P1 清账 B8–B12 | ✅ 全部完成（第 77 节） |
-| P1 吸收调研 | P1-3 ✅；P1-1 被 B18 阻塞；**P1-2 / P1-4 / P1-5 前提不成立**（见下）；P1-6 不适用（我们没有可覆盖 prompt） |
+| P1 吸收调研 | P1-3 ✅；P1-1 **待做**（B18 已接线，`observe` 档可以上了）；**P1-2 / P1-4 / P1-5 前提不成立**（见下）；P1-6 不适用（我们没有可覆盖 prompt） |
 | B7 语言分层决策 | ✅ 规则已写进 `coding-standards.md` |
 | P2 恢复测试（B14） | ✅ `tests/test_recovery.py`：持锁进程被强杀后后来者能继续 |
 | P2 拒绝清单 | ✅ `ARCHITECTURE_REVIEW.md` 第六节 |
@@ -63,7 +63,7 @@
 | B15 | `DEBUG_LOG.md` 第 69 节写着"最小化会让窗口从列表消失"——**实测是错的** | 最小化后仍在 `list_windows` 里（带"已最小化"标记） | **文档说谎**，会误导下一个人 | P0（已改） |
 | B16 | `docs/FEISHU_ACCEPTANCE.md` D1–D26 未人工验收 | 需要真机点击 | 桌面工具的可用性没有被端到端确认过 | P2（人工） |
 | B17 | `focus_failed` 的消息是半句话被翻译（中文句 + 英文后半句） | `desktop_scripts.py` 原 1611–1612 行 | 模型读到被截断的混合语 | P0（已修） |
-| B18 | **主动性模块没有接线**：`proactive.py` 的 5 个入口函数与 `hooks.proactive_scope` 无生产调用方；文档却标 M2「已完成」 | 全仓 grep `should_run(`/`parse_suggestions(`/`scan_sources(`/`proactive_scope(` 只命中测试 | 测试给出"我们有主动建议"的假信心；P1-1 若照做等于在死代码上加功能 | P1 |
+| B18 | ~~主动性模块没有接线~~ → **已接线**：`/suggest`（TUI + REPL）跑一个只读回合，工具面裁成白名单、`proactive_scope` 硬拒 | `tests/test_proactive.py::test_slash_suggest_runs_one_read_only_turn` | —— | ✅ |
 
 > B15 已在本轮改掉，并保留"更正"痕迹。**它是这份清单里最值得记住的一条**：一条没有测量
 > 支撑的"记录不改"，本身就成了新的错误来源。

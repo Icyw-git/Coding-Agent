@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 
 from rich.text import Text
 from textual import events
@@ -17,26 +18,40 @@ from ui.transcript import VirtualTranscript
 SUGGESTION_LIMIT = 6
 
 
+@dataclass(frozen=True)
+class TurnRequest:
+    """一个待执行的回合：文本 + 这一回合怎么跑。
+
+    ``tools=None`` 表示用全部工具；给只读建议回合传工具面子集。
+    ``proactive=True`` 时 worker 会在 ``hooks.proactive_scope`` 里跑这一回合，
+    白名单拦截才有意义（裁剪工具面只改变"模型看到什么"）。
+    """
+
+    text: str
+    tools: tuple | None = None
+    proactive: bool = False
+
+
 class PendingQueue:
-    """待发送消息队列：worker 取头部，用户可取回最后一条编辑。"""
+    """待发送回合队列：worker 取头部，用户可取回最后一条编辑。"""
 
     def __init__(self) -> None:
-        self._items: list[str | None] = []
+        self._items: list[TurnRequest | None] = []
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
 
-    def put(self, item: str | None) -> None:
+    def put(self, item: TurnRequest | None) -> None:
         with self._cv:
             self._items.append(item)
             self._cv.notify()
 
-    def get(self) -> str | None:
+    def get(self) -> TurnRequest | None:
         with self._cv:
             while not self._items:
                 self._cv.wait()
             return self._items.pop(0)
 
-    def take_last(self) -> str | None:
+    def take_last(self) -> TurnRequest | None:
         with self._lock:
             if not self._items:
                 return None
@@ -46,22 +61,26 @@ class PendingQueue:
             self._items.pop()
             return item
 
-    def take_at(self, index: int, expected: str | None = None) -> str | None:
+    def take_at(self, index: int, expected: str | None = None) -> TurnRequest | None:
         """按位置取走一条；expected 不匹配说明队列已被消费，拒绝误取。"""
         with self._lock:
             if not 0 <= index < len(self._items):
                 return None
             item = self._items[index]
-            if item is None or (expected is not None and item != expected):
+            if item is None or (expected is not None and item.text != expected):
                 return None
             return self._items.pop(index)
 
-    def snapshot(self) -> list[str]:
+    def snapshot(self) -> list[TurnRequest]:
         with self._lock:
             return [item for item in self._items if item is not None]
 
-    def drain(self) -> list[str]:
-        """取走全部消息（用于 steer 注入或 Esc 取回）。"""
+    def texts(self) -> list[str]:
+        """只要文本（渲染队列、比对用）；回合的执行方式不参与显示。"""
+        return [item.text for item in self.snapshot()]
+
+    def drain(self) -> list[TurnRequest]:
+        """取走全部回合（用于 steer 注入或 Esc 取回）。"""
         with self._lock:
             items = [item for item in self._items if item is not None]
             self._items.clear()

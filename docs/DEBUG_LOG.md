@@ -13208,3 +13208,69 @@ grep -rn "proactive_scope(" .
 值得抄的是这个形式。
 
 全量 3381 passed / 3 skipped。
+
+---
+
+# 第 82 部分：给主动性接线（`/suggest`），以及为什么先做手动触发
+
+## 为什么不是"每天自动推"
+
+三条理由，按重要性：
+
+1. **失败的代价不同。** 手动触发失败 = 你点了、看到三条废话，一次可见的失望；自动
+   触发失败 = 每天早上一堆噪音，而且不知道该关哪里。这个功能的设计文档自己就写着
+   "主动性最容易做成品味灾难"。
+2. **还没调过 prompt，就没资格定时打扰。** `prompt()` 里的建议格式一次真实反馈都没有，
+   先让人点几次，把"什么样的建议有用"调出来，再决定频率。
+3. **手动是可回退的最小接线。** 它复用同一条执行路径，接自动档时只是多一个触发源。
+
+（顺带承认：手动触发严格说不是"主动性"，是"按需建议"。所以顺序是**先接线验证产出，
+再挂触发源**。）
+
+## 接了什么
+
+```
+/suggest
+  → proactive.scan_sources()      收集素材（工作区、待办、最近会话）
+  → proactive.prompt()            组只读提示
+  → TurnRequest(tools=只读子集, proactive=True)
+  → 正常回合路径（同一条队列、同一套事件流）
+  → agent_loop(tools=子集) + hooks.proactive_scope() 硬拒
+  → 回答进会话；proactive.record_answer() 记一次节奏状态
+```
+
+**两条腿才算只读**：`TurnRequest.tools` 让模型**看不到**写工具（不必先撞墙），
+`proactive_scope` 在钩子里**拒绝**白名单之外的工具（真拦截）。只做前者是提示，
+只做后者是浪费回合。端到端测试把这条钉住了：`write` 被拒、`read` 放行。
+
+TUI 与行式 REPL 都接了（`/suggest`），CLI 补全表同步（`test_cli_and_tui_command_sets_match`
+当场抓到我漏了 CLI 那一侧）。
+
+## 途中改的东西（都是被这次接线逼出来的）
+
+| 改动 | 为什么 |
+| --- | --- |
+| `agent_loop(..., tools=None)` | 要能裁工具面；只改"模型看到什么"，不碰白名单 |
+| `_tools_fingerprint(tools=None)` | 指纹按**实际发出去的**表算，否则事后归因会说"工具表变了" |
+| `PendingQueue` 存 `TurnRequest`（TUI 两个队列都改） | 让"这一回合怎么跑"跟着消息走。不做旁路状态——队列里第二条消息就会把模式安错回合 |
+| `_begin_turn(request, echo_text=)` | 程序生成的回合不把那段提示打进聊天区 |
+| `proactive.record_answer()` | 两个入口共用一处记账 |
+
+## 三个坑
+
+1. **heredoc 又把 `\n` 折叠成真换行**，把 `proactive.prompt()` 写成了语法错误。第三次了。
+   现在凡是代码里带转义的补丁，一律用 `write` 工具写脚本，不用 heredoc。
+2. **两个队列类型不一致**：先只改了 `_pending`（TurnRequest）、`_steering` 还是字符串，
+   于是每个读取点都要 `hasattr(entry, 'text')`。改成两边都用 TurnRequest 之后，
+   读取点只剩 `.text`/`.texts()`。
+3. **私有方法名撞车**：新混入先叫 `SuggestionActionsMixin`，和既有的
+   `SuggestionsMixin`（输入框补全）混在一起，读起来像同一个东西。改名
+   `ProactiveActionsMixin`。
+
+## 还没验的
+
+**真实模型下的效果没跑过**（本机 API 余额不足，第 84 节有记录）。所以现在能保证的是
+"接线正确、边界正确"，不能保证"建议质量好"。这正是先做手动触发的理由——下次你点一次
+就知道了。
+
+全量 3393 passed / 3 skipped。

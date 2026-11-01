@@ -6,6 +6,7 @@ import pytest
 pytest.importorskip('textual')
 
 from ui.harness_app import HarnessApp, PendingQueue  # noqa: E402
+from ui.widgets import TurnRequest  # noqa: E402
 
 
 def _busy(app, messages: list[tuple[str, str]]) -> None:
@@ -26,8 +27,8 @@ def test_enter_queues_next_and_alt_enter_steers_immediately():
             app._composer.text = 'inject now'
             await pilot.press('alt+enter')
             await pilot.pause()
-            assert app._pending.snapshot() == ['after turn']
-            assert app._steering.snapshot() == ['inject now']
+            assert app._pending.texts() == ['after turn']
+            assert app._steering.texts() == ['inject now']
             assert app._composer.text == ''
             app._busy = False
 
@@ -42,7 +43,7 @@ def test_single_queued_message_restores_directly():
             await pilot.press('ctrl+g')
             await pilot.pause()
             assert type(app.screen).__name__ != 'QueueModal'
-            assert app._pending.snapshot() == []
+            assert app._pending.texts() == []
             assert app._composer.text == 'only one'
             app._busy = False
 
@@ -72,8 +73,8 @@ def test_queue_picker_restores_selected_message_only():
             await pilot.press('enter')
             await pilot.pause()
             assert app._composer.text == 'next two'
-            assert app._steering.snapshot() == ['steer one']
-            assert app._pending.snapshot() == ['next one']
+            assert app._steering.texts() == ['steer one']
+            assert app._pending.texts() == ['next one']
             app._busy = False
 
     asyncio.run(scenario())
@@ -98,8 +99,8 @@ def test_queue_picker_deletes_selected_after_confirmation():
             assert isinstance(app.screen, ConfirmModal)
             await pilot.press('y')
             await pilot.pause()
-            assert app._steering.snapshot() == ['keep steer']
-            assert app._pending.snapshot() == []
+            assert app._steering.texts() == ['keep steer']
+            assert app._pending.texts() == []
             assert app._composer.text == ''
             app._busy = False
 
@@ -118,7 +119,7 @@ def test_cancelled_delete_keeps_message():
             await pilot.pause()
             await pilot.press('n')
             await pilot.pause()
-            assert app._pending.snapshot() == ['keep me', 'also keep']
+            assert app._pending.texts() == ['keep me', 'also keep']
             app._busy = False
 
     asyncio.run(scenario())
@@ -126,12 +127,13 @@ def test_cancelled_delete_keeps_message():
 
 def test_take_at_rejects_stale_expected_text():
     queue = PendingQueue()
-    queue.put('a')
-    queue.put('b')
+    queue.put(TurnRequest(text='a'))
+    queue.put(TurnRequest(text='b'))
     assert queue.take_at(0, expected='b') is None
-    assert queue.snapshot() == ['a', 'b']
-    assert queue.take_at(1, expected='b') == 'b'
-    assert queue.snapshot() == ['a']
+    assert queue.texts() == ['a', 'b']
+    taken = queue.take_at(1, expected='b')
+    assert taken is not None and taken.text == 'b'
+    assert queue.texts() == ['a']
 
 
 def test_stale_picker_row_does_not_restore_another_message():
@@ -149,7 +151,51 @@ def test_stale_picker_row_does_not_restore_another_message():
             await pilot.press('enter')     # 仍指向已失效的 steer:0
             await pilot.pause()
             assert app._composer.text == ''
-            assert app._pending.snapshot() == ['next stays']
+            assert app._pending.texts() == ['next stays']
             app._busy = False
 
     asyncio.run(scenario())
+
+
+# ---------- 队列条目可以带"这一回合怎么跑" ----------
+
+def test_turn_request_defaults_to_a_plain_turn():
+    from ui.widgets import TurnRequest
+
+    item = TurnRequest(text='hello')
+    assert item.text == 'hello'
+    assert item.tools is None        # None = 全部工具
+    assert item.proactive is False
+
+
+def test_queue_carries_turn_requests_and_keeps_text_helpers():
+    """队列条目换成对象后，取回/去重/取出仍按**文本**工作。
+
+    `/suggest` 要靠这个类型把「只用只读工具」带到 worker，而取回队列、去重、
+    按位置取走这些既有行为不能跟着变。
+    """
+    from ui.widgets import PendingQueue, TurnRequest
+
+    queue = PendingQueue()
+    queue.put(TurnRequest(text='a'))
+    queue.put(TurnRequest(text='b', tools=[], proactive=True))
+
+    assert [item.text for item in queue.snapshot()] == ['a', 'b']
+    taken = queue.take_at(1, expected='b')
+    assert taken is not None and taken.text == 'b' and taken.proactive is True
+    assert queue.take_at(0, expected='nope') is None     # 期望不匹配 → 拒绝误取
+    assert queue.take_last().text == 'a'
+    assert len(queue) == 0
+
+
+def test_queue_drain_returns_requests_for_restore():
+    from ui.widgets import PendingQueue, TurnRequest
+
+    queue = PendingQueue()
+    queue.put(TurnRequest(text='one'))
+    queue.put(None)          # 退出哨兵不算消息
+    queue.put(TurnRequest(text='two'))
+
+    drained = queue.drain()
+    assert [item.text for item in drained] == ['one', 'two']
+    assert len(queue) == 0

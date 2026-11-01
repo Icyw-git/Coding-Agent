@@ -195,8 +195,11 @@ from workspace_context import current_workspace, use_workspace
 # 请求前缀包含 system + tools + 历史：把 tools 指纹写进 usage 事件，事后
 # 不用开调试开关也能把缓存跌破归因到「模型 / system / 工具表」哪一项变了。
 # MCP 工具在运行期才追加到 TOOLS，所以指纹要在记 usage 时现算。
-def _tools_fingerprint() -> str:
-    return hashlib.sha1(repr(TOOLS).encode('utf-8', 'replace')).hexdigest()[:12]
+def _tools_fingerprint(tools=None) -> str:
+    # 建议回合只带只读工具面子集，指纹要按**实际发出去的**表算，
+    # 否则事后归因会把这一次当成"工具表变了"。
+    table = TOOLS if tools is None else tools
+    return hashlib.sha1(repr(table).encode('utf-8', 'replace')).hexdigest()[:12]
 
 def _apply_secure_credentials() -> None:
     """密文凭据优先于 .env：迁移过的密钥不该被同名的明文值盖回去。
@@ -1036,6 +1039,8 @@ class _TurnState:
     memory_profile_pending: bool = True
     turn_baseline: object = None
     baseline_taken: bool = False
+    #: 本回合的工具面。None = 用全局 ``TOOLS``；给只读建议回合传子集。
+    tools: object = None
 
 
 def _turn_cancelled(state: _TurnState) -> bool:
@@ -1093,7 +1098,7 @@ def _run_llm_request(state: _TurnState, request_messages: list, profile_timing: 
         kwargs = dict(
             model=selected_model,
             messages=request_messages,
-            tools=TOOLS,
+            tools=state.tools if state.tools is not None else TOOLS,
             temperature=0.7,
             max_tokens=max_tokens,
         )
@@ -1152,7 +1157,7 @@ def _record_request_result(state: _TurnState, response, *, profile_timing: dict,
             'usage_available': False,
             'model': active_model(state.recovery_state),
             'system_fp': _system_fingerprint(state.system),
-            'tools_fp': _tools_fingerprint(),
+            'tools_fp': _tools_fingerprint(state.tools),
             'finish_reason': getattr(response.choices[0], 'finish_reason', None),
         }
         if state.memory_profile_pending:
@@ -1163,7 +1168,7 @@ def _record_request_result(state: _TurnState, response, *, profile_timing: dict,
     # 归因字段：缓存跌破到底是换了模型、system 改了，还是工具表变了。
     detail['model'] = active_model(state.recovery_state)
     detail['system_fp'] = _system_fingerprint(state.system)
-    detail['tools_fp'] = _tools_fingerprint()
+    detail['tools_fp'] = _tools_fingerprint(state.tools)
     detail.update(profile_timing)
     if state.memory_profile_pending:
         detail['memory_load_ms'] = state.memory_load_ms
@@ -1421,12 +1426,15 @@ def _run_tool_calls(state: _TurnState, message) -> bool:
 @_isolated_checkpoint_context()
 def agent_loop(messages:list, session_store=None, on_delta=None, *,
                on_event=None, housekeeping=True, steer_provider=None,
-               turn_source='cli', turn_id=None):
+               turn_source='cli', turn_id=None, tools=None):
     """Run one OpenAI session, recording an append-only event stream for recovery.
 
     ``on_event`` mirrors tool execution for one-shot transports; ``housekeeping``
     can be disabled by short-lived processes that would otherwise start title /
     memory LLM calls in daemon threads and die before they finish.
+
+    ``tools`` 只给需要裁剪工具面的回合用（目前是只读建议回合）。默认 None 表示
+    用全局 ``tools.TOOLS``；裁剪只改"模型看到什么"，真正的拦截仍在 hooks 的白名单。
     """
     perf_reset()   # 分段计时清零（HARNESS_PERF=1 时生效）
     # 污点是回合级状态：上回合读过密钥，不该让本回合每一次联网都变红（那样
@@ -1496,6 +1504,7 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         turn_started=turn_started,
         # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
         turn_cp_start=_safe_checkpoint(checkpoint_manager.head),
+        tools=tools,
     )
 
     outcome = {'status': 'completed'}

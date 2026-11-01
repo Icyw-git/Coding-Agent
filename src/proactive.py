@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import settings
@@ -83,6 +84,9 @@ def _write_state(cache_dir, data: dict) -> None:
     path = _state_path(cache_dir)
     tmp = path.with_name(path.name + '.tmp')
     try:
+        # 首次运行时 .cache 可能还不存在；不建目录的话这里会静默失败，
+        # 节奏状态永远写不进去（自动档就会每次都触发）。
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=0),
                        encoding='utf-8')
         tmp.replace(path)
@@ -164,24 +168,65 @@ def scan_sources(*, workdir, sessions_dir) -> dict:
     return material
 
 
+@dataclass(frozen=True)
+class SuggestionRun:
+    """一次建议回合的结果。``error`` 非空表示入口那边的回合没跑成。"""
+
+    material: dict
+    suggestions: list[str]
+    error: str = ''
+
+
+def read_only_schemas() -> list[dict]:
+    """喂给模型的工具面：**就是**白名单本身，不是它的超集。
+
+    提示词挡不住工具，白名单才能。这里按 ``READ_ONLY_TOOLS`` 过滤 ``tools.TOOLS``，
+    而不是反过来往白名单里补名字——多一个写工具就等于把"只读"变成口号。
+    """
+    import tools
+
+    wanted = READ_ONLY_TOOLS
+    return [schema for schema in tools.TOOLS
+            if str(schema.get('function', {}).get('name') or '') in wanted]
+
+
+def run_turn(*, workdir, sessions_dir, cache_dir, ask, limit: int | None = None
+             ) -> SuggestionRun:
+    """跑一次建议回合。``ask(text) -> str`` 由入口注入（TUI / REPL 各自执行回合）。
+
+    建议不是行动：这里只收集文字，不调用任何写工具，也不改任何文件。真正动手要
+    用户在下一条消息里明说（"做第 2 条"），那时走的是正常的审批路径。
+    """
+    count = max_suggestions() if limit is None else max(1, int(limit))
+    material = scan_sources(workdir=workdir, sessions_dir=sessions_dir)
+    try:
+        raw = ask(prompt(material, limit=count))
+    except Exception as exc:      # 入口的回合可能抛（网络/取消/中断）
+        return SuggestionRun(material, [], f'{type(exc).__name__}: {exc}')
+    suggestions = parse_suggestions(str(raw or ''), limit=count)
+    # 跑过就记：自动档的间隔判断靠它，手动跑同样算"今天已经建议过"。
+    record_run(cache_dir, len(suggestions))
+    return SuggestionRun(material, suggestions)
+
+
 def prompt(material: dict, *, limit: int = 3) -> str:
     """生成给模型的只读建议提示。
 
     即使工具面已经裁了，提示里也再说一次：少一次无效尝试总归更好。
+    建议会直接显示给用户，所以要求用中文、一条一行。
     """
     recent = material.get('recent_sessions') or []
     recent_text = '、'.join(
         str(item.get('title') or '') for item in recent) or '（无）'
     return (
-        "You are reviewing the user's local state to suggest what to do next.\n"
-        'You have READ-ONLY tools. Do not attempt to change anything.\n\n'
-        f"Workspace: {material.get('workspace')}\n"
-        f"Open todos: {material.get('todos')}\n"
-        f"Recent sessions: {recent_text}\n\n"
-        f'Suggest at most {limit} concrete next actions. For each: one line, '
-        'actionable, specific to what you can see. Skip anything you cannot '
-        'justify from the state above. If nothing is worth suggesting, output '
-        'exactly: NONE'
+        '你看看我本机的状态，给几条今天值得做的事。\n'
+        '你只有只读工具，不要尝试改动任何东西。\n\n'
+        f"工作区：{material.get('workspace')}\n"
+        f"未完成的待办：{material.get('todos')}\n"
+        f"最近的会话：{recent_text}\n\n"
+        f'最多给 {limit} 条，一条一行，用中文，要具体到能直接动手；'
+        '每条都要能从上面看到的状态里说清理由，没把握的不要写。'
+        '如果确实没有值得做的事，只输出：NONE'
     )
 
 
@@ -211,3 +256,14 @@ def parse_suggestions(text: str, *, limit: int = 3) -> list[str]:
         if len(out) >= limit:
             break
     return out
+
+
+def record_answer(cache_dir, answer) -> int:
+    """记一次建议回合的结果，返回解析到的条数。
+
+    两个入口（TUI 的 `/suggest` 与行式 REPL）共用这一处：间隔判断、条数统计
+    都从这里走，避免一边记一边忘。
+    """
+    count = len(parse_suggestions(str(answer or '')))
+    record_run(cache_dir, count)
+    return count
