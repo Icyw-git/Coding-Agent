@@ -18,6 +18,10 @@ from exec_policy import is_secret_path
 from tool_text import BinaryFileError, decode_text
 
 MAX_SEARCH_BYTES = 2 * 1024 * 1024
+#: 单次列举的路径行数上限。实测 ls C:/Windows/System32 一次就是 4689 行
+#: （13.6 万字符，约 4.5 万 token）——一次只读调用能把上下文吃掉一半。
+#: grep 早有 max_results（默认 100），这几个工具漏了。
+MAX_PATH_ROWS = 500
 SEARCH_IGNORE = frozenset(checkpoints.DEFAULT_IGNORE) | {
     'node_modules', '.venv', 'venv', '.tox', '.mypy_cache'}
 RG_TIMEOUT = 30.0
@@ -193,6 +197,10 @@ def glob_files(pattern: str, path: str | None, cwd: str | None, *,
             return f'Error: path not found: {path}'
         matches = [p for p in root.glob(pattern) if p.is_file()]
         results = sorted(str(p.relative_to(root)) for p in matches)
+        if len(results) > MAX_PATH_ROWS:
+            omitted = len(results) - MAX_PATH_ROWS
+            return ("\n".join(results[:MAX_PATH_ROWS])
+                    + f'\n(truncated: {omitted} more matches)')
         return "\n".join(results) if results else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
@@ -269,11 +277,14 @@ def ls_dir(path: str, show_all: bool, cwd: str | None, *,
             return f'f  {root.name}  {root.stat().st_size} B'
         if not root.is_dir():
             return f'Error: not a file or directory: {path}'
+        items = sorted(root.iterdir(),
+                       key=lambda p: (not p.is_dir(), p.name.lower()))
+        if not show_all:
+            items = [item for item in items
+                     if not item.name.startswith('.')]
+        # 目录项本身已经全枚举出来了，这里限制的是**输出行数**。
         rows = []
-        for item in sorted(root.iterdir(),
-                           key=lambda p: (not p.is_dir(), p.name.lower())):
-            if not show_all and item.name.startswith('.'):
-                continue
+        for item in items[:MAX_PATH_ROWS]:
             try:
                 if item.is_dir():
                     rows.append(f'd  {item.name}/')
@@ -281,6 +292,8 @@ def ls_dir(path: str, show_all: bool, cwd: str | None, *,
                     rows.append(f'f  {item.name}  {item.stat().st_size} B')
             except OSError:
                 rows.append(f'?  {item.name}')
+        if len(items) > MAX_PATH_ROWS:
+            rows.append(f'(truncated: {len(items) - MAX_PATH_ROWS} more entries)')
         return "\n".join(rows) if rows else "(empty)"
     except Exception as e:
         return f"Error: {e}"
