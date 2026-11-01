@@ -53,6 +53,7 @@
 | B15 | `DEBUG_LOG.md` 第 69 节写着"最小化会让窗口从列表消失"——**实测是错的** | 最小化后仍在 `list_windows` 里（带"已最小化"标记） | **文档说谎**，会误导下一个人 | P0（已改） |
 | B16 | `docs/FEISHU_ACCEPTANCE.md` D1–D26 未人工验收 | 需要真机点击 | 桌面工具的可用性没有被端到端确认过 | P2（人工） |
 | B17 | `focus_failed` 的消息是半句话被翻译（中文句 + 英文后半句） | `desktop_scripts.py` 原 1611–1612 行 | 模型读到被截断的混合语 | P0（已修） |
+| B18 | **主动性模块没有接线**：`proactive.py` 的 5 个入口函数与 `hooks.proactive_scope` 无生产调用方；文档却标 M2「已完成」 | 全仓 grep `should_run(`/`parse_suggestions(`/`scan_sources(`/`proactive_scope(` 只命中测试 | 测试给出"我们有主动建议"的假信心；P1-1 若照做等于在死代码上加功能 | P1 |
 
 > B15 已在本轮改掉，并保留"更正"痕迹。**它是这份清单里最值得记住的一条**：一条没有测量
 > 支撑的"记录不改"，本身就成了新的错误来源。
@@ -206,7 +207,11 @@
 
 每项都按同一模板写：借鉴点 → 我们的落点 → 测试先行 → 验收 → 代价。
 
-### P1-1 主动性加一档 `observe`（借鉴 accept mode）
+### P1-1 主动性加一档 `observe`（借鉴 accept mode）——**被 B18 阻塞**
+
+> **先解决 B18**：这个模块目前没有调用方。在死代码上加"档位"只会让假信心更厚。
+> 先决定接线还是删除（建议接线：一个 `/suggest` 命令 + 手动触发即可验价值），
+> 再谈 observe/auto 的模式划分。
 
 - **借鉴点**：默认"评估但只记录 would-accept"，而不是"不评估"。
 - **落点**：`src/proactive.py`。新增配置 `HARNESS_PROACTIVE_MODE=off|observe|auto`（默认 `off`，

@@ -81,6 +81,28 @@ stdout 打印诊断；进度展示只暴露 `phase / tool / elapsed`，工具内
 `tests/test_cli_input.py` 的 SlashCompleter 前缀断言；改工具行为必须同步
 `tool_schemas.py` 与相关文档；顺序由 `tests/test_tool_schemas.py` 锁定。
 
+## 输出语言：按"给谁看"分层
+
+工具输出不是一种东西，服务两类读者。混着改会制造第三种不一致，所以按族定规则
+（B7 的决策，见 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md)）：
+
+| 族 | 谁读 | 规则 |
+|---|---|---|
+| 审批卡、TUI、飞书卡片、`/help`、`/status` | 人 | **中文**，全角标点；不出现字段名、原始 dict、内部枚举（`tests/test_ui_copy.py` 守着） |
+| `desktop_*`、`screen_*` | 模型（人也会瞥一眼） | **中文**：它们是"替人看屏幕"，措辞要能直接讲给用户听 |
+| `clipboard_*`、`read/write/edit`、`grep/glob/ls`、`bash`、`apply_patch` | 模型（数据通道） | 保持英文；`Error:` 前缀与标记词（`(truncated: …)`、`(no matches)`）**全族一致** |
+
+判据只有一句：**这条输出会不会被人读到？** 会，就中文；不会，就跟本族的既有写法
+保持一致——**族内一致 > 全局统一**。
+
+因此：不要单独把某个工具的半句话翻成中文（那会变成"中英各半"，历史上真发生过：
+`focus_failed` 的「中文句 + 英文后半句」）。要改就按族整体改，并在 `DEBUG_LOG.md`
+里说明为什么这一族要换语言。
+
+PowerShell 里用 `$why =` / `$why +=` 拼消息时，同一条消息不能一半中文一半英文——
+`tests/test_desktop_inspect.py::test_ps_messages_are_not_half_translated` 会把相邻
+赋值拼成整句再判断（逐行扫描抓不到这种错）。
+
 ## 空行与逻辑块
 
 | 位置 | 空行 |

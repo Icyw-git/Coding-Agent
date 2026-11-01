@@ -13088,3 +13088,74 @@ assert len(current.list(limit=100)) == 3  →  2
 | B8–B12 | 一致性清账五项，行为不变 |
 
 全量 **3374 passed / 3 skipped**，ruff 干净。
+
+---
+
+# 第 80 部分：B18（主动性没接线）+ B7（语言分层决策）+ P1-3（判官逐项留痕）
+
+## B18：一个"已完成"的功能没有调用方
+
+做 P1-1（给主动性加 `observe` 档）之前先确认它现在跑在哪，结果：
+
+```
+grep -rn "should_run(\|parse_suggestions(\|scan_sources(\|record_run(" --include=*.py .
+→ 只命中 tests/test_proactive.py
+grep -rn "proactive_scope(" .
+→ 只命中 src/hooks.py 的定义本身
+```
+
+`src/proactive.py` 的五个入口函数、`hooks.proactive_scope`，**没有任何生产调用方**；
+只有 `enabled()` 与 `READ_ONLY_TOOLS` 被 hooks 用到。而
+`docs/PERSONAL_AGENT_ROUND3.md` 写着「M2 只读主动建议 ✅ 已完成」。
+
+处理：
+
+1. 文档改成「⚠️ 模块完成、未接线」，并写明"单元测试全绿不代表用户能用到它"；
+2. 计划里 P1-1 标为**被 B18 阻塞**——在死代码上加"档位"只会让假信心更厚；
+3. 下一步是二选一（接线 or 删除），这是产品决定，不替用户做。
+
+> 教训：**"测试覆盖率高"和"用户能用到"是两件事。** 一个模块有 8 个测试、docstring
+> 写得像模像样，也可能一行都没被调用。核对功能是否存在，要 grep **调用方**，
+> 不是 grep 测试。
+
+## B7：语言分层写成规则（只改文档）
+
+`docs/coding-standards.md` 新增一节「输出语言：按"给谁看"分层」：
+
+| 族 | 规则 |
+| --- | --- |
+| 审批卡 / TUI / 飞书 / `/help` / `/status` | 中文，全角标点，不出现字段名与内部枚举 |
+| `desktop_*` / `screen_*` | 中文（它们是"替人看屏幕"，措辞要能念给用户听） |
+| `clipboard_*` / 文件工具 / `bash` / `apply_patch` | 英文，`Error:` 前缀与标记词全族一致 |
+
+判据一句：**这条输出会不会被人读到？** 族内一致 > 全局统一。并写明"不要单独翻半句"
+（`focus_failed` 那次事故）。
+
+## P1-3：判官逐条留痕（阴性也要写）
+
+**问题**：审查官只回答"能不能放行"。它想到的那条写了，没想到的四条既没被考虑、
+也没留下"没考虑"的痕迹。
+
+**改法**：五条检查项固定下来（`JUDGE_CHECKS`），判决必须逐条给 `matched`：
+
+```json
+{"decision": "approve",
+ "checks": [{"code": "outside_workspace", "matched": false, "reason": "..."}, ...]}
+```
+
+- `_parse_checks()` 校验"恰好覆盖每一条"：漏项、未知 code、重复 → **审查不可用**
+  → 回落人工（fail-closed）。漏判从"看不出来的空洞"变成 schema 错误。
+- 审计加两列：`checks`（覆盖 `5/5`）、`matched`（命中的 code）。
+  **"5/5 且 matched 为空"本身是证据**——说明它逐条看过、一条没命中。
+- 批量路径同样要求 checks：不合规的**不缓存**，回到单条路径重新判定（单条会把
+  逐条结论写进审计）。批量只是延迟优化，不能绕过留痕。
+
+**测试改动**：这个契约变了，`tests/test_approval_judge.py` 里 25 处判决字面量
+（`{"decision": "approve"}`）全部换成带 checks 的 helper。断言守的是"判官放行/
+升级/失败"三类行为，不是那句 JSON——所以改字面量、不改断言。
+
+顺带修掉一处**我自己写的坏测试**：`judge_stats` 是进程级累计计数器，我却断言绝对值
+（`== 1`），单跑通过、和其他用例一起跑就红。改成断言增量。这不是"偶发"，是**测试
+依赖执行顺序**——同一个坑（等 A 判 B）在这一轮出现第三次了。
+
+全量 3378 passed / 3 skipped。

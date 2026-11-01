@@ -195,8 +195,16 @@ automations 复用线程。
 | **N2** | 记忆老化（带归档） | ✅ 已完成 | 开 |
 | **M4** | 记忆审计事件 | ✅ 已完成 | 开 |
 | **M5** | 跨渠道接续 | ✅ 已完成 | 开 |
-| **M2** | 只读主动建议 | ✅ 已完成 | **关** |
+| **M2** | 只读主动建议 | ⚠️ **模块完成、未接线** | **关** |
 | N7 | 审批作用域 once/task/expires | 未做（可选） | — |
+
+**M2 的更正（2026-11-01）**：`src/proactive.py` 里的 `should_run` / `prompt` /
+`parse_suggestions` / `scan_sources` / `record_run`，以及 `hooks.proactive_scope`，
+**没有任何生产调用方**——只有 `enabled()` 与 `READ_ONLY_TOOLS` 被 hooks 用到。
+测试覆盖的是模块自身的逻辑，所以"单元测试全绿"并不代表用户能用到它。
+
+把它标成"已完成"是错的。要么接线（一个 `/suggest` 命令 + 后台触发），要么删掉；
+在那之前不要基于它加功能（原计划的 `observe` 档就卡在这里）。
 
 实现细节见 [PERSONAL_AGENT_ROUND3_IMPL.md](PERSONAL_AGENT_ROUND3_IMPL.md) 与
 [PERSONAL_AGENT_ROUND3_SECURITY.md](PERSONAL_AGENT_ROUND3_SECURITY.md)。

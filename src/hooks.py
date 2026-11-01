@@ -386,7 +386,8 @@ def _record_policy_denied(tool: str, args: dict, decision, *,
 
 
 def _record_auto_approval(tool: str, args: dict, decision, *,
-                          by: str, reason: str) -> None:
+                          by: str, reason: str,
+                          judge_checks: list[dict] | None = None) -> None:
     """自动放行写审计事件（观察性，不改变流程）。
 
     审查官放行是本机唯一「不经人点头就执行」的路径，必须留下痕迹：谁批的
@@ -400,6 +401,14 @@ def _record_auto_approval(tool: str, args: dict, decision, *,
     args = args if isinstance(args, dict) else {}
     summary = approval_view.summarize(tool, args)
     command = summary.get('command')
+    extra: dict = {}
+    if judge_checks:
+        # 逐条结论的紧凑留痕：覆盖几条、命中哪几条。阴性结果也要能看见——
+        # “五条都答了、一条都没命中”和“只答了一条”在台账里必须可区分。
+        import approval_judge
+
+        covered, matched = approval_judge.checks_summary(judge_checks)
+        extra = {'checks': covered, 'matched': matched}
     _append_audit('approval_auto', {
         'tool': tool,
         'by': by,
@@ -407,6 +416,7 @@ def _record_auto_approval(tool: str, args: dict, decision, *,
         'reason': str(reason or '')[:200],
         'command': str(command)[:400] if command else '',
         'args_keys': sorted(str(key) for key in args)[:20],
+        **extra,
     })
 
 GATE = PermissionGate(
@@ -751,14 +761,17 @@ def enforce(tool: str, args: dict, *, interactive: bool) -> str | None:
     # 判定为常规开发操作则自动放行；升级或审查不可用则照常走人工审批。
     # 仅限 interactive 路径：无头线程（teammate/后台/任务 runner）的审批
     # 语义是「排队等远程决议」，不能被 LLM 旁路——它们的 ASK 照旧进队列。
+    judge_checks: list[dict] = []
     if (interactive and llm_approval_enabled()
             and policy.approval_policy == 'on-request'
-            and decision.code in JUDGEABLE_CODES
-            and _judge_auto_approve(tool, args, decision)):
-        _record_auto_approval(tool, args, decision, by='llm-judge',
-                              reason=decision.reason)
-        issue_grant(tool, args)
-        return None
+            and decision.code in JUDGEABLE_CODES):
+        approved, judge_checks = _judge_auto_approve(tool, args, decision)
+        if approved:
+            _record_auto_approval(tool, args, decision, by='llm-judge',
+                                  reason=decision.reason,
+                                  judge_checks=judge_checks)
+            issue_grant(tool, args)
+            return None
     ask = GATE.decide if interactive else GATE.decide_queued
     allowed, message = ask(tool, args, decision.reason,
                            code=decision.code)

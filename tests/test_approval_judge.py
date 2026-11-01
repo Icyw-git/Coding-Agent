@@ -32,6 +32,30 @@ def make_client(replies):
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), calls
 
 
+def approve_json(**over):
+    """一个完整的 approve 判决：逐条检查项都给结论（默认全部不命中）。"""
+    return _verdict('approve', **over)
+
+
+def escalate_json(reason='需要人看', **over):
+    return _verdict('escalate', reason=reason, **over)
+
+
+def batch_item(index, decision='approve', reason=''):
+    """批量路径的一条判决：同样必须带 checks。"""
+    import json as _json
+
+    payload = {'index': index, 'decision': decision}
+    if reason:
+        payload['reason'] = reason
+    checks = []
+    import approval_judge as _aj
+    for code, _label in _aj.JUDGE_CHECKS:
+        checks.append({'code': code, 'matched': False, 'reason': '不适用'})
+    payload['checks'] = checks
+    return _json.dumps(payload, ensure_ascii=False)
+
+
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
     """档位回默认、审批历史/缓存/会话白名单清零。"""
@@ -46,7 +70,7 @@ def _clean_state(monkeypatch):
 
 def test_judge_auto_approves_interpreter(monkeypatch):
     """`python -m pytest` 这类解释器命令经审查官放行：不再问人、历史可审计。"""
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -61,7 +85,7 @@ def test_judge_auto_approves_interpreter(monkeypatch):
 
 
 def test_judge_escalates_to_human(monkeypatch):
-    client, calls = make_client(['{"decision": "escalate", "reason": "会删除工作区外文件"}'])
+    client, calls = make_client([escalate_json('会删除工作区外文件')])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -92,7 +116,7 @@ def test_judge_failure_falls_back_to_human(monkeypatch, capsys):
 def test_judge_budget_fits_thinking_models(monkeypatch):
     """审查官 max_tokens 必须给足：deepseek-flash 默认思考模式，思考 token
     先于正文消耗（实测简单命令 reasoning 4000+，60 预算=空 content 静默失效）。"""
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
 
     hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
@@ -130,8 +154,8 @@ def test_egress_read_auto_approved_send_escalated(monkeypatch):
     """外发纳入 L1：普通读请求（公共 API 的 GET）审查放行；
     带请求体的外传必须升级人工（审查官提示词规则 3 + fail-closed）。"""
     client, calls = make_client([
-        '{"decision": "approve"}',                                   # GET → 放行
-        '{"decision": "escalate", "reason": "请求体可能携带本机数据"}',  # -d → 升级
+        approve_json(),                                   # GET → 放行
+        escalate_json('请求体可能携带本机数据'),  # -d → 升级
     ])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
@@ -150,7 +174,7 @@ def test_egress_read_auto_approved_send_escalated(monkeypatch):
 def test_untrusted_tier_skips_judge(monkeypatch):
     """untrusted 档「每条都问」是显式选择，审查官不改变它。"""
     monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'untrusted')
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -163,7 +187,7 @@ def test_untrusted_tier_skips_judge(monkeypatch):
 def test_never_tier_denies_before_judge(monkeypatch):
     """never 档：ASK 在策略层已转 DENY，轮不到审查官（档位语义不松动）。"""
     monkeypatch.setenv('HARNESS_APPROVAL_POLICY', 'never')
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -176,7 +200,7 @@ def test_never_tier_denies_before_judge(monkeypatch):
 
 def test_exact_command_cached_across_calls(monkeypatch):
     """同会话同命令只审查一次（grant_key 指纹缓存），重复调用零 LLM 开销。"""
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
 
     for _ in range(2):
@@ -187,7 +211,7 @@ def test_exact_command_cached_across_calls(monkeypatch):
 
 def test_judge_disabled_by_env(monkeypatch):
     monkeypatch.setenv('HARNESS_LLM_APPROVAL', '0')
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -200,7 +224,7 @@ def test_judge_disabled_by_env(monkeypatch):
 def test_judge_skipped_for_headless_threads(monkeypatch):
     """无头路径（teammate/后台/任务 runner）的审批语义是排队等远程决议，
     审查官不得旁路——interactive=False 时直接进队列。"""
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     queued = []
     monkeypatch.setattr(hooks.GATE, 'decide_queued',
@@ -214,13 +238,13 @@ def test_judge_skipped_for_headless_threads(monkeypatch):
 def test_judge_call_has_short_timeout(monkeypatch):
     """审查官调用必须带独立超时（默认 30s，远小于审批的 300s）——否则供应商
     卡住时绕过整个 fail-safe 语义。"""
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
 
     hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True)
     assert calls[0]['timeout'] == hooks.DEFAULT_JUDGE_TIMEOUT == 30.0
     monkeypatch.setenv('HARNESS_JUDGE_TIMEOUT', '5')
-    client2, calls2 = make_client(['{"decision": "approve"}'])
+    client2, calls2 = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client2)
     hooks.GATE._judge_approved.clear()
     hooks.enforce('bash', {'command': 'python build.py'}, interactive=True)
@@ -230,8 +254,8 @@ def test_judge_call_has_short_timeout(monkeypatch):
 def test_revoke_and_tier_switch_clear_judge_cache(monkeypatch):
     """/revoke 与档位切换必须连带清掉审查官放行缓存——撤销的意义是「此前
     给出去的免审全部作废」，审查官批过的也是预授权。"""
-    client, calls = make_client(['{"decision": "approve"}',
-                                 '{"decision": "approve"}'])
+    client, calls = make_client([approve_json(),
+                                 approve_json()])
     monkeypatch.setattr(harness, 'client', client)
 
     assert hooks.enforce('bash', {'command': 'python -m pytest'}, interactive=True) is None
@@ -260,9 +284,8 @@ def test_preflight_batch_merges_into_one_llm_call(monkeypatch):
     """批内 3 条会 ASK 的 bash → 一次 LLM 调用按索引判定；
     放行的进缓存（enforce 零开销），升级的照旧走人工。"""
     client, calls = make_client([
-        '[{"index": 0, "decision": "approve"},'
-        ' {"index": 1, "decision": "approve"},'
-        ' {"index": 2, "decision": "escalate", "reason": "删除工作区外文件"}]'
+        '[' + batch_item(0) + ', ' + batch_item(1) + ', '
+        + batch_item(2, 'escalate', '删除工作区外文件') + ']'
     ])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
@@ -306,8 +329,7 @@ def test_batch_payload_carries_the_same_defenses_as_single(monkeypatch):
     单审有事实、批判没事实，审查官看到的前提都不一样。
     """
     client, calls = make_client([
-        '[{"index": 0, "decision": "approve"},'
-        ' {"index": 1, "decision": "approve"}]'])
+        '[' + batch_item(0) + ', ' + batch_item(1) + ']'])
     monkeypatch.setattr(harness, 'client', client)
     monkeypatch.setenv('HARNESS_JUDGE_MODEL', 'cheap-judge')
 
@@ -325,8 +347,7 @@ def test_batch_payload_carries_the_same_defenses_as_single(monkeypatch):
 def test_batch_skips_over_budget_commands(monkeypatch):
     """超预算命令不进批量：单条路径会直接升级人工，批量不能拿半条命令盲批。"""
     client, calls = make_client([
-        '[{"index": 0, "decision": "approve"},'
-        ' {"index": 1, "decision": "approve"}]'])
+        '[' + batch_item(0) + ', ' + batch_item(1) + ']'])
     monkeypatch.setattr(harness, 'client', client)
     long_command = 'python -c "' + 'x' * (hooks.JUDGE_DETAIL_BUDGET + 100) + '"'
 
@@ -386,7 +407,7 @@ def test_truncated_command_escalates_without_llm(monkeypatch):
     """截断盲批防御：detail 超预算直接升级人工——opaque_command 最危险的
     部分通常在尾部，只喂头部等于盲批（且放行还会入缓存）。"""
     long_cmd = 'python -c "' + 'x' * 3000 + '"'
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     decided = []
     monkeypatch.setattr(hooks.GATE, 'decide',
@@ -405,7 +426,7 @@ def test_judge_payload_has_data_marker_and_facts(monkeypatch):
     def create(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content='{"decision": "approve"}'))])
+            content=approve_json()))])
 
     monkeypatch.setattr(harness, 'client',
                         SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
@@ -446,7 +467,7 @@ def test_judge_model_env(monkeypatch):
     def create(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content='{"decision": "approve"}'))])
+            content=approve_json()))])
 
     monkeypatch.setattr(harness, 'client',
                         SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
@@ -458,7 +479,7 @@ def test_judge_model_env(monkeypatch):
 def test_status_shows_judge_summary(tmp_path, monkeypatch):
     """/status 显示审查官统计行。"""
     store = SessionEventStore(tmp_path, session_id='st')
-    client, calls = make_client(['{"decision": "approve"}'])
+    client, calls = make_client([approve_json()])
     monkeypatch.setattr(harness, 'client', client)
     monkeypatch.setattr(harness, 'MEMORY_DIR', tmp_path / 'mem')
     monkeypatch.setattr(harness, 'MEMORY_INDEX', tmp_path / 'mem' / 'MEMORY.md')
@@ -489,3 +510,94 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------- P1-3：判官必须逐条给结论（阴性也要写） ----------
+
+def _verdict(decision='approve', *, matched=(), missing=(), reason=''):
+    """构造一个带 checks 的判决。missing 用来故意漏项。"""
+    import approval_judge
+
+    checks = []
+    for code, _label in approval_judge.JUDGE_CHECKS:
+        if code in missing:
+            continue
+        checks.append({'code': code, 'matched': code in matched,
+                       'reason': '命中' if code in matched else '不适用'})
+    payload = {'decision': decision, 'checks': checks}
+    if reason or decision == 'escalate':
+        payload['reason'] = reason or '需要人看'
+    import json as _json
+    return _json.dumps(payload, ensure_ascii=False)
+
+
+def test_judge_requires_a_verdict_for_every_check(monkeypatch):
+    """漏项不能被当成"没命中"——那等于让判官只写它想写的。
+
+    返回缺项的判决按"审查不可用"处理：回落人工审批（fail-closed），并打印原因。
+    """
+    before = dict(hooks.GATE.judge_stats)
+    client, _calls = make_client([_verdict(missing={'credentials'})])
+    monkeypatch.setattr(harness, 'client', client)
+    decided = []
+    monkeypatch.setattr(hooks.GATE, 'decide',
+                        lambda *a, **kw: decided.append(a) or (True, ''))
+
+    result = hooks.enforce('bash', {'command': 'python -m pytest -q'}, interactive=True)
+
+    assert result is None and decided, '缺项 → 转人工（这里由假 decide 放行）'
+    # judge_stats 是进程级累计计数器：断言增量，不依赖别的用例跑没跑过
+    assert hooks.GATE.judge_stats['failed'] == before['failed'] + 1
+    assert hooks.GATE.judge_stats['approved'] == before['approved']
+
+
+def test_judge_accepts_a_complete_verdict(monkeypatch):
+    before = dict(hooks.GATE.judge_stats)
+    client, _calls = make_client([_verdict()])
+    monkeypatch.setattr(harness, 'client', client)
+    decided = []
+    monkeypatch.setattr(hooks.GATE, 'decide',
+                        lambda *a, **kw: decided.append(a) or (True, ''))
+
+    assert hooks.enforce('bash', {'command': 'python -m pytest -q'},
+                         interactive=True) is None
+    assert not decided, '判决完整 → 不打扰人工'
+    assert hooks.GATE.judge_stats['approved'] == before['approved'] + 1
+
+
+def test_negative_checks_are_recorded_in_the_audit(monkeypatch):
+    """阴性结果也要留痕：审计里能看出「五条都答了、一条都没命中」。
+
+    「只答了一条」和「答了五条都没命中」在台账上必须可区分——前者是漏判。
+    """
+    import approval_judge
+
+    checks, error = approval_judge._parse_checks({
+        'decision': 'approve',
+        'checks': [{'code': code, 'matched': False, 'reason': '不适用'}
+                   for code, _label in approval_judge.JUDGE_CHECKS],
+    })
+    assert error == '' and len(checks) == len(approval_judge.JUDGE_CHECKS)
+
+    seen = {}
+    monkeypatch.setattr(hooks, '_append_audit',
+                        lambda name, payload: seen.update({'name': name, **payload}))
+    hooks._record_auto_approval(
+        'bash', {'command': 'ls'}, SimpleNamespace(code='opaque_command', reason='x'),
+        by='llm-judge', reason='审查放行', judge_checks=checks)
+
+    assert seen['name'] == 'approval_auto'
+    assert seen['checks'] == f'{len(checks)}/{len(checks)}'
+    assert seen['matched'] == ''          # 有覆盖、无命中：这本身就是证据
+
+
+def test_matched_checks_are_named_in_the_audit(monkeypatch):
+    import approval_judge
+
+    checks, _error = approval_judge._parse_checks({
+        'decision': 'approve',
+        'checks': [{'code': code, 'matched': code == 'data_egress', 'reason': 'x'}
+                   for code, _label in approval_judge.JUDGE_CHECKS],
+    })
+    summary = approval_judge.checks_summary(checks)
+    assert summary == (f'{len(checks)}/{len(checks)}', 'data_egress')
