@@ -31,7 +31,8 @@
 | P0-5 B13 偶发 | ⚠️ 单测连跑 20/20 通过，**未复现**；按纪律不改代码，保持记录 |
 | B17 半翻译消息（新增） | ✅ 已修 + 守卫（第 76 节） |
 | P1 清账 B8–B12 | ✅ 全部完成（第 77 节） |
-| P1 吸收调研 | P1-3 ✅；P1-1 **待做**（B18 已接线，`observe` 档可以上了）；**P1-2 / P1-4 / P1-5 前提不成立**（见下）；P1-6 不适用（我们没有可覆盖 prompt） |
+| P1 吸收调研 | P1-1 ✅（`observe` 档 + 观察台账）、P1-3 ✅；**P1-2 / P1-4 / P1-5 前提不成立**（见下）；P1-6 不适用（我们没有可覆盖 prompt） |
+| 主动性的三个档位 | `HARNESS_PROACTIVE_MODE=off\|observe\|auto`（默认 off；旧 `HARNESS_PROACTIVE=1` 仍等于 auto） |
 | B7 语言分层决策 | ✅ 规则已写进 `coding-standards.md` |
 | P2 恢复测试（B14） | ✅ `tests/test_recovery.py`：持锁进程被强杀后后来者能继续 |
 | P2 拒绝清单 | ✅ `ARCHITECTURE_REVIEW.md` 第六节 |
@@ -217,11 +218,16 @@
 
 每项都按同一模板写：借鉴点 → 我们的落点 → 测试先行 → 验收 → 代价。
 
-### P1-1 主动性加一档 `observe`（借鉴 accept mode）——**被 B18 阻塞**
+### P1-1 主动性加一档 `observe`（借鉴 accept mode）——✅ 已完成
 
-> **先解决 B18**：这个模块目前没有调用方。在死代码上加"档位"只会让假信心更厚。
-> 先决定接线还是删除（建议接线：一个 `/suggest` 命令 + 手动触发即可验价值），
-> 再谈 observe/auto 的模式划分。
+B18 接线（`/suggest`）之后做的。三档：`off`（默认）/ `observe` / `auto`。
+
+- `observe`：按节奏跑一个**静默回合**，建议只写观察台账（`.cache/proactive-observations.jsonl`，
+  上限 50 条），不打扰人；启动时只留一行"已记录"。
+- `auto`：走 `/suggest` 的同一条路径，建议直接摆出来。
+- 未知取值一律退回 `off`（不猜）；旧的 `HARNESS_PROACTIVE=1` 仍等于 `auto`（不能把别人的开关换功能）。
+
+观察台账是这一档的全部意义：**事后能看见它本来会说什么**，否则 observe 和 off 对用户没区别。
 
 - **借鉴点**：默认"评估但只记录 would-accept"，而不是"不评估"。
 - **落点**：`src/proactive.py`。新增配置 `HARNESS_PROACTIVE_MODE=off|observe|auto`（默认 `off`，

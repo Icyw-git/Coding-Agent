@@ -13274,3 +13274,62 @@ TUI 与行式 REPL 都接了（`/suggest`），CLI 补全表同步（`test_cli_a
 就知道了。
 
 全量 3393 passed / 3 skipped。
+
+---
+
+# 第 83 部分：P1-1 —— 主动性加 `observe` 档（评估但只记录）
+
+## 借鉴的是哪一层
+
+super-agent 的 accept mode 是 `off / observe / auto`，其中 `observe` 的含义是
+**"照常评估，把正向结论记录成 would-accept，什么都不接"**。他们默认就停在这一档：
+运营者看几天记录，再决定要不要切 auto。
+
+我们原来的主动性只有"关 / 开"（`HARNESS_PROACTIVE`），中间那档没有——而那一档恰恰
+是最该有的：它让"这套建议有没有用"变成**可以先观察、再决定**的事。
+
+## 落地成什么样
+
+```
+HARNESS_PROACTIVE_MODE = off | observe | auto      默认 off
+  off      : 什么都不做
+  observe  : 按节奏跑一个**静默回合**，建议写进观察台账，启动只留一行"已记录"
+  auto     : 走 /suggest 同一条路径，建议直接摆出来
+```
+
+两个细节：
+
+- **未知取值退回 `off`**，不猜。写错一个字母就静默变成"每天打扰你"是最坏的失败方式。
+- **旧的 `HARNESS_PROACTIVE=1` 仍然等于 `auto`**。已经有部署只设过这个变量；加模式时
+  把它的含义悄悄改掉，等于把别人的开关换了功能。
+
+频率仍由 `should_run` 管（连续忽略 3 次降到每周一次）。
+
+## 观察台账（这一档的全部意义）
+
+`.cache/proactive-observations.jsonl`，一行一次：
+
+```json
+{"at": "2026-11-01T22:10:03", "workspace": "...", "limit": 3,
+ "suggestions": ["把迁移脚本跑通", "清掉 .test-tmp 里的旧日志"]}
+```
+
+上限 50 条，超过丢最老的。**没有这张表，observe 和 off 对用户毫无区别**——"只记录"
+必须真的能被看见，否则它只是给实现者的心理安慰。
+
+## 静默回合
+
+`TurnRequest.silent=True`：worker 照常跑完，但**不把回答画到聊天区**，只记账
+（节奏状态 + 观察台账）。手动 `/suggest` 永远不静默——那是用户自己点的。
+
+启动时机放在 `on_mount` 末尾的 `call_after_refresh`：首帧之后再看要不要自己来一次，
+避免和布局抢时间，也避免在 composer 还没建好时弹提示。
+
+## 测试
+
+- 档位映射：默认 off / 三档往返 / 未知值退回 off / 旧开关等于 auto；
+- 台账：写入字段、上限丢最老、读回跳过坏行；
+- `maybe_auto_suggest`：off 不碰任何东西、observe 排静默只读回合并留"已记录"、
+  auto 走可见路径。
+
+全量 3403 passed / 3 skipped。

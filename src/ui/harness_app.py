@@ -211,6 +211,8 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
         self.set_interval(0.05, self._flush_layout)
         self.set_interval(0.2, self._tick_border_status)
         self.set_interval(1.0, self._refresh_footer)
+        # 首帧之后再看要不要自己来一次建议（默认 off，什么都不做）
+        self.call_after_refresh(self.maybe_auto_suggest)
 
     def action_quit_app(self) -> None:
         self.exit()
@@ -599,11 +601,12 @@ class HarnessApp(SessionActionsMixin, SessionAdminActionsMixin,
                 finally:
                     harness.permission_gate.use_ui = False
                 if item.proactive:
-                    self.record_proactive_run(answer)
-                try:
-                    self.call_from_thread(self._sync_final_answer, answer)
-                except Exception:
-                    pass
+                    self.record_proactive_run(answer, silent=item.silent)
+                if not item.silent:
+                    try:
+                        self.call_from_thread(self._sync_final_answer, answer)
+                    except Exception:
+                        pass
                 self._ui_call(self._refresh_queue)
                 self._ui_call(self._refresh_footer)
                 if len(self._pending) == 0:

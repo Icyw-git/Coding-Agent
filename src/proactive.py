@@ -51,9 +51,95 @@ SLOW_INTERVAL_S = 7 * 86400
 NORMAL_INTERVAL_S = 86400
 
 
+#: 三档主动性，默认 ``off``。
+#:
+#: 借鉴 super-agent 的 accept mode：**默认不是"不评估"，而是"评估了但只记录"**。
+#: 我们的 ``observe`` 就是那一档——按节奏生成一次建议，但只写进观察台账，
+#: 不打扰人；``auto`` 才把建议摆到眼前。看几天台账再决定要不要升到 auto。
+MODE_ENV = 'HARNESS_PROACTIVE_MODE'
+MODE_OFF = 'off'
+MODE_OBSERVE = 'observe'
+MODE_AUTO = 'auto'
+MODES = (MODE_OFF, MODE_OBSERVE, MODE_AUTO)
+
+#: 观察台账最多保留多少条（只记录也不能无限长）。
+OBSERVATION_LIMIT = 50
+OBSERVATION_NAME = 'proactive-observations.jsonl'
+
+
+def mode() -> str:
+    """当前主动性档位。
+
+    ``HARNESS_PROACTIVE_MODE`` 优先；没设时，老的 ``HARNESS_PROACTIVE=1`` 仍然
+    表示 ``auto``——已经有部署只设过那个变量，加模式时不能把它的含义悄悄改掉。
+    写了不认识的值一律退回 ``off``（最安全的那一档），不猜。
+    """
+    raw = (os.getenv(MODE_ENV) or '').strip().casefold()
+    if raw in MODES:
+        return raw
+    if raw:
+        return MODE_OFF
+    return MODE_AUTO if settings.flag('HARNESS_PROACTIVE', False) else MODE_OFF
+
+
 def enabled() -> bool:
-    """默认关。只有显式设 ``HARNESS_PROACTIVE=1`` 才启用。"""
-    return settings.flag('HARNESS_PROACTIVE', False)
+    """是否启用自动建议（observe 与 auto 都算启用，off 不算）。"""
+    return mode() != MODE_OFF
+
+
+def observation_path(cache_dir) -> Path:
+    return Path(cache_dir) / OBSERVATION_NAME
+
+
+def record_observation(cache_dir, suggestions, *, workspace: str = '',
+                       limit: int = 0) -> dict:
+    """observe 档：把"它本来会建议什么"写进台账。返回写入的那一行。
+
+    台账的意义就是**事后能看见**：不然 observe 和 off 对用户毫无区别。
+    超过 ``OBSERVATION_LIMIT`` 时丢最老的。
+    """
+    path = observation_path(cache_dir)
+    row = {
+        'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'workspace': str(workspace or ''),
+        'limit': int(limit or 0),
+        'suggestions': [str(item) for item in (suggestions or [])],
+    }
+    rows: list[str] = []
+    if path.is_file():
+        try:
+            rows = [line for line in path.read_text(encoding='utf-8').splitlines()
+                    if line.strip()]
+        except OSError:
+            rows = []
+    rows.append(json.dumps(row, ensure_ascii=False))
+    rows = rows[-OBSERVATION_LIMIT:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(chr(10).join(rows) + chr(10), encoding='utf-8')
+    except OSError:
+        return row      # 台账写不进去不该影响别的事
+    return row
+
+
+def recent_observations(cache_dir, limit: int = 5) -> list[dict]:
+    """读回最近几次观察（``/suggest --last`` 用）。损坏的行直接跳过。"""
+    path = observation_path(cache_dir)
+    if not path.is_file():
+        return []
+    out: list[dict] = []
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return []
+    for line in lines[-max(1, limit):]:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
 
 
 def max_suggestions() -> int:

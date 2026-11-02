@@ -30,6 +30,8 @@ class TurnRequest:
     text: str
     tools: tuple | None = None
     proactive: bool = False
+    #: 静默回合：回答只记账，不画到聊天区（observe 档用）。
+    silent: bool = False
 
 
 class PendingQueue:

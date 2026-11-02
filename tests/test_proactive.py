@@ -387,3 +387,159 @@ def test_slash_suggest_runs_one_read_only_turn(monkeypatch, tmp_path):
     assert seen['proactive'] is True, '只读回合没有打开 proactive_scope'
     assert seen['write_blocked'], '白名单之外的 tool 必须被拒'
     assert seen['read_allowed'] is None, '读工具应当放行'
+
+
+# ---------- P1-1：observe 档（评估但只记录） ----------
+
+def test_mode_defaults_to_off_and_reads_three_values(monkeypatch):
+    import proactive
+
+    monkeypatch.delenv(proactive.MODE_ENV, raising=False)
+    monkeypatch.delenv('HARNESS_PROACTIVE', raising=False)
+    assert proactive.mode() == proactive.MODE_OFF
+    assert proactive.enabled() is False
+
+    for value in ('off', 'observe', 'auto', 'AUTO', ' observe '):
+        monkeypatch.setenv(proactive.MODE_ENV, value)
+        assert proactive.mode() == value.strip().casefold()
+    assert proactive.enabled() is True
+
+
+def test_legacy_switch_still_means_auto(monkeypatch):
+    """老开关 `HARNESS_PROACTIVE=1` 的语义保持不变（等于 auto）。
+
+    已有部署只设过这个变量；加模式时把它的意思悄悄改掉，等于把别人的开关换了功能。
+    """
+    import proactive
+
+    monkeypatch.delenv(proactive.MODE_ENV, raising=False)
+    monkeypatch.setenv('HARNESS_PROACTIVE', '1')
+    assert proactive.mode() == proactive.MODE_AUTO
+
+
+def test_unknown_mode_value_falls_back_to_off(monkeypatch):
+    """写错了就退到最安全的那一档，并且不静默当成 auto。"""
+    import proactive
+
+    monkeypatch.delenv('HARNESS_PROACTIVE', raising=False)
+    monkeypatch.setenv(proactive.MODE_ENV, 'always')
+    assert proactive.mode() == proactive.MODE_OFF
+
+
+def test_observation_ledger_keeps_what_it_would_have_said(tmp_path):
+    """observe 档的价值在于**事后能看见它本来会说什么**。"""
+    import json
+
+    import proactive
+
+    cache = tmp_path / 'cache'
+    proactive.record_observation(cache, ['把迁移脚本跑通'],
+                                 workspace=str(tmp_path), limit=3)
+
+    lines = proactive.observation_path(cache).read_text(
+        encoding='utf-8').splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row['suggestions'] == ['把迁移脚本跑通']
+    assert row['workspace'] == str(tmp_path)
+    assert row['at']
+
+
+def test_observation_ledger_is_bounded(tmp_path):
+    """只记录也不能无限长：超过上限就丢最老的。"""
+    import proactive
+
+    cache = tmp_path / 'cache'
+    for index in range(proactive.OBSERVATION_LIMIT + 5):
+        proactive.record_observation(cache, [f'第 {index} 条'], workspace='w')
+
+    lines = proactive.observation_path(cache).read_text(
+        encoding='utf-8').splitlines()
+    assert len(lines) == proactive.OBSERVATION_LIMIT
+    assert '第 0 条' not in lines[0]      # 最老的先走
+
+
+def test_silent_turn_request_is_opt_in():
+    """静默回合必须显式声明；默认值是"会显示"。"""
+    from ui.widgets import TurnRequest
+
+    assert TurnRequest(text='x').silent is False
+    assert TurnRequest(text='x', silent=True).silent is True
+
+
+def test_auto_suggest_does_nothing_when_off(tmp_path, monkeypatch):
+    import harness
+    import proactive
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.delenv(proactive.MODE_ENV, raising=False)
+    monkeypatch.delenv('HARNESS_PROACTIVE', raising=False)
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def _notice(self, text, **kwargs):
+            raise AssertionError('off 档不该有任何提示')
+
+        def _begin_turn(self, request, *, echo_text=True):
+            raise AssertionError('off 档不该开回合')
+
+    Fake().maybe_auto_suggest()
+
+
+def test_auto_suggest_observes_silently(tmp_path, monkeypatch):
+    """observe 档：跑一个静默回合，只记台账；不把建议甩到聊天区。"""
+    import harness
+    import proactive
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.setenv(proactive.MODE_ENV, proactive.MODE_OBSERVE)
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    seen = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def _notice(self, text, **kwargs):
+            seen['notice'] = text
+
+        def _begin_turn(self, request, *, echo_text=True):
+            seen['request'] = request
+            return True
+
+    Fake().maybe_auto_suggest()
+
+    request = seen['request']
+    assert request.proactive is True and request.silent is True
+    assert {s['function']['name'] for s in request.tools} == set(
+        proactive.READ_ONLY_TOOLS)
+    assert '记录' in seen['notice']
+
+
+def test_auto_suggest_shows_in_auto_mode(tmp_path, monkeypatch):
+    import harness
+    import proactive
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.setenv(proactive.MODE_ENV, proactive.MODE_AUTO)
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    called = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def start_suggestions(self):
+            called['yes'] = True
+
+        def _begin_turn(self, request, *, echo_text=True):     # pragma: no cover
+            raise AssertionError('auto 档应当走可见的 /suggest 路径')
+
+    Fake().maybe_auto_suggest()
+    assert called.get('yes') is True
