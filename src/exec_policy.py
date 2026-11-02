@@ -136,6 +136,11 @@ DEFAULT_APPROVAL_POLICY = 'on-request'
 _WARNED: frozenset = frozenset()
 
 READ_WRITE_TOOLS = ('write', 'edit', 'apply_patch')
+
+#: agent 自己的指令与技能（Ring 1）：写这些等于改"它怎么做事的依据"，
+#: 所以要走审批。读不受影响——它得先看懂自己的指令才谈得上遵守。
+SELF_MODIFICATION_NAMES = frozenset({'agents.md', 'agents.override.md', 'claude.md'})
+SELF_MODIFICATION_DIRS = frozenset({'skills'})
 # 只读文件工具：读哪里都放行，但秘密路径与解析失败的路径硬拒。
 READ_ONLY_FILE_TOOLS = ('read', 'view_image', 'read_document',
                         'render_document', 'glob', 'grep', 'ls', 'recall')
@@ -477,6 +482,10 @@ class Policy:
         if tool in READ_ONLY_FILE_TOOLS:
             # 读是开放的：项目外的文档、日志、配置本来就是个人助手的日常输入。
             return Decision(ALLOW)
+        if _self_modification(path, cwd=args.get('cwd'), workspace=workspace):
+            return Decision(ASK, 'self_modification',
+                            "this file is the agent's own instructions or "
+                            'skills; changing it needs your approval')
         if self.sandbox_mode == 'read-only':
             # 持久授权放宽的是「要不要问越界写」，不是只读档本身：换档仍要人确认。
             return Decision(ASK, 'sandbox_read_only',
@@ -755,6 +764,35 @@ def _outside_write_targets(command: str, *, cwd, workspace, secrets) -> list[str
 # 授权只在「工作区外、且不是秘密/系统目录」这一格里起作用。系统目录即使有人
 # 手工往账本里塞了路径也不放宽 —— 重新分类而不是直接信任授权表，避免账本被
 # 误编辑后变成提权通道。
+
+def _self_modification(path: str, *, cwd, workspace) -> bool:
+    """这个写操作是不是在改 agent 自己的指令/技能。
+
+    ``AGENTS.md`` / ``AGENTS.override.md`` / ``CLAUDE.md``（工作区根目录）与
+    ``skills/**``（工作区顶层目录）会被读进 system prompt，等于 agent 的行为依据。
+    danger-full-access 档有意不拦：那是用户显式选的"完全自主"。
+    """
+    # workspace 可能没有（纯策略判定、没有会话上下文）。没有基准目录时
+    # 分不清"工作区里的 skills"和别处的 skills，交给后面的分区判定处理。
+    base = workspace or cwd
+    if not base:
+        return False
+    try:
+        resolved = resolve_tool_path(path, cwd=cwd, workspace=base)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
+    root = Path(base).resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if not parts:
+        return False
+    if len(parts) == 1 and parts[0].casefold() in SELF_MODIFICATION_NAMES:
+        return True
+    return len(parts) > 1 and parts[0].casefold() in SELF_MODIFICATION_DIRS
+
 
 def _grant_covers(target: str, *, cwd, workspace, secrets, write_grants) -> bool:
     """bash 的单个写入目标是否被某条持久授权覆盖。"""

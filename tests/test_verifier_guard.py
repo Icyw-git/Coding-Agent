@@ -174,3 +174,58 @@ def test_background_turn_is_also_blocked(permissive):
     out = hooks.enforce('write', {'path': 'tests/a.py', 'content': 'x'},
                         interactive=False)
     assert out and 'Refused' in out
+
+
+# ---------- B19：规则文件属于"判定面"，和测试同等对待 ----------
+
+def test_rules_file_is_protected_like_tests():
+    """.cache/rules.yaml 决定"什么算被允许"——改它等于改证据。
+
+    实测过：write('/.cache/rules.yaml') 原来是 allow，且没有任何 guard。
+    agent 可以给自己写一条 rule_allowed，把审批关掉。
+    """
+    import verifier_guard
+
+    for target in ('.cache/rules.yaml',
+                   'D:/harness-agent/.cache/rules.yaml',
+                   r'..\.cache\rules.yaml',
+                   '.cache/rules.yaml/../rules.yaml'):
+        refusal = verifier_guard.check('write', {'path': target, 'content': 'x'})
+        assert refusal, target
+        refusal.encode('gbk')
+        assert '.cache/rules.yaml' in refusal or 'rules' in refusal
+
+
+def test_rules_file_is_protected_for_every_write_tool():
+    import verifier_guard
+
+    for tool, args in (
+            ('edit', {'path': '.cache/rules.yaml', 'old_text': 'a', 'new_text': 'b'}),
+            ('delete_paths', {'paths': ['.cache/rules.yaml']}),
+            ('apply_patch', {'patch': '*** Begin Patch\n*** Delete File: '
+                                      '.cache/rules.yaml\n*** End Patch'})):
+        assert verifier_guard.check(tool, args), tool
+
+
+def test_a_rules_yaml_outside_the_cache_is_still_ordinary(tmp_path):
+    """别误伤：普通项目里自己的 rules.yaml 不该被硬拒。"""
+    import verifier_guard
+
+    assert verifier_guard.check('write', {'path': 'config/rules.yaml',
+                                          'content': 'x'}) == ''
+    assert verifier_guard.check('write', {'path': str(tmp_path / 'rules.yaml'),
+                                          'content': 'x'}) == ''
+
+
+def test_reading_rules_is_not_blocked():
+    """读不受影响：agent 需要看现在的规则才能解释自己的行为。"""
+    import verifier_guard
+
+    assert verifier_guard.check('read', {'path': '.cache/rules.yaml'}) == ''
+
+
+def test_protected_paths_mentions_the_policy_surface():
+    import verifier_guard
+
+    listed = verifier_guard.protected_paths()
+    assert any('rules.yaml' in item for item in listed), listed

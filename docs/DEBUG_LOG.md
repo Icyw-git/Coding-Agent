@@ -13333,3 +13333,72 @@ HARNESS_PROACTIVE_MODE = off | observe | auto      默认 off
   auto 走可见路径。
 
 全量 3403 passed / 3 skipped。
+
+---
+
+# 第 84 部分：B19 —— 把"自修改面"接上（Ring 1 + 规则文件）
+
+评估里实测到三处可以直接写，而文档说它们该被保护：
+
+```
+AGENTS.md           policy=allow  guard=-      ← 文档说 Ring 1 需审批
+skills/demo.md      policy=allow  guard=-
+.cache/rules.yaml   policy=allow  guard=-      ← 规则文件：能给自己放宽审批
+```
+
+`verifier_guard` 自己的理由一字不差地适用："如果我能改测试，'测试全过'就不再是
+证据"——改成规则，就是"'策略允许'不再是证据"。
+
+## 改法（先测试，后代码）
+
+**规则文件 → 硬拒**（`verifier_guard`）
+
+```python
+def is_policy_surface(path) -> bool:      # .cache 段 + rules.yaml 文件名
+```
+
+按**路径段**判，不解析绝对路径：调用方给的可能是相对路径，而 guard 不知道 cwd；
+`.cache` + `rules.yaml` 这两段已经够精确，也不会误伤项目里自己的 `config/rules.yaml`
+（专门有一条测试守这个）。
+
+**指令与技能 → 审批**（`exec_policy`）
+
+```python
+SELF_MODIFICATION_NAMES = {'agents.md', 'agents.override.md', 'claude.md'}
+SELF_MODIFICATION_DIRS  = {'skills'}
+```
+
+插在"只读工具放行"之后、"只读档询问"之前——**读必须放行**（agent 得先看懂自己的
+指令才谈得上遵守），写才问。`danger-full-access` 档有意不拦：那是用户显式选的完全自主。
+
+审批卡的中文理由按 code 加一条：`self_modification: 要改 agent 自己的指令或技能
+（会影响之后每次行为）`。
+
+## 真机核对（问策略层，不跑模型）
+
+```
+AGENTS.md            policy=ask    self_modification
+skills/demo.md       policy=ask    self_modification
+.cache/rules.yaml    policy=allow                    guard=BLOCK
+.env                 policy=deny   secret_path
+tests/test_x.py      policy=allow                    guard=BLOCK
+src/app.py           policy=allow
+docs/x.md            policy=allow
+```
+
+## 一次差点漏掉的回归
+
+第一版 `_self_modification` 直接 `Path(workspace).resolve()`，而纯策略判定
+（`tests/test_exec_policy.py` 那批）**没有 workspace**，于是 `Path(None)` 抛
+`TypeError`，8 条既有用例红。改成"没有基准目录就返回 False，交给后面的分区判定"。
+
+这正是"修改要谨慎"的具体含义：新分支要能承受**老调用方传进来的不完整参数**，
+而不是假设调用方总会给全。
+
+## 边界（写清楚，不装作没有）
+
+`verifier_guard` 只拦 `write / edit / apply_patch / delete_paths`。**用 bash 写这些
+文件仍然拦不住**（`echo > .cache/rules.yaml`）——这条限制对测试文件同样存在，
+是既有设计边界；补它需要解析 shell 重定向，属于另一件事，这里记录不改。
+
+全量 3421 passed / 3 skipped。

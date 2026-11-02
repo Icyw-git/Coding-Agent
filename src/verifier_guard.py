@@ -84,7 +84,20 @@ PROTECTED_DIRS = (
 #: 会改动文件内容的工具。
 WRITE_TOOLS = frozenset({'write', 'edit', 'apply_patch', 'delete_paths'})
 
+#: 策略文件（`.cache/rules.yaml`）也属于"判定面"：它的规则能让命令免审。
+#: 允许 agent 改它，等于允许它给自己放宽审批——和允许改测试同一类问题。
+POLICY_SURFACE_NAME = 'rules.yaml'
+POLICY_SURFACE_DIR = '.cache'
+
 ENV = 'HARNESS_VERIFIER_GUARD'
+
+_POLICY_TEMPLATE = (
+    'Refused: {target} holds the policy rules that decide what may run without '
+    'approval, so it must be changed by the user personally. This is not an '
+    'approval question — if I could edit the rules, "the policy allowed it" '
+    'would stop being evidence that anything is safe. Report what you think '
+    'should change and let the user decide.'
+)
 
 _TEMPLATE = (
     'Refused: {target} is part of the evaluation surface (tests / CI / lint '
@@ -134,6 +147,20 @@ def is_protected(path: str) -> bool:
     return False
 
 
+def is_policy_surface(path: str) -> bool:
+    """.cache/rules.yaml —— 规则文件。
+
+    按路径段判（不解析绝对路径）：调用方给的可能是相对路径，而这里不知道
+    cwd；`.cache` + `rules.yaml` 这两段已经足够精确，也不会误伤项目里自己的
+    `config/rules.yaml`。
+    """
+    segments = [part.casefold() for part in _normalize(path)]
+    if len(segments) < 2:
+        return False
+    return (segments[-1] == POLICY_SURFACE_NAME
+            and POLICY_SURFACE_DIR in segments[:-1])
+
+
 def check(tool: str, args: dict) -> str:
     """命中返回拒绝语，否则空串。只拦写操作，读测试不拦。"""
     if not enabled() or tool not in WRITE_TOOLS:
@@ -158,6 +185,8 @@ def check(tool: str, args: dict) -> str:
                 targets.append(line.split(':', 1)[-1].strip())
 
     for target in targets:
+        if is_policy_surface(target):
+            return _POLICY_TEMPLATE.format(target=target)
         if is_protected(target):
             return _TEMPLATE.format(target=target)
     return ''
@@ -165,4 +194,5 @@ def check(tool: str, args: dict) -> str:
 
 def protected_paths() -> list[str]:
     """给 `/status` 与文档用的清单。"""
-    return sorted(PROTECTED_SEGMENTS) + ['*.github/workflows/*']
+    return (sorted(PROTECTED_SEGMENTS)
+            + ['*.github/workflows/*', f'{POLICY_SURFACE_DIR}/{POLICY_SURFACE_NAME}'])

@@ -162,6 +162,7 @@ _REASON_ZH = {
     'opaque_command': '命令里含有无法静态判断的部分（解释器、变量展开等）',
     'sandbox_read_only': '当前是只读档，写操作需要你确认',
     'outside_workspace_write': '要写到工作区外的路径',
+    'self_modification': '要改 agent 自己的指令或技能（会影响之后每次行为）',
     'network_egress': '要向网络发送请求',
     'external_tool': '第三方工具，副作用无法预先判断',
     'secret_egress': '命令同时提到了秘密文件和对外发送',

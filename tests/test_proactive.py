@@ -354,7 +354,6 @@ def test_slash_suggest_runs_one_read_only_turn(monkeypatch, tmp_path):
     seen = {}
 
     def fake_loop(messages, **kwargs):
-        import proactive
         seen['tools'] = kwargs.get('tools')
         seen['proactive'] = hooks.proactive_turn()
         # 只读白名单在钩子里真的生效
