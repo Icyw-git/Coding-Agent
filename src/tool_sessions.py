@@ -60,7 +60,8 @@ def run_rename_session(title: str) -> str:
     return f'Renamed current session to: {title}'
 
 
-def _record_grant_removal(record: dict, session_id: str) -> None:
+def _record_grant_removal(record: dict) -> None:
+    """记一笔撤销；session_id 由事件信封带（SessionEventStore.append）。"""
     try:
         store = getattr(_h().active_checkpoint_manager(), 'session_store', None)
         if store is None:
@@ -68,8 +69,7 @@ def _record_grant_removal(record: dict, session_id: str) -> None:
         store.append('grant_removed', path=record.get('path', ''),
                      scope=record.get('scope', 'write'),
                      expires=record.get('expires', ''),
-                     by='revoke_permissions', note=record.get('note', ''),
-                     session_id=session_id)
+                     by='revoke_permissions', note=record.get('note', ''))
     except Exception as exc:
         print(f'  [grants] failed to record grant_removed: '
               f'{type(exc).__name__}: {exc}')
@@ -91,7 +91,7 @@ def run_revoke_permissions() -> str:
     except Exception as exc:
         return f'Error: {type(exc).__name__}: {exc}'
     for record in removed:
-        _record_grant_removal(record, session_id)
+        _record_grant_removal(record)
     if removed or domains:
         return (f'Revoked {count} permission grant(s), {len(removed)} '
                 f'path grant(s) and {len(domains)} domain rule(s) for this session.')

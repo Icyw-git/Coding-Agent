@@ -81,6 +81,23 @@ stdout 打印诊断；进度展示只暴露 `phase / tool / elapsed`，工具内
 `tests/test_cli_input.py` 的 SlashCompleter 前缀断言；改工具行为必须同步
 `tool_schemas.py` 与相关文档；顺序由 `tests/test_tool_schemas.py` 锁定。
 
+## 测试里的等待条件
+
+**等"你要用的那个东西"，不要等它的前序信号。** 轮询循环里的 `if X: break` 决定的是
+"什么时候开始断言"，所以 X 必须是断言真正需要的条件。
+
+踩过五次（回合槽、网关重启流、快照整理、清理弹窗、`/suggest` 只读回合）：
+
+| 等了什么 | 实际要什么 | 症状 |
+| --- | --- | --- |
+| `calls` 已有记录 | `not app._busy` | 偶发"锁被占用" |
+| 屏幕名变成 `CleanupPickerModal` | `picker._visible` 非空 | 全选变成"没有匹配的会话" |
+| 弹窗出现 | `on_mount` 跑完 | `KeyError` / 空集合 |
+| `'tools' in seen` | `'read_allowed' in seen` | `KeyError: 'read_allowed'` |
+
+工作线程/事件循环里，多个字段是**逐条写入**的：等到第一个字段就断言后面几个，等于用
+"部分写入"当作"全部就绪"。
+
 ## 测试里的性能断言
 
 **能数次数就不要量时间。** 同一台机器上，`import harness` 空载 0.35–0.48s、全量测试跑到

@@ -166,3 +166,38 @@ def test_desktop_list_projection_keeps_only_counts():
                            'windows': [{'title': 'secret document'}]})
     assert event.fields == {'count': 5, 'total': 23}
     assert 'windows' not in event.fields      # 窗口标题不进审计流
+
+
+def test_every_written_field_is_whitelisted():
+    """审计是按**字段白名单**落盘的：写了但不在白名单里的字段会被静默丢掉。
+
+    踩过：元素动作的 `degraded='click'`（降级成物理点击）写进去了，白名单没收，
+    台账上看不出「这次没按批准的方式做」。
+
+    这条静态扫所有 `_audit(...)` / `store.append('<审计事件>', ...)` 调用，
+    任何一个多余字段就红——它抓的正是"信息被静默丢弃"这一类。
+    """
+    import ast
+    from pathlib import Path
+
+    import audit
+
+    problems = []
+    for path in sorted((Path(__file__).resolve().parent.parent / 'src').rglob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)
+            if name not in ('_audit', '_notify', 'append'):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            event = node.args[0].value
+            if not isinstance(event, str) or event not in audit.AUDIT_EVENTS:
+                continue
+            extra = sorted({kw.arg for kw in node.keywords if kw.arg}
+                           - set(audit.AUDIT_EVENTS[event]))
+            if extra:
+                problems.append(f'{path.name}:{node.lineno} {event} 多写 {extra}')
+    assert not problems, problems

@@ -14314,3 +14314,69 @@ _INTERESTING = (b'"usage"', b'"tool_profile"', b'"message"', ...)
 > 不会让它变得有意义。
 
 全量 3471 passed / 3 skipped。
+
+---
+
+# 第 100 部分：审计台账体检，以及又一次"等 A 断言 B"
+
+## 一、审计字段：写了但被白名单丢掉
+
+`audit` 是**按字段白名单落盘**的（`AUDIT_EVENTS`）。用 `ast` 静态扫所有
+`_audit(...)` / `store.append('<审计事件>', ...)` 调用，找"写了但白名单不收"的字段：
+
+```
+2 处：hooks.py:323 approval_timeout 多写 ['session_id']
+      tool_sessions.py:68 grant_removed 多写 ['session_id']
+```
+
+两处都是冗余：`SessionEventStore.append()` 的信封里已经带 `session_id`，
+payload 再写一遍只是让每行 JSON 多几十字节。删掉，顺带把
+`_record_grant_removal(record, session_id)` 里已无用的参数一起去掉。
+
+**新增守卫** `test_every_written_field_is_whitelisted`：任何一笔审计写了白名单外的字段
+就红。这条抓的正是"信息被静默丢弃"——第 96 部分 `degraded` 那个坑。
+
+用合成样本验证守卫会红：`_audit(audit, 'grant_removed', path='x', oops='漏了')` →
+`grant_removed 多写 ['oops']`。
+
+## 二、真实台账读数
+
+30 种审计事件里，真实会话只出现过 3 种（`desktop_snapshot_failed`×4、`screen_captured`、
+`screen_ocr`）——其余功能还没被真实用过，不是事件没写。
+
+`/audit` 文本渲染这三条都读得懂：
+
+```
+🔎 10-26 13:58:21  OCR · zh-Hans-CN · 1433 字 · 会话: 回顾历史会话与喝水提醒状态
+🖥️ 10-26 13:57:39  截屏 · 2160x1440 · 会话: …
+⚠️ 10-26 13:57:59  桌面快照失败 · 无法覆盖本程序 PID…
+```
+
+四条 `desktop_snapshot_failed` 的 `reason` 是 U+FFFD 乱码——**历史数据**，来自 base64
+协议修复之前（那次的根因是 stdin 按 GBK 解码），不可追，也不需要修。
+
+## 三、又一次"等 A 断言 B"
+
+全量跑挂了我这轮写的 `test_slash_suggest_runs_one_read_only_turn`：
+
+```
+KeyError: 'read_allowed'
+```
+
+`fake_loop` 在 worker 线程里逐条写 `seen`：`tools` → `proactive` → `write_blocked` →
+`read_allowed`。而轮询等的是 `'tools' in seen`，一就绪就断言 `read_allowed`。
+
+改成等**最后一个**键。这是本次会话第五次同类问题，已经写进
+`docs/coding-standards.md`「测试里的等待条件」，附四次实例：
+
+| 等了什么 | 实际要什么 |
+| --- | --- |
+| `calls` 有记录 | `not app._busy` |
+| 屏幕名变成弹窗类 | `picker._visible` 非空 |
+| 弹窗出现 | `on_mount` 跑完 |
+| `'tools' in seen` | `'read_allowed' in seen` |
+
+> **工作线程里多个字段是逐条写入的；等到第一个就断言后面几个，等于把"部分写入"
+> 当成"全部就绪"。**
+
+全量 3471 passed / 3 skipped。

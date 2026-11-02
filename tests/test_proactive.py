@@ -370,10 +370,12 @@ def test_slash_suggest_runs_one_read_only_turn(monkeypatch, tmp_path):
         app = HarnessApp([])
         async with app.run_test(size=(90, 26)) as pilot:
             app.submit_text('/suggest')
+            # 等**最后一个**键，不是第一个：fake_loop 在 worker 线程里逐条写
+            # seen，只等 'tools' 会在 'read_allowed' 之前放行（KeyError）。
             for _ in range(60):
                 await pilot.pause()
                 await asyncio.sleep(0.02)
-                if 'tools' in seen:
+                if 'read_allowed' in seen:
                     break
             app._exiting = True
             app._pending.put(None)

@@ -325,7 +325,6 @@ def _record_approval_timeout(req: PermissionRequest) -> None:
             request_id=req.req_id,
             tool=req.tool,
             reason=str(req.reason)[:200],
-            session_id=session_id,
             source=source,
             timeout_s=round(float(GATE.timeout), 1),
         )
