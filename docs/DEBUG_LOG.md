@@ -13958,3 +13958,60 @@ cd /d D:\harness-agent && findstr /s /n /c:"interrupt_main" src\*.py
 > 但 `2>&1` 不写文件——一个字符的误判让 36% 的并行机会消失了几个月。
 
 全量 3462 passed / 3 skipped。
+
+---
+
+# 第 94 部分：grep 的 12 秒 —— 排除规则只匹配根目录
+
+## 现象
+
+真实数据里最慢的一次 `grep`：`path=.` 扫全仓，**12,098ms，命中 0 条**。
+
+## 根因：两个后端的排除范围不一致
+
+```python
+command += ['--glob', f'!{name}/**']      # 只匹配「搜索根下」的 name/
+```
+
+而 Python 回退是按**目录名**在任意层级跳过（`os.walk` 每一层都过滤）：
+
+```python
+dirnames[:] = [d for d in dirnames if d not in SEARCH_IGNORE]
+```
+
+本仓根目录没有 `node_modules`，但 `visualizer/node_modules` 有 **106 MB**。于是：
+快路径扫进去、回退路径不扫——**同一个查询，两个后端给出不同结果**。
+
+这比慢更严重：用户会看到"有时候搜得到、有时候搜不到"。
+
+## 修法
+
+`!name/**` → `!**/name/**`。一行。
+
+## 验收用确定性指标，不用耗时
+
+这条查询的墙钟时间在 **0.6s / 12s / 23s / 64s** 之间跳——全是文件系统缓存冷热和机器
+负载造成的（同一份代码，同一台机器）。所以改用"会扫到多少"：
+
+| | 扫描文件 | 扫描字节 |
+| --- | --- | --- |
+| 修前 | 7,480 | 304.9 MB |
+| 修后 | 1,727 | 192.7 MB |
+
+去掉的是 5,753 个嵌套 `node_modules` 文件 / 112 MB。
+
+新增两条守卫：
+
+- `test_ripgrep_excludes_nested_directories`：子目录里的 `node_modules` 不许被扫到；
+- `test_both_backends_agree_on_scope`：同一棵树同一个查询，两条后端的结果集合必须相同。
+
+第二条是这次真正的教训——**后端不同只该影响"多快"，不该影响"搜到了什么"**。
+
+## 没做的事
+
+`visualizer/.npm-cache`、`visualizer/dist` 也不小（合计约 70 MB），但它们不在
+`SEARCH_IGNORE` 里。加进去等于把某个项目的目录名写进通用规则；改成"尊重 .gitignore"
+则是行为变更（用户可能就是要搜被忽略的目录）。**两条都会改变语义，不是修 bug**，
+所以只记录。真要搜得准，用户应当把 `path` 指到具体目录。
+
+全量 3464 passed / 3 skipped。

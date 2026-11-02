@@ -106,8 +106,12 @@ def _grep_with_ripgrep(pattern: str, root: Path, glob: str | None,
     ]
     if case_insensitive:
         command.append('-i')
+    # `!name/**` 只匹配**搜索根下**的 name/，扫不进 `pkg/name/`；Python 回退是按
+    # 目录名在任意层级跳过（os.walk 每层都过滤）。实测：仓库根没有 node_modules，
+    # 但 `visualizer/node_modules` 有 106MB，于是同一个查询在快路径上要 12–64 秒、
+    # 命中 0 条，还和回退路径给出不同结果。加 `**/` 让两者范围一致。
     for name in RG_GLOB_IGNORES:
-        command += ['--glob', f'!{name}/**']
+        command += ['--glob', f'!**/{name}/**']
     for secret in checkpoints.DEFAULT_SECRETS:
         command += ['--glob', f'!{secret}']
     command += ['--', '.']
