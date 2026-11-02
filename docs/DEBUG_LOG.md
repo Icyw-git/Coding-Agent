@@ -13517,3 +13517,67 @@ SPACED_CJK_LINES = 2      # 至少两行，一行带空格可能只是排版
 `write_bytes(PNG)` 造一个文件——否则拿到的是"找不到这张截图"。
 
 全量 3432 passed / 3 skipped。
+
+---
+
+# 第 87 部分：启动优化 —— 测量推翻了我自己的估算
+
+## 先纠正一个数字
+
+上一节我写"yaml+dotenv 合计 168ms、占启动三分之一"。**那个数字是错的**：它来自
+"单独 import 这两个包"的测量，把公共依赖算了两遍。
+
+在 `import harness` 的真实路径里（`-X importtime` 累计列，三次）：
+`dotenv` 26–33ms、`yaml` 33–34ms、总计 343–386ms。**合计约 60ms，占 17%。**
+
+## 而且 half of it 不能动
+
+- `yaml` 看着可以惰性化（三处都在函数体内用）；
+- **`dotenv` 不行**：`harness.py:221` 的 `load_dotenv()` 必须在任何 import 期读
+  `os.environ` 的代码之前跑（`CONTEXT_LIMIT` 就是 import 期算的）。推迟它 = `.env` 失效。
+
+## 照着改，测试立刻告诉我还有一个人
+
+把 `memory.py` / `llm_config.py` 的 `import yaml` 移进函数后，守卫测试**还是红**——
+`yaml` 仍在 `sys.modules` 里。用 `sys.meta_path` 钩子打印调用栈，找到了：
+
+```
+harness.py:241  scan_skills()
+  → skill_system.py:80  _parse_frontmatter()
+    → memory.py:1123  import yaml
+```
+
+**yaml 是被 import 期的技能扫描拉进来的。** 而 `list_skills()`（拼 prompt）与
+`skill_commands()` 本来都会自己调 `scan_skills()`（带签名缓存），所以 import 期那次
+是**冗余的**——删掉它，技能照样能被扫描到（实测：拼完 prompt 后 `SKILL_REGISTRY` 有 1 条）。
+
+## A/B 实测
+
+`scripts/ab_startup.py`（7 轮，git stash 来回切，交替测）：
+
+```
+旧（import 期 scan_skills）  min 425.3ms  p50 453.8ms
+新（按需 scan）              min 356.0ms  p50 402.0ms
+                            中位差 51.8ms | 最小差 69.3ms
+```
+
+比预估的 34ms 多，因为省掉的是 "yaml + 一次技能目录遍历 + 每个 manifest 的解析"。
+
+## 一个测量方法上的收获
+
+同一台机器上 `import harness` 的**绝对值波动很大**（344 / 386 / 402 / 454ms 都测到过，
+取决于当时的负载）。所以：
+
+- 只看**A/B 差**，不看单次绝对值；
+- 为了让 A/B 可信，用 stash 来回切、**交替**测量，而不是"先测完旧的再测新的"。
+
+守卫测试因此只断言两件确定性的事：`yaml` 不在 `sys.modules`（确定），以及总耗时
+< 0.9s（宽松上界，只防数量级退化）。
+
+## 顺带修掉的坏测试
+
+我第一版断言"`rules.load()` 之后 yaml 必然在 sys.modules 里"——但规则文件可能不存在，
+于是根本没走 YAML 路径，测试红得莫名其妙。改成测 `memory._parse_frontmatter()`：
+它会确定解析 YAML，而且能顺带验证 `{'name': '演示'}` 这种中文值解析正确。
+
+全量 3434 passed / 3 skipped。

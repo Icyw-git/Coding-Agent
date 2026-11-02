@@ -35,10 +35,50 @@ harness        482ms
 （`importtime` 的"累计"列会把子模块的时间算进父模块，单模块自带依赖时数字偏小；
 下面用的是**单独导入**的实测值，更接近"去掉它能省多少"。）
 
-单模块实测（`-X importtime`）：`yaml` **79.6ms**、`dotenv` **88.5ms**——两者合计约
-**168ms**，占 482ms 的三分之一。它们只在"读配置"时需要，而现在都是模块级 `import`
-（`llm_config.py:27`、`memory.py:22`、`harness.py:44`、`agent_teams.py:10`）。
-这是启动慢最直接的一块。
+**更正**：初稿写的是"yaml+dotenv 合计 168ms、占三分之一"，那个数字来自**单独导入**这两个
+包的测量，把公共依赖（`re`、`codecs` 等）算了两遍。在 `import harness` 的真实路径里
+（`-X importtime` 三次，取累计列）：
+
+```
+dotenv   26–33ms
+yaml     33–34ms
+harness  343–386ms（总）
+```
+
+合计约 **60ms，占 17%**。两者的处境还不一样：
+
+- **`yaml` 可以完全惰性化**：`llm_config.py:390`、`memory.py:1124`、`rules.py:288` 都在
+  函数体内用，模块级没有解析动作；
+- **`dotenv` 不能**：`harness.py:221` 的 `load_dotenv()` 必须在任何读取 `os.environ` 的
+  模块级代码之前跑（`CONTEXT_LIMIT` 就是 import 期算的）。推迟它等于让 `.env` 失效。
+
+所以这一项的实际收益是"去掉 yaml 的 34ms"，不是 168ms。
+
+### 落地与实测（改动后回填）
+
+真正去掉 yaml 还要多一步：`harness.py` 在 import 期调了 `scan_skills()`，而它会解析
+每个 `skill.md` 的 frontmatter——**yaml 是被技能扫描拉进来的**。而 `list_skills()`
+（拼 system prompt）与 `skill_commands()` 本来就会自己调 `scan_skills()`（带签名缓存），
+所以 import 期那一次是冗余的。
+
+改动三处：
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/memory.py` | `import yaml` 移进 `_parse_frontmatter` |
+| `src/llm_config.py` | 同上，移进配置解析 |
+| `harness.py` | 删掉 import 期的 `scan_skills()`（按需扫描保持不变） |
+
+**A/B 交替测量**（`scripts/ab_startup.py`，7 轮 stash 来回切，`-X importtime` 累计列）：
+
+```
+旧（import 期 scan_skills）  min 425.3ms  p50 453.8ms
+新（按需 scan）              min 356.0ms  p50 402.0ms
+                            中位差 51.8ms | 最小差 69.3ms
+```
+
+比预估的 34ms 更多，因为省掉的不只是 yaml，还有一次技能目录遍历 + 每个 manifest 的解析。
+**绝对耗时在同一台机器上波动很大**（344–454ms），所以只能看 A/B 差，不能看单次绝对值。
 
 > pi 快的原因不只是语言：它是 bundle（`dist/bundle/cli.js` 单入口），Node 的模块加载是
 > 编译期就绪的字节码缓存；我们每次都要 import 一堆纯 Python 模块。
@@ -193,9 +233,10 @@ plan mode"*——**少即是设计**，复杂能力靠扩展装。
    `KEEP_RECENT=6` → `KEEP_RECENT_TOKENS=20000`；`_tail_within_budget` 已经把预算算出来了，
    只是外面还套了一层条数。落点：`compaction.py` + `harness.py` 的调用处。
 
-3. **启动去 `yaml`/`dotenv` 的模块级导入**（省 ≈168ms，占启动 1/3）
-   两者都只在读配置时用，改成函数内惰性导入。落点：`memory.py`/`rules.py`/`llm_config.py`
-   的 `import yaml`，`harness.py` 的 `from dotenv import load_dotenv`。
+3. **启动去 `yaml` 的模块级导入**（省 ≈34ms；`dotenv` 不能动，见上）
+   只动 `yaml`（`memory.py:22`、`llm_config.py:27`；`rules.py` 本来就是惰性的）。
+   `dotenv` 保持模块级：`load_dotenv()` 必须在 import 期跑完，否则 `.env` 里配置的
+   `CONTEXT_LIMIT` 之类会在读到它之前就被算成默认值。
 
 > 三件都不改行为，只改"什么时候花这笔钱"。按计划纪律：每件先写一个能失败的度量断言
 > （字符数 / 耗时 / 导入列表），再改。

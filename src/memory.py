@@ -19,8 +19,6 @@ from datetime import date as _date
 from datetime import timedelta as _timedelta
 from pathlib import Path
 
-import yaml
-
 import bounded_cache
 import llm_route
 import memory_aging
@@ -1120,6 +1118,10 @@ def _parse_frontmatter(text: str):
     parts = text.split('---', 2)
     if len(parts) < 3:
         return {}, text
+    # yaml 只在真要解析时才导入：它是启动路径上最贵的一个第三方包（约 34ms），
+    # 而很多会话根本不会读带 frontmatter 的记忆文件。
+    import yaml
+
     try:
         meta = yaml.safe_load(parts[1]) or {}
     except yaml.YAMLError:

@@ -238,7 +238,10 @@ def get_workdir() -> Path:
 
 SKILLS_DIR=WORKDIR/"skills"                 # 当前工作区的项目技能
 BUILTIN_SKILLS_DIR=APP_DIR/"skills"         # 随 harness 分发的内建技能
-scan_skills()   # 扫描内建 + 项目技能目录 → SKILL_REGISTRY（skill_system 内）
+# 技能扫描不在这里做：`list_skills()`（拼 system prompt）与 `skill_commands()`
+# 都会自己调 `scan_skills()`（带签名缓存，签名没变是空操作）。放在 import 期要多付
+# 一次目录遍历 + 每个 skill.md 的 YAML 解析——实测 yaml 是启动路径上最贵的第三方包
+# （约 34ms / 占启动 10%），而绝大多数会话在第一次拼 prompt 之前根本不需要它。
 
 
 # ── 提示与标题的依赖注入 ──

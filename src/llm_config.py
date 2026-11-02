@@ -24,8 +24,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 ROLES = ('main', 'summary', 'memory', 'title', 'approval')
 DEFAULT_PROVIDER = 'default'
 DEFAULT_API_KEY_ENV = 'LLM_API_KEY'
@@ -387,6 +385,9 @@ def _read_config(environ: Mapping[str, str]) -> tuple[Mapping | None, str]:
         text = raw
         source = '<inline>'
     try:
+        # 同上：yaml 在解析配置时才需要，不必跟着每次启动加载。
+        import yaml
+
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ConfigError(f'cannot parse LLM config from {source}: {exc}') from exc
