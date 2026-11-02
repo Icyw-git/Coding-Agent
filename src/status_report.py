@@ -15,6 +15,7 @@ import grants
 import limits
 import net_grants
 import never_do
+import proactive
 import rules as user_rules
 import sandbox
 import screen_capture
@@ -152,10 +153,16 @@ def format_status(session_store) -> str:
          limits_snapshot.describe().replace('资源限额：', ''))
     # 「未启用」和「未创建」含义不同：前者是开关关着，后者是还没初始化。
     # 混在一起说会让人以为要去改开关，实际该去跑 setup 脚本。
-    # 「未启用」和「未创建」含义不同：前者是开关关着，后者是还没初始化。
-    # 混在一起说会让人以为要去改开关，实际该去跑 setup 脚本。
     _cap('浏览器 profile', browser_profile.exists(), '已创建',
          '跑 python scripts/browser_setup.py 创建')
+    # 主动性是唯一"会自己开口"的能力：用户设了 observe 却看不到，就不知道它
+    # 是不是在记录；设成 off 也发现不了。三档各说各的，别只写"开/关"。
+    _proactive_mode = proactive.mode()
+    _cap('主动建议',
+         _proactive_mode != proactive.MODE_OFF,
+         {'observe': '观察模式（只记录，不打扰）',
+          'auto': '自动（会主动给建议）'}.get(_proactive_mode, _proactive_mode),
+         '设 HARNESS_PROACTIVE_MODE=observe|auto')
     _cap('不可代做', never_do.enabled(),
          f'{len(never_do.actions())} 类（改密码/支付/2FA 等，不可绕过）')
 

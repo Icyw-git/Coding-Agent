@@ -95,6 +95,7 @@
 | `HARNESS_DESKTOP_TREE_MS` | `2500` | 单次遍历的时间预算（毫秒），超了就返回已采集部分；`desktop_wait` 复用这三个值，但每轮最多 80 个控件 / 900ms |
 | `HARNESS_DESKTOP_EXCLUDE_PROCESSES` | — | 逗号分隔的进程名；`desktop_inspect` / `desktop_wait` / 元素动作在**进入该进程的无障碍树之前**就跳过（病灶 provider 会卡住遍历） |
 | `HARNESS_DESKTOP_CONTROL` | — | 桌面控制的**总开关**，`=1` 才启用；未设时 6 个桌面工具一律 DENY |
+| `HARNESS_PROACTIVE_MODE` | **`off`** | 主动性三档：`off` 什么都不做 / `observe` 按时跑一次只记录（写 `.cache/proactive-observations.jsonl`）/ `auto` 会主动给建议。写错的值退回 `off`；旧的 `HARNESS_PROACTIVE=1` 仍等于 `auto`。手动入口 `/suggest` 不受此开关限制 |
 
 ## 6. PowerShell worker（性能）
 
@@ -167,11 +168,17 @@
 | `HARNESS_DEBUG_CACHE` / `_SAMPLE` | — | 前缀缓存调试 |
 | `HARNESS_TOOL_RESULT_CHARS` | 见代码 | 工具结果截断长度 |
 | `HARNESS_PROGRESS_INTERVAL` | 见代码 | 进度输出间隔 |
-| `HARNESS_HISTORY_INITIAL_MESSAGES` / `_PAGE_MESSAGES` | 见代码 | 历史分页 |
+| `HARNESS_HISTORY_INITIAL_MESSAGES` | 见代码 | 首屏加载多少条历史 |
+| `HARNESS_HISTORY_PAGE_MESSAGES` | 见代码 | `/more` 每次翻多少条 |
 | `HARNESS_PROJECT_CONTEXT` | `1` | 是否读 `AGENTS.md`/`CLAUDE.md` |
+| `HARNESS_KEEP_RECENT_TOKENS` | `20000` | 压缩后保留的最近现场（按 token 而不是条数）；小窗口模型由 `CONTEXT_LIMIT/8` 兜底 |
+| `HARNESS_TOOL_DISCOVERY` | **关** | `1` 开启工具按需发现（`tool_search`）。**默认关**：延迟加载会让 tools 中途变化、打掉 prompt 缓存前缀，实测净亏（见 `PERFORMANCE_PROFILE.md`） |
+| `HARNESS_VERIFIER_GUARD` | `1` | 硬拒修改 tests / CI / lint 配置。只在排查误伤时关 |
+| `HARNESS_API_LOG_BACKUPS` | 见代码 | API 访问日志保留的轮转份数 |
 | `HARNESS_UI` | — | UI 模式 |
 | `HARNESS_SOFFICE` | — | LibreOffice 路径（文档转换） |
-| `HARNESS_SCREEN_OUT` / `_META` / `_MODE` / `_OCR_IN` / `_OCR_META` | — | 截屏/OCR 内部路径开关 |
+| `HARNESS_SCREEN_OUT` / `HARNESS_SCREEN_META` / `HARNESS_SCREEN_MODE` / `HARNESS_SCREEN_REGION` | — | 截屏 worker 的**内部**传参（输出路径、元数据路径、模式、区域）。由 `screen_capture` 设置，用户不用手填 |
+| `HARNESS_OCR_IN` / `HARNESS_OCR_META` | — | OCR worker 的**内部**传参（输入图片、元数据路径），同上 |
 | `HARNESS_DEBUG_CACHE_SAMPLE` | — | 缓存采样率 |
 
 ---

@@ -346,3 +346,37 @@ def test_status_does_not_depend_on_real_credentials_file(tmp_path):
     assert str(tmp_path) in str(credentials.store_path())
     # 未迁移状态下就是「没有加密文件」，不依赖本机是否迁移过
     assert credentials.status()['exists'] is False
+
+
+def test_status_shows_the_proactive_mode(tmp_path, monkeypatch):
+    """主动性档位必须在 /status 里看得见。
+
+    它是**会自己开口**的能力：用户设了 observe 却看不到，就不知道它是不是在记录；
+    设错了 off 也发现不了。和屏幕/桌面那些开关一样，得有一行。
+    """
+    import harness
+    import proactive
+
+    store = harness.SessionEventStore(tmp_path, session_id='proactive-status')
+    monkeypatch.setattr(harness, 'get_checkpoint_manager',
+                        lambda _: SimpleNamespace(list=lambda **kwargs: []))
+    monkeypatch.setattr(harness, 'list_tasks', lambda: [])
+
+    def proactive_lines(text):
+        # 只看主动性那一行：`off` 这个词在别处也出现（"OS 沙箱：off"），
+        # 对整段做 `'off' not in text` 会误判。
+        return [line for line in text.splitlines() if '主动建议' in line]
+
+    monkeypatch.delenv(proactive.MODE_ENV, raising=False)
+    monkeypatch.delenv('HARNESS_PROACTIVE', raising=False)
+    off = proactive_lines(harness.format_status(store))
+    assert off and '未启用' in off[0]
+    assert 'HARNESS_PROACTIVE_MODE' in off[0], '未启用时要说明怎么开'
+
+    monkeypatch.setenv(proactive.MODE_ENV, 'observe')
+    observe = proactive_lines(harness.format_status(store))
+    assert observe and '观察模式' in observe[0] and '只记录' in observe[0]
+
+    monkeypatch.setenv(proactive.MODE_ENV, 'auto')
+    auto = proactive_lines(harness.format_status(store))
+    assert auto and '自动' in auto[0]

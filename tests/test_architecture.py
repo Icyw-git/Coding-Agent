@@ -163,3 +163,22 @@ def test_only_entry_adapters_import_harness_at_module_level():
         f'({sorted(_ENTRY_ADAPTERS)}); found: {sorted(set(offenders))}. '
         'Use `llm_route.harness()` inside the function instead.'
     )
+
+
+def test_every_switch_is_documented():
+    """代码里的每个 HARNESS_* 开关都要在 ENVIRONMENT.md 里能查到。
+
+    踩过的坑：`HARNESS_PROACTIVE_MODE` 加了三个月、`HARNESS_KEEP_RECENT_TOKENS`
+    和 `HARNESS_TOOL_DISCOVERY` 是这一轮加的，都只在代码里——用户能设，但没人知道
+    该设什么。开关名是人与系统之间唯一的接口，它必须有文档。
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    used = set()
+    for path in list((root / 'src').rglob('*.py')) + [root / 'harness.py']:
+        used.update(re.findall(r"['\"](HARNESS_[A-Z0-9_]+)['\"]",
+                               path.read_text(encoding='utf-8')))
+    doc = (root / 'docs' / 'ENVIRONMENT.md').read_text(encoding='utf-8')
+    missing = sorted(name for name in used if name not in doc)
+    assert not missing, f'这些开关没有文档：{missing}'
