@@ -266,13 +266,18 @@ class SuggestionRun:
 def read_only_schemas() -> list[dict]:
     """喂给模型的工具面：**就是**白名单本身，不是它的超集。
 
-    提示词挡不住工具，白名单才能。这里按 ``READ_ONLY_TOOLS`` 过滤 ``tools.TOOLS``，
-    而不是反过来往白名单里补名字——多一个写工具就等于把"只读"变成口号。
+    提示词挡不住工具，白名单才能。这里按 ``READ_ONLY_TOOLS`` 过滤
+    ``capability_surface()``，而不是反过来往白名单里补名字——多一个写工具就等于把
+    "只读"变成口号。
+
+    用 ``capability_surface()`` 而不是 ``tools.TOOLS``：后者受**工具发现**裁剪
+    （`recall` / `read_document` 属于被延迟的组），而建议回合是程序生成的固定集合，
+    不该依赖"这一轮主循环搜过什么"。
     """
     import tools
 
     wanted = READ_ONLY_TOOLS
-    return [schema for schema in tools.TOOLS
+    return [schema for schema in tools.capability_surface()
             if str(schema.get('function', {}).get('name') or '') in wanted]
 
 

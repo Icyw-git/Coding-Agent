@@ -105,8 +105,46 @@ def _capability_disabled(schema: dict) -> bool:
     return False
 
 
-# MCP 运行期会 append，必须是独立可变列表
-TOOLS = [schema for schema in TOOL_SCHEMAS if not _capability_disabled(schema)]
+def capability_surface() -> list:
+    """按**能力开关**过滤后的完整工具面（不做发现裁剪）。
+
+    子代理等入口按需构造自己的工具面，它们不该受"主循环这一轮搜过什么"影响：
+    被延迟的工具对它们仍然是可用的能力。运行期 append 的 MCP 工具也在这里
+    （它们不在 TOOL_SCHEMAS 里），否则子代理会看不见第三方工具。
+    """
+    canonical = {id(schema) for schema in TOOL_SCHEMAS}
+    runtime_added = [schema for schema in TOOLS if id(schema) not in canonical]
+    return [schema for schema in TOOL_SCHEMAS
+            if not _capability_disabled(schema)] + runtime_added
+
+
+def _visible(schema: dict) -> bool:
+    """能力开着，并且工具发现认为它现在该出现。"""
+    import tool_discovery
+
+    if _capability_disabled(schema):
+        return False
+    return tool_discovery.visible(str(schema['function']['name']))
+
+
+def rebuild_tools() -> None:
+    """就地把 TOOLS 重建成"当前该发的工具面"。
+
+    就地改（``TOOLS[:] = ...``）而不是换对象：`harness`、子代理与测试都持有这个
+    列表的引用。MCP 工具是运行期 append 进来的（不在 TOOL_SCHEMAS 里），重建时
+    必须保住它们。
+    """
+    canonical = {id(schema) for schema in TOOL_SCHEMAS}
+    runtime_added = [schema for schema in TOOLS if id(schema) not in canonical]
+    TOOLS[:] = [schema for schema in TOOL_SCHEMAS if _visible(schema)] + runtime_added
+
+
+# MCP 运行期会 append，必须是独立可变列表；内容由 rebuild_tools() 决定。
+TOOLS: list = []
+rebuild_tools()
+import tool_discovery  # noqa: E402  （放在 TOOLS 之后：导入期就要接上监听）
+
+tool_discovery.set_listener(rebuild_tools)
 
 
 BASH_TIMEOUT = 120
@@ -229,6 +267,29 @@ def run_remember(text: str, type: str = 'preference', name: str = '',
 def run_forget(name: str) -> str:
     from tool_memory import forget
     return forget(name)
+
+
+def run_tool_search(query: str = '') -> str:
+    """`tool_search`：按用途找到并激活额外工具。
+
+    返回**工具名 + 一句话用途 + 参数名**，而不重发整份 schema——它们已经在本轮
+    的工具面里了（search 会激活并触发重建）。这样既让模型知道"能用了"，
+    又不把刚省下的 token 又花回去。
+    """
+    import tool_discovery
+
+    hit = tool_discovery.search(query)
+    if not hit:
+        available = '、'.join(sorted(tool_discovery.GROUPS))
+        return (f'没有匹配「{query}」的工具。可以搜这些方向：{available}；'
+                '或者直接说你要做什么。')
+    lines = [f'已启用 {len(hit)} 个工具（本轮起可用）：']
+    for schema in hit:
+        fn = schema['function']
+        params = list((fn.get('parameters', {}).get('properties') or {}))
+        lines.append(f"- {fn['name']}：{fn.get('description', '').split('.')[0]}"
+                     + (f"（参数：{'、'.join(params)}）" if params else ''))
+    return chr(10).join(lines)
 
 
 def run_recall(query: str = '', limit: int = 10) -> str:
@@ -441,6 +502,7 @@ tool_registry = {
     'remember': run_remember,
     'forget': run_forget,
     'recall': run_recall,
+    'tool_search': run_tool_search,
     'desktop_snapshot': run_desktop_snapshot,
     'desktop_inspect': run_desktop_inspect,
     'desktop_displays': run_desktop_displays,

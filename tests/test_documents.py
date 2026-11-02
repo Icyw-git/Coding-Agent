@@ -287,7 +287,8 @@ def test_run_read_document_missing_and_secret(tmp_path):
 
 def test_tool_is_registered_and_read_only():
     assert 'read_document' in tools.tool_registry
-    schema = next(item for item in tools.TOOLS
+    # 文档工具属于被**发现**延迟的组：schema 断言要看完整能力面
+    schema = next(item for item in tools.capability_surface()
                   if item['function']['name'] == 'read_document')
     assert schema['function']['parameters']['required'] == ['path']
     assert 'read_document' in exec_policy.READ_ONLY_FILE_TOOLS

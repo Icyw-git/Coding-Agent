@@ -29,9 +29,10 @@ ORDER = [
     'desktop_windows', 'desktop_action',
     'delete_paths', 'remind', 'move_paths', 'undo_moves',
     'remember', 'forget', 'recall',
+    'tool_search',
 ]
 
-SCHEMA_SHA1 = 'debcfb293546133f992cb151001afa8d261f8942'
+SCHEMA_SHA1 = 'f4dee724c28b7a5dfbbaae64e98aa94ac9619691'
 
 
 def test_tool_spec_order_is_stable():

@@ -932,4 +932,19 @@ TOOL_SCHEMAS = [{'type': 'function',
                                             'minimum': 1,
                                             'maximum': 50,
                                             'description': 'Maximum results (default 10)'}},
-                              'required': []}}}]
+                              'required': []}}},
+ {'type': 'function',
+  'function': {'name': 'tool_search',
+               'description': 'Find additional tools by what you want to do. Most tools '
+                              'are not loaded until you search for them: cron jobs, long-'
+                              'term memory, documents, subagents/teammates, session '
+                              'history, screen reading, worktrees, clipboard. Search once '
+                              'and the tools stay available for the rest of the session.',
+               'parameters': {'type': 'object',
+                              'properties': {
+                                  'query': {'type': 'string',
+                                            'description': 'What you want to do or the tool '
+                                                           'name, e.g. "remind me every '
+                                                           'morning", "记忆", '
+                                                           'schedule_cron'}},
+                              'required': ['query']}}}]

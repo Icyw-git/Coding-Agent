@@ -6,7 +6,7 @@ import os
 import llm_route
 from agent_core import _extract_text, expand_image_parts, image_attachment_message, trigger_hooks
 from subagent_events import SubagentRecorder
-from tools import TOOLS
+from tools import capability_surface
 from ui_bridge import agent_context
 
 # 子代理拿不到父代理的 loop 级能力与协作编排：这些工具要么没有 handler
@@ -51,7 +51,9 @@ def _subagent_surface():
     registry = _h().tool_registry
     schemas = []
     handlers = {}
-    for schema in TOOLS:
+    # 用 capability_surface 而不是 TOOLS：子代理不该受"主循环这一轮搜过什么"影响，
+    # 被延迟的工具对它们仍然是可用的能力（发现机制只服务主循环的 token 预算）。
+    for schema in capability_surface():
         name = schema['function']['name']
         if name in _SUBAGENT_EXCLUDED or name not in registry:
             continue

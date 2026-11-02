@@ -25,9 +25,12 @@ PROBE = '''
 import json, sys
 sys.path.insert(0, {src!r})
 sys.path.insert(0, {root!r})
-import harness
-names = [t["function"]["name"] for t in harness.TOOLS]
-chars = len(json.dumps([t["function"] for t in harness.TOOLS], ensure_ascii=False))
+import tools
+# 能力面：能力开关过滤后的**完整**集合。工具发现（tool_search）只影响主循环
+# 这一轮发什么，不改变"这个能力存不存在"，所以能力断言一律看它。
+names = [t["function"]["name"] for t in tools.capability_surface()]
+chars = len(json.dumps([t["function"] for t in tools.capability_surface()],
+                       ensure_ascii=False))
 print(json.dumps({{"names": names, "chars": chars}}))
 '''
 

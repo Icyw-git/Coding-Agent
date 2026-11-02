@@ -6,6 +6,10 @@
 **一句话**：把 41 个低频工具的 schema 从"每轮都发"改成"用时才发现"，理论上能把
 5,762 tokens 压到约 1,700，但**它改的是交互模型，不是调优**，所以先出提案再动手。
 
+> **状态（2026-11-01）：第一步已实现并验收通过。** 实测 5,923 → 2,839 tokens
+> （−3,083，−52%）。代码见 `src/tool_discovery.py`，验收脚本
+> `scripts/accept_tool_discovery.py`，实测结论见第 8 节。
+
 ---
 
 ## 1. 现状与机会
@@ -143,7 +147,57 @@ def activate(group): ...   # 返回该组 schema，并让它们进入后续请�
 
 ---
 
-## 7. 一句话
+## 7. 实施结果（第一步，2026-11-01）
+
+### 改了什么
+
+| 文件 | 内容 |
+| --- | --- |
+| `src/tool_discovery.py` | 新增：`BASE_TOOLS`（10 个核心）、8 个 `GROUPS`、激活集、`search()` |
+| `src/tools.py` | `capability_surface()`（能力过滤，不含发现）与 `rebuild_tools()`（就地重建 `TOOLS`） |
+| `src/tool_schemas.py` | 新增 `tool_search` 工具 |
+| `src/subagent.py` | 改用 `capability_surface()`——子代理不该受主循环搜过什么影响 |
+| `src/proactive.py` | 同上（建议回合是程序生成的固定集合） |
+| `src/tool_recovery.py` | `tool_search` 登记为只读（它只改进程内的激活集） |
+
+### 效果（验收数字）
+
+```
+完整能力面：52 个工具，23,694 字符 ≈ 5,923 tokens
+默认工具面：22 个工具，11,359 字符 ≈ 2,839 tokens
+           省 12,335 字符 ≈ 3,083 tokens（52%）
+搜 cron 后：25 个工具，13,060 字符
+```
+
+比提案预估的 −53% 一致（差值来自新增的 `tool_search` schema 本身）。
+
+### 端到端验收（`scripts/accept_tool_discovery.py`）
+
+真实 `agent_loop` + 脚本化模型，三轮：
+
+```
+第 1 轮工具数：22    含 schedule_cron：False   含 tool_search：True
+第 2 轮工具数：25    含 schedule_cron：True     ← tool_search 之后
+第 3 轮工具数：25    含 schedule_cron：True     ← 粘性
+验收结果: PASS
+```
+
+同时验证了 `tool_registry` 全程不变（能力没被裁）。
+
+### 三条不变量（`tests/test_tool_discovery.py`，11 条用例）
+
+1. **延迟 ≠ 不能用**：被延迟的工具仍在 `tool_registry`，策略层 / 审批 / 审计照旧；
+2. **搜到就粘住**：不会下一轮又消失；
+3. **每个被延迟的工具都有确定的发现路径**：按工具名 / 组名 / 中文关键词都能命中
+   （这条逐工具验证）。
+
+### 测试断言的调整（不是放宽）
+
+8 条既有用例原本断言 `tools.TOOLS` 含某工具。它们守的是"这个**能力**存不存在"，
+所以改用 `capability_surface()`——**能力层与发现层是两件事**，混着断言会在两层之间
+来回打架。`SCHEMA_SHA1` 与顺序表随 `tool_search` 更新。
+
+## 8. 一句话
 
 **这是唯一还有"量级"的杠杆（−50%～−75%），但它把"工具是常量"变成"工具是状态"。**
 该做，但该单独做、单独验收、单独回滚。

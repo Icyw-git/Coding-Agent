@@ -24,6 +24,8 @@ READ_ONLY_TOOLS = frozenset({
     'glob', 'grep', 'ls', 'web_fetch', 'load_skill',
     'todo_read', 'list_tasks', 'get_task', 'list_crons', 'background_output',
     'find_sessions', 'screen_ocr', 'clipboard_read', 'desktop_snapshot',
+    # `tool_search` 只在本进程里激活工具面（不改文件、不发请求），重试无副作用。
+    'tool_search',
     'desktop_inspect', 'desktop_displays', 'desktop_wait', 'desktop_windows',
     # 记忆召回只读磁盘，重试没有副作用。
     'recall',
