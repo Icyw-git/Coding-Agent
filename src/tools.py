@@ -83,7 +83,30 @@ def _gate_file(tool: str, path: str, cwd: str | None) -> str | None:
     return _gate().enforce_headless(tool, args)
 
 
-TOOLS = list(TOOL_SCHEMAS)   # MCP 运行期会 append，必须是独立可变列表
+def _capability_disabled(schema: dict) -> bool:
+    """这个工具在当前进程里有没有可能被放行？没有就别发 schema。
+
+    只按**能力开关**判：桌面控制默认关，策略层对它一律 DENY——把 6 个 desktop 工具
+    的 schema（1,631 tokens）发出去，模型拿到的是"必然被拒的说明书"，每次请求都在付钱。
+    屏幕/剪贴板同理（它们默认开，只有显式关掉时才裁）。
+
+    刻意不按"用户偏好"或"场景猜测"裁剪：那会让同一句话在不同会话里得到不同的工具，
+    模型无从学起。开关只认进程启动环境，所以这里按启动时的值算与会话行为一致。
+    """
+    import exec_policy
+
+    name = str(schema.get('function', {}).get('name') or '')
+    if name in exec_policy.DESKTOP_TOOLS:
+        return not exec_policy.desktop_control_enabled()
+    if name in exec_policy.SCREEN_TOOLS:
+        return not exec_policy.screen_tools_enabled()
+    if name in exec_policy.CLIPBOARD_TOOLS:
+        return not exec_policy.clipboard_tools_enabled()
+    return False
+
+
+# MCP 运行期会 append，必须是独立可变列表
+TOOLS = [schema for schema in TOOL_SCHEMAS if not _capability_disabled(schema)]
 
 
 BASH_TIMEOUT = 120

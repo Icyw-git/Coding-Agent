@@ -2,6 +2,10 @@
 
 `TOOLS` 的顺序进入 system prompt 与 `_tools_fingerprint`，直接影响请求前缀缓存和
 usage 事件的归因。schema 搬到独立模块后，这份快照是第一道回归护栏。
+
+注意 `tools.TOOLS` 是**按能力开关裁剪后**的表（桌面控制默认关，那 6 个工具的 schema
+不发），所以顺序/指纹这两条断言针对**规范表** `TOOL_SCHEMAS`：它们要守的是"schema
+有没有被误改"，不是"当前环境发了哪些"。发不发是 `tests/test_tool_surface.py` 的事。
 """
 import hashlib
 import json
@@ -30,12 +34,19 @@ ORDER = [
 SCHEMA_SHA1 = '2c4cdb2530f8d60a109c06eaa4a8867801a3e581'
 
 
-def test_tool_order_is_stable():
-    assert [item['function']['name'] for item in tools.TOOLS] == ORDER
+def test_tool_spec_order_is_stable():
+    assert [item['function']['name'] for item in tool_schemas.TOOL_SCHEMAS] == ORDER
+
+
+def test_runtime_tool_order_follows_the_canonical_order():
+    """运行时表是规范表的**保序子集**：裁剪只删，不重排。"""
+    names = [item['function']['name'] for item in tools.TOOLS]
+    assert names == [name for name in ORDER if name in set(names)]
 
 
 def test_tool_schema_content_is_stable():
-    blob = json.dumps(tools.TOOLS, ensure_ascii=False, sort_keys=False)
+    blob = json.dumps(tool_schemas.TOOL_SCHEMAS, ensure_ascii=False,
+                      sort_keys=False)
 
     assert hashlib.sha1(blob.encode()).hexdigest() == SCHEMA_SHA1
 
@@ -51,4 +62,11 @@ def test_every_schema_has_a_handler():
 def test_tools_is_a_mutable_copy_of_the_schema_list():
     # MCP 运行期会 append 到 TOOLS；不能污染模块级的规范列表。
     assert tools.TOOLS is not tool_schemas.TOOL_SCHEMAS
-    assert tools.TOOLS == tool_schemas.TOOL_SCHEMAS
+    # 是子集（按能力开关裁剪），不是同一份
+    assert all(item in tool_schemas.TOOL_SCHEMAS for item in tools.TOOLS)
+    tools.TOOLS.append({'function': {'name': 'probe_only'}})
+    try:
+        assert all(item['function']['name'] != 'probe_only'
+                   for item in tool_schemas.TOOL_SCHEMAS)
+    finally:
+        tools.TOOLS.pop()
