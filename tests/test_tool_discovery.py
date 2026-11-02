@@ -21,10 +21,43 @@ import tools
 
 
 @pytest.fixture(autouse=True)
-def _reset_discovery():
+def _discovery_on(monkeypatch):
+    """这些用例测的是"开启时"的行为；关闭时的行为另有专门用例。
+
+    默认关闭的原因见 src/tool_discovery.py 的 ENV 注释（prompt 缓存账）。
+    """
+    monkeypatch.setenv(tool_discovery.ENV, '1')
     tool_discovery.reset()
+    import tools
+
+    tools.rebuild_tools()
     yield
     tool_discovery.reset()
+    tools.rebuild_tools()
+
+
+def test_discovery_is_off_by_default(monkeypatch):
+    """默认关闭：延迟加载会让 tools 中途变化，把缓存前缀打掉。
+
+    实测（p50 prompt 44,178 tokens、命中率 96%）：省下的 3,083 tokens 因为在缓存里
+    实际只值 ≈419/轮，而一次前缀失效多付 ≈38,170。盈亏平衡 91 轮，实测平均会话 42 轮。
+    """
+    import tools
+
+    monkeypatch.delenv(tool_discovery.ENV, raising=False)
+    tool_discovery.reset()
+    tools.rebuild_tools()
+    try:
+        names = {s['function']['name'] for s in tools.TOOLS}
+        assert 'schedule_cron' in names, '关闭时应当是完整能力面'
+        assert 'tool_search' not in names, '关闭时 tool_search 没有可发现的东西，不该发'
+
+        # 关闭时 == 完整能力面（只是不发 tool_search 本身：没有可发现的东西）
+        expected = {s['function']['name'] for s in tools.capability_surface()} - {
+            'tool_search'}
+        assert names == expected
+    finally:
+        tools.rebuild_tools()
 
 
 def _names(schemas) -> set[str]:

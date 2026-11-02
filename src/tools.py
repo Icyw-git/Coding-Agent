@@ -119,12 +119,15 @@ def capability_surface() -> list:
 
 
 def _visible(schema: dict) -> bool:
-    """能力开着，并且工具发现认为它现在该出现。"""
+    """能力开着，并且工具发现认为它现在该出现（发现默认关闭，见 tool_discovery）。"""
     import tool_discovery
 
     if _capability_disabled(schema):
         return False
-    return tool_discovery.visible(str(schema['function']['name']))
+    name = str(schema['function']['name'])
+    if name == 'tool_search' and not tool_discovery.searchable():
+        return False
+    return tool_discovery.visible(name)
 
 
 def rebuild_tools() -> None:

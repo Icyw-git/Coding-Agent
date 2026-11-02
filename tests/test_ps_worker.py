@@ -165,3 +165,62 @@ def test_shutdown_clears_registry():
     ps_worker.get_worker('shutdown-test', ECHO_SCRIPT)._ensure()
     ps_worker.shutdown()
     assert ps_worker.stats() == {}
+
+
+# ---------- 预热：该预热的预热，不该预热的一个都别开 ----------
+
+def test_warmup_skips_capabilities_that_are_switched_off(monkeypatch):
+    """桌面控制关着时不该预热它的 worker。
+
+    预热要跑 2.7s 的 Add-Type + 拉一个 powershell 进程；能力关着时这些全是白费，
+    而且会让人以为"它已经在跑桌面控制了"。
+    """
+    warmed = []
+    monkeypatch.setattr(ps_worker, 'warm', lambda name, script: warmed.append(name))
+    monkeypatch.delenv('HARNESS_DESKTOP_CONTROL', raising=False)
+    monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '0')
+    monkeypatch.delenv('HARNESS_PS_WARMUP', raising=False)
+    ps_worker._warm_started.clear()
+
+    ps_worker.start_warmup()
+
+    assert warmed == []
+
+
+def test_warmup_runs_for_enabled_capabilities(monkeypatch):
+    warmed = []
+    monkeypatch.setattr(ps_worker, 'warm', lambda name, script: warmed.append(name))
+    monkeypatch.setenv('HARNESS_DESKTOP_CONTROL', '1')
+    monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '1')
+    monkeypatch.delenv('HARNESS_PS_WARMUP', raising=False)
+    ps_worker._warm_started.clear()
+
+    ps_worker.start_warmup()
+
+    assert warmed == ['desktop', 'clipboard']
+
+
+def test_warmup_is_idempotent(monkeypatch):
+    warmed = []
+    monkeypatch.setattr(ps_worker, 'warm', lambda name, script: warmed.append(name))
+    monkeypatch.setenv('HARNESS_DESKTOP_CONTROL', '1')
+    monkeypatch.setenv('HARNESS_CLIPBOARD_TOOLS', '1')
+    ps_worker._warm_started.clear()
+
+    ps_worker.start_warmup()
+    ps_worker.start_warmup()
+
+    assert warmed == ['desktop', 'clipboard']
+
+
+def test_cli_entry_warms_the_workers():
+    """CLI/TUI 入口要预热——原来只有 API 模式预热。
+
+    实测：命令行会话里 `desktop_snapshot` p50 7.7s（4 次），而预热后同一操作
+    稳定在 15–60ms。差别就是那一次 Add-Type + PowerShell 启动。
+    """
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parent.parent / 'entrypoint.py'
+    text = source.read_text(encoding='utf-8')
+    assert 'start_warmup' in text, '入口没有预热 PowerShell worker'

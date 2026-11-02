@@ -20,6 +20,22 @@
 """
 from __future__ import annotations
 
+import os
+
+#: 开关。**默认关闭**：延迟加载会让 tools 在会话中途变化，而 tools 位于 prompt
+#: 缓存前缀的最前面——一变，整个前缀从 96% 命中掉到 0%，那一轮多付 ≈38k tokens。
+#: 省下的是 3,083 tokens/轮（且因为在缓存里，实际只值 ≈419/轮），盈亏平衡 ≈91 轮，
+#: 而实测平均会话只有 42 轮。数据见 docs/PERFORMANCE_PROFILE.md「工具表」一节。
+#:
+#: 保留开关给**没有 prompt 缓存**的部署（本地模型、自建推理），那里这个优化是真赚。
+ENV = 'HARNESS_TOOL_DISCOVERY'
+
+
+def enabled() -> bool:
+    raw = (os.getenv(ENV) or '').strip().casefold()
+    return raw in ('1', 'true', 'yes', 'on', 'enabled')
+
+
 #: 每轮都发的核心工具：几乎所有工作都要用。
 BASE_TOOLS = frozenset({
     'bash', 'read', 'write', 'edit', 'apply_patch',
@@ -75,12 +91,22 @@ def deferred_tools() -> frozenset[str]:
     return frozenset(name for group in GROUPS.values() for name in group)
 
 
+def searchable() -> bool:
+    """`tool_search` 这个工具本身要不要发。
+
+    关闭时也不发：没有可发现的东西，它只会占 schema。
+    """
+    return enabled()
+
+
 def visible(name: str) -> bool:
     """这个工具现在该不该出现在请求的工具面里。
 
     核心工具、`tool_search` 本身、以及**不属于任何组**的工具（杂项）永远可见——
     杂项零散、模型猜不到组名，延迟它们等于让功能消失。
     """
+    if not enabled():
+        return True          # 关闭时一切照旧（完整能力面）
     if name in BASE_TOOLS or name == 'tool_search':
         return True
     if name not in deferred_tools():

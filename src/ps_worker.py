@@ -456,15 +456,18 @@ def start_warmup() -> None:
     if (os.getenv('HARNESS_PS_WARMUP') or '').strip().casefold() in (
             '0', 'false', 'off', 'no'):
         return
+    # 只预热**开着的**能力：预热要跑 2.7s 的 Add-Type 并拉起一个 powershell 进程，
+    # 能力关着时这些全是白费（而且会让人以为"桌面控制已经在跑"）。
     try:
-        import desktop_control_windows as desktop
+        import exec_policy
 
-        warm('desktop', desktop.worker_script)
-    except Exception:
-        pass
-    try:
-        import clipboard_windows as clipboard
+        if exec_policy.desktop_control_enabled():
+            import desktop_control_windows as desktop
 
-        warm('clipboard', clipboard.worker_script)
+            warm('desktop', desktop.worker_script)
+        if exec_policy.clipboard_tools_enabled():
+            import clipboard_windows as clipboard
+
+            warm('clipboard', clipboard.worker_script)
     except Exception:
         pass

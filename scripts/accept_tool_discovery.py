@@ -1,5 +1,7 @@
 """端到端验收：真实 agent_loop 里，工具面会随 tool_search 变化。
 
+需要 `HARNESS_TOOL_DISCOVERY=1`（默认关闭，原因见 src/tool_discovery.py）。
+
 验收点（来自 docs/TOOL_DISCOVERY_PROPOSAL.md 第 3 节）：
 1. 第一轮请求里没有 schedule_cron（被延迟）；
 2. 模型调 tool_search 之后，第二轮请求里就有 schedule_cron；
@@ -87,6 +89,13 @@ def main():
     registry_before = set(tools.tool_registry)
     harness.agent_loop([{'role': 'user', 'content': '每天提醒我喝水'}],
                        session_store=store, housekeeping=False)
+
+    import tool_discovery
+    if not tool_discovery.enabled():
+        print(f'工具发现当前关闭（{tool_discovery.ENV} 未设）。')
+        print('这是默认值：延迟加载会打掉 prompt 缓存前缀，实测净亏（见 PERFORMANCE_PROFILE）。')
+        print('要看机制行为，请带 HARNESS_TOOL_DISCOVERY=1 重跑。')
+        return 0
 
     ok = True
     first, second = scripted.tool_names[0], scripted.tool_names[1]

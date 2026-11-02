@@ -9,6 +9,7 @@ from pathlib import Path
 
 import console
 import harness
+import ps_worker
 
 console.harden_stdio()
 
@@ -125,6 +126,10 @@ def main(argv=None) -> int:
     ).start()
 
     harness.start_mcp_initialization_async()
+    # 预热门控能力（桌面/剪贴板）的 PowerShell worker：Add-Type + 拉进程是固定成本，
+    # 实测首次 `desktop_snapshot` 7.7s、预热后 15–60ms。原来只在 API 模式预热，
+    # 命令行会话每次都要等第一次调用付这笔钱。
+    ps_worker.start_warmup()
     with _interactive_lock():
         try:
             if args.resume:
