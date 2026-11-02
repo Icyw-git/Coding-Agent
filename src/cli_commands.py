@@ -71,7 +71,7 @@ COMMANDS = (
     Command('/memories', (), '[on|off|readonly|writeonly | why <名字> | quality]',
             '记忆：本会话开关 / 某条记忆的来源 / 质量评测',
             '记忆与自我改进'),
-    Command('/improvements', (), '[begin <目标> | check <机制> | status | end | rollback <批次号>]',
+    Command('/improvements', (), '[begin <目标> [--metric <指标>] | check <机制> | status | end | rollback <批次号>]',
             '自我改进：开一次会话、判定一轮、回滚某次改动',
             '记忆与自我改进'),
     Command('/usage', (), '[天数]',

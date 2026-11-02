@@ -355,7 +355,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec('undo-move', '撤销上一批文件移动',
                 '[batch_id]', ()),
     CommandSpec('improvements', '自我改进：会话/记录/回滚',
-                '[begin <目标> | check <机制> | status | end | rollback <id>]',
+                '[begin <目标> [--metric <指标>] | check <机制> | status | end '
+                '| rollback <id>]',
                 ()),
     CommandSpec('rules', '查看用户规则文件（allow/ask/deny）'),
     CommandSpec('memories',

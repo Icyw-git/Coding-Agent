@@ -442,6 +442,21 @@ class CommandActionsMixin:
             return
         self._notice(ledger.format_ledger(cache))
 
+    def _split_metric(self, text: str) -> tuple[str, str]:
+        """从参数里取出 `--metric <名字>`，返回 (剩余目标, 指标名)。
+
+        指标必须在**开会话时**定死：判定口径中途变了，前面几轮就没有可比性
+        （`Session._restore` 也因为同一目标同一指标才接上进度）。
+        """
+        parts = str(text or '').split()
+        metric = 'ruff_errors'
+        if '--metric' in parts:
+            index = parts.index('--metric')
+            value = parts[index + 1] if index + 1 < len(parts) else ''
+            metric = value or metric
+            del parts[index:index + 2]
+        return ' '.join(parts).strip(), metric
+
     def _improvements_begin(self, cache, goal: str) -> None:
         """开一个改进会话并跑基线。
 
@@ -449,8 +464,14 @@ class CommandActionsMixin:
         """
         import self_improve
 
+        goal, metric = self._split_metric(goal)
         if not goal:
-            self._notice('用法：/improvements begin <目标>')
+            self._notice('用法：/improvements begin <目标> [--metric '
+                         + '|'.join(sorted(self_improve.METRICS)) + ']')
+            return
+        if metric not in self_improve.METRICS:
+            self._notice(f'没有这个指标：{metric}；可选：'
+                         + '、'.join(sorted(self_improve.METRICS)))
             return
         existing = self_improve.load_state(cache)
         if existing and existing.get('goal') != goal:
@@ -459,9 +480,10 @@ class CommandActionsMixin:
                 f"（{existing.get('rounds')} 轮）。先 /improvements end 结束它。")
             return
         session = self_improve.Session(cache_dir=cache, workdir=self._workdir_for_improve(),
-                                       goal=goal)
+                                       goal=goal, metric=metric)
         baseline = session.baseline()
         self._notice('基线已记录：' + self._describe_metrics(baseline)
+                     + chr(10) + f'指标：{metric}'
                      + chr(10) + '改完用 /improvements check <一句话机制说明> 判定。')
 
     def _improvements_check(self, cache, mechanism: str) -> None:

@@ -13402,3 +13402,69 @@ docs/x.md            policy=allow
 是既有设计边界；补它需要解析 shell 重定向，属于另一件事，这里记录不改。
 
 全量 3421 passed / 3 skipped。
+
+---
+
+# 第 85 部分：给 RSI 一个能表达"质量"的指标
+
+## 为什么需要
+
+现有四个指标全是机械量：`pytest_pass`、`ruff_errors`（硬）+ `tokens`、
+`wall_time`（软）。它们能回答"没变坏"，回答不了"**变得更准了没有**"。
+
+于是 `/improvements begin "让记忆召回更准"` 这件事没法做——没有指标可接，最后只能
+靠感觉宣布改进。这正是评估里给的 P1。
+
+## 做了什么
+
+新增 `memory_quality`（软指标，方向 higher，key `recall_precision`）：
+
+```python
+def measure_memory_quality(*, workdir) -> dict:
+    stats = memory_eval.summarize(Path(workdir) / '.cache')
+    precision, samples = stats.get('recall_precision'), stats.get('recall_samples') or 0
+    if precision is None or samples < MIN_QUALITY_SAMPLES:
+        return {}
+    return {'recall_precision': float(precision), 'samples': int(samples)}
+```
+
+三个刻意的选择：
+
+1. **不新造测量机制**，直接聚合 `memory_eval` 的台账。同一份数据、同一套口径——
+   `/memories quality` 看到的和这里算的必须是一个数（有测试钉住）。
+2. **样本不足就返回 `{}`**（`MIN_QUALITY_SAMPLES = 5`）。三条采样能翻天，拿出来当
+   指标只会误导；返回空 + 软指标 = "这次没读数"，不参与判定。
+3. **必须软**：它来自判官采样（κ 还没校准），一票否决会让一次真改进被抽样噪声杀掉。
+
+顺带加了 `/improvements begin <目标> --metric <指标>`——否则新指标只能靠改默认值
+才用得上，而改默认值会让所有既有会话的判定口径一起变。
+
+## 一处措辞修正（被测试逼出来的）
+
+指标没数据时，原来的结论是 `discard · "memory_quality did not improve enough"`。
+**这是误导**：它听起来像"改得不够好"，实际是"这个指标还不知道"——两种处境要做的
+下一步完全不同（一个是改代码，一个是去开采样）。
+
+新增 `_unmeasured()`，单独给出：
+
+```
+memory_quality has no data yet — nothing was measured, so this round proves nothing;
+enable sampling with HARNESS_MEMORY_EVAL=1 and let it collect 5+ samples first
+```
+
+## 既有测试的调整
+
+`test_soft_metrics_are_registered` 原来断言 `soft == {'tokens','wall_time'}`。
+它守的是"哪些指标是软的"，所以改成 `{'tokens','wall_time','memory_quality'} <= soft`
+并补一句为什么质量指标必须软——**不是放宽，是口径变了**。
+
+## 真机读数
+
+```
+指标: ['memory_quality', 'pytest_pass', 'ruff_errors', 'tokens', 'wall_time']
+质量指标读数（本仓真实数据）: {}     ← 因为 HARNESS_MEMORY_EVAL 默认关，采样为 0
+```
+
+这正是设计要的行为：没数据就说没数据，不编一个 0 出来。
+
+全量 3428 passed / 3 skipped。

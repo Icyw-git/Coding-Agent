@@ -186,6 +186,34 @@ def measure_ruff(*, workdir) -> dict:
     return {'errors': errors}
 
 
+#: 质量指标至少要有这么多采样才给数：三条采样能翻天，当指标用只会误导。
+MIN_QUALITY_SAMPLES = 5
+
+
+def measure_memory_quality(*, workdir) -> dict:
+    """记忆召回精确率（来自真实回合的判官采样）。
+
+    为什么要有它：``pytest_pass`` / ``ruff_errors`` 只能表达"机械上没变坏"，
+    而"让建议更准""召回到位"这类目标没有指标可接——那就只能靠感觉宣布改进。
+
+    数据源是 ``memory_eval`` 的台账（``.cache/memory-eval.jsonl``），聚合用它
+    自己的 ``summarize``：**同一份数据、同一套口径**，`/memories quality` 看到的
+    和这里算的必须是同一个数。
+
+    ⚠ 它来自判官采样（κ 尚未校准），所以登记为**软指标**：证据不足时返回 ``{}``，
+    而不是给一个看起来精确的 0。
+    """
+    import memory_eval
+
+    cache = Path(workdir) / '.cache'
+    stats = memory_eval.summarize(cache)
+    precision = stats.get('recall_precision')
+    samples = int(stats.get('recall_samples') or 0)
+    if precision is None or samples < MIN_QUALITY_SAMPLES:
+        return {}
+    return {'recall_precision': float(precision), 'samples': samples}
+
+
 #: 固定指标表。**不接受调用方自定义**——那是"自己抬标准"的入口。
 METRICS = {
     'pytest_pass': {'direction': 'higher', 'measure': measure_pytest,
@@ -199,6 +227,10 @@ METRICS = {
                'key': 'tokens_per_turn', 'hard': False},
     'wall_time': {'direction': 'lower', 'measure': measure_wall_time,
                   'key': 'wall_time_s', 'hard': False},
+    # 质量维度：机械指标看不到"变得更准了没有"。软指标，证据不足时返回 {}
+    # （见 measure_memory_quality 的说明）。
+    'memory_quality': {'direction': 'higher', 'measure': measure_memory_quality,
+                       'key': 'recall_precision', 'hard': False},
 }
 
 
@@ -235,6 +267,19 @@ def regressed(before: dict, after: dict) -> list[str]:
 #: 小基数时按绝对值判：0 → -1（lint 从 0 变负不可能，但 1 → 0 是实打实的改进），
 #: 而 10 → 9 只算 10%，不该算 keep。
 MIN_ABSOLUTE_STEP = 1
+
+
+def _unmeasured(before: dict, after: dict, *, metric: str) -> bool:
+    """主指标两次都没有读数（例如质量指标还没采样）。
+
+    单独判一次是因为它和"改得不够好"完全是两种处境：前者要人去开采样，
+    后者要人换个改法。混成一句话会把用户引到错的下一步。
+    """
+    spec = METRICS.get(metric)
+    if spec is None:
+        return True
+    return (_value(spec, before.get(metric) or {}) is None
+            and _value(spec, after.get(metric) or {}) is None)
 
 
 def improved(before: dict, after: dict, *, metric: str = 'ruff_errors') -> bool:
@@ -469,6 +514,15 @@ class Session:
                 decision = 'discard'
                 reason = 'patience exhausted: ' + '; '.join(broken)
                 self.pending_regression = 0
+        elif _unmeasured(self.best or {}, after, metric=self.metric):
+            # "没变好"和"还不知道"是两件事：后者不该记成一次失败的改进。
+            decision = 'discard'
+            reason = (f'{self.metric} has no data yet — nothing was measured, '
+                      'so this round proves nothing')
+            if self.metric == 'memory_quality':
+                reason += ('; enable sampling with HARNESS_MEMORY_EVAL=1 and let '
+                           f'it collect {MIN_QUALITY_SAMPLES}+ samples first')
+            self.pending_regression = 0
         elif improved(self.best or {}, after, metric=self.metric):
             decision = 'keep'
             reason = f'{self.metric} improved'

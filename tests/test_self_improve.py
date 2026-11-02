@@ -10,6 +10,7 @@ Ring 0（策略/审批/测试）不可改、指标不可自定义、改错能回
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -224,9 +225,13 @@ def test_session_report(tmp_path):
 
 def test_soft_metrics_are_registered():
     """SICA 的效用是 性能 .5 / 成本 .25 / 时间 .25。只有正确性没有成本，
-    「测试全绿但 token 翻三倍」在本判据里会是「无变化」。"""
+    「测试全绿但 token 翻三倍」在本判据里会是「无变化」。
+
+    质量指标也必须是软的：它来自判官采样（κ 未校准），一票否决会让一次
+    真改进被抽样噪声杀掉。"""
     soft = {name for name, spec in si.METRICS.items() if not spec['hard']}
-    assert soft == {'tokens', 'wall_time'}
+    assert {'tokens', 'wall_time', 'memory_quality'} <= soft
+    assert 'pytest_pass' not in soft and 'ruff_errors' not in soft
 
 
 def test_soft_drift_is_reported_but_not_blocking():
@@ -526,3 +531,131 @@ def test_ledger_marks_are_gbk_safe(tmp_path):
         ledger.update_decision(tmp_path, change_id, decision, 'x')
     text = ledger.format_ledger(tmp_path)
     text.encode('gbk')          # 编码失败会抛 UnicodeEncodeError
+
+
+# ---------- P1：给 RSI 一个能表达"质量"的指标 ----------
+
+def _write_eval_rows(cache_dir, rows):
+    import json
+    path = cache_dir / 'memory-eval.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows),
+                    encoding='utf-8')
+
+
+def _recall_row(relevant=2, irrelevant=1, judged=3):
+    return {'ts': 1.0, 'kind': 'recall',
+            'relevant': list(range(relevant)),
+            'irrelevant': list(range(irrelevant)),
+            'abstain': [], 'missing': '', 'confidence': 'high',
+            'judged': judged}
+
+
+def test_memory_quality_metric_is_registered_as_soft():
+    """质量指标必须是软指标：它来自判官采样，不该一票否决一次改动。"""
+    import self_improve
+
+    spec = self_improve.METRICS['memory_quality']
+    assert spec['direction'] == 'higher'
+    assert spec['hard'] is False
+    assert spec['key'] == 'recall_precision'
+    # 能作为会话指标传进去（构造函数会校验名字）
+    self_improve.Session(cache_dir=Path(), workdir=Path(),
+                         goal='g', metric='memory_quality')
+
+
+def test_memory_quality_returns_empty_without_data(tmp_path):
+    """没有评测数据就返回 {}——和 tokens 同一条规矩，不填默认值。"""
+    import self_improve
+
+    assert self_improve.measure_memory_quality(workdir=tmp_path) == {}
+
+
+def test_memory_quality_needs_enough_samples(tmp_path):
+    """样本太少不给数：三条采样能翻天，拿出来当指标只会误导。"""
+    import self_improve
+
+    _write_eval_rows(tmp_path / '.cache', [_recall_row() for _ in range(3)])
+    assert self_improve.measure_memory_quality(workdir=tmp_path) == {}
+
+    _write_eval_rows(tmp_path / '.cache',
+                     [_recall_row() for _ in range(self_improve.MIN_QUALITY_SAMPLES)])
+    assert self_improve.measure_memory_quality(workdir=tmp_path) != {}
+
+
+def test_memory_quality_matches_the_eval_summary(tmp_path):
+    """数值必须和 `/memories quality` 看到的一致——同一份数据，两处口径。"""
+    import memory_eval
+    import self_improve
+
+    _write_eval_rows(tmp_path / '.cache', [_recall_row() for _ in range(6)])
+    measured = self_improve.measure_memory_quality(workdir=tmp_path)
+    stats = memory_eval.summarize(tmp_path / '.cache')
+
+    assert measured['recall_precision'] == stats['recall_precision']
+    assert measured['samples'] == stats['recall_samples']
+
+
+def test_begin_can_pick_the_quality_metric(tmp_path, monkeypatch):
+    """`/improvements begin <目标> --metric memory_quality`：目标要能用质量指标衡量。
+
+    没有这个入口，新指标只能靠改默认值才用得上——而默认值一改，所有既有会话的
+    判定口径就都变了。
+    """
+    from ui.command_actions import CommandActionsMixin
+
+    notices = []
+
+    class Fake(CommandActionsMixin):
+        def _notice(self, text, **kwargs):
+            notices.append(text)
+
+        def _workdir_for_improve(self):
+            return tmp_path
+
+    import harness
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    Fake()._improvements_begin(tmp_path / 'cache',
+                              '让召回更准 --metric memory_quality')
+
+    state = si.load_state(tmp_path / 'cache')
+    assert state['goal'] == '让召回更准'
+    assert state['metric'] == 'memory_quality'
+    assert any('memory_quality' in text for text in notices)
+
+
+def test_begin_rejects_an_unknown_metric(tmp_path):
+    from ui.command_actions import CommandActionsMixin
+
+    notices = []
+
+    class Fake(CommandActionsMixin):
+        def _notice(self, text, **kwargs):
+            notices.append(text)
+
+        def _workdir_for_improve(self):
+            return tmp_path
+
+    Fake()._improvements_begin(tmp_path / 'cache', '目标 --metric nope')
+
+    assert not si.load_state(tmp_path / 'cache'), '未知指标不该开会话'
+    assert any('nope' in text for text in notices)
+
+
+def test_discard_reason_says_when_the_metric_has_no_data(tmp_path, monkeypatch):
+    """指标没数据时，"did not improve enough" 是误导。
+
+    它听起来像"改得不够好"，实际是"这个指标还不知道"。质量指标刚接上时必然
+    是这种状态（要用户先开采样），提示得说清下一步怎么做。
+    """
+    session = si.Session(cache_dir=tmp_path, workdir=tmp_path, goal='g',
+                         metric='memory_quality')
+    session.baseline()          # 质量指标此时是 {}（没有采样）
+    monkeypatch.setattr(si.ledger, 'record', lambda *a, **kw: 'chg_1')
+    monkeypatch.setattr(si.ledger, 'update_decision', lambda *a, **kw: None)
+
+    result = session.evaluate(['skills/x.md'], summary='s',
+                              mechanism='让召回更准')
+    assert result['decision'] == 'discard'
+    assert 'no data' in result['reason'] or 'unmeasured' in result['reason']
+    assert 'memory_quality' in result['reason']
