@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import ocr_windows
@@ -114,6 +115,28 @@ def _line_center(line: dict) -> tuple[int, int] | None:
     return x + width // 2, y + height // 2
 
 
+#: 汉字之间被插了空格（OCR 引擎常见行为：每个字当一个词）。
+_SPACED_CJK = re.compile(r'[\u4e00-\u9fff][ \t]+[\u4e00-\u9fff]')
+
+#: 至少这么多行出现拆字才提示——一行带空格可能只是排版。
+SPACED_CJK_LINES = 2
+
+
+def _spaced_cjk_hint(lines: list[dict]) -> str:
+    """中文被拆成带空格的字时给一句提示（不改变识别结果本身）。
+
+    实测：一个「记住我」复选框会被识别成「记 住 我」，于是"用控件名去 OCR 结果里搜"
+    必然搜不到。这不是 bug（模型读得懂，坐标也对），但值得说一句——**只在真的
+    出现拆字时**说，否则每次 OCR 都付这句话的 token。
+    """
+    hits = sum(1 for line in lines
+               if _SPACED_CJK.search(str(line.get('text') or '')))
+    if hits < SPACED_CJK_LINES:
+        return ''
+    return ('（这张图里的中文被拆成了带空格的字，例如「记 住 我」；'
+            '按控件名去找时请忽略这些空格。）')
+
+
 def _format_lines(lines: list[dict], origin: tuple[int, int] | None = None) -> str:
     rendered = []
     for index, line in enumerate(lines[:MAX_OCR_LINES], start=1):
@@ -169,4 +192,7 @@ def ocr(path=None, lang: str = ocr_windows.DEFAULT_LANGUAGE, region=None, *,
             blocks.append('这张截图没有留下坐标信息（不是 screen_capture 生成的），'
                           '下面的 bbox 只能按图像像素理解。\n'
                           + _format_lines(result.lines))
+        hint = _spaced_cjk_hint(result.lines)
+        if hint:
+            blocks.append(hint)
     return '\n\n'.join(blocks)

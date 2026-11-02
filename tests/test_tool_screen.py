@@ -166,3 +166,63 @@ def test_ocr_region_outside_image_is_reported(tmp_path):
 
     assert result.startswith('识别失败：')
     assert '超出图片' in result
+
+
+# ---------- B4：OCR 把中文拆成带空格的字 ----------
+
+def _ocr_runner_with(lines):
+    """构造一个返回给定文本行的 OCR 假件。"""
+    def runner(script, env, timeout):
+        meta = {'ok': True, 'language': env.get('HARNESS_OCR_LANG') or 'zh-Hans-CN',
+                'width': 800, 'height': 600, 'region': None, 'text': '',
+                'lines': lines}
+        out = Path(env['HARNESS_OCR_META'])
+        out.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+        return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+    return runner
+
+
+def test_spaced_chinese_says_how_to_read_it(tmp_path):
+    """引擎会把「记住我」识别成「记 住 我」——按控件名搜索必然搜不到。
+
+    只在真的出现拆字时才说这一句：每个 OCR 调用都付这句话的 token 不值。
+    """
+    # 需要一个存在的截图文件：ocr() 先解析路径再调 runner
+    (tmp_path / 'shot.png').write_bytes(PNG)
+    lines = [
+        {'text': '记 住 我', 'bbox': [10, 20, 60, 18], 'words': []},
+        {'text': '高 级 选 项', 'bbox': [10, 60, 90, 18], 'words': []},
+    ]
+    result = tool_screen.ocr('shot.png', directory=tmp_path,
+                             runner=_ocr_runner_with(lines))
+    assert '带空格' in result
+    result.encode('gbk')
+
+
+def test_normal_chinese_gets_no_hint(tmp_path):
+    """没拆字就不要多一句话。"""
+    (tmp_path / 'shot.png').write_bytes(PNG)
+    lines = [{'text': '记住我', 'bbox': [10, 20, 60, 18], 'words': []},
+             {'text': '高级选项', 'bbox': [10, 60, 90, 18], 'words': []}]
+    result = tool_screen.ocr('shot.png', directory=tmp_path,
+                             runner=_ocr_runner_with(lines))
+    assert '带空格' not in result
+
+
+def test_english_only_gets_no_hint(tmp_path):
+    (tmp_path / 'shot.png').write_bytes(PNG)
+    lines = [{'text': 'Save changes', 'bbox': [10, 20, 120, 18], 'words': []},
+             {'text': 'Cancel', 'bbox': [10, 60, 80, 18], 'words': []}]
+    result = tool_screen.ocr('shot.png', directory=tmp_path,
+                             runner=_ocr_runner_with(lines))
+    assert '带空格' not in result
+
+
+def test_a_single_spaced_line_is_not_enough(tmp_path):
+    """一行里带空格可能是排版，不足以断言"引擎在拆字"。"""
+    (tmp_path / 'shot.png').write_bytes(PNG)
+    lines = [{'text': '记 住 我', 'bbox': [10, 20, 60, 18], 'words': []},
+             {'text': 'Save', 'bbox': [10, 60, 80, 18], 'words': []}]
+    result = tool_screen.ocr('shot.png', directory=tmp_path,
+                             runner=_ocr_runner_with(lines))
+    assert '带空格' not in result
