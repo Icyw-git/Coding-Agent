@@ -13634,3 +13634,56 @@ harness.py:241  scan_skills()
 > 只有前者能变成代码里的规则。
 
 全量 3439 passed / 3 skipped。
+
+---
+
+# 第 89 部分：压缩保留从"按条数"改成"按 token 预算"
+
+## 为什么条数是坏尺子
+
+压缩后保留"最近现场"的量，原来按**条数**（`keep=6`）+ 一个兜底预算
+`min(50k, CONTEXT_LIMIT/8)`。两个方向都不对：
+
+| 场景 | 按条数（旧） | 按预算 20k（新） |
+| --- | --- | --- |
+| 40 条短消息（共 998 tokens） | 保留 **6 条 / 150 tokens** | 保留 **40 条 / 998 tokens** |
+| 6 条各 120KB（各 34k tokens） | 1 条 / 34,296 | 1 条 / 34,296 |
+
+- 第一行：消息便宜时，**白扔掉**本来留得起的现场——150 vs 998 tokens，差 6 倍；
+- 第二行：消息很贵时两者一样，因为预算先亮红灯（说明"双约束"里预算那条一直在干活，
+  条数那条只会在便宜的时候坏事）。
+
+## 改法
+
+`_tail_within_budget(messages, keep=None, budget_tokens=None)`：
+
+- `keep` 降级为**可选的条数上限**（不给就纯按预算）；
+- 默认预算 = `KEEP_RECENT_TOKENS`（默认 20000，`HARNESS_KEEP_RECENT_TOKENS` 可覆盖，
+  1k–200k）；
+- `CONTEXT_LIMIT // 8` 继续兜住小窗口（64k 窗口下预算被压到 8k）。
+
+`compact_history` / `reactive_compact` 不再传 `keep`。
+
+## 与 pi 对齐
+
+pi 的 `keepRecentTokens` 默认 20000，`reserveTokens` 16384 决定何时开始压。我们现在
+保留量对齐了；触发点仍是我们自己的 `(窗口-8192)*0.8`（对 1M 窗口意味着 832k 才压，
+比 pi 晚很多——这是刻意的，见第 85 节的讨论）。
+
+## 一个容易搞混的边界
+
+场景 B 里"6 条里 3 个巨型工具结果"时，两种策略都保留 0 条——不是 bug：尾部起点落在
+工具结果上会被"孤儿工具结果"规则跳过（它的 assistant 已被裁掉，留着下一轮会被拒）。
+这条规则在改动前后都没变。
+
+## 测试
+
+两条新用例：
+
+- `test_tail_keeps_a_token_budget_not_a_message_count`：40 条短消息 + 预算 500 →
+  必须留 > 10 条（按条数只会留 6 条）；
+- `test_tail_never_exceeds_the_budget`：6 条各 40KB + 预算 3000 → 只留 1 条。
+
+原有的 `test_tail_within_budget`（显式传 keep=3）继续通过——条数上限这条路径没丢。
+
+全量 3441 passed / 3 skipped。

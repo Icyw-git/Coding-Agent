@@ -576,3 +576,30 @@ def test_snip_marker_is_byte_stable_across_rounds(monkeypatch):
         return markers[0]['content']
 
     assert marker_for(30) == marker_for(40) == compaction.SNIP_MARKER
+
+
+def test_tail_keeps_a_token_budget_not_a_message_count(tmp_path, monkeypatch):
+    """尾部保留按 **token 预算**，不按条数。
+
+    按条数的毛病：6 条里如果塞了三个大文件，压缩后立刻又超限；反过来 6 条短消息
+    会把本该保留的上下文切掉。pi 的做法是"保留最近 N 千 tokens"，这里跟它对齐。
+
+    做法：把"条数上限"换成"预算下界"——预算没用完就继续向前取，用完就停。
+    """
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 800_000)
+    small = [{'role': 'user', 'content': '第 %d 句 ' % i + 'x' * 40}
+             for i in range(40)]
+
+    # 40 条短消息 ≈ 每条 15 tokens 量级：预算 500 tokens 时应当取到远多于 6 条
+    start = harness._tail_within_budget(small, budget_tokens=500)
+    kept = len(small) - start
+    assert kept > 10, f'预算没用完就停了（只留 {kept} 条），仍在按条数截'
+
+
+def test_tail_never_exceeds_the_budget(monkeypatch):
+    """上界仍要守住：大消息不能因为"想多留几条"而突破预算。"""
+    monkeypatch.setattr(harness, 'CONTEXT_LIMIT', 800_000)
+    big = [{'role': 'user', 'content': 'y' * 40_000} for _ in range(6)]
+    start = harness._tail_within_budget(big, budget_tokens=3_000)
+    kept = len(big) - start
+    assert kept == 1, f'预算 3k 却留了 {kept} 条（每条 ≈10k tokens）'

@@ -448,7 +448,24 @@ def update_panel_status(messages=None, *, model=None, ctx_tokens=None,
     payload['branch'] = current_branch(get_workdir())
     payload['sandbox'] = load_policy().sandbox_mode
     ui_emit('status', **payload)
-KEEP_RECENT=6
+KEEP_RECENT=6          # 旧式条数上限：仍按条数调用的地方（工具结果占位）用它
+
+
+def _keep_recent_tokens() -> int:
+    """压缩后保留的最近现场（token）。
+
+    按预算而不是条数：条数在“6 条里有三个大文件”时会立刻再次超限，在“6 条寒暄”
+    时又会切掉该留的现场。窗口小的模型由 CONTEXT_LIMIT//8 兜住
+    （见 compaction._tail_within_budget）。
+    """
+    import settings
+
+    return int(settings.number('HARNESS_KEEP_RECENT_TOKENS', 20_000,
+                               minimum=1_000, maximum=200_000, integer=True))
+
+
+#: 压缩后保留的最近现场（token）——上面那个函数的读取结果。
+KEEP_RECENT_TOKENS=_keep_recent_tokens()
 PERSIST_THERSHOLD=10000
 TOOL_RESULT_CHAR_LIMIT=int(os.getenv('HARNESS_TOOL_RESULT_CHARS') or 24_000)  # 工具输出入口截断线（≈7k tokens）
 

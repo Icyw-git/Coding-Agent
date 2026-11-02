@@ -280,15 +280,21 @@ def summarize_history(messages):  # 总结对话记录，返回总结内容
     return (response.choices[0].message.content or "(empty summary)").strip()
 
 
-def _tail_within_budget(messages, keep, budget_tokens):
-    """按「条数上限 + token 预算」双约束取尾部；起点不落在孤儿工具结果上。
+def _tail_within_budget(messages, keep=None, budget_tokens=None):
+    """按 **token 预算**取尾部；``keep`` 是可选的条数上限。
 
-    旧实现只按条数（messages[-6:]），6 条各 100k 字符的工具结果会原样保留、
-    压缩后立刻又超限。"""
+    为什么从"按条数"改成"按预算"：条数是条坏尺子——6 条里塞三个大文件，压缩
+    完立刻又超限；反过来 6 条寒暄会把本该保留的现场切掉。token 才是成本本身
+    （pi 也是保留最近 20k tokens，见 docs/PERFORMANCE_PROFILE.md）。
+
+    ``keep`` 保留下来只作上限（调用方想额外封顶时用）；不给就纯按预算。
+    起点不落在孤儿工具结果上——那是压缩完还会被下一轮拒掉的形态。
+    """
     h = _h()
-    tail_start = max(0, len(messages) - keep)
+    tail_start = max(0, len(messages) - keep) if keep else 0
     total = 0
-    budget = min(budget_tokens if budget_tokens is not None else 50_000,
+    default_budget = getattr(h, 'KEEP_RECENT_TOKENS', 20_000)
+    budget = min(budget_tokens if budget_tokens is not None else default_budget,
                  h.CONTEXT_LIMIT // 8)
     # 从尾部向前累计，预算耗尽则收缩 tail_start（条数与预算取更紧的那个）
     idx = len(messages)
@@ -305,8 +311,8 @@ def _tail_within_budget(messages, keep, budget_tokens):
     return tail_start
 
 
-def compact_history(messages, keep=6, budget_tokens=None):  # 使用 llm 进行对话记录压缩：摘要 + 保留最近几轮原文
-    # 对齐 Codex 手感：压缩后保留最近工作现场（对话不断层），更早内容进摘要。
+def compact_history(messages, keep=None, budget_tokens=None):  # 摘要 + 保留最近工作现场
+    # 保留范围按 token 预算（默认 KEEP_RECENT_TOKENS），不再数条数。
     # tail 会写入 compaction 事件（见 _record_compaction），回放时完整还原。
     transcript_path = write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
@@ -317,7 +323,7 @@ def compact_history(messages, keep=6, budget_tokens=None):  # 使用 llm 进行�
     return result
 
 
-def reactive_compact(messages, keep=5, budget_tokens=None):
+def reactive_compact(messages, keep=None, budget_tokens=None):
     """保存完整对话记录，摘要 + 按预算保留最近现场（reactive 重试会逐次缩 keep/预算）。"""
     transcript_path = write_transcript(messages)
     print(f'[transcript saved:{transcript_path}]')
