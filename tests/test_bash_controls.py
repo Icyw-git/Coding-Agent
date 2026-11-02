@@ -131,3 +131,67 @@ def test_kill_background_terminates_running_process(tmp_path):
     snap = background_task.wait_background(bg_id, 5)
     assert snap['status'] == 'cancelled'
     assert tools.run_kill_background('bg_9999').startswith('Error:')
+
+
+# ---------- 并行调度：无害重定向与 cd 不该挡住只读判定 ----------
+
+def test_fd_duplication_is_not_a_write():
+    """`2>&1` 是"错误输出转到标准输出"，不写任何文件。
+
+    实测：451 条真实 bash 命令里几乎每条都以 `cd … && … 2>&1` 结尾，而
+    `_looks_read_only` 只要看到 `>` 就判非只读，于是整批 bash 只能串行。
+    """
+    from policy_bash import is_readonly_command
+
+    for command in (
+        'git diff HEAD -- a.py 2>&1',
+        'cd /d repo && git diff HEAD -- a.py 2>&1',
+        'git status 1>&2',
+        'dir /b src 2>nul',
+        'ls 2>/dev/null',
+    ):
+        assert is_readonly_command(command), command
+
+
+def test_real_writes_are_still_rejected():
+    """别放水：真写文件的重定向仍然非只读。"""
+    from policy_bash import is_readonly_command
+
+    for command in (
+        'git diff > out.txt',
+        'dir /b src > list.txt',
+        'echo hi >> log.txt',
+        'git status 2> errors.txt',      # 写一个真实的错误日志文件
+        'type a.txt > b.txt 2>&1',
+    ):
+        assert not is_readonly_command(command), command
+
+
+def test_cd_is_read_only_but_does_not_launder_writes():
+    """`cd` 只改进程自己的工作目录；但它不能把后面的写命令洗成只读。"""
+    from policy_bash import is_readonly_command
+
+    assert is_readonly_command(r'cd /d C:\work')
+    assert is_readonly_command('cd repo && dir /b src')
+    assert not is_readonly_command('cd repo && rm -rf src')
+    assert not is_readonly_command('cd repo && git push')
+
+
+def test_two_read_only_bash_commands_run_in_parallel():
+    """验收：这种最常见的形态（两条 cd 前缀的只读命令）应当并行。"""
+    from types import SimpleNamespace
+
+    import tool_dispatch
+
+    def call(call_id, command):
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name='bash', arguments=json.dumps({'command': command})))
+
+    batch = [call('c1', 'cd /d repo && git status --short 2>&1'),
+             call('c2', 'cd /d repo && git log --oneline -5 2>&1')]
+    commands = tool_dispatch._batch_bash_commands(batch)
+    from policy_bash import is_readonly_command
+
+    assert commands is not None
+    assert all(is_readonly_command(c) for c in commands)

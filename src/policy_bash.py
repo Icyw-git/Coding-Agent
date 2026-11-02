@@ -15,6 +15,9 @@ import re
 READ_ONLY_COMMANDS = frozenset({
     'dir', 'ls', 'cat', 'type', 'head', 'tail', 'findstr', 'grep', 'wc', 'stat',
     'pwd', 'which', 'where', 'whoami', 'hostname', 'date', 'echo', 'ver',
+    # 只改进程自己的工作目录，不碰文件系统。实测 451 条真实 bash 命令里几乎每条
+    # 都以 `cd /d <repo> && …` 开头——不认它，整批命令就永远判不成只读。
+    'cd', 'pushd', 'popd',
     'git',        # 配合 _git_subcommand 只放只读子命令
 })
 GIT_READONLY_SUBCOMMANDS = frozenset({
@@ -63,6 +66,18 @@ _NO_SESSION_GRANT = (frozenset({'git-lfs'})
 # 分号/管道/逻辑串联都是「一条命令里的多个动作」，逐段判定。
 # 换行在 POSIX shell 里同样分隔命令；Windows cmd 行为不同，但判定层按会执行的
 # 最坏情况处理，不能因为平台差异把第二行漏掉。
+# 无害重定向：fd 复制（`2>&1` / `1>&2`）与丢弃（`2>nul` / `2>/dev/null`）。
+# 它们都不写文件，但两处会误判：`&` 被当成命令分隔符、`>` 被当成写重定向。
+# 只在**调度判据**里剥离（见 is_readonly_command），安全路径仍按原文判定。
+_FD_DUPLICATION = re.compile(r'\d*>&\d+')
+_NULL_SINK = re.compile(r'\d*>\s*(?:nul|/dev/null)\b', re.IGNORECASE)
+
+
+def _strip_harmless_redirects(command: str) -> str:
+    """去掉不写文件的重定向，其余原样返回。"""
+    return _NULL_SINK.sub(' ', _FD_DUPLICATION.sub(' ', command))
+
+
 _SEGMENT_SPLIT = re.compile(r'\||&&|;|&|[\r\n]+')
 # 带捕获组的分隔符：逐段剥包装器时要原样拼回去，否则 `curl … | sh` 的
 # 管道结构会被抹平，opaque 标签就落到别的分支上了。
@@ -487,7 +502,7 @@ def is_readonly_command(command: str) -> bool:
     供并行调度使用：整批 bash 全部只读时按无副作用处理，与只读文件工具一样
     可并行执行。这是调度判据，不是安全边界 —— 安全判定仍在 evaluate()，
     两条路径共用同一份白名单（READ_ONLY_COMMANDS / GIT_READONLY_SUBCOMMANDS）。"""
-    normalized = str(command or '').casefold()
+    normalized = _strip_harmless_redirects(str(command or '').casefold())
     if not normalized.strip():
         return True
     verbs = (_command_verbs(normalized)
