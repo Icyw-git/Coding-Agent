@@ -627,8 +627,7 @@ TOOL_SCHEMAS = [{'type': 'function',
  {'type': 'function',
   'function': {'name': 'desktop_snapshot',
                'description': 'Inspect the foreground window and focused UI control. '
-                              'Requires HARNESS_DESKTOP_CONTROL=1 and explicit approval '
-                              'each time. Use pid and window_id for a following action.',
+                              'Use pid and window_id for a following action.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_inspect',
@@ -638,8 +637,7 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'read-only) and which element operations each one accepts. '
                               'Read-only. Use this instead of guessing coordinates: find '
                               'the control, then act on its number. The list is capped '
-                              'and may be truncated. Requires HARNESS_DESKTOP_CONTROL=1 '
-                              'and explicit approval.',
+                              'and may be truncated.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_displays',
@@ -647,17 +645,14 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'area and DPI scale, and say which monitor the '
                               'foreground window is on. Read-only. Use it when '
                               'coordinates look wrong on a scaled or multi-monitor '
-                              'setup. Requires HARNESS_DESKTOP_CONTROL=1 and explicit '
-                              'approval.',
+                              'setup.',
                'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
  {'type': 'function',
   'function': {'name': 'desktop_wait',
                'description': 'Wait inside one call until something appears or '
                               'disappears, polling the real desktop instead of '
                               'sleeping and re-checking. Use it after an action that '
-                              'triggers loading, a dialog, a toast, or a new window. '
-                              'Read-only. Requires HARNESS_DESKTOP_CONTROL=1 and '
-                              'explicit approval.',
+                              'triggers loading, a dialog, a toast, or a new window.',
                'parameters': {'type': 'object',
                               'properties': {
                                   'text': {'type': 'string',
@@ -708,8 +703,7 @@ TOOL_SCHEMAS = [{'type': 'function',
                               'deliberate sequence of steps (action=sequence) '
                               'executed left to right under a single approval — '
                               'use it to combine click, typing, and keys into one '
-                              'plan. Requires HARNESS_DESKTOP_CONTROL=1 and '
-                              'explicit approval every time. First call '
+                              'plan. First call '
                               'desktop_snapshot or desktop_inspect; expected_pid and '
                               'expected_window_id must match that window (element '
                               'mode also needs the tree fingerprint). Every step '

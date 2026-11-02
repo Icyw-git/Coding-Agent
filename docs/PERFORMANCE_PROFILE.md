@@ -189,6 +189,23 @@ rebuild 耗时 34.5ms | 峰值增量 0.53 MB | 驻留约 1873 B/条
 
 配置：`HARNESS_KEEP_RECENT_TOKENS`（默认 20000，1k–200k）。
 
+### schema 文案：只删"开关名"，不动语义（已落地）
+
+先量化，再决定删什么。默认工具面 23,050 字符里，**description 占 65%**（14,700+ 字符）。
+但逐条看过之后，绝大部分是"什么时候该用它 / 每个取值什么意思"——那是模型用对工具
+的依据，删了省 2% token 却要冒用错的风险，**不做**。
+
+真正删掉的只有一类：**"Requires HARNESS_DESKTOP_CONTROL=1 and explicit approval"**
+（5 个 desktop 工具各写一遍）。它描述的是本项目的配置项，不是工具语义；要不要审批由
+策略层决定，调用时 prompt 本来就会说。
+
+```
+打开桌面控制后：29,690 → 29,368 字符（−322 ≈ −80 tokens）
+```
+
+新增守卫 `test_no_schema_restates_the_feature_switch`：三个 `HARNESS_*` 开关名都不许
+再出现在工具描述里。
+
 ## 五、与 pi 的 runtime 对比
 
 ### 5.1 工具面（差距最大的一处）
