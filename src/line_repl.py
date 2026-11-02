@@ -128,7 +128,7 @@ def _new(requested: str, session_store):
                 return None
     elif requested:
         if not requested.replace('-', '').replace('_', '').isalnum():
-            print('  [session] invalid session id')
+            print('  [session] 会话 ID 只能包含字母、数字、- 和 _')
             return None
         session_id = requested
     else:

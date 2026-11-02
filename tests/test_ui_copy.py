@@ -282,7 +282,7 @@ def test_approval_detail_is_human_readable_chinese(key):
     if tool in _RAW_DETAIL and not variant:
         return
     assert re.search(r'[一-鿿]', text), f'{tool} 的审批文案没有中文: {text!r}'
-    leftover = re.findall(r'[a-z_]{2,}=(?=\S)', text)
+    leftover = re.findall(r'\b[a-z_]{2,}=(?=\S)', text)
     assert not leftover, f'{tool} 的审批文案还在用 key=value: {leftover} in {text!r}'
 
 
@@ -339,3 +339,18 @@ def test_cli_and_tui_command_sets_match():
     assert not missing, (
         'these commands exist in the TUI palette but not in CLI completion '
         f'(users cannot tab-complete them): {missing}')
+
+
+def test_background_action_failures_are_chinese():
+    """后台动作（审阅 / 跟踪）的失败消息不能被推到界面上还是英文。
+
+    同类错误（`要建议失败：`、`清理快照失败：`）都是中文；这两条是唯一漏掉的。
+    用户看到的 `Review failed: TimeoutError: …` 既没说是谁失败，也没说下一步。
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent
+              / 'src' / 'ui' / 'background_actions.py').read_text(encoding='utf-8')
+    for english in ('Review failed', 'Watch failed'):
+        assert english not in source, f'{english} 还是英文'
+    assert '审阅失败' in source and '跟踪失败' in source

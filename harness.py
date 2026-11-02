@@ -824,7 +824,7 @@ def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn
                                        timeout=5.0, action='写入标题'):
                         session_store.append_session_title(title, source='auto')
                 except SessionBusy as exc:
-                    print(f'  [33m[title] skipped: {exc}[0m')
+                    print(f'  \033[33m[title] skipped: {exc}\033[0m')
     except Exception as exc:
         print(f'  \033[33m[title] skipped: {exc}\033[0m')
     try:

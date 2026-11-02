@@ -14110,3 +14110,82 @@ payload"——150 行 PowerShell 重写。而实测历史里 `screen_capture` �
 > 的同名词。
 
 全量 3466 passed / 3 skipped。
+
+---
+
+# 第 97 部分：源码里的隐形字符，藏着一个"永远不生效"的守卫
+
+继续按"失败可解释 / 有入口"两条判据扫，先补了三处英文提示，然后撞上一类更麻烦的东西。
+
+## 一、三处英文提示（顺手）
+
+| 位置 | 原文 | 现在 |
+| --- | --- | --- |
+| `ui/background_actions.py` | `Review failed: / Watch failed:` | `审阅失败：/ 跟踪失败：` |
+| `cli_input.py` | `(no saved sessions)` | `（还没有保存的会话）` |
+| `line_repl.py` | `[session] invalid session id` | `[session] 会话 ID 只能包含字母、数字、- 和 _` |
+| `approval.py` | `stdin unavailable → denied` | `读不到终端输入（后台运行或输入已关闭），按拒绝处理` |
+
+## 二、我自己先写进了一个隐形字符
+
+改 `approval.py` 时，补丁脚本里的 `\x1b` 被 Python 解释成了真的 ESC 字节，写进了源码。
+文件照样能跑，但在编辑器/git diff 里看不见——review 会整行跳过。
+
+修掉之后加了守卫 `test_source_files_have_no_raw_control_characters`，覆盖
+`src/`、`tests/`、`harness.py`。
+
+## 三、守卫一开，立刻抓出两处真 bug
+
+**16 处裸控制字符**，其中 8 处是**退格符（0x08）**，全部在正则里：
+
+```python
+(r'\x08402\x08|insufficient balance|...'      # feishu_gateway._ERROR_HINTS
+```
+
+本意是 `\b402\b`（词边界），被写成了退格符。后果：`HTTP 402 payment required`
+匹配不上——**402 / 401 / 403 / 429 四条分类全是死的**，用户只会看到原始报文。
+
+验证：
+
+```
+'HTTP 402 payment required'   错的=0  对的=1
+'insufficient balance'        错的=1  对的=1   ← 只有字面子串能碰巧命中
+```
+
+另一处更讽刺：`tests/test_ui_copy.py` 里那条"审批文案还在用 `key=value`"的守卫——
+`re.findall(r'<BS>[a-z_]{2,}=(?=\S)', text)` 也在找一个退格符，所以**它从来没拦住过
+任何东西**。改成 `\b` 之后立刻能抓到 `action=click` 这类残留。
+
+## 四、修法
+
+- 8 × 0x08 → 文本 `\b`（feishu_gateway、test_ui_copy）
+- 8 × 0x1b → 文本 `\033`（cron_scheduler、desktop_control_windows、harness）
+- 守卫扩到 `harness.py` 与 `tests/`，并新增 `test_error_patterns_match_real_provider_messages`：
+  拿 `HTTP 402 payment required` 这类**真实报文**去试分类正则。
+
+## 五、顺手修掉一条靠墙钟的断言
+
+全量里 `test_frontmatter_cache_survives_above_the_limit` 挂了：
+
+```
+AssertionError: cold=9.808s warm=95.095s: 缓存没生效
+```
+
+查下来不只是噪声——**超过上限后 LRU 顺序扫描必然抖动**（插入第 i+N 条正好淘汰第 i 条），
+实测 552 条时热读把 552 条全解析了一遍，热读根本不比冷读快。那条
+`warm < cold * 0.6` 从来就不可能稳定成立。
+
+改成两条确定性断言：
+
+- 超上限 → 缓存**非空且不超上限**（淘汰而非清空，这是原意）；
+- 未超上限 → 热读**一次都不解析**（计 `_parse_frontmatter` 调用次数）。
+
+## 收获
+
+> **隐形字符让"测试通过"失去意义。** 两处守卫因为一个字节在悄悄空转，而它们守的
+> 分别是"错误分类"和"审批文案不许回退成 key=value"。这类失效没有任何信号。
+
+> **"性能断言"要能被负载解释。** 同一条断言在空载和满载下能差 10 倍；如果它守的是
+> 语义（缓存有没有命中），就该数次数，而不是量时间。
+
+全量 3469 passed / 3 skipped。

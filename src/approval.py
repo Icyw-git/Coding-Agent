@@ -426,7 +426,8 @@ class PermissionGate:
                            't=允许特 N 次) ' if klass
                            else 'Allow? (y=允许 / n=拒绝) ').strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print('  \033[31m[permission] stdin unavailable → denied\033[0m')
+            # stdin 不可用（后台运行 / 管道 / EOF）：默认拒绝，但要说清为什么
+            print('  \033[31m[permission] 读不到终端输入（后台运行或输入已关闭），按拒绝处理\033[0m')
             self.resolve(req.req_id, False, by='console(EOF)')
             return False
         if choice == 't' and klass:

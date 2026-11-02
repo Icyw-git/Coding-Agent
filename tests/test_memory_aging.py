@@ -312,40 +312,58 @@ def test_age_memories_prunes_noise_but_keeps_signal(tmp_path, monkeypatch):
 def test_frontmatter_cache_survives_above_the_limit(tmp_path, monkeypatch):
     """缓存超上限时逐条淘汰，不能整体清空。
 
-    实测踩到的 bug：原来到 256 条就 `clear()`，记忆数一旦超过上限，每次插入都
-    清空全表、命中率归零——500 条时一次索引重建要 6.8 秒，热缓存读也要 240ms。
+    实测踩到的 bug：原来到上限就 `clear()`，记忆数一旦超过上限，每次插入都清空
+    全表、命中率归零——500 条时一次索引重建要 6.8 秒，热缓存读也要 240ms。
+
+    **不能用"热读比冷读快多少"来验收**：超过上限后顺序扫描会让 LRU 抖动（插入第
+    i+N 条时正好淘汰第 i 条），实测 552 条时热读把 552 条全解析了一遍，热读并不
+    比冷读快；在满载机器上还测到过 warm=95s / cold=9.8s 这种 10 倍反向差。
+    所以这里判两件确定的事：超限时是**淘汰**（表非空、且不超上限），未超限时
+    热读**一次都不解析**。
     """
     import memory
 
     home = memory._h()
     monkeypatch.setattr(home, 'MEMORY_DIR', tmp_path, raising=False)
     monkeypatch.setattr(home, 'MEMORY_INDEX', tmp_path / 'MEMORY.md', raising=False)
+
+    calls = []
+    real_parse = memory._parse_frontmatter
+
+    def counting_parse(text):
+        calls.append(1)
+        return real_parse(text)
+
+    def write_entries(count):
+        for index in range(count):
+            (tmp_path / f'n{index}.md').write_text(
+                f'---\nname: n{index}\ndescription: d\ntype: fact\n---\n\nbody\n',
+                encoding='utf-8')
+
+    # 一、超过上限：淘汰而不是清空
     memory._cache_clear()
-
-    total = memory._CACHE_MAX + 40
-    for index in range(total):
-        (tmp_path / f'n{index}.md').write_text(
-            f'---\nname: n{index}\ndescription: d\ntype: fact\n---\n\nbody\n',
-            encoding='utf-8')
-    memory._cache_clear()
-
-    import time
-
-    started = time.perf_counter()
-    first = memory.list_memory_files()          # 冷：填满缓存（会触发淘汰）
-    cold = time.perf_counter() - started
-    assert len(first) == total
-    # 淘汰后缓存里仍应有内容，而不是被清空
+    write_entries(memory._CACHE_MAX + 40)
+    listed = memory.list_memory_files()
+    assert len(listed) == memory._CACHE_MAX + 40
     assert memory._FRONTMATTER_CACHE, 'cache was cleared instead of evicted'
     assert len(memory._FRONTMATTER_CACHE) <= memory._CACHE_MAX
 
-    # 相对比较而不是绝对阈值：淘汰掉一半后第一次仍是半冷，再读一次才全热。
-    # 绝对阈值在负载下会误报（实测冷读 296 条要 0.75s）。
-    memory.list_memory_files()
-    started = time.perf_counter()
-    memory.list_memory_files()
-    warm = time.perf_counter() - started
-    assert warm < cold * 0.6, f'cold={cold:.3f}s warm={warm:.3f}s: 缓存没生效'
+    # 二、未超上限：热读一次都不解析（这才是缓存该有的样子）
+    small = tmp_path / 'small'
+    small.mkdir()
+    for index in range(max(4, memory._CACHE_MAX // 8)):
+        (small / f'm{index}.md').write_text(
+            f'---\nname: m{index}\ndescription: d\ntype: fact\n---\n\nbody\n',
+            encoding='utf-8')
+    monkeypatch.setattr(home, 'MEMORY_DIR', small)
+    memory._cache_clear()
+    monkeypatch.setattr(memory, '_parse_frontmatter', counting_parse)
+
+    memory.list_memory_files()          # 冷：全部解析一次
+    assert calls, '冷读没有解析任何文件，用例前提不成立'
+    calls.clear()
+    memory.list_memory_files()          # 热：应当全部命中
+    assert not calls, f'热读仍然解析了 {len(calls)} 次，缓存没生效'
 
 
 def test_age_scan_reads_recall_log_once(tmp_path, monkeypatch):

@@ -271,7 +271,7 @@ def update_job(job_id:str,*,allow_side_effects:bool|None=None,
     if durable:
         save_durable_jobs()
     mode='可写' if job.allow_side_effects else '只读'
-    print(f"  [35m[cron update] {job.id} → {mode}[0m")
+    print(f"  \033[35m[cron update] {job.id} → {mode}\033[0m")
     return job
 
 def _probe_idle(probe=None) -> dict:
@@ -381,12 +381,12 @@ def tick(now: datetime | None = None, idle_probe=None) -> list[CronJob]: #扫描
                 job.deferred_since = None
                 _last_fired[job.id] = minute_marker
                 fired.append(job)
-                print(f"  [35m[cron fire] {job.id} → "
-                      f"{job.prompt[:40]}[0m")
+                print(f"  \033[35m[cron fire] {job.id} → "
+                      f"{job.prompt[:40]}\033[0m")
                 if not job.recurring: # 如果任务不重复执行
                     scheduled_jobs.pop(job.id, None)
             except Exception as e:
-                print(f"  [31m[cron error] {job.id}: {e}[0m")
+                print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
         if any(job.durable for job in fired + deferred + dropped):
             save_durable_jobs()
     for job in deferred:

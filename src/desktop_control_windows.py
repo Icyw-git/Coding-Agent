@@ -318,7 +318,7 @@ def _run(payload: dict, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> dic
             # 只会得到同样的结果，还会把可读的 message 换成「unexpected output」。
             # 只有 worker 真的不可用（启动失败/超时/协议错）才降级。
             if _is_worker_failure(exc):
-                print(f'  [33m[desktop] worker unavailable, falling back: {exc}[0m')
+                print(f'  \033[33m[desktop] worker unavailable, falling back: {exc}\033[0m')
             else:
                 raise DesktopControlError(str(exc)) from exc
     return _run_standalone(payload, runner=runner, timeout=timeout)

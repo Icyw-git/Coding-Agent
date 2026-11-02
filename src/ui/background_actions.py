@@ -78,7 +78,9 @@ class BackgroundActionsMixin:
         try:
             result = run_review(progress=progress)
         except Exception as exc:
-            result = f'Review failed: {type(exc).__name__}: {exc}'
+            # 和同类错误（要建议失败 / 清理快照失败）保持一致：先说清是哪件事，
+            # 再给原因。这条曾经是唯一漏网的英文。
+            result = f'审阅失败：{type(exc).__name__}: {exc}'
         try:
             self.call_from_thread(self._review_done, block_id, result)
         except Exception:
@@ -115,7 +117,7 @@ class BackgroundActionsMixin:
         try:
             result = watch_command(argument, emit=progress)
         except Exception as exc:
-            result = f'Watch failed: {type(exc).__name__}: {exc}'
+            result = f'跟踪失败：{type(exc).__name__}: {exc}'
         try:
             self.call_from_thread(self._watch_done, block_id, result)
         except Exception:

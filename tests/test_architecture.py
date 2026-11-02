@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -182,3 +183,46 @@ def test_every_switch_is_documented():
     doc = (root / 'docs' / 'ENVIRONMENT.md').read_text(encoding='utf-8')
     missing = sorted(name for name in used if name not in doc)
     assert not missing, f'这些开关没有文档：{missing}'
+
+
+def test_source_files_have_no_raw_control_characters():
+    """源码里不许出现裸控制字符（尤其是 ESC）。
+
+    踩过：改文案时把 `\033[31m` 写成了字符串里的真 ESC 字节。文件仍能运行，
+    但在编辑器/git diff 里看不见，review 时会整行跳过——这种"隐形字符"很难事后发现。
+
+    制表符与换行是合法的；其余 C0 控制字符（除 ESC 外还有退格、响铃等）一律不许。
+    """
+    root = Path(__file__).resolve().parent.parent
+    allowed = {'\t', '\n'}
+    offenders = []
+    targets = (list((root / 'src').rglob('*.py'))
+               + list((root / 'tests').rglob('*.py'))
+               + [root / 'harness.py'])
+    for path in targets:
+        for lineno, line in enumerate(path.read_text(encoding='utf-8').splitlines(True), 1):
+            bad = {ch for ch in line if ord(ch) < 32 and ch not in allowed}
+            if bad:
+                offenders.append(f'{path.name}:{lineno} {sorted(map(ord, bad))}')
+    assert not offenders, offenders[:5]
+
+
+def test_error_patterns_match_real_provider_messages():
+    """provider 错误分类的正则必须能匹配真实报文。
+
+    踩过：`\b402\b` 在源码里被写成了真的退格符（`\x08`），于是 `HTTP 402 payment
+    required` 匹配不上——402/401/403/429 四条分类全都是死的，用户只会看到原始报文。
+    这类错误看不见（控制字符在编辑器里不可见），只能靠"拿真实报文试一遍"抓。
+    """
+    import feishu_gateway
+
+    patterns = feishu_gateway._ERROR_HINTS
+    samples = {
+        402: 'HTTP 402 payment required',
+        401: '401 Unauthorized',
+        403: '403 Forbidden',
+        429: '429 Too Many Requests',
+    }
+    for code, text in samples.items():
+        assert any(re.search(pattern, text, re.IGNORECASE)
+                   for pattern, _zh in patterns), f'{code} 认不出来：{text}'

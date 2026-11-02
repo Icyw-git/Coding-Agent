@@ -47,7 +47,7 @@ def filter_session_rows(rows, workspace=None, include_empty=False, query=''):
 def choose_session(rows, current_id=None, workspace=None):
     """Select by recognizable context, not an opaque identifier."""
     if not rows:
-        print('  (no saved sessions)')
+        print('  （还没有保存的会话）')
         return None
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print('\n\n'.join(session_label(row) for row in rows))

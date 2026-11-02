@@ -297,12 +297,12 @@ def _accepts_kwarg(fn, name: str) -> bool:
 
 # 常见失败 → 一句能照着做的话。未知错误保留原文，不做猜测性改写。
 _ERROR_HINTS = (
-    (r'402|insufficient balance|insufficient_quota|quota exceeded',
+    (r'\b402\b|insufficient balance|insufficient_quota|quota exceeded',
      '模型 provider 余额/额度不足（402）。充值或换个模型后再试。'),
-    (r'401|unauthorized|invalid api key|invalid_api_key',
+    (r'\b401\b|unauthorized|invalid api key|invalid_api_key',
      '模型鉴权失败（401）：API key 可能失效或被禁用。'),
-    (r'403|forbidden|permission denied', '模型拒绝访问（403）：检查 key 的权限与地区限制。'),
-    (r'429|rate limit|too many requests', '请求过于频繁（429）：等几秒再发一次。'),
+    (r'\b403\b|forbidden|permission denied', '模型拒绝访问（403）：检查 key 的权限与地区限制。'),
+    (r'\b429\b|rate limit|too many requests', '请求过于频繁（429）：等几秒再发一次。'),
     (r'timeout|timed out', '请求超时：网络或 provider 响应太慢，可直接重试。'),
     (r'turn_busy|another turn|409', '上一轮还在执行：等它结束，或点「停止这个回合」再发。'),
 )

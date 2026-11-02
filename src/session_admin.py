@@ -245,7 +245,7 @@ def format_session_list(limit: int = 20) -> str:
     if not rows:
         rows = h.session_rows(max(100, limit), include_empty=False)[:limit]
     if not rows:
-        return '  (no saved sessions)'
+        return '  （还没有保存的会话）'
     return '\n\n'.join(session_label(row) for row in rows)
 
 
