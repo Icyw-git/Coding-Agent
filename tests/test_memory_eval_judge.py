@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-import time
+import threading
 
 import pytest
 
@@ -155,18 +155,25 @@ def test_run_async_skips_when_not_sampled(tmp_path, monkeypatch):
 
 
 def test_run_async_does_not_block_caller(tmp_path, monkeypatch):
-    """关键性质：判得慢也不能拖住调用方。"""
+    """关键性质：判得慢也不能拖住调用方。
+
+    **不用耗时判**（原来断言 < 0.2s）：机器的负载会让同一条判据差十倍。
+    改成握手：判官卡在事件上不返回，如果 `run_async` 等它，就会卡在那里；
+    能走到下一行、且判官尚未完成，才说明是异步的。
+    """
     monkeypatch.setenv(me.ENV, '1')
+    release = threading.Event()
+    finished = threading.Event()
 
     def slow(prompt: str) -> str:
-        time.sleep(0.4)
+        release.wait(10)          # 不 set 就永远不返回（10s 兜底防挂死）
+        finished.set()
         return _fake()(prompt)
 
-    started = time.perf_counter()
     me.run_async(cache_dir=tmp_path, turn_no=10, message='x',
                  recalled=RECALLED, complete=slow)
-    elapsed = time.perf_counter() - started
-    assert elapsed < 0.2, f'run_async 阻塞了 {elapsed:.2f}s'
+    assert not finished.is_set(), 'run_async 一直等到判官执行完才返回，是同步的'
+    release.set()
     me.wait_for_eval(10)
 
 

@@ -14260,3 +14260,57 @@ assert float(elapsed_line) > 0, '耗时没量到'
 
 heredoc 又把 `\n` 折叠成真换行，把测试文件写成语法错误，修了三次才干净。
 **带反斜杠转义的补丁脚本一律用 `write` 工具写文件，不用 heredoc。**
+
+---
+
+# 第 99 部分：最后两条墙钟断言，以及一条"量错了对象"的测试
+
+上一节留下两条真阈值（`elapsed < 0.2`、`elapsed < 1.0`）没动，理由是"没失败过"。
+这轮把它们的语义表达清楚——**不是放宽阈值，是换成能确定性验证的东西**。
+
+## 一、`run_async` 不阻塞：用握手，不用秒表
+
+```python
+release = threading.Event()
+finished = threading.Event()
+def slow(prompt):
+    release.wait(10)      # 不 set 就一直不返回（10s 兜底防挂死）
+    finished.set()
+    return _fake()(prompt)
+me.run_async(...)
+assert not finished.is_set(), 'run_async 一直等到判官执行完才返回，是同步的'
+release.set()
+```
+
+原来的 `assert elapsed < 0.2`（判官 sleep 0.4s）在满载机器上没有判别力：线程启动慢一点
+就会误报。改写后与速度无关——**"能不能走到下一行"本身就是答案**。
+
+验证过它真会红：把实现换成同步调用，`finished.is_set()` 立刻为真，断言失败。
+
+## 二、预筛测试：原来量错了对象
+
+`test_only_interesting_lines_are_parsed` 用 200 行 `message` 做 bulk，然后断言
+"扫描 < 1.0s"。查 `_INTERESTING` 才发现：
+
+```python
+_INTERESTING = (b'"usage"', b'"tool_profile"', b'"message"', ...)
+```
+
+**`message` 是"关心"的事件**（要数用户消息），所以那 200 行本来就会被解码——这条测试
+从未测到预筛，只是在量解码 201 行要多久。
+
+改成：
+
+- bulk 换成 `turn_started`（真正会被字节预筛跳过的类型）；
+- 判据换成"解码了几行"——201 行里必须只有 1 行（那行 `usage`）。
+
+实测复现：6 行里解码 1 行；把预筛去掉就是 6 行全解码，断言会红。
+
+## 收获
+
+> **"没失败过"不等于"测对了"。** 这条预筛测试跑了很久都没红，因为它测的是另一件事。
+
+> **换成计数之后，才第一次真正验证了它声称要守的东西。** 阈值调低只是让它更可能红，
+> 不会让它变得有意义。
+
+全量 3471 passed / 3 skipped。

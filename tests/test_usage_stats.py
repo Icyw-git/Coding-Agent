@@ -197,19 +197,33 @@ def test_report_warns_when_no_model_requests(sessions):
 
 # ---------------------------------------------------------------- 性能：字节预筛
 
-def test_only_interesting_lines_are_parsed(sessions):
+def test_only_interesting_lines_are_parsed(sessions, monkeypatch):
     """会话里绝大多数是 message 行，全解码会慢一个数量级。
 
     实测 22 个会话：全解码 1095ms，字节预筛后 83ms。
+
+    **用"解码了几行"验收，不用耗时**：墙钟在同一台机器上能差十倍（全量跑时
+    这条曾以 1.07s 超阈值），而"201 行里只解码 1 行"是确定的。
     """
-    bulk = [('message', {'message': {'role': 'user', 'content': 'x' * 200}})
-            for _ in range(200)]
+    # 用**不关心**的事件类型做 bulk：`_INTERESTING` 里包含 "message"（它要数
+    # 用户消息），所以 message 行本来就会被解码，用它们测不出预筛。
+    # 真正会被跳过的是 turn_started / checkpoint 这类。
+    bulk = [('turn_started', {'turn_id': f't{i}', 'source': 'cli' * 40})
+            for i in range(200)]
     _session(sessions, events=bulk + [('usage', _usage())])
-    started = time.perf_counter()
+
+    decoded = []
+    real_loads = usage_stats.json.loads
+
+    def counting_loads(raw, *args, **kwargs):
+        decoded.append(1)
+        return real_loads(raw, *args, **kwargs)
+
+    monkeypatch.setattr(usage_stats.json, 'loads', counting_loads)
     stats = usage_stats.collect(sessions, days=7)
-    elapsed = time.perf_counter() - started
+
     assert stats['requests'] == 1
-    assert elapsed < 1.0, f'扫描 {elapsed:.2f}s，预筛可能失效'
+    assert len(decoded) == 1, f'201 行里解码了 {len(decoded)} 行，字节预筛失效'
 
 
 def test_local_only_activity_is_not_reported_as_empty(sessions):
