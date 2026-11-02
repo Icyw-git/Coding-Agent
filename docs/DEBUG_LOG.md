@@ -14015,3 +14015,51 @@ dirnames[:] = [d for d in dirnames if d not in SEARCH_IGNORE]
 所以只记录。真要搜得准，用户应当把 `path` 指到具体目录。
 
 全量 3464 passed / 3 skipped。
+
+---
+
+# 第 95 部分：screen_capture 的 2.1s，量清后决定不改
+
+## 拆解
+
+| 步骤 | 耗时 |
+| --- | --- |
+| 空 PowerShell（`exit 0`） | 1,309–1,480ms |
+| + `Add-Type Drawing/Forms` | 1,635ms |
+| + DPI-aware 的 C# 编译 | 1,897ms |
+| 完整 `capture()` | 2,072–2,958ms |
+
+**每次截屏有 ≈1.4s 纯粹在拉起 PowerShell 进程**，和桌面工具（常驻 worker，首次 2.9s、
+之后 15–60ms）是同一个病。
+
+另外确认了它没有多余的数据搬运：PNG 直接写临时文件、Python 读字节，没有走 base64 回传。
+
+## 为什么不改
+
+要复用常驻 worker，得把 `CAPTURE_SCRIPT` 从"读 `$env:HARNESS_SCREEN_*`"改成"读请求
+payload"——150 行 PowerShell 重写。而实测历史里 `screen_capture` 只被调用 **1 次**、
+`screen_ocr` 1 次。
+
+**为低频操作重写一份实现，还要多担一条"两条传输路径漂移"的风险**（第 62 部分刚踩过
+`_failure_text` 只在一条路径上生效的坑），代价大于收益。
+
+判据写进文档了：`screen_*` 在真实会话里的调用次数超过 `desktop_*` 时再动手。
+
+## 这一轮的方法小结
+
+五个性能问题，两种性质：
+
+| 问题 | 判据来源 | 处理 |
+| --- | --- | --- |
+| 启动 168ms（我算错） | 单模块 import | 更正为 60ms，做 yaml 惰性化 |
+| 工具延迟加载 | 真实 usage 事件 | **净亏 → 默认关闭** |
+| worker 没预热 | 真实 tool_profile | 修 |
+| 并行度误判 | 真实命令参数 | 修（0 → 36%） |
+| ripgrep 排除不递归 | 扫到多少文件 | 修（−5,753 文件） |
+| screen_capture 1.4s | PS 启动拆解 | **量清后不改** |
+
+三件"看起来该做但没做"的都是用测量否掉的：引号内不切分（收益 0）、扩展 SEARCH_IGNORE
+（改语义不是修 bug）、screen worker（低频 + 重写 + 漂移风险）。
+
+> **性能优化的另一半工作是"证明某件事不值得做"。** 只报"我优化了什么"的清单，
+> 会鼓励下一个人把所有看起来慢的地方都改一遍。
