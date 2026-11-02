@@ -285,3 +285,34 @@ def test_tool_line_shows_total_time(sessions):
     text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
     assert '总' in text
     assert '2.5s' in text
+
+
+def test_model_tally_says_when_it_covers_only_some_requests(sessions):
+    """模型统计可能只覆盖一部分请求（`model` 字段是后加的）。
+
+    实测真实数据：768 次请求里只有 280 次带 `model`。只写「模型：deepseek-flash×280」
+    会被读成"总共 280 次请求"——数字对不上时要说清它数的是什么。
+    """
+    # 两条老事件（没有 model 字段）+ 一条新的
+    _session(sessions, events=[
+        ('usage', {'prompt': 10, 'completion': 1}),
+        ('usage', {'prompt': 10, 'completion': 1}),
+    ])
+    _session(sessions, events=[('usage', {**_usage(), 'model': 'deepseek-flash'})])
+
+    stats = usage_stats.collect(sessions, days=7)
+    text = usage_stats.format_report(stats)
+
+    assert stats['requests'] == 3
+    assert 'deepseek-flash×1' in text
+    assert '3 次' in text and '1 次' in text, '提示里要给出「几次请求里有几次带模型」'
+
+
+def test_model_tally_stays_plain_when_every_request_has_one(sessions):
+    _session(sessions, events=[('usage', {**_usage(), 'model': 'm1'}),
+                               ('usage', {**_usage(), 'model': 'm1'})])
+    text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
+    model_line = next(l for l in text.splitlines() if '模型：' in l)
+    assert 'm1×2' in model_line
+    # 只看这一行：`其中` 在 token 那行（其中缓存 …）也有，对整段断言会误判
+    assert '带模型记录' not in model_line, '全都带模型时不该多一句'

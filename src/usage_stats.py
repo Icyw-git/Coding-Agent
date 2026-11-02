@@ -229,6 +229,12 @@ def format_report(stats: dict, *, top_tools: int = 8) -> str:
     if stats.get('models'):
         top = '、'.join(f'{name}×{count}'
                         for name, count in list(stats['models'].items())[:3])
+        # `model` 字段是后加的：老事件没有，只写「模型：x×280」在 768 次请求旁边
+        # 会被读成"总共 280 次"。数字对不上时说清它覆盖了多少。
+        tallied = sum(stats['models'].values())
+        requests = int(stats.get('requests') or 0)
+        if 0 < tallied < requests:
+            top += f'（{requests} 次请求里 {tallied} 次带模型记录）'
         lines.append(f'  模型：{top}')
 
     tools = stats.get('tools') or {}
