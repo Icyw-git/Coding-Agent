@@ -153,7 +153,7 @@ class CommandActionsMixin:
         elif verb == 'watch':
             self.start_watch(argument)
         elif verb == 'suggest':
-            self.start_suggestions()
+            self.start_suggestions(argument)
         elif verb == 'copy':
             self.copy_last_tool()
         elif verb == 'dequeue':

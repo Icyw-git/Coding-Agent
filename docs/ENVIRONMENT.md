@@ -95,7 +95,7 @@
 | `HARNESS_DESKTOP_TREE_MS` | `2500` | 单次遍历的时间预算（毫秒），超了就返回已采集部分；`desktop_wait` 复用这三个值，但每轮最多 80 个控件 / 900ms |
 | `HARNESS_DESKTOP_EXCLUDE_PROCESSES` | — | 逗号分隔的进程名；`desktop_inspect` / `desktop_wait` / 元素动作在**进入该进程的无障碍树之前**就跳过（病灶 provider 会卡住遍历） |
 | `HARNESS_DESKTOP_CONTROL` | — | 桌面控制的**总开关**，`=1` 才启用；未设时 6 个桌面工具一律 DENY |
-| `HARNESS_PROACTIVE_MODE` | **`off`** | 主动性三档：`off` 什么都不做 / `observe` 按时跑一次只记录（写 `.cache/proactive-observations.jsonl`）/ `auto` 会主动给建议。写错的值退回 `off`；旧的 `HARNESS_PROACTIVE=1` 仍等于 `auto`。手动入口 `/suggest` 不受此开关限制 |
+| `HARNESS_PROACTIVE_MODE` | **`off`** | 主动性三档：`off` 什么都不做 / `observe` 按时跑一次只记录（写 `.cache/proactive-observations.jsonl`，用 `/suggest --last` 看）/ `auto` 会主动给建议。写错的值退回 `off`；旧的 `HARNESS_PROACTIVE=1` 仍等于 `auto`。手动入口 `/suggest` 不受此开关限制 |
 
 ## 6. PowerShell worker（性能）
 

@@ -14189,3 +14189,74 @@ AssertionError: cold=9.808s warm=95.095s: 缓存没生效
 > 语义（缓存有没有命中），就该数次数，而不是量时间。
 
 全量 3469 passed / 3 skipped。
+
+---
+
+# 第 98 部分：observe 记了东西却没人能看；以及我又在测试里写了墙钟阈值
+
+## 一、observe 档的"最后一公里"
+
+`observe` 会按时跑一次、把建议写进 `.cache/proactive-observations.jsonl`——**然后就没有然后了**。
+用户看不到记录，`observe` 和 `off` 在使用体验上没有区别。
+
+补了 `/suggest --last`：
+
+```
+2026-11-02T20:37:07 · 2 条
+  · 把迁移脚本跑通
+  · 清掉 .test-tmp 旧日志
+（台账：…/.cache/proactive-observations.jsonl）
+```
+
+空台账时说清怎么开、台账在哪：
+
+```
+还没有观察记录。开启方式：HARNESS_PROACTIVE_MODE=observe
+台账位置：…/.cache/proactive-observations.jsonl
+```
+
+这条正好用上了上一轮写了却没人调的 `recent_observations()`——**"写了函数没接线"和
+"记了数据没出口"是同一个毛病的两个阶段**。
+
+## 二、扫全仓死函数，11 个里两个是自己的
+
+`ast` 扫模块级函数，看全仓（含测试）引用次数，11 个 ≤1。逐个查：
+
+- `autonomous_agent.py` 整个模块是活的（`agent_teams` 用 `idle_poll`），只是
+  `scan_unclaimed_tasks` 是标着"兼容旧调用"的垫片；
+- 其余是历史遗留（`audit.iter_session`、`net_grants.check_writable` 等），**没有证据
+  说明该删**，按"先查调用方、别急着删"的规矩留着；
+- 两个是我这轮加的：`proactive.recent_observations`（现在接上了）和
+  `tool_discovery.active_extra`（纯调试用、没人调，删掉）。
+
+## 三、我又在测试里写了墙钟阈值
+
+`test_startup_cost` 里我写了 `assert float(elapsed_line) < 0.90`，注释还写着
+"宽松上界"。结果全量跑到后半段直接红：**实测 1.072s**——同一份代码，空载 0.35–0.48s。
+
+这已经是这一轮第三次被墙钟咬（前两次：`grep` 0.6s/12s/23s/64s、缓存用例
+cold=9.8s/warm=95s）。
+
+改成只保留确定性判据（`yaml` 不在 `sys.modules`），时间那行退化成"有没有量到"：
+
+```python
+# 刻意**不**断言耗时：同一条 import harness 空载 0.35–0.48s、满载 1.07s
+assert float(elapsed_line) > 0, '耗时没量到'
+```
+
+顺手扫了全仓 13 条含耗时的断言：11 条是 `>= 0`（只验字段存在，无害），两条是真阈值
+（`test_memory_eval_judge` 的 0.2s、`test_usage_stats` 的 1.0s）。后两条这轮没失败过，
+**不预先改**——没有失败证据的改动就是猜测。
+
+## 收获
+
+> **"记了但看不到"和"写了没接线"是一回事。** 前者是数据没有出口，后者是代码没有入口；
+> 两者都不会让测试变红。
+
+> **我自己写测试时也在犯同一类错。** 三次被墙钟咬，说明"性能断言要数次数、不要量时间"
+> 这条得写进 `coding-standards.md`，而不是每次凭记忆。
+
+## 一个操作教训（第 4 次）
+
+heredoc 又把 `\n` 折叠成真换行，把测试文件写成语法错误，修了三次才干净。
+**带反斜杠转义的补丁脚本一律用 `write` 工具写文件，不用 heredoc。**

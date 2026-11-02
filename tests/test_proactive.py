@@ -542,3 +542,54 @@ def test_auto_suggest_shows_in_auto_mode(tmp_path, monkeypatch):
 
     Fake().maybe_auto_suggest()
     assert called.get('yes') is True
+
+
+def test_observe_ledger_is_readable_from_the_command(tmp_path, monkeypatch):
+    """observe 档记录了东西，就必须有地方能看。
+
+    否则"只记录不打扰"等于"记了没人知道"——用户看不到它本来会说什么，
+    observe 和 off 就没区别了。`/suggest --last` 把最近几次记录打出来。
+    """
+    import harness
+    import proactive
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    monkeypatch.setattr(harness, 'get_workdir', lambda: tmp_path)
+    monkeypatch.setattr(harness, 'SESSIONS_DIR', tmp_path / 'sessions')
+    proactive.record_observation(tmp_path / 'cache', ['先跑测试', '再补文档'],
+                                 workspace=str(tmp_path), limit=2)
+
+    seen = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def _notice(self, text, **kwargs):
+            seen['notice'] = text
+
+        def _begin_turn(self, request, *, echo_text=True):     # pragma: no cover
+            raise AssertionError('--last 不该再跑一轮模型')
+
+    Fake().start_suggestions('--last')
+    assert 'notice' in seen, '--last 应当打出台账内容'
+    assert '先跑测试' in seen['notice'] and '再补文档' in seen['notice']
+    assert '2 条' in seen['notice']
+
+
+def test_observe_ledger_empty_says_so(tmp_path, monkeypatch):
+    import harness
+    from ui.proactive_actions import ProactiveActionsMixin
+
+    monkeypatch.setattr(harness, 'CACHE_DIR', tmp_path / 'cache')
+    seen = {}
+
+    class Fake(ProactiveActionsMixin):
+        _busy = False
+
+        def _notice(self, text, **kwargs):
+            seen['notice'] = text
+
+    Fake().start_suggestions('--last')
+    assert '还没有' in seen['notice']
+    assert 'HARNESS_PROACTIVE_MODE' in seen['notice']

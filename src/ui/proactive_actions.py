@@ -34,8 +34,14 @@ class ProactiveActionsMixin:
             return None
         return TurnRequest(text=text, tools=tools, proactive=True, silent=silent)
 
-    def start_suggestions(self) -> None:
-        # 手动触发不看档位：`HARNESS_PROACTIVE_MODE` 管的是"它自己会不会来"。
+    def start_suggestions(self, argument: str = '') -> None:
+        """`/suggest` 跑一轮；`/suggest --last` 读 observation 台账。
+
+        手动触发不看档位：`HARNESS_PROACTIVE_MODE` 管的是"它自己会不会来"。
+        """
+        if str(argument or '').strip() == '--last':
+            self._show_observations()
+            return
         if self._busy:
             self._notice('等这一回合结束再要建议——建议本身也是一轮。')
             return
@@ -45,6 +51,28 @@ class ProactiveActionsMixin:
         if not self._begin_turn(request, echo_text=False):
             return
         self._notice('只读建议回合：这次只给读工具，不会改动任何文件。')
+
+    def _show_observations(self) -> None:
+        """把 observe 档最近的记录打出来。
+
+        observe 的意义是"先看几天它本来会说什么"，所以这些记录必须能看到——
+        藏在 .cache 的 jsonl 里等于没有。
+        """
+        import harness
+        import proactive
+
+        rows = proactive.recent_observations(harness.CACHE_DIR, limit=3)
+        if not rows:
+            self._notice('还没有观察记录。开启方式：HARNESS_PROACTIVE_MODE=observe'
+                         + chr(10) + f'台账位置：{proactive.observation_path(harness.CACHE_DIR)}')
+            return
+        lines = []
+        for row in rows:
+            lines.append(f"{row.get('at') or '?'} · {len(row.get('suggestions') or [])} 条")
+            for item in row.get('suggestions') or []:
+                lines.append(f'  · {item}')
+        self._notice(chr(10).join(lines) + chr(10)
+                     + f"（台账：{proactive.observation_path(harness.CACHE_DIR)}）")
 
     def maybe_auto_suggest(self) -> None:
         """启动时按档位决定要不要自己来一次（默认 off，什么都不做）。

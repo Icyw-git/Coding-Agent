@@ -159,11 +159,6 @@ def found_names(schemas: list[dict]) -> set[str]:
     return {schema['function']['name'] for schema in schemas}
 
 
-def active_extra() -> frozenset[str]:
-    """已激活的额外工具（调试 / `/status` 用）。"""
-    return frozenset(_activated)
-
-
 def reset() -> None:
     """清空激活集（测试与 `/tool-reset` 用）。"""
     if _activated:
