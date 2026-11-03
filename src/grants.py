@@ -160,27 +160,27 @@ def _save(records: list[dict]) -> None:
 def _validate_path(raw) -> Path:
     text = str(raw or '').strip()
     if not text:
-        raise GrantError('path must not be empty')
+        raise GrantError('路径不能为空')
     if '\x00' in text:
-        raise GrantError('path contains a NUL byte')
+        raise GrantError('路径里含 NUL 字节')
     if len(text) > MAX_PATH_CHARS:
-        raise GrantError(f'path is longer than {MAX_PATH_CHARS} characters')
+        raise GrantError(f'路径超过 {MAX_PATH_CHARS} 个字符')
     candidate = Path(text).expanduser()
     if not candidate.is_absolute():
-        raise GrantError('path must be absolute')
+        raise GrantError('路径必须是绝对路径')
     try:
         resolved = candidate.resolve()
     except (OSError, RuntimeError, ValueError) as exc:
-        raise GrantError(f'cannot resolve path: {exc}') from exc
+        raise GrantError(f'解析不了这个路径：{exc}') from exc
     if resolved.parent == resolved:
-        raise GrantError('refusing to grant a filesystem root')
+        raise GrantError('不能把文件系统根目录加进授权')
     if not resolved.exists():
-        raise GrantError('path does not exist')
+        raise GrantError('路径不存在')
     if not resolved.is_dir():
-        raise GrantError('path is not a directory')
+        raise GrantError('这不是目录')
     for root in system_roots():
         if resolved == root or resolved.is_relative_to(root):
-            raise GrantError('refusing to grant a protected system directory')
+            raise GrantError('不能授权受保护的系统目录')
     return resolved
 
 
@@ -193,9 +193,9 @@ def _validate_expiry(raw) -> str:
         try:
             value = date.fromisoformat(str(raw).strip())
         except ValueError as exc:
-            raise GrantError('expires must be YYYY-MM-DD') from exc
+            raise GrantError('到期日要写成 YYYY-MM-DD') from exc
     if value < date.today():
-        raise GrantError('expires must not be in the past')
+        raise GrantError('到期日不能是过去')
     return value.isoformat()
 
 
@@ -231,14 +231,14 @@ def _lookup_path(raw) -> Path:
     """查询/删除用的路径归一：只要求绝对、可解析，不要求已存在。"""
     text = str(raw or '').strip()
     if not text or '\x00' in text:
-        raise GrantError('path must not be empty')
+        raise GrantError('路径不能为空')
     candidate = Path(text).expanduser()
     if not candidate.is_absolute():
-        raise GrantError('path must be absolute')
+        raise GrantError('路径必须是绝对路径')
     try:
         return candidate.resolve()
     except (OSError, RuntimeError, ValueError) as exc:
-        raise GrantError(f'cannot resolve path: {exc}') from exc
+        raise GrantError(f'解析不了这个路径：{exc}') from exc
 
 
 def find_path(path) -> dict | None:

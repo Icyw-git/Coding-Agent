@@ -164,9 +164,9 @@ def _validate_expiry(raw) -> str:
         try:
             value = date.fromisoformat(str(raw).strip())
         except ValueError as exc:
-            raise NetGrantError('expires must be YYYY-MM-DD') from exc
+            raise NetGrantError('到期日要写成 YYYY-MM-DD') from exc
     if value < date.today():
-        raise NetGrantError('expires must not be in the past')
+        raise NetGrantError('到期日不能是过去')
     return value.isoformat()
 
 
@@ -176,7 +176,7 @@ def add(host, *, scope: str = net_policy.ALLOW, expires=None, note: str = '',
     pattern = net_policy.normalize_pattern(host)
     scope = str(scope or '').strip().casefold()
     if scope not in net_policy.SCOPES:
-        raise NetGrantError(f'scope must be one of {", ".join(net_policy.SCOPES)}')
+        raise NetGrantError(f'scope 只能是 {", ".join(net_policy.SCOPES)} 之一')
     expiry = _validate_expiry(expires)
     record = {
         'host': pattern,
@@ -197,7 +197,7 @@ def add(host, *, scope: str = net_policy.ALLOW, expires=None, note: str = '',
                 break
         else:
             if len(records) >= MAX_RECORDS:
-                raise NetGrantError(f'refusing more than {MAX_RECORDS} domain rules')
+                raise NetGrantError(f'域名规则最多 {MAX_RECORDS} 条')
             records.append(record)
         _save(records)
     return dict(record)

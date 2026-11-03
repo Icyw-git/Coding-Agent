@@ -62,20 +62,21 @@ def test_validation_rejects_unsafe_paths(tmp_path, monkeypatch):
     a_file = tmp_path / 'file.txt'
     a_file.write_text('x', encoding='utf-8')
 
+    # 断言的是「哪种校验拦下的」——消息已中文化，关键词跟着换，语义不变。
     for path, message in (
-            ('', 'empty'),
-            ('relative/dir', 'absolute'),
-            (tmp_path / 'missing', 'does not exist'),
-            (a_file, 'not a directory'),
-            (system, 'system directory'),
-            (Path(tmp_path.anchor), 'filesystem root')):
+            ('', '不能为空'),
+            ('relative/dir', '绝对路径'),
+            (tmp_path / 'missing', '不存在'),
+            (a_file, '不是目录'),
+            (system, '系统目录'),
+            (Path(tmp_path.anchor), '根目录')):
         with pytest.raises(grants.GrantError, match=message):
             grants.add_path(path)
 
 
 def test_expiry_validation_and_active_filter(roots):
     _, outside = roots
-    with pytest.raises(grants.GrantError, match='past'):
+    with pytest.raises(grants.GrantError, match='过去'):
         grants.add_path(outside, expires=(date.today() - timedelta(days=1)).isoformat())
     with pytest.raises(grants.GrantError, match='YYYY-MM-DD'):
         grants.add_path(outside, expires='next week')
@@ -297,7 +298,7 @@ def test_api_add_list_remove_and_audit(api_client, roots):
     bad = api_client.post('/v1/grants', headers=_headers(),
                           json={'path': 'relative'})
     assert bad.status_code == 400
-    assert 'absolute' in bad.json()['detail']
+    assert '绝对路径' in bad.json()['detail']
 
     removed = api_client.post('/v1/grants/remove', headers=_headers(),
                               json={'path': str(outside), 'by': 'test'})

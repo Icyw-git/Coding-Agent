@@ -43,7 +43,7 @@ def test_ring0_paths_are_not_editable(path):
 
 def test_metric_must_come_from_fixed_table(tmp_path):
     """不允许调用方塞新指标——那是"自己抬标准"的入口。"""
-    with pytest.raises(ValueError, match='metric must be one of'):
+    with pytest.raises(ValueError, match='指标只能是这些之一'):
         si.Session(cache_dir=tmp_path, workdir=tmp_path, goal='g',
                    metric='my_custom_metric')
 

@@ -354,3 +354,27 @@ def test_background_action_failures_are_chinese():
     for english in ('Review failed', 'Watch failed'):
         assert english not in source, f'{english} 还是英文'
     assert '审阅失败' in source and '跟踪失败' in source
+
+
+def test_user_facing_command_errors_are_chinese():
+    """`/grants` `/domain` `/rules` `/checkpoints` `/sessions` 的报错要中文。
+
+    这几个是**命令**，报错直接进 TUI 通知 / 审批卡 / API 的 detail，读的人是用户。
+    实测过：`/grants add relative/path` → `[grants] path must be absolute`。
+
+    刻意**不**包括工具（`remind` / `moves` / `tool_*`）：那是数据通道族，英文更稳
+    （见 coding-standards「输出语言」）。`reminders.py` 的英文还带着"示例保留中文
+    写法"的用意，测试里有专门说明。
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / 'src'
+    for name in ('grants.py', 'net_grants.py', 'net_policy.py',
+                 'rules.py', 'checkpoints.py', 'session_admin.py'):
+        source = (src / name).read_text(encoding='utf-8')
+        for match in re.finditer(r"raise (\w*Error|ValueError)\(f?'([^']{4,})'", source):
+            message = match.group(2)
+            assert re.search(r'[一-鿿]', message), (
+                f'{name} 里的报错是英文：{message}')
+

@@ -351,10 +351,10 @@ class CheckpointManager:
     def get(self, cp_id: str) -> dict:
         node_dir = self._node_dir(cp_id)
         if not node_dir.is_dir():
-            raise CheckpointError(f'checkpoint {cp_id} not found')
+            raise CheckpointError(f'找不到快照 {cp_id}')
         meta = _read_json(node_dir / 'meta.json')
         if not meta:
-            raise CheckpointError(f'checkpoint {cp_id} has no meta.json')
+            raise CheckpointError(f'快照 {cp_id} 缺 meta.json')
         return meta
 
     def head(self) -> str | None:
@@ -375,7 +375,7 @@ class CheckpointManager:
         """
         rows = self.list(limit=10_000)
         if not rows:
-            raise CheckpointError('no checkpoint available')
+            raise CheckpointError('还没有可用的快照')
         if ref in ('head', 'latest', ''):
             return rows[0]['cp_id']
         if ref == 'last':
@@ -441,7 +441,7 @@ class CheckpointManager:
     def label_active(self, label: str, session_store=None, *, trigger: str = 'manual') -> str:
         """给当前回合的有效快照加标签，不在未完成 tool call 中间另建快照。"""
         if not self._active:
-            raise CheckpointError('no active checkpoint to label')
+            raise CheckpointError('当前轮次还没有进行中的快照，不能加标签')
         node_dir = self._node_dir(self._active)
         meta = self.get(self._active)
         meta['label'] = label
@@ -739,7 +739,7 @@ class CheckpointManager:
     def messages_snapshot(self, cp_id: str) -> list[dict]:
         path = self._messages_path(cp_id)
         if not path.is_file():
-            raise CheckpointError(f'checkpoint {cp_id} has no messages snapshot')
+            raise CheckpointError(f'快照 {cp_id} 里没有对话快照文件')
         if path.suffix == '.gz':
             with gzip.open(path, 'rt', encoding='utf-8') as handle:
                 lines = handle.read().splitlines()

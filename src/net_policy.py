@@ -70,21 +70,21 @@ def normalize_pattern(raw) -> str:
     """校验并归一化一条域名模式（可带 `*.` 前缀）。"""
     text = normalize_host_input(raw)
     if not text:
-        raise NetPolicyError('host must not be empty')
+        raise NetPolicyError('域名不能为空')
     if len(text) > MAX_HOST_CHARS:
-        raise NetPolicyError(f'host is longer than {MAX_HOST_CHARS} characters')
+        raise NetPolicyError(f'域名超过 {MAX_HOST_CHARS} 个字符')
     if any(ch in text for ch in '/:@?#\\ '):
-        raise NetPolicyError('host must not contain scheme, port, path or spaces')
+        raise NetPolicyError('只写域名：不要带协议、端口、路径或空格')
     if text == '*':
-        raise NetPolicyError("refusing to match every host; list domains explicitly")
+        raise NetPolicyError("不能匹配所有域名；请逐个写清楚")
     if '*' in text and not text.startswith('*.'):
-        raise NetPolicyError("wildcard is only allowed as a leading '*.'")
+        raise NetPolicyError("通配符只能写在最前面，形如 *.example.com")
     if not _HOST_RE.match(text):
-        raise NetPolicyError('host must be a valid DNS name')
+        raise NetPolicyError('这不是合法的域名')
     if text.startswith('*.'):
         base = text[2:]
         if not _HOST_RE.match(base):
-            raise NetPolicyError('wildcard host must be a valid DNS name')
+            raise NetPolicyError('通配域名不合法')
         # `*.com` / `*.cn` 这类只覆盖一个标签的通配等于放开整个顶级域：写的人
         # 通常想要的是「某个站点的子域」，而不是「所有 .com」。真正需要整域放行
         # 时应该写明具体域名，或用两条精确规则。这里直接拒绝，避免一次手滑把

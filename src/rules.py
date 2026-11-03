@@ -181,9 +181,9 @@ def _prefix_match(prefix: str, segment: str) -> bool:
 def _clean_prefix(raw) -> str:
     text = normalize_command(raw)
     if not text:
-        raise RuleError('prefix must not be empty')
+        raise RuleError('前缀不能为空')
     if len(text) > MAX_PREFIX_CHARS:
-        raise RuleError(f'prefix is longer than {MAX_PREFIX_CHARS} characters')
+        raise RuleError(f'前缀超过 {MAX_PREFIX_CHARS} 个字符')
     return text
 
 
@@ -195,45 +195,45 @@ def _clean_tools(raw) -> tuple[str, ...]:
     elif isinstance(raw, (list, tuple)):
         items = [str(item).strip() for item in raw if str(item).strip()]
     else:
-        raise RuleError('tools must be a string or a list')
+        raise RuleError('tools 要是字符串或列表')
     if not items:
         return ('bash',)
     for item in items:
         if len(item) > 64:
-            raise RuleError('tool name is too long')
+            raise RuleError('工具名太长')
     return tuple(items)
 
 
 def parse(data) -> list[Rule]:
     """把已解析的 YAML 结构转成规则列表；任何格式问题都抛 RuleError。"""
     if not isinstance(data, dict):
-        raise RuleError('rules file must be a mapping')
+        raise RuleError('规则文件的最外层要是映射')
     if data.get('version') != VERSION:
-        raise RuleError(f'unsupported rules version: {data.get("version")!r}')
+        raise RuleError(f'不认识的规则版本：{data.get("version")!r}')
     raw_rules = data.get('rules')
     if raw_rules is None:
         return []
     if not isinstance(raw_rules, list):
-        raise RuleError('rules must be a list')
+        raise RuleError('rules 要是列表')
     if len(raw_rules) > MAX_RULES:
-        raise RuleError(f'refusing more than {MAX_RULES} rules')
+        raise RuleError(f'规则最多 {MAX_RULES} 条')
     rules: list[Rule] = []
     for index, item in enumerate(raw_rules, 1):
         if not isinstance(item, dict):
-            raise RuleError(f'rule #{index} must be a mapping')
+            raise RuleError(f'第 {index} 条规则要是映射')
         decision = str(item.get('decision') or '').strip().casefold()
         if decision not in DECISIONS:
-            raise RuleError(f'rule #{index}: decision must be one of '
+            raise RuleError(f'第 {index} 条规则：decision 只能是 '
                             f'{", ".join(DECISIONS)}')
         scope = str(item.get('scope') or SCOPE_GLOBAL).strip().casefold()
         if scope not in SCOPES:
-            raise RuleError(f'rule #{index}: scope must be one of '
+            raise RuleError(f'第 {index} 条规则：scope 只能是 '
                             f'{", ".join(SCOPES)}')
         raw_prefixes = item.get('prefixes')
         if not isinstance(raw_prefixes, list) or not raw_prefixes:
-            raise RuleError(f'rule #{index}: prefixes must be a non-empty list')
+            raise RuleError(f'第 {index} 条规则：prefixes 不能为空')
         if len(raw_prefixes) > MAX_PREFIXES:
-            raise RuleError(f'rule #{index}: too many prefixes')
+            raise RuleError(f'第 {index} 条规则：前缀太多')
         prefixes = tuple(_clean_prefix(value) for value in raw_prefixes)
         tools = _clean_tools(item.get('tools'))
         note = str(item.get('note') or '')[:MAX_NOTE_CHARS]
@@ -411,12 +411,12 @@ def add_rule(decision: str, prefixes, *, tools=None, note: str = '',
     """
     decision = str(decision or '').strip().casefold()
     if decision not in DECISIONS:
-        raise RuleError(f'decision must be one of {", ".join(DECISIONS)}')
+        raise RuleError(f'decision 只能是 {", ".join(DECISIONS)} 之一')
     if isinstance(prefixes, str):
         prefixes = [prefixes]
     cleaned = tuple(_clean_prefix(item) for item in prefixes or ())
     if not cleaned:
-        raise RuleError('at least one prefix is required')
+        raise RuleError('至少要写一个前缀')
     tool_list = _clean_tools(tools)
     rule = Rule(decision=decision, tools=tool_list, prefixes=cleaned,
                 note=str(note or '')[:MAX_NOTE_CHARS], scope=scope)
@@ -435,7 +435,7 @@ def add_rule(decision: str, prefixes, *, tools=None, note: str = '',
             break
     else:
         if len(updated) >= MAX_RULES:
-            raise RuleError(f'refusing more than {MAX_RULES} rules')
+            raise RuleError(f'规则最多 {MAX_RULES} 条')
         updated.append(rule)
     write(updated, path)
     return rule
@@ -445,7 +445,7 @@ def remove_rule(prefix: str, *, decision: str = '', path=None) -> list[Rule]:
     """按前缀删除规则（可限定 decision）；返回被删掉的规则。"""
     target = str(prefix or '').strip()
     if not target:
-        raise RuleError('prefix must not be empty')
+        raise RuleError('前缀不能为空')
     wanted = str(decision or '').strip().casefold()
     ruleset = load(path)
     if ruleset.error:

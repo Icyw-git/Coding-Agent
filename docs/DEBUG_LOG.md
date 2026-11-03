@@ -14430,3 +14430,68 @@ KeyError: 'read_allowed'
 写断言时的第一反应应该是"我要验的那个东西在哪一行"。
 
 全量 3474 passed / 3 skipped。
+
+---
+
+# 第 102 部分：命令面最后的英文报错；以及一次把文件改重复的失误
+
+## 一、六个用户可见模块的报错中文化
+
+`/grants` `/domain` `/rules` `/checkpoints` `/sessions` 的报错直接进 TUI 通知、审批卡
+和 API 的 `detail`，读的人是用户。实测：
+
+```
+/grants add relative/path   → [grants] path must be absolute
+/grants add C:/             → [grants] refusing to grant a filesystem root
+/domain add ''              → host must not be empty
+```
+
+改掉 6 个模块共 30 条（`grants` / `net_grants` / `net_policy` / `rules` /
+`checkpoints` / `session_admin`），code 与异常类型不变，只换给人看的话。
+
+## 二、刻意的边界：工具族保持英文
+
+`reminders.py` 我也顺手改了，然后被它自己的测试拦下：
+
+```
+def test_errors_are_english_but_keep_chinese_examples():
+    """错误文案用英文（与其它工具一致、模型读取更可靠），
+    但示例保留中文写法……"""
+```
+
+`remind` 是**工具**，走数据通道族（`coding-standards.md`「输出语言」明写：工具输出
+保持英文）。**已回退**，并把边界写进新的守卫 docstring，避免下一个人再犯。
+
+同理没有碰 `agent_runtime` / `cron_scheduler` / `moves`：它们混着数据通道族，而且
+`api_crons.py:43` 用 `'already exists' in job` **按字符串判 HTTP 状态码**——改消息会连带
+改判定，那是另一件事。
+
+## 三、守卫覆盖 6 个模块
+
+`test_user_facing_command_errors_are_chinese`：扫这 6 个文件里所有
+`raise XxxError('…')` / `raise ValueError('…')` 的字面量消息，含中文才算过。
+
+它当场抓到我第一遍批量替换漏掉的一条（`checkpoints.py` 的
+`has no messages snapshot`）——**守卫写对了，就会替人检查**。
+
+## 四、我把测试文件改重复了 60 行
+
+给 `test_ui_copy.py` 换守卫时，我算了 `start`（新函数位置）和 `end`（下一个函数位置），
+但 `start` 在 `end` **之后**，于是 `s[:start] + new + s[end:]` 把中间那段复制了一遍：
+
+```
+F811 Redefinition of unused `test_cli_and_tui_command_sets_match`
+```
+
+60 行重复。按行切掉重复块（先 assert 首尾两行确实是重复的那两个 def）后恢复。
+
+> **按索引切片时先断言 `start < end`。** 两个 `index()` 调用的顺序取决于谁先出现在文件里，
+> 而"新加的函数在文件末尾"这个直觉是错的——它是被追加到上一次追加的位置。
+
+## 五、连带修的两处断言
+
+改了文案就要改守着文案的断言（`test_grants.py` 的 `match='absolute'`、
+`test_self_improve.py` 的 `match='metric must be one of'`、
+`test_terminal_views.py` 的 `match='prefix'`）。这不是放宽，是新文案就在守那个语义。
+
+全量 3475 passed / 3 skipped。

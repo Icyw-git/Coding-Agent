@@ -402,7 +402,7 @@ class Session:
                  metric: str = 'ruff_errors',
                  max_rounds: int = DEFAULT_MAX_ROUNDS):
         if metric not in METRICS:
-            raise ValueError(f'metric must be one of {sorted(METRICS)}')
+            raise ValueError(f'指标只能是这些之一：{"、".join(sorted(METRICS))}')
         self.cache_dir = cache_dir
         self.workdir = Path(workdir)
         self.goal = goal

@@ -60,10 +60,10 @@ def _session_catalog():
 def resolve_session_path(session_id: str) -> Path:
     """Resolve a session ID without accepting arbitrary filesystem paths."""
     if not session_id or not session_id.replace('-', '').replace('_', '').isalnum():
-        raise ValueError('Invalid session ID')
+        raise ValueError('会话 ID 不合法')
     path = _h().SESSIONS_DIR / f'session_{session_id}.jsonl'
     if not path.is_file():
-        raise FileNotFoundError(f'Session {session_id} not found')
+        raise FileNotFoundError(f'找不到这个会话：{session_id}')
     return path
 
 
@@ -79,7 +79,7 @@ def set_workspace(path: str) -> Path:
         candidate = h.get_workdir() / candidate
     candidate = candidate.resolve()
     if not candidate.is_dir():
-        raise ValueError(f'Workspace does not exist: {candidate}')
+        raise ValueError(f'这个工作区不存在：{candidate}')
     h.WORKDIR = candidate
     h.SKILLS_DIR = candidate / 'skills'
     h.scan_skills()   # 项目技能随工作区切换；签名未变时是空操作
@@ -94,7 +94,7 @@ def start_new_session(workspace=None, session_id=None):
     """
     h = _h()
     if session_id and (h.SESSIONS_DIR / f'session_{session_id}.jsonl').exists():
-        raise FileExistsError(f'already exists: {session_id}; use /r {session_id}')
+        raise FileExistsError(f'这个会话已经存在：{session_id}；用 /r {session_id} 打开它')
     previous = h.get_workdir()
     target = previous if workspace is None else h.set_workspace(str(workspace))
     try:

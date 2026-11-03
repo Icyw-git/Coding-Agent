@@ -131,7 +131,7 @@ def test_add_rule_rejects_bad_decision(decision):
 
 
 def test_add_rule_requires_prefix():
-    with pytest.raises(rules.RuleError, match='prefix'):
+    with pytest.raises(rules.RuleError, match='至少要写一个前缀'):
         rules.add_rule('allow', [])
 
 
