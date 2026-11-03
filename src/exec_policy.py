@@ -26,6 +26,7 @@ from pathlib import Path
 
 from policy_bash import (
     _STRIP_QUOTES,
+    DESKTOP_TOOLS,
     EGRESS_COMMANDS,
     EGRESS_SEND_FLAGS,
     EXTERNAL_OPERATIONS,
@@ -151,8 +152,7 @@ SCREEN_ENV = 'HARNESS_SCREEN_TOOLS'
 CLIPBOARD_TOOLS = ('clipboard_read', 'clipboard_write')
 CLIPBOARD_ENV = 'HARNESS_CLIPBOARD_TOOLS'
 # Desktop input is opt-in and each action requires a human decision.
-DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
-                 'desktop_displays', 'desktop_windows', 'desktop_action')
+# 清单在 policy_bash：审批卡渲染也要用同一份。
 # 删除：可撤销，但仍是一次破坏性动作，逐次审批。
 DELETE_TOOLS = ('delete_paths',)
 DESKTOP_ENV = 'HARNESS_DESKTOP_CONTROL'

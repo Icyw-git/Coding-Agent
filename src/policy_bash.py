@@ -118,6 +118,12 @@ FILE_WRITE_COMMANDS = frozenset({
     'move-item',
 })
 
+# 桌面输入默认关闭，每次动作都要人点头。清单位于这一层，是因为 exec_policy
+# 从这里导入工具名元组（先例见 WORKTREE_TOOLS），而审批卡渲染也要用它——
+# 三个地方各写一份就会漂移：漏了审批卡就把原始参数铺出来，漏了授权键判定
+# 就给出一个可复用的「同类免审」。
+DESKTOP_TOOLS = ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
+                 'desktop_displays', 'desktop_windows', 'desktop_action')
 WORKTREE_TOOLS = {'create_worktree': 'create worktree',
                   'remove_worktree': 'remove worktree',
                   'keep_worktree': 'keep worktree'}
@@ -586,10 +592,9 @@ def approval_class(tool: str, args) -> str:
     文件工具返回空串：一次「写 a.txt」的批准不该免审同会话的任意路径写入，
     尤其是越界写。按目录的范围授权需要先解析 cwd/工作区，留到路径范围化那一轮。
     """
-    if tool in ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
-                'desktop_displays', 'desktop_windows', 'desktop_action'):
+    if tool in DESKTOP_TOOLS:
         # 桌面工具一律不给「同会话同类免审」的键：exec_policy 里它们每次都
-        # 走 ASK，给个可复用的键等于开了后门。清单从 exec_policy 同步。
+        # 走 ASK，给个可复用的键等于开了后门。
         return ''
     if tool in ('read', 'write', 'edit', 'apply_patch'):
         return ''

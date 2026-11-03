@@ -15,6 +15,8 @@ bash 的 command 是唯一按「留头尾、中间省略」处理的字段：它
 """
 import re
 
+from policy_bash import DESKTOP_TOOLS
+
 # 普通参数值：短摘要即可，write 的整份 content、MCP 的大参数不该进审批面。
 PREVIEW_CHARS = 200
 # 写入/编辑内容的上限：卡片要能看出「写了什么」，又要留在 30KB 卡片
@@ -632,8 +634,7 @@ def detail(tool: str, args) -> str:
         return safe_text(_screen_detail(tool, args))
     if tool in ('clipboard_read', 'clipboard_write'):
         return safe_text(_clipboard_detail(tool, args))
-    if tool in ('desktop_snapshot', 'desktop_inspect', 'desktop_wait',
-               'desktop_displays', 'desktop_windows', 'desktop_action'):
+    if tool in DESKTOP_TOOLS:
         return safe_text(_desktop_detail(tool, args))
     if tool == 'delete_paths':
         return safe_text(_delete_detail(args))

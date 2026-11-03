@@ -14565,3 +14565,55 @@ Error: 读不到前台窗口：no_foreground_window: 当前没有可用的前台
 工具输出是模型与用户共用的一段字符串，拆不开。留码。
 
 全量 3481 passed / 3 skipped。
+
+---
+
+# 第 104 部分：桌面工具清单写了三遍；以及本轮"查了但没问题"的几处
+
+本轮的方法只有一条：**只找有第二份数据可以交叉验证的地方**。先记下没问题的（写下来
+是为了下次不必重查），再记问题的。
+
+## 一、查过、确认没问题的四件事
+
+| 交叉验证 | 结果 |
+| --- | --- |
+| `usage_stats.collect` 的字节预筛 vs 同一文件集全量 `json.loads` | 768 请求 / 71 批 / 104 工具 / prompt 35,969,300 / cached 32,157,312 **完全一致** |
+| `/status` 的 `usage_totals()`（单会话）vs 逐文件 usage 聚合 | 59 个会话文件逐项比对，**0 处不一致** |
+| `/usage` 报「会话 24」而窗口内有 59 个会话文件 | 35 个文件只有一条 `workspace_changed`（空壳），排除正确 |
+| 工具批次里 `duration_ms` 为 `None` 导致均值失真 | 真实数据 104 个条目**没有一个缺失** |
+
+## 二、桌面工具清单写了三遍
+
+找出方法是扫 `src/` 里跨文件重复的字符串元组字面量。命中的第一条就是它：
+
+```
+exec_policy:154    DESKTOP_TOOLS = ('desktop_snapshot', …, 'desktop_action')
+approval_view:635  if tool in ('desktop_snapshot', …, 'desktop_action'):
+policy_bash:589    if tool in ('desktop_snapshot', …, 'desktop_action'):
+```
+
+`policy_bash` 那儿还留着一句注释——「清单从 exec_policy **同步**」。靠人同步。
+
+加第七个桌面工具时漏掉任一处会怎样：
+
+- 漏 `approval_view`：`_desktop_detail` 不认它，审批卡退化成把原始参数铺出来（未裁剪的界面坐标/标题）；
+- 漏 `policy_bash`：它拿到一个可复用的「同会话同类免审」授权键——`exec_policy` 每次都
+  ASK 的前提被绕掉一半。
+
+改法：唯一定义落 `policy_bash.py`，另外两处导入。选这个位置不是随手挑的——
+`exec_policy` **本来就**从 `policy_bash` 导入工具名元组（先例是 `WORKTREE_TOOLS`），
+而 `policy_bash` 自己不导入任何本地模块，所以两个方向都不成环。
+
+`test_desktop_tool_list_is_shared` 断言三处是**同一个对象**（`is`），并且禁止
+`approval_view` 再出现成串的桌面工具名。单个名字（标签表、`setvalue` 特例）仍然允许——
+第一版测试写成「源码里不许出现 `'desktop_snapshot'`」，把合法的标签表也判红了。
+
+## 三、另一件查过但没动的事
+
+`/usage` 里的「自动放行 / 策略拒绝」两行在真实数据上永远是 0，因为只读命令走的是
+**不分流**的放行路径（`hooks.enforce` 直接返回 `None`，不写 `approval_auto`）。这是
+设计如此，`test_auto_approval_audit.py:100` 就写着「普通放行的命令不写 approval_auto」。
+
+数字没错，只是常年为零 → 那两行不显示。不是 bug，不动。
+
+全量 3483 passed / 3 skipped；启动 0.328/0.332/0.358s（无回归）。
