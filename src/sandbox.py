@@ -129,33 +129,10 @@ if _WINDOWS:
         _fields_ = [('AclRevision', w.BYTE), ('Sbz1', w.BYTE),
                     ('AclSize', w.WORD), ('AceCount', w.WORD), ('Sbz2', w.WORD)]
 
-    class _IO_COUNTERS(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_ulonglong) for name in (
-            'ReadOperationCount', 'WriteOperationCount', 'OtherOperationCount',
-            'ReadTransferCount', 'WriteTransferCount', 'OtherTransferCount')]
-
-    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ('PerProcessUserTimeLimit', ctypes.c_longlong),
-            ('PerJobUserTimeLimit', ctypes.c_longlong),
-            ('LimitFlags', w.DWORD),
-            ('MinimumWorkingSetSize', ctypes.c_size_t),
-            ('MaximumWorkingSetSize', ctypes.c_size_t),
-            ('ActiveProcessLimit', w.DWORD),
-            ('Affinity', ctypes.c_size_t),
-            ('PriorityClass', w.DWORD),
-            ('SchedulingClass', w.DWORD),
-        ]
-
-    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ('BasicLimitInformation', _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ('IoInfo', _IO_COUNTERS),
-            ('ProcessMemoryLimit', ctypes.c_size_t),
-            ('JobMemoryLimit', ctypes.c_size_t),
-            ('PeakProcessMemoryUsed', ctypes.c_size_t),
-            ('PeakJobMemoryUsed', ctypes.c_size_t),
-        ]
+    # 结构体定义在 limits.py：SetInformationJobObject 只吃字节布局，两边各写一份
+    # 迟早会有一份成错（补字段/改宽度都不会报错，只会让限制值错位）。这里只是换个
+    # 名字对齐 winnt.h，调用点不动。
+    from limits import _EXTENDED_LIMIT as _JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
     def _init_api() -> None:
         k, a = _kernel32, _advapi32

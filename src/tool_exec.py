@@ -149,7 +149,7 @@ def run_kill_background(bg_id: str) -> str:
     if task is None:
         return f'Error: unknown background task {bg_id}'
     status = task['status']
-    if status in ('completed', 'failed', 'cancelled'):
+    if status in background_task.TERMINAL_STATUSES:
         return f'[{bg_id}] already {status}'
     return f'[{bg_id}] cancel requested; use background_output to confirm'
 

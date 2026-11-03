@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import re
 
-#: 显式记忆的类型枚举。与自动抽取的 MEMORY_TYPES 不同：这四个是**语义**分类，
-#: 直接对应"该不该长期记住"的判断依据。
+from memory_schema import TYPES
+
+#: 显式记忆接受的类型。与归一表是同一张（`memory_schema.TYPES`）——这里再写
+#: 一份就会出现「工具拒了 schema 允许的值」。
 #: - preference：用户的稳定偏好（"我周三不看代码"）
 #: - correction：用户纠正过我（"不是 A 是 B"），优先级最高
 #: - fact：花时间才查到的确定事实（"部署走 make ship-prod"）
 #: - context：项目/环境的背景设定
-TYPES = ('preference', 'correction', 'fact', 'context')
 
 
 def _fmt_list(items, *, empty: str = '(none)') -> str:

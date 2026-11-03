@@ -19,6 +19,9 @@ background_lock=threading.Lock() # 保护 background_tasks 和 background_result
 background_cond=threading.Condition(background_lock)
 current_background_id:ContextVar[str|None]=ContextVar(
     'current_background_id', default=None)
+# 终态：到了这三个之一就不会再变，结果已进 background_finished。新增终态时
+# 只改这里——漏掉一处会让那个任务的结果永远收不走。
+TERMINAL_STATUSES=('completed','failed','cancelled')
 
 def is_slow_operation(tool_name:str,tool_input:dict)->bool:
     if tool_name!='bash':
@@ -194,7 +197,7 @@ def kill_background(bg_id:str)->dict|None:
         if task is None:
             finished=background_finished.get(bg_id)
             return dict(finished) if finished is not None else None
-        if task['status'] in ('completed','failed','cancelled'):
+        if task['status'] in TERMINAL_STATUSES:
             return dict(task)
         task['cancel_requested']=True
         proc=background_procs.get(bg_id)
@@ -208,7 +211,7 @@ def collect_background_results()->list[dict]: #收集后台任务结果，返回
 
     with background_lock: # 加锁保护 background_tasks 和 background_results 访问
         ready_ids=[bid for bid,task in background_tasks.items()
-                   if task['status'] in ('completed','failed','cancelled')]
+                   if task['status'] in TERMINAL_STATUSES]
 
     notifications=[]
     for bg_id in ready_ids:

@@ -14676,3 +14676,67 @@ def _format_task_duration(task: dict) -> str:
 按名字计数对常见词有假阴性——所以扫出来的 9 个是**上限**，不是全部。
 
 全量 3488 passed / 3 skipped。
+
+---
+
+# 第 106 部分：三处「同一份定义写在两个文件里」——按后果排序
+
+上一轮用的方法（扫跨文件重复的字符串元组）留了一批候选没逐个看。这轮逐个查完，
+按**漂移之后的后果**分成三类：静默错 > 看得见的错 > 无所谓。
+
+## 一、静默错：Job Object 的 ctypes 结构体
+
+`limits.py` 与 `sandbox.py` 各定义了一遍 `_IO_COUNTERS`、BasicLimit、ExtendedLimit，
+字段顺序与类型**逐字相同**，只有类名不同（`_BASIC_LIMIT` vs
+`_JOBOBJECT_BASIC_LIMIT_INFORMATION`）。
+
+这是最危险的一类：`SetInformationJobObject` 只吃结构体的**字节布局**。改动一份
+（补字段、改 `ctypes` 宽度）另一份不会跟着动，而布局错了**不会报错**——只会把
+内存上限、CPU 时间这些限制值当成别的东西生效。
+
+`sandbox.py:298` 本来就有惰性 `import limits`，反向没有 → `limits` 是下层。结构体
+定义留在 `limits`，`sandbox` 导入并换个名字对齐 winnt.h（调用点不动）：
+
+```python
+from limits import _EXTENDED_LIMIT as _JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+```
+
+另加一条 `test_struct_layout_matches_winnt_order`——字段顺序是 ABI，不是风格问题，
+锁定它顺便说明白为什么不能「各写一份」。
+
+## 二、看得见的错：记忆类型四处副本，其中一条注释指向不存在的常量
+
+`tool_memory.py:24` 的注释写着「与自动抽取的 `MEMORY_TYPES` 不同」——**`MEMORY_TYPES`
+在全仓库都不存在**（规范化表叫 `memory_schema.TYPES`）。下一任读到这里会去找一个
+没有的东西。
+
+四处副本里：
+
+| 位置 | 该不该合 |
+| --- | --- |
+| `memory_schema.TYPES` | 归一表（唯一来源） |
+| `tool_memory.TYPES` | 工具校验用的集合 → **合了**（`from memory_schema import TYPES`） |
+| `tool_schemas` 的 `remember.type.enum` | 模型看到的契约 → 不合并（`tool_schemas` 在启动路径上，不为 4 个字符串加一次导入），但加了断言 |
+| `approval_view._MEMORY_TYPE_LABELS` | 英文→中文的标签表，且有 `.get(kind, kind)` 兜底 → 不合并 |
+
+合掉的那一处是真有后果：模型按 schema 传一个类型、工具却回
+`type must be one of …`，就是这两张表不一致。
+
+## 三、状态机词表：`('completed','failed','cancelled')` 三遍
+
+`background_task.py` 两遍（`kill_background` 与 `collect_background_results`）+
+`tool_exec.py` 一遍。这是**状态机词表**：将来加一个终态（比如 `timeout`）漏掉任一处，
+那个任务的结局就永远不会被 `collect_background_results` 收走——结果通知不来，
+`/status` 里它一直显示在跑。
+
+收成 `background_task.TERMINAL_STATUSES`。
+
+## 四、查了但决定不动的三组
+
+| 候选 | 为什么不动 |
+| --- | --- |
+| `tool_discovery.GROUPS['memory']` vs `approval_view` 的 `('remember','forget','recall')` | 一个是延迟加载的**发现分组**、一个是渲染**分派**，概念不同；合并等于把两件事绑死 |
+| token 求和键（`headless` 4 个 / `usage_totals` 4 个 / `usage_stats` 5 个含 `reasoning`） | `total` 用的是供应商原值、不是相加得来，漂移算不出错的数；且 `reasoning` 真实数据全为 0（只有 deepseek-flash） |
+| `reasoning` 被聚合但从不显示 | 无后果、也没坏处，删了下次加显示还要补回来 |
+
+全量 3495 passed / 3 skipped。
