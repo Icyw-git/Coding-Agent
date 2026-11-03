@@ -54,6 +54,20 @@ AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
     'policy_denied': ('tool', 'code', 'zone', 'reason', 'blocked_by',
                       'command'),
     'permission_revoked': ('count', 'by'),
+    # 删除与移动是这套系统里风险最高的两个操作。它们的事件一直写进了会话流、
+    # 中文名也一直在 EVENT_LABELS 里，却没在白名单——于是 `/audit` 永远看不到。
+    # 字段跟生产者写的完全对齐：写了不收等于静默丢掉（见 test_audit）。
+    'delete_trashed': ('count', 'method', 'paths'),
+    'delete_failed': ('count', 'reason'),
+    'move_preview': ('count', 'moves'),
+    'move_rejected': ('reason'),
+    'moved': ('count', 'batch', 'moves'),
+    'move_failed': ('count', 'reason'),
+    'moves_undone': ('count', 'batch', 'skipped'),
+    'move_undo_failed': ('reason'),
+    'remind_scheduled': ('when', 'cron', 'chars'),
+    'remind_rejected': ('reason'),
+    'remind_failed': ('reason'),
     # 记忆是长期状态：写了一条会影响之后每一个会话，删了不可逆。
     # 这三类事件让“它为什么记得这个”可追溯。
     'memory_written': ('name', 'type', 'chars', 'by'),

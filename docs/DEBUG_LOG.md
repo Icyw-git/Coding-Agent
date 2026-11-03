@@ -14889,3 +14889,89 @@ _status_zh('interrupted') → 'interrupted'
 （`\n` `\033` `\b`），一律用 `edit` 工具，不用 heredoc 脚本。**
 
 全量 3504 passed / 3 skipped。
+
+---
+
+# 第 109 部分：删除、移动、提醒的审计留痕一直是不可见的
+
+方法换成「只找可枚举的差集」——两套词表、两份白名单、两个分支的键集对不上。
+并发那条线已经证明假阳性太多，这条线不会。
+
+## 一、第一个差集：白名单 vs 中文名表 vs 生产者
+
+审计有两个表：
+
+```
+AUDIT_EVENTS  （30 项）  哪个事件类型可以进 /audit，以及收哪些字段
+EVENT_LABELS  （41 项）  终端与飞书共用的中文名
+```
+
+41 > 30，说明有 11 个中文名对应的类型**不在白名单里**：
+
+```
+delete_trashed  delete_failed  move_preview  move_rejected  moved
+move_failed  moves_undone  move_undo_failed
+remind_scheduled  remind_rejected  remind_failed
+```
+
+把「生产者实际写出的类型」也算出来（扫 `_notify(audit, '…')` / `_audit(…)` /
+`_screen_audit(…)` 的字符串常量），结果正好是同样这 11 个。
+
+链路是通的、只是断在最后一环：
+
+```
+tool_delete._notify(audit, 'delete_trashed', …)
+  → tools._screen_audit → store.append('delete_trashed', …)     # 已进会话流
+  → /audit → audit.collect() → audit.project()                   # AUDIT_EVENTS.get() → None → 丢掉
+```
+
+所以：**事件在磁盘上、中文名也写好了、`/audit` 永远看不到**。而删除和移动是这套
+系统里风险最高的两个操作——`delete_paths` 当初就是为「模型看错目标或 glob 多匹配
+一个文件，用户没有第二次机会」而加的。
+
+## 二、为什么没早点发现
+
+`test_every_written_field_is_whitelisted` 已经存在，但它写的是：
+
+```python
+if not isinstance(event, str) or event not in audit.AUDIT_EVENTS:
+    continue          # ← 不在白名单的类型直接跳过
+```
+
+也就是说它只检查「白名单里的事件有没有多写字段」，**没检查「写出来的事件在不在白名单」**。
+方向少了一半，那 11 个恰好落在没检查的那一半。
+
+补的 `test_audit_event_coverage` 正是这个方向，另加一条端到端：写一条
+`delete_trashed` 进会话文件，`audit.collect()` 必须能拿到。
+
+## 三、补齐时守的一条：字段跟生产者完全对齐
+
+白名单的注释是「其余字段一律丢弃」，所以只把事件登记进去、字段少写两个，等于让
+那部分信息静默消失——正是既有守卫要拦的事。所以按生产者实际写的字段登记：
+
+```python
+'delete_trashed': ('count', 'method', 'paths'),
+'moved':          ('count', 'batch', 'moves'),
+'moves_undone':   ('count', 'batch', 'skipped'),
+'remind_scheduled': ('when', 'cron', 'chars'),
+```
+
+`paths` / `moves` 是列表。渲染两条路都查过了，**都不会铺出原始 dict**：
+终端 `_audit_line` 只渲染固定几个键（`count` / `reason` / `path` …），飞书 `_detail`
+对不认识的类型返回空串。实际输出：
+
+```
+01-01 08:00:01 删除到回收站  count=3
+01-01 08:00:02 移动文件  count=2
+01-01 08:00:03 设置提醒
+```
+
+## 四、刻意没做的两件
+
+1. **飞书卡片不给这三类加详情**。`_detail` 目前只覆盖 screen / desktop / clipboard /
+   approval_* / policy_denied，其余（`记忆写入`、`授权新增`…）都只显示类型名。只给
+   delete/move/remind 加一行，反而让它们成为那一大群里唯一的例外。
+2. **终端不渲染 `paths`**。删了哪些文件是最有用的信息，但那是 20 项的列表、会撑长整行，
+   而且这条不在本次发现里。先记下：要显示得给两条渲染路径设计一个统一的列表格式。
+
+全量 3507 passed / 3 skipped。
