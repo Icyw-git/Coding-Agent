@@ -148,6 +148,26 @@ _TOOL_LABELS = {
     'remember': '记住一条',
     'forget': '删除一条记忆',
     'recall': '查记忆',
+    # 下面这些也会出现在活动行/进度行，缺了就会是「· kill_background」
+    # 「正在kill_background」——中文名必须唯一（反查表靠它还原原名）。
+    'todo_read': '读待办',
+    'list_tasks': '列任务',
+    'get_task': '查任务',
+    'claim_task': '认领任务',
+    'complete_task': '完成任务',
+    'find_sessions': '找会话',
+    'rename_session': '改会话名',
+    'revoke_permissions': '撤销授权',
+    'background_output': '读后台输出',
+    'kill_background': '停止后台任务',
+    'tool_search': '搜工具',
+    'create_worktree': '建工作树',
+    'remove_worktree': '删工作树',
+    'keep_worktree': '留工作树',
+    'checkpoint': '存档',
+    'compact': '压缩上下文',
+    'task': '派子代理',
+    'load_skill': '加载技能',
 }
 
 

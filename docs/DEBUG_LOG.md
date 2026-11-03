@@ -14975,3 +14975,77 @@ if not isinstance(event, str) or event not in audit.AUDIT_EVENTS:
    而且这条不在本次发现里。先记下：要显示得给两条渲染路径设计一个统一的列表格式。
 
 全量 3507 passed / 3 skipped。
+
+---
+
+# 第 110 部分：18 个工具在活动行/进度行里显示英文原名
+
+继续用「可枚举的差集」。这次比的是三张表：
+
+```
+tool_schemas.TOOL_SCHEMAS    58 个下发给模型的工具
+tools.tool_registry          54 个有 handler 的（harness 里另注册 task / load_skill）
+approval_view._TOOL_LABELS   39 个中文短名
+```
+
+58 − 39 = **18 个工具没有中文名**。
+
+## 一、先排除两个假差集
+
+**`schema − registry` 的 4 个**：`checkpoint` / `compact` 是 loop 行为（`harness.py:1386`
+起就是特殊处理，注释写明"不注册进 tool_registry，由 agent_loop 特殊处理"）；
+`task` / `load_skill` 在 `harness.py:630-631` 才注册。**不是缺口**——我第一次探针只
+导入了 `tools`，所以看不到后两个，这是探针的问题不是代码的问题。
+
+**`registry − labels` 里那些从不触发审批的工具**：`tool_label()` 本来就有兜底
+（"没有登记的工具（含 MCP 工具）会走这里"），而且这 14 个 `evaluate()` 全是 `allow`，
+不会出审批卡。所以它们在**审批面**没问题。
+
+## 二、真正的问题在这条链上
+
+`tool_name_zh()` 不是只给审批卡用的，它用在两个**每次工具调用都会出现**的地方：
+
+```
+tool_activity.format_line   →  `· 停止后台任务  1.20s √`
+turn_progress 进度行        →  `⏳ 00:02 · 正在停止后台任务`
+```
+
+没有中文名就回退原名，于是：
+
+```
+· kill_background  1.20s √
+⏳ 00:02 · 正在kill_background          ← 「正在」直接接英文动词
+```
+
+`kill_background`（停掉后台命令）、`background_output`（读后台输出）都是日常会用到的，
+不是边角工具。
+
+## 三、补 18 个，守三条不变量
+
+```
+todo_read 读待办   list_tasks 列任务   get_task 查任务   claim_task 认领任务
+complete_task 完成任务   find_sessions 找会话   rename_session 改会话名
+revoke_permissions 撤销授权   background_output 读后台输出
+kill_background 停止后台任务   tool_search 搜工具
+create_worktree 建工作树   remove_worktree 删工作树   keep_worktree 留工作树
+checkpoint 存档   compact 压缩上下文   task 派子代理   load_skill 加载技能
+```
+
+`test_tool_labels_coverage` 守的是：
+
+1. **schema 里每个工具都有中文名**（差集方向，和审计白名单那次同一形状）；
+2. **中文名唯一**——`_RAW_TOOL_BY_LABEL` 是 `{中文名: 原名}` 反查表，两个工具同名
+   会让其中一个还原成错的原名；
+3. **GBK 可编码**——活动行每次工具调用都打印；
+4. 端到端：`format_progress_line({'tool': 'kill_background'})` 里不能出现英文原名。
+
+## 四、又一次被 ruff 挡住
+
+批量加条目时我把 `'remember': '记住一条'` 又写了一遍（原表里已有），14 个重复 key。
+Python 的 dict 字面量会静默取最后一个，**不会报错**——是 ruff 的 `F601` 抓到的。
+
+值得一提的是我自己的 `test_labels_are_unique` 抓不到它：那是检查**值**重复，
+而 dict 字面量里重复的**键**在构造时就合并了，测试看到的已经是合并后的字典。
+两个检查方向不同，缺一个就漏。
+
+全量 3511 passed / 3 skipped。
