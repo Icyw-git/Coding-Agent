@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import time
+
 MAX_TASKS = 8
 MAX_LOG_LINES = 120
 MAX_LOG_CHARS = 12_000
@@ -31,6 +33,12 @@ def _button(label: str, value: dict, *, kind: str = 'default') -> dict:
 
 
 def _duration(task: dict) -> str:
+    """任务用时。
+
+    三种来源依次回退：已记好的秒/毫秒 → 运行中按 `started_at` 现算 → 排队中。
+    运行中的任务 `duration_ms` 还是 `None`，只认毫秒的话，卡片上正在跑的任务会显示
+    「用时 —」——看着像没在跑。
+    """
     from turn_progress import format_duration
 
     for key in ('duration_s', 'elapsed_s'):
@@ -39,6 +47,14 @@ def _duration(task: dict) -> str:
             return format_duration(value)
     if isinstance(task.get('duration_ms'), (int, float)):
         return format_duration(task['duration_ms'] / 1000)
+    started = task.get('started_at')
+    if isinstance(started, (int, float)):
+        ended = task.get('ended_at')
+        finished = isinstance(ended, (int, float))
+        text = format_duration(max(0.0, (ended if finished else time.time()) - started))
+        return text if finished else f'{text}（进行中）'
+    if str(task.get('status') or '').strip().lower() == 'queued':
+        return '排队中'
     return '—'
 
 
@@ -136,5 +152,5 @@ def logs_card(task: dict, logs: str, *, lines: int = 60) -> dict:
 
 def tasks_text(tasks: list[dict]) -> str:
     if not tasks:
-        return '(no tasks)'
+        return '（没有后台任务）'
     return '\n'.join(_task_line(task) for task in tasks)

@@ -301,17 +301,3 @@ def format_changes(changes: list[dict], *, max_files: int = MAX_FILES) -> str:
         lines.append(f'    … 另有 {len(changes) - len(shown)} 个文件')
     lines.append('    /diff 查看逐行改动')
     return '\n'.join(lines)
-
-
-def format_turn_summary(workspace: Path, baseline: dict | None,
-                        fallback: dict[str, str] | None = None,
-                        *, max_files: int = MAX_FILES,
-                        ignore=DEFAULT_IGNORE) -> str:
-    """回合结束时的改动文件清单；无改动返回空串。
-
-    Git 可用时以基线比较为准（能看见 bash 造成的改动）；否则回退到
-    checkpoint 记录的 write/edit/apply_patch 文件。
-    """
-    return format_changes(
-        turn_changes(workspace, baseline, fallback, ignore),
-        max_files=max_files)

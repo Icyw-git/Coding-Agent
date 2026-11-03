@@ -14617,3 +14617,62 @@ policy_bash:589    if tool in ('desktop_snapshot', …, 'desktop_action'):
 数字没错，只是常年为零 → 那两行不显示。不是 bug，不动。
 
 全量 3483 passed / 3 skipped；启动 0.328/0.332/0.358s（无回归）。
+
+---
+
+# 第 105 部分：一个有完整 docstring 的死函数，和它本该修的那个显示问题
+
+方法：AST 扫全部模块级 `def` / `class`，统计名字在整个仓库（含 tests、scripts）里出现
+的次数；只出现一次（即定义自身）的就是没被引用的。9 个候选，逐个查 `getattr` / 字符串
+调用 / 文档提及。
+
+## 一、`_format_task_duration`：写了、写得很细、没人调
+
+```python
+def _format_task_duration(task: dict) -> str:
+    """任务用时展示（统一 mm:ss / h:mm:ss）：
+    排队中 → 动态已用时（进行中）→ 总用时；旧记录缺 duration_ms 时按
+    started_at/ended_at 动态计算，升级后历史任务不会显示为空。"""
+```
+
+零调用方。飞书任务卡片实际走 `feishu_task_card._duration` 的简化版：只认
+`duration_s` / `elapsed_s` / `duration_ms`，都没有就返回 `—`。
+
+而 `TaskRecord`（`task_manager.py:49`）**运行中的任务 `duration_ms` 就是 `None`**——
+所以飞书任务卡片上**正在跑的任务显示「用时 —」**，看上去像没在跑。
+
+这不是"多了一行没人用的代码"，是**两份实现里活的那份缺功能、死的那份有功能**。
+上一轮查死代码时把它们按"先查调用方、别急着删"留着了；这轮的不同之处是找到了
+**实际后果**。
+
+修法：把完整逻辑并进活的那份（不再保留两份），删掉死的那份。
+
+```
+运行中   → 02:05（进行中）      ← 原来：—
+排队中   → 排队中               ← 原来：—
+有记录   → 01:00
+什么都没有 → —                  ← 保持，不猜
+```
+
+顺带同一文件里 `tasks_text([])` 返回的是 `'(no tasks)'`——英文，而卡片版的空状态是
+中文且带引导（`（没有后台任务）需要跑命令时直接说"在后台跑 xxx"…`）。卡片发不出去时
+走的就是这个文本兜底，用户看到的是英文。
+
+## 二、删掉两个"活的实现旁边的那份副本"
+
+这两处上一轮也扫到过，当时的结论是「没有证据说明该删」。这轮多了一条证据：
+**副本会漂移，而漂移的结果是本轮那个「用时 —」**。所以只删「已有活的实现在干同一件事」
+的副本，不碰零散的调试小函数（`perf.fmt`、`random_hex`、`check_writable`、
+`ledger_path`、`scan_unclaimed_tasks`、`_slug_like`——它们不复制任何东西，删只是churn）。
+
+| 删掉 | 为什么它是副本 |
+| --- | --- |
+| `audit.iter_session` | 「按行读 jsonl 跳过坏行」的第 4 份；`collect` 用的是 `_lines_of_interest`（字节预筛 + 正则），这份零调用方 |
+| `workspace_diff.format_turn_summary` | 只是 `turn_changes` + `format_changes` 的组合；`harness.py:1317` 自己就是这么调的——而且中间还要拿 `changes` 落库，所以包装永远不够用 |
+
+## 三、AST 扫法的局限
+
+`perf.snapshot` 没被扫出来，因为 `snapshot` 这个名字全仓库到处都是（会话快照、桌面快照）。
+按名字计数对常见词有假阴性——所以扫出来的 9 个是**上限**，不是全部。
+
+全量 3488 passed / 3 skipped。

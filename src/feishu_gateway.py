@@ -117,21 +117,6 @@ LOCAL_ALERT_ENV = 'FEISHU_LOCAL_ALERTS'
 LOCAL_ALERT_BODY = 400
 
 
-def _format_task_duration(task: dict) -> str:
-    """任务用时展示（统一 mm:ss / h:mm:ss）：
-    排队中 → 动态已用时（进行中）→ 总用时；旧记录缺 duration_ms 时按
-    started_at/ended_at 动态计算，升级后历史任务不会显示为空。"""
-    if not task.get('started_at'):
-        return '排队中' if task.get('status') == 'queued' else '未开始'
-    ended = task.get('ended_at')
-    duration_ms = task.get('duration_ms')
-    if duration_ms is None:
-        end = ended if ended is not None else time.time()
-        duration_ms = round((end - task['started_at']) * 1000)
-    text = format_duration(max(0, duration_ms) / 1000)
-    return text if ended is not None else f'{text}（进行中）'
-
-
 def permission_result(record: dict) -> str:
     status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}.get(
         record['status'], '审批已处理')

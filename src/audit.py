@@ -172,24 +172,6 @@ def _session_title(events: list[dict]) -> str:
     return ''
 
 
-def iter_session(path: Path):
-    """逐行读一个会话文件，跳过损坏行；不抛异常给调用方。"""
-    try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(event, dict):
-                    yield event
-    except OSError:
-        return
-
-
 # 文本预筛：审计只关心少数事件类型，先用子串把绝大多数行挡在 json.loads 之外。
 # 实测 56 会话 / 7550 条事件，全量解析 235ms，预筛后只剩 21 条候选。
 # 预筛标记按 **JSON 字段形态** 匹配（`"type":"grant_added"`），而不是裸名字：
