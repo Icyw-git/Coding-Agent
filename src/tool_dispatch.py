@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import checkpoints
+import tool_activity
 from agent_core import _bound_tool_output, image_attachment_message
 from background_task import should_run_background, start_background_task
 from exec_policy import is_readonly_command, is_secret_path
@@ -147,7 +148,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
             output = f"Error: {e}"
     elapsed = time.perf_counter() - started
     text_output = str(output)
-    failed = text_output.lstrip().startswith(('Error', 'Permission denied'))
+    # 唯一实现在 tool_activity：这份判定原本抄了三份、规则还各不相同
+    failed = tool_activity.is_failure(text_output)
     h.ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
               output_preview=text_output[:2000], output_len=len(text_output),
               diff=_tool_diff(diff_before) if diff_before else '',
@@ -159,9 +161,9 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
               duration_ms=round(elapsed * 1000))
     h.METRICS.record_tool()
     if on_activity is not None:
-        from tool_activity import is_failure, result_hint
-        on_activity(name, args, elapsed, is_failure(output),
-                    background_started, result_hint(output), str(output))
+        on_activity(name, args, elapsed, failed,
+                    background_started, tool_activity.result_hint(output),
+                    str(output))
     if hooks:
         h.trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
@@ -170,7 +172,7 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     if on_event:
         text = str(content)
         status = ('blocked' if blocked else
-                  'error' if text.startswith(('Error:', 'Permission denied')) else 'ok')
+                  'error' if tool_activity.is_failure(text) else 'ok')
         on_event('tool.completed', {
             'name': name, 'call_id': tool_call.id, 'status': status,
             'output': text,

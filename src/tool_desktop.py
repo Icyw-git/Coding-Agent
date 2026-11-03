@@ -122,7 +122,8 @@ def snapshot(*, runner=None, audit=None) -> str:
         state = desktop_control_windows.snapshot(runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_snapshot_failed', reason=str(exc)[:120])
-        return f'读不到前台窗口：{exc}。'
+        # `Error:` 是给机器看的（活动行打 ×、/usage 记失败）；后面仍是中文。
+        return f'Error: 读不到前台窗口：{exc}。'
     _audit(audit, 'desktop_snapshot', process=state.process, pid=state.pid,
            window_id=state.window_id,
            title_sha1=_title_sha1(state),
@@ -274,7 +275,7 @@ def inspect(*, runner=None, audit=None) -> str:
         _audit(audit, 'desktop_inspect_failed', reason=str(exc)[:120])
         if _is_refusal(str(exc)):
             return str(exc)
-        return (f'读不到这个窗口的界面结构：{exc}。'
+        return (f'Error: 读不到这个窗口的界面结构：{exc}。'
                 '可以先让用户切到目标窗口，或改用 desktop_snapshot 看前台窗口。')
     state = tree.state
     _audit(audit, 'desktop_inspect', process=state.process, pid=state.pid,
@@ -348,7 +349,7 @@ def wait(*, target='control', text=None, state='present', timeout_ms=None,
             expected_window_id=expected_window_id, runner=runner)
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_wait_failed', reason=str(exc)[:120])
-        return str(exc) if _is_refusal(str(exc)) else f'等待失败：{exc}'
+        return str(exc) if _is_refusal(str(exc)) else f'Error: 等待失败：{exc}'
     _audit(audit, 'desktop_wait', target=result.target, desired=result.desired,
            matched=result.matched, elapsed_ms=result.elapsed_ms,
            polls=result.polls, process=result.state.process,
@@ -455,7 +456,7 @@ def element_action(*, operation, element, tree, expected_pid, expected_window_id
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action='element',
                reason=str(exc)[:120])
-        return str(exc)
+        return str(exc) if _is_refusal(str(exc)) else f'Error: {exc}'
     state = result.state
     target = result.target
     label = (target.name or target.label) if target else ''
@@ -581,7 +582,7 @@ def action(action_name: str, *, x=None, y=None, text=None, key=None,
     except desktop_control_windows.DesktopControlError as exc:
         _audit(audit, 'desktop_action_failed', action=str(action_name)[:30],
                reason=str(exc)[:120])
-        return str(exc) if _is_refusal(str(exc)) else f'操作没做成：{exc}'
+        return str(exc) if _is_refusal(str(exc)) else f'Error: 操作没做成：{exc}'
     state = result.state
     step_records = getattr(result, 'steps', ()) or ()
     # 坐标和键名要进台账：只记「点了一次」没法回答「点在哪儿」。

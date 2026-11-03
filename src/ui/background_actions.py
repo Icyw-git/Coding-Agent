@@ -8,6 +8,8 @@ from __future__ import annotations
 import threading
 import time
 
+import tool_activity
+
 
 class BackgroundActionsMixin:
     """把后台进度和最终文本折叠进同一个 notice 块。"""
@@ -48,7 +50,7 @@ class BackgroundActionsMixin:
             pass
 
     def _finish_shell(self, block_id: str, output: str, duration_ms: int) -> None:
-        failed = str(output).lstrip().startswith(('Error', 'Permission denied'))
+        failed = tool_activity.is_failure(output)
         if self.model.get(block_id) is not None:
             self.model.update(block_id,
                               state='failed' if failed else 'complete',

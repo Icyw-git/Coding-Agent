@@ -14495,3 +14495,73 @@ F811 Redefinition of unused `test_cli_and_tui_command_sets_match`
 `test_terminal_views.py` 的 `match='prefix'`）。这不是放宽，是新文案就在守那个语义。
 
 全量 3475 passed / 3 skipped。
+
+---
+
+# 第 103 部分：同一个判断抄了四份，其中两份规则不同
+
+## 一、四份「这个工具输出算不算失败」
+
+| 位置 | 规则 |
+| --- | --- |
+| `tool_activity.is_failure`（有 docstring 的那份） | `lstrip()` + `('Error', 'Permission denied')` |
+| `tool_dispatch:150` | 同上（原样抄） |
+| `tool_dispatch:173` | `startswith` + **`('Error:', 'Permission denied')`** |
+| `ui/background_actions:51` | 同上（原样抄） |
+
+第 2 份和第 3 份在同一个函数里，隔了二十行，规则却不一样：`Error x`（没有冒号）和
+`\nError: x`（前面有换行）在前者算失败、在后者算成功。真实会话里 49 条错误输出两种
+判法全一致，所以没暴露过——**但这不代表它们一致，只是还没有输入走进那个缝**。
+
+`test_is_failure_is_the_only_implementation` 扫全部 `src/`，发现任何 `Permission denied`
++ `startswith` 的自建判定就红。它当场列出三处。
+
+改法：删掉三份拷贝，统一调 `tool_activity.is_failure`。这是去重，不是加防线。
+
+## 二、然后发现：失败的工具在活动行上打 `√`
+
+`tool_activity.py:104` 是活动行的标记：
+
+```python
+parts.append(f'{elapsed:.2f}s {"×" if failed else "√"}')
+```
+
+`failed` 来自上面那个判定，而判定的约定写在 docstring 里：**「错误以 `Error` 开头」**。
+
+`tool_desktop` 不守这个约定，它的失败文案是纯中文：
+
+```
+读不到前台窗口：…
+读不到这个窗口的界面结构：…
+等待失败：…
+操作没做成：…
+```
+
+于是**一次失败的桌面动作在终端里打的是 `√`**，`/usage` 记成完成，审批/统计两本账不一致
+（审计台账有 5 条 `desktop_snapshot_failed`，`/usage` 里 desktop_snapshot 失败数是 0）。
+
+改法最小：failure 文案前面加 `Error: `，后面仍是中文。
+
+```
+Error: 读不到前台窗口：no_foreground_window: 当前没有可用的前台窗口。
+```
+
+这正是早就定过的分层——**`code` 是机器契约，message 是给人看的**。`Error:` 属于前者。
+
+`element_action` 原来整段 `return str(exc)`，失败和拒绝分不开；改成
+`str(exc) if _is_refusal(...) else f'Error: {exc}'`，和另外三处一个形状。
+
+拒绝码（`sensitive_target` / `process_excluded` / `terminal_input`）**不加前缀**：
+别处靠码头判"这是拒绝，不是失败"（`test_refusals_stay_recognizable_as_refusals` 守着）。
+
+## 三、没有继续往下改的
+
+失败文案里带着 `no_foreground_window` 这种内部码，用户会看到。核实过这是**刻意**的：
+
+- `ps_worker.failure_text` 的 docstring：「同一个拒绝对模型应当是同一句话，否则上游按
+  前缀分流（如"拒绝"与"失败"）时会在其中一条路上失效」；
+- `_is_refusal` 也就靠这个前缀工作。
+
+工具输出是模型与用户共用的一段字符串，拆不开。留码。
+
+全量 3481 passed / 3 skipped。
