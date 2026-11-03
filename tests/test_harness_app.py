@@ -2084,8 +2084,8 @@ def test_watch_command_updates_notice_block(monkeypatch):
     import background_watch
 
     def fake_watch(argument, emit=None):
-        emit('  ● bg_1  running  00:01  pytest -q')
-        return '  [bg_1] completed\n  Output:\nok'
+        emit('  ● bg_1  运行中  00:01  pytest -q')
+        return '  [bg_1] 已完成\n  输出：\nok'
 
     monkeypatch.setattr(background_watch, 'watch_command', fake_watch)
     _no_agent(monkeypatch)
@@ -2097,9 +2097,9 @@ def test_watch_command_updates_notice_block(monkeypatch):
             for _ in range(100):
                 await pilot.pause()
                 await asyncio.sleep(0.02)
-                if any('Output:' in text for text in _notice_texts(app)):
+                if any('输出：' in text for text in _notice_texts(app)):
                     break
-            assert any('[bg_1] completed' in text
+            assert any('[bg_1] 已完成' in text
                        for text in _notice_texts(app))
 
     asyncio.run(scenario())

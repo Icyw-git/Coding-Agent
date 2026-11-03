@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import time
 
+import task_status
+
 MAX_TASKS = 8
 MAX_LOG_LINES = 120
 MAX_LOG_CHARS = 12_000
@@ -58,20 +60,9 @@ def _duration(task: dict) -> str:
     return '—'
 
 
-#: 任务状态的中文名。原始值是 ``running`` / ``completed`` / ``failed`` /
-#: ``cancelled`` ——给用户看英文状态等于没写。
-_STATUS_ZH = {
-    'running': '运行中',
-    'queued': '排队中',
-    'completed': '已完成',
-    'failed': '失败',
-    'cancelled': '已取消',
-}
-
-
 def _status_zh(status) -> str:
-    key = str(status or '').strip().lower()
-    return _STATUS_ZH.get(key) or key or '未知'
+    """状态中文名。表在 task_status：两套词表合成一处，别在这里再写一份。"""
+    return task_status.zh(status)
 
 
 def _task_line(task: dict) -> str:

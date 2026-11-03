@@ -35,7 +35,7 @@ def test_format_tasks_empty_and_listing():
                          result='done'))
     text = background_watch.format_tasks(store)
 
-    assert 'bg_0001' in text and 'completed' in text
+    assert 'bg_0001' in text and '已完成' in text   # 状态显示中文，不是 completed
     assert '01:00' in text          # 结束时间 - 开始时间
     assert '--timeout' in text
 
@@ -45,7 +45,7 @@ def test_watch_finished_task_returns_output_immediately():
 
     text = background_watch.watch('bg_0001', store, timeout=1)
 
-    assert '[bg_0001] completed' in text
+    assert '[bg_0001] 已完成' in text      # 状态显示中文，不是 completed
     assert '总用时 00:30' in text
     assert 'ok' in text
 
@@ -61,8 +61,8 @@ def test_watch_follows_running_until_terminal():
                                   interval=0.01, emit=emitted.append,
                                   sleep=lambda seconds: None)
 
-    assert emitted and 'running' in emitted[0]
-    assert 'built' in text and 'completed' in text
+    assert emitted and '运行中' in emitted[0]
+    assert 'built' in text and '已完成' in text
 
 
 def test_watch_times_out_and_keeps_task_running():
@@ -78,7 +78,7 @@ def test_watch_times_out_and_keeps_task_running():
     text = background_watch.watch('bg_0001', store, timeout=0.5,
                                   interval=0.1, clock=clock, sleep=sleep)
 
-    assert '仍在 running' in text
+    assert '仍在运行中' in text
     assert store.task['status'] == 'running'
 
 
@@ -127,7 +127,7 @@ def test_watch_command_list_flag_shows_tasks():
 
     text = background_watch.watch_command('--list', store)
 
-    assert 'bg_0001' in text and 'completed' in text
+    assert 'bg_0001' in text and '已完成' in text
 
 
 def test_watch_command_timeout_without_id():
@@ -135,7 +135,7 @@ def test_watch_command_timeout_without_id():
 
     text = background_watch.watch_command('--timeout 0.001', store)
 
-    assert '仍在 running' in text
+    assert '仍在运行中' in text
 
 
 def test_watch_command_routes_progress_through_emit(monkeypatch):

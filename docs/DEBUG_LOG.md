@@ -14823,3 +14823,69 @@ Windows 上文件被编辑器/别的进程打开时就是 `PermissionError`—�
 否则会留下原行尾巴。
 
 全量 3500 passed / 3 skipped。
+
+---
+
+# 第 108 部分：并发查了四轮没找到 bug；用户看到的是英文状态
+
+## 一、并发/加锁：四处静态命中，四处都不是 bug
+
+方法：AST 扫「模块级可变容器在 `with <*lock*>` 之外被访问」。
+
+| 位置 | 结论 |
+| --- | --- |
+| `background_task:129` `background_finished[bg_id]=…` | `_remember_finished` 的两个调用方都在 `with background_lock:` 内。`background_lock` 是**不可重入**的 `Lock`，所以函数自己不取锁是唯一正确写法 |
+| `cron_scheduler:184` `scheduled_jobs[job.id]=job` | `load_durable_jobs()` 是启动期调用，早于调度线程创建（`entrypoint.py:113` 早于 `:121`；`scheduler_service.start()` 里也在建线程之前） |
+| `project_context:79` `_cache[...]=…` | 全程无锁，但每步都是 GIL 下的单步（`get` / 赋值 / `next(iter())` 后立刻 `pop`，且只有这一处淘汰）。加锁属于过度防御 |
+| `agent_teams:525` `active_teammates[name]=True` | `in` / 赋值都是单步；`spawn` 由 lead 串行调用。同名并发派发会漏判，但没有证据这条路被并发走过 |
+
+另外查了两件更危险的事，都没问题：
+
+- **陈旧锁**：`file_lock` 用的是 OS advisory lock（`flock` / `msvcrt.locking`），进程死亡自动释放 → 不存在「崩溃后永久卡住」。`session_locks` / `turn_coordinator` 都建在它上面；
+- **持锁做阻塞操作**：`turn_coordinator.acquire()` 确实在持有 `_STATE` 的情况下等文件锁，但 `DEFAULT_TIMEOUT = 0.0`（竞争立即失败），生产调用方没有一个传超时（只有测试传）。**目前无害**，但这是一处陷阱：把默认值调大，`held()` 这种纯读也会跟着卡。
+
+## 二、顺带扫出来的真问题：状态词表两套，中文表只覆盖一套
+
+飞书任务卡片渲染的是 `TaskRecord`（`task_manager`），状态集是
+`queued / running / succeeded / failed / cancelled / interrupted`；
+卡片里的 `_STATUS_ZH` 只写了 `background_task` 那套
+（`running / queued / completed / failed / cancelled`）。
+
+差集正好落在**最常见的那条路径**：
+
+```
+_status_zh('succeeded')   → 'succeeded'      ← 跑成功了，显示英文
+_status_zh('interrupted') → 'interrupted'
+```
+
+`/watch` 更直接——`_status_line` 压根没查表：
+
+```
+√ bg_0001  completed  01:00  npm test      ← 同一行旁边却是中文顿号与「用时」
+```
+
+改法：新增 `src/task_status.py`（只放「状态 → 中文」，15 行、无 import），
+两套词表合成一处，两处渲染都改用它。不认识的状态**返回原值**——猜一个中文名会让人
+以为程序认得它。
+
+顺带把 `/watch` 里同一段用户消息的 `Command:` / `Output:` / `(no output)` 改成中文：
+它们和刚改的「总用时」在同一条返回串里，一半中文一半英文比不改更难看。
+
+## 三、连带的测试改动（5 处）
+
+改了显示就要改守着显示的断言，**这不是放宽，是新文案就在守那个语义**：
+
+| 断言 | 改成 |
+| --- | --- |
+| `'completed' in text` | `'已完成' in text` |
+| `'仍在 running'` | `'仍在运行中'` |
+| `'succeeded' in fake.last_card()` | `'成功' in …` |
+| harness_app 假 `watch_command` 的返回串 | 跟着改成中文（假件也得像真件） |
+
+## 四、又一次 heredoc（第 6 次）
+
+想批量替换含 `\n` 的字符串，`\n` 被折叠成真换行，`count(old) == 1` 断言失败，文件没
+写坏。这已经是同一类问题的第 6 次——**结论固定下来：凡是要匹配源码里的转义序列
+（`\n` `\033` `\b`），一律用 `edit` 工具，不用 heredoc 脚本。**
+
+全量 3504 passed / 3 skipped。

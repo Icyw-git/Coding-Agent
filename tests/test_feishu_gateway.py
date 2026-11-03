@@ -148,7 +148,7 @@ def test_commands_run_status_logs_stop(gateway):
 
     # /status <id> 与 /logs 现在都是卡片（就地可刷新/停止），不再回纯文本
     gw.on_message('c1', f'/status {task_id}')
-    assert 'succeeded' in fake.last_card()
+    assert '成功' in fake.last_card()   # 状态显示中文，不是 succeeded
     gw.on_message('c1', f'/logs {task_id}')
     assert 'feishu-task' in fake.last_card()
 

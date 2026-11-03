@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 
+import task_status
 from turn_progress import format_duration
 
 DEFAULT_TIMEOUT = 600.0
@@ -34,7 +35,7 @@ def _status_line(task: dict, now: float) -> str:
     elapsed = (ended or now) - started if started else None
     elapsed_text = format_duration(elapsed) if elapsed is not None else '--:--'
     command = str(task.get('command') or '').replace('\n', ' ')[:60]
-    return (f'  {icon} {task["id"]}  {task.get("status", "?")}  '
+    return (f'  {icon} {task["id"]}  {task_status.zh(task.get("status"))}  '
             f'{elapsed_text}  {command}')
 
 
@@ -77,16 +78,16 @@ def watch(bg_id: str, store=None, *, timeout: float = DEFAULT_TIMEOUT,
                 if task.get('created_at') and task.get('ended_at'):
                     elapsed = (f' · 总用时 '
                                f'{format_duration(task["ended_at"] - task["created_at"])}')
-                return (f'  [{bg_id}] {status}{elapsed}\n'
-                        f'  Command: {task.get("command", "")}\n'
-                        f'  Output:\n{text or "(no output)"}')
+                return (f'  [{bg_id}] {task_status.zh(status)}{elapsed}\n'
+                        f'  命令：{task.get("command", "")}\n'
+                        f'  输出：\n{text or "（没有输出）"}')
             line = _status_line(task, time.time())
             if line != announced:
                 emit(line)
                 announced = line
             remaining = deadline - clock()
             if remaining <= 0:
-                return (f'  [{bg_id}] 仍在 {status}；已停止跟踪。'
+                return (f'  [{bg_id}] 仍在{task_status.zh(status)}；已停止跟踪。'
                         '\n  用 /watch <bg_id> 继续，或 background_output 查看。')
             sleep(min(interval, remaining))
     except KeyboardInterrupt:
