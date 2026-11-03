@@ -8,7 +8,7 @@
 **顺带修掉一个真实缺陷**：`remember` 工具（M1）写入的是语义类型
 `preference`/`correction`/`fact`/`context`，而合并校验用的是旧词表
 `user`/`feedback`/`project`/`reference`。两边不一致的后果是：用户一旦用过
-`remember`，后续每次合并都会整批校验失败并被静默跳过（`[memory] skipped`）。
+`remember`，后续每次合并都会整批校验失败并被静默跳过（`[记忆] 本轮跳过`）。
 这里用 `normalize_type()` 做双向归一，旧词表继续能读，新写入一律规范化。
 
 向 schema v2 新增的字段

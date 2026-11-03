@@ -14740,3 +14740,86 @@ from limits import _EXTENDED_LIMIT as _JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 | `reasoning` 被聚合但从不显示 | 无后果、也没坏处，删了下次加显示还要补回来 |
 
 全量 3495 passed / 3 skipped。
+
+---
+
+# 第 107 部分：每回合都在用户屏幕上打英文诊断
+
+这轮换了筛选顺序：不看「扫出来的候选」，先按**会不会有人受伤**挑类。最后落到两类：
+时长用了哪种时钟、静默吞异常。
+
+## 一、先记没问题的
+
+**时长时钟**：AST 扫同一表达式里同时出现 `time.time()` 与 `time.monotonic()`——0 处。
+进一步查「一处用 `time.time()` 写、另一处用 `monotonic` 读」：`turn_files` 的
+`started_at` 与 `turn_watcher` 都默认 `time.time`，一致。这里**必须**是墙钟——两个进程
+通过文件比时间戳，`monotonic` 不跨进程。
+
+## 二、静默吞异常：172 处，按后果收窄到 20 处逐个看
+
+按「会丢数据的写入路径」筛（audit / session_store / checkpoints / grants / memory /
+self_improve_ledger / trash / moves）。多数是对的：跳过损坏行、观察层失败不影响判定。
+
+**一处真问题**：`self_improve_ledger.rollback()` 逐个 `shutil.copy2`，失败就 `continue`。
+Windows 上文件被编辑器/别的进程打开时就是 `PermissionError`——很常见。结果是仓库停在
+**半新半旧**，而 `/improvements rollback` 只说「已恢复 2 个文件：a、b」。
+
+这句话本身没错，但它和「这次只需要恢复 2 个」长得一样。本该恢复的数量在
+`snapshotted` 里已经存着，说出来是零成本的：
+
+```
+已恢复 1 个文件：a.py
+有 1 个没能恢复（可能被占用）：b.py
+关掉对应程序后可再执行一次。
+```
+
+`rollback()` 的返回类型不动（三个测试依赖），加一个和 `created_paths` 对称的
+`snapshotted_paths()`。
+
+## 三、12 条英文诊断在**每回合**路径上
+
+`harness.py:831` 每回合调 `extract_memories` + `consolidate_memories`，里面有 12 条
+无条件 `print`：
+
+```
+[Memory: extract returned empty (LLM judged nothing worth remembering)]
+[Memory: extract failed - no valid JSON array in LLM reply: 'sorry, I cannot ...']
+```
+
+可见性按入口不同：
+
+| 入口 | 这些 print 去哪了 |
+| --- | --- |
+| TUI | `redirect_stdout(io.StringIO())` → **看不见**（但仍在生成字符串） |
+| headless | `redirect_stdout(stderr)` → 到 stderr（JSONL 流没被污染，查过） |
+| `entrypoint.py` 默认交互（`run_repl`） | **就在用户屏幕上** |
+
+两类毛病：
+
+1. **英文 + 常态**。「这轮没什么可记」是最常见的情况，于是每回合一行英文噪音；
+2. **把模型回复的 Python repr 倒出来**——`{text[:200]!r}` 是开发者视角，而且可能带正文。
+
+改法按「会不会有事发生」分：
+
+| 情况 | 处理 |
+| --- | --- |
+| 没有可抽取的文本 / 模型判断没什么可记 / 解析失败重试 | **不吭声**（什么都没发生） |
+| 新记住 N 条 / 整理完成 | `[记忆] 新记住 N 条`、`[记忆] 整理完成：a 条 → b 条` |
+| 解析失败 / 抽出错 / 整理出错 | `[记忆] 这轮没能从模型回复里解析出结果，本轮跳过。` 等（**不带原文**） |
+| 整理结果是空 → 放弃（照做会删光） | `[记忆] 整理结果是空，已放弃（照做会把记忆全部删掉）。`（这是安全事件，必须说） |
+
+顺手同文件三处 `[memory]` 前缀归成 `[记忆]`，以及 `harness.py` 里同一子系统的
+`[memory] skipped` → `[记忆] 本轮跳过`。`[title]` / `[checkpoint]` / `[memory-eval]`
+**没动**——它们只在异常时出现，且分属别的子系统；半套本地化比不做更难看，那是另一件
+该单独决定的事。
+
+## 四、踩了第 5 次 heredoc
+
+用 `python - <<'PYEOF'` 批量替换含 `\033` 的字符串，`\033` 被折叠成真 ESC 字符，
+断言直接失败（幸好断言挡住了，文件没写坏）。改用 `edit` 工具字面匹配。
+
+同一次里还踩了另一个：把 `print(f"...")` 的 `oldText` 少写了收尾 `)`，替换后变成
+`print(...))`——三处语法错误。**批量替换含括号的语句时，oldText 要整行完整**，
+否则会留下原行尾巴。
+
+全量 3500 passed / 3 skipped。

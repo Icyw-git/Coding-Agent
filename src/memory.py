@@ -228,7 +228,7 @@ def _audit(event: str, payload: dict) -> None:
 
 def _record_redaction(kinds: list[str]) -> None:
     """脱敏是静默篡改用户要记的东西：必须留痕，否则“我明明让它记住了”无解。"""
-    print(f'  \033[33m[memory] redacted {len(kinds)} secret(s): {", ".join(kinds)}\033[0m')
+    print(f'  \033[33m[记忆] 脱敏了 {len(kinds)} 处凭据类内容：{", ".join(kinds)}\033[0m')
     _audit('memory_redacted', {
         'kinds': ','.join(kinds),
         'reason': 'credential-shaped content in memory body',
@@ -765,7 +765,6 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
     dialogue = "\n".join(dialogue_parts)
 
     if not dialogue.strip():
-        print("[Memory: extract skipped - no text content in recent messages]")
         return
 
     # post-action 反馈：从「模型做了什么 → 用户怎么反应」里学。
@@ -775,7 +774,7 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
         feedback_block = memory_feedback.as_prompt_block(
             memory_feedback.collect(messages))
     except Exception as exc:
-        print(f'  \033[33m[memory] feedback signals skipped: '
+        print(f'  \033[33m[记忆] 反馈信号跳过：'
               f'{type(exc).__name__}: {exc}\033[0m')
         feedback_block = ''
 
@@ -838,10 +837,9 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
                 except Exception:
                     continue
         if not isinstance(items, list):
-            print(f"[Memory: extract failed - no valid JSON array in LLM reply: {text[:200]!r}]")
+            print("  [记忆] 这轮没能从模型回复里解析出结果，本轮跳过。")
             return
         if not items:
-            print("[Memory: extract returned empty (LLM judged nothing worth remembering)]")
             return
         count = 0
         for mem in items:
@@ -860,11 +858,11 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
                     supersedes=str(mem.get('supersedes') or ''))
                 count += 1
         if count:
-            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+            print(f"\n\033[33m[记忆] 新记住 {count} 条\033[0m")
         else:
-            print(f"[Memory: extract returned {len(items)} items but none had desc+body]")
+            print(f"  [记忆] 模型给了 {len(items)} 条，但没有一条同时有描述和正文，本轮跳过。")
     except Exception as e:
-        print(f"[Memory: extract error: {e}]")
+        print(f"  [记忆] 抽取出错，本轮跳过：{e}")
 
 
 def _validate_consolidated(items) -> list[dict]:
@@ -1022,8 +1020,8 @@ def age_memories(days: int | None = None) -> list[dict]:
     if moved:
         names = ', '.join(item['name'] for item in moved[:3])
         more = f' 等{len(moved)} 条' if len(moved) > 3 else ''
-        print(f'  \033[90m[memory] archived {names}{more} '
-              f'(太久没用到；可用 /memories archived 找回)\033[0m')
+        print(f'  \033[90m[记忆] 已归档 {names}{more} '
+              f'（太久没用到；可用 /memories archived 找回）\033[0m')
         for item in moved:
             _audit('memory_archived', {'name': item.get('name', ''),
                                        'age_days': item.get('age_days', 0)})
@@ -1040,7 +1038,7 @@ def consolidate_memories():
         archive_session_scope()
         age_memories()
     except Exception as exc:
-        print(f'  \033[33m[memory] aging skipped: {type(exc).__name__}: {exc}\033[0m')
+        print(f'  \033[33m[记忆] 本轮跳过老化：{type(exc).__name__}: {exc}\033[0m')
     files = list_memory_files()
     if len(files) < h.CONSOLIDATE_THRESHOLD:
         return
@@ -1084,32 +1082,30 @@ def consolidate_memories():
         return text
 
     match = None
-    last_text = ''
     for attempt in range(2):   # 首次失败（跑题/截断）：点名要求纯 JSON 重试一次
         text = _call('\n\nREMINDER: Reply with ONLY the JSON array, nothing else.'
                      if attempt else '')
-        last_text = text
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if match:
             break
-        print(f"[Memory: consolidate reply had no JSON array (attempt {attempt + 1}/2), retrying]")
+        pass
     if not match:
-        print(f"[Memory: consolidate failed - no JSON array in LLM reply: {last_text[:200]!r}]")
+        print("  [记忆] 整理没能从模型回复里解析出结果，原有记忆保持不变。")
         return
     try:
         items = json.loads(match.group())
         if not items:
             # 必须先于删除逻辑返回：否则会把所有记忆文件删光再写 0 条
-            print("[Memory: consolidate returned empty - aborting (would delete all memories)]")
+            print("  [记忆] 整理结果是空，已放弃（照做会把记忆全部删掉）。")
             return
         prepared = _validate_consolidated(items)
         _replace_memory_files(prepared)
-        print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(prepared)} memories]\033[0m")
+        print(f"\n\033[33m[记忆] 整理完成：{len(files)} 条 → {len(prepared)} 条\033[0m")
     except ValueError as exc:
         # 整批校验失败：此时还没动过任何旧文件
-        print(f"[Memory: consolidate aborted - {exc}; existing memories kept]")
+        print(f"  [记忆] 整理放弃，原有记忆保持不变：{exc}")
     except Exception as e:
-        print(f"[Memory: consolidate error: {e}]")
+        print(f"  [记忆] 整理出错，原有记忆保持不变：{e}")
 
 
 def _parse_frontmatter(text: str):

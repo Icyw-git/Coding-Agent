@@ -435,10 +435,18 @@ class CommandActionsMixin:
                 self._notice(f'回滚失败：{change_id} 没有可恢复的快照')
                 return
             created = ledger.created_paths(cache, change_id)
-            self._notice(f'已恢复 {len(restored)} 个文件：'
-                         + '、'.join(restored)
-                         + (chr(10) + '新增的文件不会自动删除：'
-                            + '、'.join(created) if created else ''))
+            expected = ledger.snapshotted_paths(cache, change_id)
+            missed = [name for name in expected if name not in restored]
+            message = f'已恢复 {len(restored)} 个文件：' + '、'.join(restored)
+            if missed:
+                # 恢复是按个 copy 的，被别的进程占住就会失败。不说出来，用户会以为
+                # 已经全部回到改动前，实际上仓库停在半新半旧。
+                message += (chr(10) + f'有 {len(missed)} 个没能恢复（可能被占用）：'
+                            + '、'.join(missed)
+                            + chr(10) + '关掉对应程序后可再执行一次。')
+            if created:
+                message += chr(10) + '新增的文件不会自动删除：' + '、'.join(created)
+            self._notice(message)
             return
         self._notice(ledger.format_ledger(cache))
 

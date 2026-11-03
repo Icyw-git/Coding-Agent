@@ -831,7 +831,7 @@ def _post_turn_housekeeping(pre_compress, messages_snapshot, session_store, turn
         extract_memories(pre_compress)
         consolidate_memories()
     except Exception as exc:
-        print(f'  \033[33m[memory] skipped: {exc}\033[0m')
+        print(f'  \033[33m[记忆] 本轮跳过：{exc}\033[0m')
     # 异步 LLM 评测（默认关）：判“这轮召回的记忆真的有用吗”与“库里的记忆
     # 该不该长期保留”。只写 jsonl 报告，不参与任何决策、不改记忆。
     # 放在抽取/合并**之后**：这样质量评测带得到本轮新沉淀的条目。

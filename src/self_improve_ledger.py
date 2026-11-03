@@ -181,6 +181,17 @@ def rollback(cache_dir, change_id: str) -> list[str]:
     return restored
 
 
+def snapshotted_paths(cache_dir, change_id: str) -> list[str]:
+    """这次改动**本该**恢复的路径（有快照的那些）。
+
+    `rollback()` 逐个 `copy2`，失败就跳过——文件被别的进程打开时在 Windows 上很常见。
+    返回值只含成功项，所以界面要拿这个列表和它比，才知道有没有半途失手的。
+    """
+    row = next((item for item in entries(cache_dir, limit=10_000)
+                if item.get('change_id') == change_id), None)
+    return list((row or {}).get('snapshotted') or [])
+
+
 def created_paths(cache_dir, change_id: str) -> list[str]:
     """这次改动里**新增**的路径（没有快照的那些）。回滚时由人决定要不要删。"""
     row = next((item for item in entries(cache_dir, limit=10_000)
