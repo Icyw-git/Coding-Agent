@@ -845,6 +845,22 @@ _DENY_HINTS = {
     'sandbox_read_only': 'The sandbox is read-only; ask the user to switch tiers.',
     'invalid_url': 'Use a plain http(s) URL with a public host.',
     'invalid_path': 'The path could not be resolved; check it and retry.',
+    # 能力被关掉 / 档位不允许：模型改写法没用，得让用户去改开关。
+    'screen_tools_disabled': 'Screen capture is turned off on this machine; tell '
+                            'the user they can enable it (HARNESS_SCREEN_TOOLS=1).',
+    'clipboard_tools_disabled': 'Clipboard access is turned off on this machine; '
+                               'tell the user they can enable it '
+                               '(HARNESS_CLIPBOARD_TOOLS=1).',
+    'desktop_control_disabled': 'Desktop control is opt-in and currently off; '
+                               'tell the user they can enable it '
+                               '(HARNESS_DESKTOP_CONTROL=1).',
+    'desktop_control_approval_required': 'This tier never asks, but desktop '
+                                        'control always needs per-action '
+                                        'approval; ask the user to switch tiers.',
+    'rule_denied': 'A user rule denies this; do not retry the same call - ask '
+                   'the user whether the rule should change.',
+    'invalid_patch': 'The patch could not be parsed; re-read the file and send '
+                     'a well-formed patch.',
 }
 
 

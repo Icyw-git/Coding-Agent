@@ -15049,3 +15049,75 @@ Python 的 dict 字面量会静默取最后一个，**不会报错**——是 ru
 两个检查方向不同，缺一个就漏。
 
 全量 3511 passed / 3 skipped。
+
+---
+
+# 第 111 部分：拒绝时模型只拿到 `Error:`，不知道该不该重试
+
+延续差集方法。这次比的是「策略拒绝码」与「拒绝提示表」。
+
+## 一、先记三个查了不动的
+
+**1. 所有工具名名单都没有陈旧名字。** 扫了 7 张表（`SCHEDULED_FORBIDDEN_TOOLS` 29、
+`PARALLEL_SAFE_TOOLS` 12、`DESKTOP_TOOLS` 6、`SCREEN_TOOLS` 2、`CLIPBOARD_TOOLS` 2、
+`DELETE_TOOLS` 1、`WORKTREE_TOOLS` 3），逐个名字对 `TOOL_SCHEMAS ∪ tool_registry`——
+零个未知。这条不变量值得留着：**改名之后残留的旧名 = 静默失守**。
+
+**2. `_REASON_ZH` 没有死映射。** 反方向查了：29 条中文原因，每一个码都有地方产出。
+
+**3. `rule_ask` 没中文原因是**有意**的，不是漏的。** 它的理由串是
+`must ask by rule: <规则前缀或用户备注>`——机器英文和**用户自己写的话**挤在同一个
+字段里。加一条 `_REASON_ZH` 映射会把用户写的备注一起抹掉；要拆开就得改
+`Decision.reason` 的语义，而那个字段同时喂给 `deny_message()`（工具输出，数据通道
+族要保持英文）和审批卡（要中文）。**一个字段两个消费者要不同的语言**，这才是
+`_REASON_ZH` 存在的理由。留着英文，比丢掉用户的话好。
+
+## 二、真问题：拒绝提示表只覆盖了 10/13
+
+`deny_message()` 在拒绝语后面追加一行"接下来怎么办"（`_DENY_HINTS`，按 code 查）。
+缺了这行，模型拿到的只有：
+
+```
+Error: Bash is disabled (HARNESS_SCREEN_TOOLS=0)
+```
+
+它分不清这是**策略拒绝**（重试多少次都没用）还是**暂时失败**（换个写法就行），
+于是原地重试，白烧回合。
+
+缺的 6 个：
+
+| 码 | 为什么必须说清 |
+| --- | --- |
+| `screen_tools_disabled` | 能力被关掉，模型改写法没用，得让用户去开 `HARNESS_SCREEN_TOOLS=1` |
+| `clipboard_tools_disabled` | 同上（`HARNESS_CLIPBOARD_TOOLS=1`） |
+| `desktop_control_disabled` | 同上（`HARNESS_DESKTOP_CONTROL=1`） |
+| `desktop_control_approval_required` | `approval_policy=never` 与"桌面每次都要问"冲突，要用户换档位 |
+| `rule_denied` | 用户规则拦的，重试无意义，得问用户要不要改规则 |
+| `invalid_patch` | 格式问题，重试有意义——但要先说清是格式问题 |
+
+补完之后：
+
+```
+Error: Bash is disabled (HARNESS_SCREEN_TOOLS=0)
+Screen capture is turned off on this machine; tell the user they can enable it (HARNESS_SCREEN_TOOLS=1).
+```
+
+## 三、反方向有 3 条够不到的，但**留着**
+
+`outside_workspace_write` / `sandbox_read_only` / `secret_egress` 都只以 `ASK` 出现
+（`Decision.denied` 就是 `action == 'deny'`，两处 `deny_message()` 调用都在
+`if decision.denied:` 里），所以这三条提示目前取不到。
+
+没删的理由：删掉省 6 行，判断错就少一条提示；留着零风险。测试只查单向
+（`deny 码 ⊆ 提示表`），多余的条目不算违规——这也正是"将来某个码从 ask 变 deny"
+时的兜底。
+
+## 四、守卫
+
+`test_deny_hints_coverage` 两件事：
+
+1. AST 扫全部 `Decision(DENY, '<code>')`，每一个码都必须在 `_DENY_HINTS` 里；
+2. 提示本身必须是**英文单行**——它是给模型看的（数据通道族），
+   `test_hints_are_english_and_single_line` 防着有人顺手把它翻译成中文。
+
+全量 3513 passed / 3 skipped。
