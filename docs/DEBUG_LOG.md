@@ -15121,3 +15121,80 @@ Screen capture is turned off on this machine; tell the user they can enable it (
    `test_hints_are_english_and_single_line` 防着有人顺手把它翻译成中文。
 
 全量 3513 passed / 3 skipped。
+
+---
+
+# 第 112 部分：审批卡上唯一一处 `max_chars：5000`
+
+继续差集。这轮查了两个表，一个假警报、一个真问题。
+
+## 一、环境变量 vs 文档：先差点误判
+
+代码里 88 个 `HARNESS_*`、`docs/ENVIRONMENT.md` 里 89 个，差集只有
+`HARNESS_MODEL_APPROVAL`——文档有、代码「没有」。
+
+差一点就当文档过时去删它。实际查下去发现**我的正则漏了**：
+
+```python
+ROLE_ENV = {role: f'HARNESS_MODEL_{role.upper()}' for role in ROLES}
+```
+
+名字是 f-string 拼的，正则扫不到。实测（同时配 `LLM_MODEL_ID`，否则
+`resolve_for('approval')` 先解析 main 会抛 ConfigError）：
+
+```
+LLM_MODEL_ID=main-model HARNESS_MODEL_APPROVAL=judge-model
+  → approval: judge-model, main: main-model
+```
+
+**文档是对的，`approval_judge._judge_model` 的 docstring 也是对的**
+（`HARNESS_MODEL_APPROVAL > roles.approval > HARNESS_JUDGE_MODEL > main`）。
+
+顺带发现一个真的文档不全：`ROLES` 有 5 个（`main` / `summary` / `memory` /
+`title` / `approval`），而表格只列了 `MAIN` 和 `APPROVAL` 两行。通用规则
+`HARNESS_MODEL_<ROLE>` 写在 `docs/LLM_PROVIDERS.md` 里，`ENVIRONMENT.md` 这张
+「参考表」里反而看不出来。**这轮没改文档**——先说清为什么不改（见第四节）。
+
+## 二、工具参数名 vs 中文名表：32 处裸参数，只有 1 处能到用户面前
+
+扫全部 58 个工具：32 个 (工具, 参数) 组合会在 `detail()` 里渲染成 `key：value`。
+但 `detail()` 只服务审批面（`approval.py` 终端提示、飞书卡片、`approval_judge`
+载荷），而绝大多数工具**永远不会被判成 ASK**。
+
+所以不能按「有裸参数」报缺陷——要按「会不会真的出卡」筛。造参数把每个敏感工具
+推到 ASK 再渲染：
+
+| 工具 | 决策 | 裸参数 |
+| --- | --- | --- |
+| `write` / `delete_paths` / `undo_moves` / `remember` / `forget` | ask | 无 |
+| `screen_*` / `clipboard_*` / `desktop_*` | ask | 无 |
+| **`web_fetch`** | ask | **`max_chars`** |
+| `bash` / `move_paths`（这组参数下） | allow | — |
+
+于是唯一的缺陷是这一行：
+
+```
+网址：https://example.com，max_chars：5000      →      网址：…，最多字符：5000
+```
+
+补一条 `_ARG_LABELS['max_chars'] = '最多字符'`。
+
+## 三、守卫按「审批可达」这个集合写
+
+`test_approval_detail_has_no_bare_parameter_names` 遍历一份 19 个工具的清单
+（`_APPROVAL_REACHABLE`，注释说明它是什么：策略会判成 ASK 的那些），用 schema 里
+**全部参数名**造 args 调 `detail()`，出现 `name：` / `name=` 就红。
+
+这条比「扫全部 58 个工具」有用：全扫会给出 32 个永远到不了用户的假阳性，
+人会学会忽略它。清单会随新工具腐化，所以注释里写清了它为什么是这个范围。
+
+## 四、刻意不改文档的两个理由
+
+1. **这张表的差集是 0**（除了我的正则漏洞）。文档目前由人同步得很好，加一条
+   「文档必须提到所有 ROLES」的测试属于给一个没出过问题的地方加守卫——这轮
+   已经连续三次在"看着该补"的地方确认"其实不用"。
+2. 真要改，正确做法是把两行合成一行通用规则 + 列 5 个角色，那是一次**面向读者的
+   重排**（表格怎么读、`MAIN` 的回退链要不要单独留），不是顺手补一行能了的事。
+   留给一次专门的文档整理。
+
+全量 3514 passed / 3 skipped。

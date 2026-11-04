@@ -48,3 +48,33 @@ def test_progress_line_reads_naturally():
         {'phase': 'tool', 'tool': 'kill_background', 'elapsed': 1.0})
     assert 'kill_background' not in line, line
     assert '正在' in line and '停止后台任务' in line, line
+
+
+#: 这些工具是**可能进审批面**的（策略会把它们判成 ASK）。审批卡正文由
+#: `approval_view.detail()` 渲染，每个参数都要有中文名，否则出现 `max_chars：5000`。
+#: 新加审批可达的工具、或给这些工具加参数时，这条会红——别改成放宽，补里子。
+_APPROVAL_REACHABLE = (
+    'write', 'edit', 'apply_patch', 'web_fetch', 'delete_paths', 'move_paths',
+    'undo_moves', 'remember', 'forget', 'screen_capture', 'screen_ocr',
+    'clipboard_read', 'clipboard_write', 'desktop_snapshot', 'desktop_inspect',
+    'desktop_wait', 'desktop_displays', 'desktop_windows', 'desktop_action',
+)
+
+
+def test_approval_detail_has_no_bare_parameter_names():
+    """审批卡上不能出现 `key：value`——那是把参数名直接亮给用户。"""
+    import approval_view
+
+    props = {item['function']['name']:
+             list(((item['function'].get('parameters') or {}).get('properties') or {}))
+             for item in tool_schemas.TOOL_SCHEMAS}
+
+    offenders = {}
+    for tool in _APPROVAL_REACHABLE:
+        args = {name: 'x' for name in props.get(tool, [])}
+        text = approval_view.detail(tool, args)
+        bare = [name for name in args
+                if f'{name}：' in text or f'{name}=' in text]
+        if bare:
+            offenders[tool] = bare
+    assert not offenders, f'审批卡上会露出英文参数名：{offenders}'

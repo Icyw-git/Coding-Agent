@@ -248,6 +248,7 @@ def tool_label(tool: str) -> str:
 #: 直接打 `url=https://…` 对用户等于没写，所以能翻的先翻。
 _ARG_LABELS = {
     'url': '网址', 'path': '路径', 'command': '命令', 'cwd': '工作目录',
+    'max_chars': '最多字符',
     'text': '内容', 'content': '内容', 'query': '查询', 'pattern': '模式',
     'subject': '主题', 'description': '描述', 'title': '标题', 'name': '名称',
     'prompt': '指令', 'schedule': '时间表', 'when': '时间', 'type': '类型',
