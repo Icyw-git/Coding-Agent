@@ -15198,3 +15198,68 @@ LLM_MODEL_ID=main-model HARNESS_MODEL_APPROVAL=judge-model
    留给一次专门的文档整理。
 
 全量 3514 passed / 3 skipped。
+
+---
+
+# 第 113 部分：同一个审批请求，终端说英文、飞书说中文
+
+## 一、这轮先排掉两个扫描器假阳性
+
+按上轮定的纪律：**单边孤项先怀疑扫描器**。
+
+| 看起来像缺陷 | 实际 |
+| --- | --- |
+| `screen_captured` 有读取方（`turn_screenshots`）但扫描说没写入方 | 写入方是 `tools._screen_audit('screen_captured', …)`，不是 `.append(...)` 形状。真实会话里有这条事件，链路通 |
+| 事件「读而没有写」的另外 6 个（`text` / `image_url` / `correction` / `quality` / `recall` / `harness_image`） | 全是非事件的 dict（消息分片的 `type == 'text'`、记忆记录的 `type == 'correction'`）。正则把 `type` 当成事件类型了 |
+
+所以这轮没在这条线上写任何代码。
+
+## 二、真问题：两处渲染，两个结论
+
+同一个 `PermissionRequest`，两个展示位：
+
+```
+飞书 feishu_approval_card   reason_zh(code, reason) + tool_label(tool)
+终端 approval._decide_console   req.reason + req.tool
+```
+
+而 `req.reason` 是**写给模型的英文**，`req.tool` 是原始标识符。实测同一请求：
+
+```
+终端  [approval] desktop_action inspects or controls the local foreground desktop;
+                  each operation requires explicit approval
+        操作: desktop_action
+
+飞书  要操作本机键鼠
+        操作键鼠 (desktop_action)
+```
+
+`PermissionRequest.code` 的字段注释本来就写着：「策略决策码：审批面按它给中文解释
+（reason 是英文）」——**字段是为这件事加的，终端这条路没用它**。
+
+这是 `0bd637d`（「并排对照终端与飞书，修两处同一功能两个结论」）漏掉的第三处：
+那次并排比的是 `/audit` 与 `/approvals`，没比**审批提示本身**。
+
+## 三、改三行
+
+```
+[approval] 要操作本机键鼠
+   操作: 操作键鼠 (desktop_action)
+     桌面操作：点击，坐标 (10,20)，左键单击
+提示语: 允许吗？（y=允许 / n=拒绝）
+```
+
+- 理由走 `reason_zh(req.code, req.reason)`——没有中文解释时仍退回英文原文（宁可显示
+  英文也不丢信息，这条是 `reason_zh` 自己的 docstring 立的规矩，测试里守着）；
+- 工具名走 `tool_label()`，和卡片同一个函数；
+- `Allow?` → `允许吗？`：原来那句是英文词接中文选项。
+
+## 四、写测试时踩的一个坑
+
+第一版测试断言 `y=`/`n=` 出现在 stdout 捕获里——红的。因为 `input()` 的提示语**不经过
+stdout**，而我把 `builtins.input` 换成了假函数，提示语根本不会渲染。
+
+改成直接记录 `input` 被调用时收到的参数。这是「测的东西和实际渲染路径不一致」的又一次
+实例：断言看着合理，测的却是另一个对象。
+
+全量 3518 passed / 3 skipped。

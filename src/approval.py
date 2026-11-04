@@ -416,15 +416,19 @@ class PermissionGate:
         没有「同类」可以记：卡片隐藏这个按钮，CLI 也不能摆一个不起作用的选项，
         否则用户以为自己买了整会话免审，其实只放了这一次。
         """
-        print(f"\n\033[33m[approval] {approval_view.safe_text(req.reason)}\033[0m")
-        print(f'   操作: {req.tool}')
+        print(f"\n\033[33m[approval] "
+              f"{approval_view.safe_text(approval_view.reason_zh(req.code, req.reason))}"
+              f"\033[0m")
+        # 卡片用 tool_label（中文名 + 原名方便对照日志），终端也用同一套：
+        # 同一个请求在两个展示位上不能一个说「操作键鼠」一个说 `desktop_action`。
+        print(f'   操作: {approval_view.tool_label(req.tool)}')
         for line in approval_view.detail(req.tool, req.args).splitlines():
             print(f'     {line}')
         klass = approval_class(req.tool, req.args)
         try:
-            choice = input('Allow? (y=仅这一次 / n=拒绝 / a=本会话允许同类 / '
-                           't=允许特 N 次) ' if klass
-                           else 'Allow? (y=允许 / n=拒绝) ').strip().lower()
+            choice = input('允许吗？（y=仅这一次 / n=拒绝 / a=本会话允许同类 / '
+                           't=允许特 N 次） ' if klass
+                           else '允许吗？（y=允许 / n=拒绝） ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             # stdin 不可用（后台运行 / 管道 / EOF）：默认拒绝，但要说清为什么
             print('  \033[31m[permission] 读不到终端输入（后台运行或输入已关闭），按拒绝处理\033[0m')
