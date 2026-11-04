@@ -58,6 +58,7 @@ import llm_route
 import notify
 import paths
 import screen_capture
+import task_status
 import tool_cache
 import turn_screenshots
 from exec_policy import CLIPBOARD_ENV, SCREEN_ENV, approval_class, clipboard_tools_enabled, screen_tools_enabled
@@ -118,9 +119,18 @@ LOCAL_ALERT_BODY = 400
 
 
 def permission_result(record: dict) -> str:
+    """审批决议回执。工具名与原因都走审批面同一套渲染。
+
+    `record` 里的 `tool` 是原始标识符、`reason` 是写给模型的英文，`code` 才是
+    给中文解释用的策略码（`PermissionRequest.code` 的注释就是这么写的）。
+    """
+    import approval_view
+
     status = {'approved': '已允许', 'denied': '已拒绝', 'timeout': '审批超时'}.get(
         record['status'], '审批已处理')
-    return f"{status} · {record.get('tool', '操作')}\n原因: {record.get('reason', '')}"
+    tool = approval_view.tool_label(str(record.get('tool') or '')) or '操作'
+    reason = approval_view.reason_zh(record.get('code'), record.get('reason') or '')
+    return f'{status} · {tool}' + (f'\n原因: {reason}' if reason else '')
 
 
 def format_permission_prompt(req: dict, index: int | None = None) -> str:
@@ -1588,7 +1598,10 @@ class FeishuGateway:
                 return
             if action == 'stop':
                 task = self.api.stop_task(task_id)
-                self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
+                # 与任务列表同一套中文名：列表写「已完成」、这一句写 succeeded
+                # 是同一个页面上的两种说法。
+                self._reply(chat_id, f"任务 {task['id']} → "
+                                     f"{task_status.zh(task['status'])}")
                 self._show_tasks(chat_id, message_id=message_id)
                 return
         except Exception as exc:
@@ -2468,7 +2481,9 @@ class FeishuGateway:
                 self._show_logs(chat_id, task, lines=lines)
             elif command == '/stop':
                 task = self.api.stop_task(argument)
-                self._reply(chat_id, f"任务 {task['id']} → {task['status']}")
+                # 与卡片按钮、任务列表用同一套中文名（三处同一句，别再各写一份）
+                self._reply(chat_id, f"任务 {task['id']} → "
+                                     f"{task_status.zh(task['status'])}")
             elif command in ('/perms', '/approvals'):
                 pending = [req for req in self.api.pending_permissions()
                            if self._request_belongs_to(chat_id, req)]

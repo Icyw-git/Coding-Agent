@@ -15263,3 +15263,73 @@ stdout**，而我把 `builtins.input` 换成了假函数，提示语根本不会
 实例：断言看着合理，测的却是另一个对象。
 
 全量 3518 passed / 3 skipped。
+
+---
+
+# 第 114 部分：审批面一共五个展示位，修到第四个才发现是同一处漏
+
+## 一、先记并排比过、确认没问题的
+
+造了三条假审批（`desktop_control` / `outside_workspace_write` / `network_egress`），
+把终端 `/approvals` 与飞书 `approval_text` 并排渲染：
+
+```
+终端   1. 操作键鼠 (desktop_action) · 要操作本机键鼠
+           桌面操作：点击，坐标 (10,20)，左键单击
+
+飞书   #1 · 操作键鼠 (desktop_action)
+       原因: 要操作本机键鼠
+       桌面操作：点击，坐标 (10,20)，左键单击
+```
+
+内容与语言都一致——`status_report.format_pending_approvals` 早就在做
+`tool_label` + `reason_zh` + `detail`，代码里还留着当时那句注释（"这两处原来只有飞书
+做了，终端还显示 `move_paths · moves or renames files`"）。
+
+飞书的 `/status` 是任务列表（CLI 的 `/status` 是会话状态）——这个差异**不是缺陷**，
+飞书自己的帮助里写着 `/status [任务id] 查看任务状态`，是渠道特有的命令集。
+
+## 二、真问题：审批面有五个展示位，只有一部分用同一套渲染
+
+| 展示位 | 工具名 | 原因 | 状态 |
+| --- | --- | --- | --- |
+| 飞书审批卡 | `tool_label` | `reason_zh` | 对 |
+| 终端 `/approvals` | `tool_label` | `reason_zh` | 对 |
+| `approval._decide_console`（CLI 提示） | **原始名** | **英文原文** | 第 113 部分已修 |
+| `feishu_gateway.permission_result`（决议回执） | **原始名** | **英文原文** | **这轮修** |
+| 任务卡「停止」按钮的回执 | — | — | 第 113 部分已修 |
+
+`permission_result` 是审批决议之后发的那句，实测：
+
+```
+已允许 · desktop_action
+原因: desktop_action inspects or controls the local foreground desktop; each
+     operation requires explicit approval
+```
+
+改完：
+
+```
+已允许 · 操作键鼠 (desktop_action)
+原因: 要操作本机键鼠
+```
+
+顺手改掉一个小的：原来无条件拼 `\n原因: {reason}`，没有原因时留一行空的「原因: 」。
+现在没有就不写。
+
+## 三、同一个字符串写了两遍
+
+`任务 {id} → {status}` 在 `/stop` **消息命令**和**卡片按钮**两条路上各写一份，
+我第 113 部分只修了按钮那条。这轮两条都改成 `task_status.zh(...)`。
+
+这已经是这套代码里反复出现的样子：**同一个用户可见字符串写在两三个入口里**，
+改一处漏两处。真正的解法是把这些入口的渲染收成一处（像 `approval_view` 做的那样），
+但那要动路由层；这次只把两处改齐，并在注释里标出「三处同一句，别再各写一份」。
+
+## 四、为什么这个问题会漏这么久
+
+因为它不报错、不失败、不影响任何断言。它是**同一个东西在两个地方长得不一样**——
+只有把两个地方并排渲染出来才看得见。`0bd637d` 用这个方法找到 2 处，第 113 部分找到 1 处，
+这轮又 1 处。同一个功能域（审批）里，一共 4 处。
+
+全量 3521 passed / 3 skipped。

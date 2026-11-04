@@ -45,3 +45,49 @@ def test_watch_list_shows_chinese_status():
          'created_at': 100.0, 'ended_at': 160.0}, now=200.0)
     assert 'completed' not in line, line
     assert '完成' in line or '成功' in line, line
+
+
+def test_stop_button_reply_is_chinese(tmp_path, monkeypatch):
+    """点任务卡上的「停止」后回的那一句，也要用同一套中文名。
+
+    卡片列表早就中文了（`tasks_card`），这一句原来直接把
+    `TaskRecord.status` 拼进去——同一个页面上「已完成」和 `succeeded` 并存。
+    """
+    import feishu_gateway
+
+    monkeypatch.setattr(feishu_gateway.FeishuGateway, '_reply',
+                        lambda self, chat_id, text, **kw: replies.append(text))
+    monkeypatch.setattr(feishu_gateway.FeishuGateway, '_show_tasks',
+                        lambda self, chat_id, **kw: None)
+    replies = []
+
+    gw = feishu_gateway.FeishuGateway.__new__(feishu_gateway.FeishuGateway)
+    gw.api = type('Api', (), {
+        'stop_task': lambda self, task_id: {'id': task_id, 'status': 'succeeded'},
+    })()
+    gw._handle_task_action('c1', {'task_action': 'stop', 'task_id': 'bg_1'})
+
+    assert replies == ['任务 bg_1 → 成功'], replies
+
+
+def test_permission_result_uses_the_same_rendering():
+    """审批回执：工具名与原因都走审批面那一套（原来两个都是英文原文）。"""
+    import feishu_gateway
+
+    text = feishu_gateway.permission_result({
+        'status': 'approved', 'tool': 'desktop_action',
+        'reason': 'desktop_action inspects or controls the local foreground '
+                  'desktop; each operation requires explicit approval',
+        'code': 'desktop_control'})
+    assert 'desktop_action inspects' not in text, text
+    assert '操作键鼠' in text and '要操作本机键鼠' in text, text
+
+
+def test_permission_result_drops_an_empty_reason_line():
+    """没有原因时不要留一个空的「原因: 」——那是噪音。"""
+    import feishu_gateway
+
+    text = feishu_gateway.permission_result(
+        {'status': 'timeout', 'tool': 'weird_tool', 'reason': '', 'code': ''})
+    assert '原因' not in text, text
+    assert '审批超时' in text and 'weird_tool' in text, text
