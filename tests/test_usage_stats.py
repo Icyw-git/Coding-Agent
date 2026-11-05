@@ -316,3 +316,32 @@ def test_model_tally_stays_plain_when_every_request_has_one(sessions):
     assert 'm1×2' in model_line
     # 只看这一行：`其中` 在 token 那行（其中缓存 …）也有，对整段断言会误判
     assert '带模型记录' not in model_line, '全都带模型时不该多一句'
+
+
+def test_latency_says_how_many_requests_were_timed(sessions):
+    """耗时只统计带 `request_ms` 的请求，样本不够要说出来。
+
+    实测真实数据：768 次请求里只有 90 次带 `request_ms`（该字段 10-24 才加），
+    而 `/usage` 把 p50/p90 摆在「模型请求 768」旁边，读起来像是全部 768 次的结果。
+    """
+    _session(sessions, events=[
+        ('usage', {'prompt': 10, 'completion': 1, 'total': 11}),          # 老事件，无计时
+        ('usage', {'prompt': 10, 'completion': 1, 'total': 11}),          # 老事件，无计时
+        ('usage', {**_usage(), 'request_ms': 1200.0}),                    # 有计时
+    ])
+
+    stats = usage_stats.collect(sessions, days=7)
+    text = usage_stats.format_report(stats)
+
+    assert stats['requests'] == 3
+    latency = next(line for line in text.splitlines() if '请求耗时' in line)
+    assert 'p50' in latency
+    assert '3' in latency and '1' in latency, f'要说明几次请求带计时：{latency}'
+
+
+def test_latency_stays_plain_when_every_request_was_timed(sessions):
+    _session(sessions, events=[('usage', {**_usage(), 'request_ms': 900.0}),
+                               ('usage', {**_usage(), 'request_ms': 1100.0})])
+    text = usage_stats.format_report(usage_stats.collect(sessions, days=7))
+    latency = next(line for line in text.splitlines() if '请求耗时' in line)
+    assert '带计时' not in latency, latency

@@ -14,10 +14,13 @@ token、工具调用、耗时、审批、记忆写入**都已经落在会话事�
 | 维度 | 事件 | 字段 |
 |---|---|---|
 | token | `usage` | prompt / completion / cached / total |
-| 请求耗时 | `usage` 与 `model_request_completed` | request_ms / ttfb_ms |
+| 请求耗时 | `usage` | request_ms / ttfb_ms（**早期事件没有这两个字段**，所以分位数只覆盖一部分请求） |
 | 工具 | `tool_profile` | tools[].name, duration_ms, status |
-| 回合 | `turn_started` / `turn_completed` | ts |
+| 用户消息 | `message` | role=user |
 | 审批与记忆 | 审计事件（同一事件流） | approval_auto、policy_denied、memory_* |
+
+**没聚合的**：`model_request_completed`（只有供应商不返回 usage 时才写，是回退回包）、
+`turn_started` / `turn_completed`。表格以前把前两个列成来源，实际没有任何一行读它们。
 
 设计约束
 --------
@@ -187,6 +190,9 @@ def collect(sessions_dir, *, days: int = DEFAULT_DAYS,
         'cache_hit_rate': _pct(tokens['cached'], tokens['prompt']),
         'request_ms_p50': _quantile(request_ms, 0.5),
         'request_ms_p90': _quantile(request_ms, 0.9),
+        # 样本数：`request_ms` 是后加的字段，老事件没有。分位数只覆盖一部分请求，
+        # 展示时要能看出覆盖了多少次。
+        'request_ms_samples': len(request_ms),
         'tools': dict(sorted(tools.items(), key=lambda kv: -kv[1]['calls'])),
         'tool_batches': tool_batches,
         'approvals': approvals,
@@ -223,8 +229,13 @@ def format_report(stats: dict, *, top_tools: int = 8) -> str:
             lines.append(f"  缓存命中率：{hit:.0%}（缓存 / 输入）")
 
     if stats.get('request_ms_p50') is not None:
-        lines.append(f"  请求耗时：p50 {stats['request_ms_p50']:.0f}ms · "
-                     f"p90 {stats['request_ms_p90']:.0f}ms")
+        latency = (f"  请求耗时：p50 {stats['request_ms_p50']:.0f}ms · "
+                   f"p90 {stats['request_ms_p90']:.0f}ms")
+        samples = int(stats.get('request_ms_samples') or 0)
+        requests = int(stats.get('requests') or 0)
+        if 0 < samples < requests:
+            latency += f'（{requests} 次请求里 {samples} 次带计时）'
+        lines.append(latency)
 
     if stats.get('models'):
         top = '、'.join(f'{name}×{count}'
