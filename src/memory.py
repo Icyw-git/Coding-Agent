@@ -350,7 +350,9 @@ def _rebuild_index_unlocked():
         meta, body, _raw = entry
         name = meta.get('name', f.name)
         desc = meta.get('description', (body.splitlines() or [''])[0][:80])
-        lines.append(f'- [{name}({f.name}) - {desc}]')  # 索引结构：[名称](文件名) - 描述
+        # 索引结构：[名称](文件名) - 描述。`]` 必须紧跟名称之后，否则整行不是
+        # markdown 链接，只是一对包住「名称(文件名) - 描述」的方括号。
+        lines.append(f'- [{name}]({f.name}) - {desc}')
     h.MEMORY_INDEX.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(h.MEMORY_INDEX, '\n'.join(lines) + '\n' if lines else '')
 

@@ -68,6 +68,12 @@ def test_queue_picker_restores_selected_message_only():
             await pilot.pause()
             await pilot.press('down')
             await pilot.press('down')              # steer one -> next two
+            # 等**高亮真的到 2**再断言：原来两个 press 之后直接 assert，
+            # 负载高时第二个按键还没被处理，`highlighted` 停在 1（全线跑时踩到）。
+            for _ in range(50):
+                if app.screen.query_one('#queue-list', OptionList).highlighted == 2:
+                    break
+                await pilot.pause()
             options = app.screen.query_one('#queue-list', OptionList)
             assert options.highlighted == 2
             await pilot.press('enter')

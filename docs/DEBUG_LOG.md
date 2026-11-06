@@ -15470,3 +15470,73 @@ f"description: {_yaml_scalar(one_line(entry.get('description')))}"
 同一类问题第 7 次了，结论不变：**凡是源码里要出现转义序列，用 `edit` 工具。**
 
 全量 3531 passed / 3 skipped。
+
+---
+
+# 第 117 部分：记忆索引的方括号位置错了；顺带修一条竞态测试
+
+## 一、索引格式：`']'` 在整行末尾
+
+`_rebuild_index_unlocked` 的注释写着「索引结构：[名称](文件名) - 描述」，实际拼的是：
+
+```python
+f'- [{name}({f.name}) - {desc}]'
+```
+
+于是生成 `[名称(文件名) - 描述]`——**不是 markdown 链接**（`[` 后面没有紧跟 `](`），
+描述还被包进了方括号里。打开 `~/.cache/memories/MEMORY.md` 就是一堆形状奇怪的括号。
+
+改成 `f'- [{name}]({f.name}) - {desc}'`：
+
+```
+- [prefer-tea](prefer-tea.md) - 下午更想喝奶茶
+```
+
+## 二、顺带确认：这份索引**没有任何读取方**
+
+查了一遍消费方：
+
+| 谁 | 走哪条路 |
+| --- | --- |
+| 召回打分（`local_relevant_memories`） | `list_memory_files()`，解析后的结构 |
+| `/memories` 命令 | 同上 |
+| system prompt | `prompt_assembly` 明确注释「记忆不再进 system prompt」（为前缀缓存） |
+| `read_memory_index()` | **只有再导出，零调用方** |
+
+所以 MEMORY.md 是**纯粹给人看的**产物——那就更该长得对。它的重建在每次写入/删除/老化
+时都会跑（重新解析全部条目 + 原子写），这点成本我**没动**：它是个约定俗成的文件名
+（`~/.codex/memories/MEMORY.md`），删不删是产品决定，不该我顺手决定。
+
+## 三、全量跑时抓到一条竞态测试
+
+`test_queue_picker_restores_selected_message_only` 在全量跑时红了一次：
+
+```
+assert options.highlighted == 2
+E   AssertionError: assert 1 == 2
+```
+
+单跑通过。看代码就明白了：
+
+```python
+await pilot.press('down')
+await pilot.press('down')        # steer one -> next two
+options = ...
+assert options.highlighted == 2   # ← 两个 press 之后直接断言
+```
+
+**第二次按键还没被处理就断言了。** 这正是我写进 `coding-standards.md` 的
+「等待条件要等最后写入的那个键」第 6 次实例。
+
+改成等高亮真的到位：
+
+```python
+for _ in range(50):
+    if app.screen.query_one('#queue-list', OptionList).highlighted == 2:
+        break
+    await pilot.pause()
+```
+
+然后连跑 5 次全绿。这条测试以前一直是"运气好"，是我改动它的邻居代码才把它撞出来。
+
+全量 3532 passed / 3 skipped。
