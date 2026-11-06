@@ -15399,3 +15399,74 @@ usage 事件 768｜带 request_ms 90｜缺 678
 「这个数覆盖了全部吗」**。同一张表里的字段往往是同一批埋点，一起加、一起缺。
 
 全量 3523 passed / 3 skipped。
+
+---
+
+# 第 116 部分：描述以 `- ` 开头，整条记忆的 frontmatter 就没了
+
+## 一、从真实数据找出来的
+
+`.cache/memories` 有 21 个文件，解析出 20 条，其中一条 `description` 是空串、`type`
+回落成 `fact`。但**磁盘上的文件是对的**：
+
+```
+description: Pending resume revisions: timeline, benchmark attribution, 878× baseline, ...
+type: feedback
+```
+
+`read_memory_file()` 原样返回这行——所以读文件的那条路没问题，是**解析**那条路把它读丢了。
+
+`memory_schema._yaml_scalar` 的 docstring 正好记着同一类事故：描述里带 `: ` 会让
+YAML 报 "mapping values are not allowed here"，**整个 frontmatter 变成空映射**。
+当时只堵了 `: `，其它 YAML 指示符没管。
+
+## 二、系统性测一遍，找出全部空洞
+
+把各种 YAML 特殊写法塞进 `description:` 再读回来看：
+
+| 输入 | 结果 |
+| --- | --- |
+| `- 像列表` / `-` | **整段 frontmatter 变空**（type 丢、description 空） |
+| `[a]` / `{a}` | description 变成 `['a']` / `{'a': None}` |
+| `? 键` / `,逗号` | 整段变空 |
+| `-x` / `x]` / `?x` / `x,` | 正常（不能一律 `startswith('-')`，那会让 diff 变脏） |
+
+`- ` 这种开头完全可能：模型把"待办/要点"写成描述就是 `- 第一条`。这不是理论风险，
+真实那条记录已经中招。
+
+## 三、改法：只补真正会坏的形状
+
+```python
+or text.startswith(('[', '{', ','))
+or text.startswith('? ') or text.startswith('- ')
+or text == '-'
+```
+
+`test_memory_yaml_scalar` 用 6 个坏形状做往返，另用 6 个正常值断言「不该无谓加引号」
+（`-x` / `x]` / `?x` / `x,` / `normal text` / `2026-01-01`）。
+
+## 四、我自己写的两处过度防御，被测试逼着删掉
+
+第一版我还加了「含 `\n`/`\t` 就加引号」并在双引号里把控制字符转义成 `\n`。测试红了，
+查下去发现：
+
+```python
+def one_line(value):
+    return ' '.join(str(value or '').split())
+...
+f"description: {_yaml_scalar(one_line(entry.get('description')))}"
+```
+
+`render_frontmatter` 对**所有**标量字段先做 `one_line()`，控制字符根本到不了
+`_yaml_scalar`。所以那段转义是**不可达代码**，删掉。测试里改成守住既有约定
+（`test_description_is_single_lined`：换行折成空格），而不是要求保留换行。
+
+这是这轮第二次「先加防御、被证据推翻、再删掉」。有用的沉淀：**`_yaml_scalar` 的输入
+永远已经单行化**——这个前提不写在函数里，是我读调用方才确认的。
+
+## 五、又一次 heredoc（第 7 次）
+
+在注释里写 `'\n'` / `'\t'` 时被折叠成真字符，`ast.parse` 直接 SyntaxError。
+同一类问题第 7 次了，结论不变：**凡是源码里要出现转义序列，用 `edit` 工具。**
+
+全量 3531 passed / 3 skipped。

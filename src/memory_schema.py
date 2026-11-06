@@ -74,12 +74,22 @@ def _yaml_scalar(value: str) -> str:
     needs_quote = (
         ': ' in text or text.endswith(':') or ' #' in text
         or text.startswith(('#', '&', '*', '!', '|', '>', '%', '@', '`', '"', "'"))
+        # 下面这几种是实测会把 frontmatter 写坏的（不只是变丑）：
+        #   '- x' / '-'   YAML 读成序列项 → 整段 frontmatter 变成空映射
+        #   '[x]' / '{x}' 读成 flow 序列/映射 → description 变成 list/dict
+        #   '? x' / ',x'  复杂键、流指示符 → 整段丢失
+        # 注意别用 startswith('-')：'-x' 是合法标量，加引号只会让 diff 变脏。
+        or text.startswith(('[', '{', ','))
+        or text.startswith('? ') or text.startswith('- ')
+        or text == '-'
         or text != text.strip()
         or text.casefold() in ('true', 'false', 'yes', 'no', 'null', '~')
         or text == ''
     )
     if not needs_quote:
         return text
+    # 双引号标量里不处理换行——`render_frontmatter` 对所有标量字段先做了
+    # `one_line()`，控制字符到不了这里。
     escaped = text.replace('\\', '\\\\').replace('"', '\\"')
     return f'"{escaped}"'
 
