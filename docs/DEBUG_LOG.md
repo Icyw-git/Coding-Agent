@@ -15540,3 +15540,58 @@ for _ in range(50):
 然后连跑 5 次全绿。这条测试以前一直是"运气好"，是我改动它的邻居代码才把它撞出来。
 
 全量 3532 passed / 3 skipped。
+
+---
+
+# 第 118 部分：两个真开关，只有读源码的人知道
+
+## 一、先确认提示词是干净的
+
+查了系统提示词里提到的所有标识符：
+
+- **工具名**：15 个，全部真实存在（`apply_patch` / `background_output` / `kill_background` /
+  `schedule_cron` …）；
+- **斜杠命令**：唯一命中 `/untrusted` 是我正则的假阳性——它匹配到了
+  `</untrusted>` 结束标签。
+
+没有"提示词让模型去调一个不存在的工具"这类问题。
+
+## 二、`feishu.env.example` 少了两个
+
+拿「代码读取的飞书变量」对「示例文件里列的」：
+
+```
+代码读 15｜示例列 10｜缺 5
+```
+
+其中 3 个（`FEISHU_ALLOW_MULTI` / `FEISHU_MAX_ATTACHMENT_MB` / `FEISHU_USE_PROXY`）
+在 `FEISHU_SETUP.md` 里有说明，只是没进复制模板；剩下 2 个**任何文档都没有**：
+
+| 变量 | 作用 |
+| --- | --- |
+| `FEISHU_BINDINGS` | 绑定关系（飞书会话 → harness 会话）存哪，默认 `.cache/feishu_bindings.json` |
+| `FEISHU_STREAM_TRACE` | 设 1 时每回合打一行时间戳，区分「模型慢 / SSE 慢 / 卡片 PATCH 慢」 |
+
+两个都在代码注释里写得很清楚，**只活在代码里**。已补进 `feishu.env.example`（注释形式，
+和文件里其它可选开关一致）。
+
+## 三、上一轮"88/88 补齐"为什么漏了它们
+
+上一轮的核对只覆盖 `HARNESS_*` 前缀。而 `FEISHU_*` 是另一套，从来没被扫过。
+
+所以这次把守卫写成**不按前缀**的：AST 提取所有真实读取点（`os.getenv` / `os.environ[...]`
+/ `XXX_ENV = '名字'` 三种形状），逐个检查是否在任何文档里出现。排除 Windows 自带的
+（`COMSPEC` / `PROGRAMFILES*`）——那不是我们的配置面。
+
+现在扫出 75 个真实环境变量，5 个未文档化里 3 个是系统变量，2 个是上面补的。
+
+守卫验证过会红会绿：把 `feishu.env.example` 里那两个名字临时改名，测试立刻报
+`FEISHU_BINDINGS, FEISHU_STREAM_TRACE`。
+
+## 四、教训
+
+「补齐了 N/N」这句话的**分母是怎么算出来的**，比 N 本身重要。上一轮的分母是
+`HARNESS_*`，于是它永远到不了 88/88 之外的任何东西；看上去"全部覆盖"，实际是
+"一个前缀全部覆盖"。
+
+全量 3533 passed / 3 skipped。
