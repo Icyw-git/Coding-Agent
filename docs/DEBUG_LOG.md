@@ -15744,3 +15744,76 @@ OS 沙箱、可选依赖、缓存、屏幕/剪贴板开关、目录授权、存�
 `import` 它。
 
 全量 3542 passed / 3 skipped。
+
+---
+
+# 第 121 部分：还有两个"只能在仓库根跑"的脚本
+
+接第 120 部分：凡是文档里出现的命令都该用子进程验。逐条扫 `README.md` / `docs/*.md`
+里的 `python xxx.py`，然后实际跑。
+
+## 一、假警报一个
+
+`python checkpoints_cli.py list` 看着是个不存在的入口。查上下文：
+
+```
+docs/CHECKPOINT_DESIGN.md:382  替代方案（独立入口 `python checkpoints_cli.py list|rewind <cp_id>`）**没有采用**
+```
+
+那是在描述**没有采用**的方案，不是让人跑的命令。跳过。
+
+## 二、真问题：`scripts/accept_tool_discovery.py` 换个目录就崩
+
+```python
+sys.path.insert(0, 'src')     # ← 相对路径
+sys.path.insert(0, '.')       # ← 相对路径
+```
+
+只在 cwd 恰好是仓库根时成立。从 `/tmp` 跑：
+
+```
+ModuleNotFoundError: No module named 'harness'
+```
+
+改成相对 `__file__`（和 `bench_ui.py`、`harness.py`、`api.py` 同一个写法）。修完
+`/tmp` 下也能跑，正常输出「工具发现当前关闭」的提示。
+
+## 三、三个基准脚本的 `--help` 是 traceback
+
+```
+$ python scripts/bench_history.py --help
+ValueError: invalid literal for int() with base 10: '--help'
+```
+
+`bench_history` / `bench_layout` / `bench_ui` 都是 `int(sys.argv[1])` 裸解析。
+而这类脚本的第一次运行往往就是 `--help`。三个都换成 `argparse`（和
+`browser_setup.py` / `feishu_acceptance.py` 一致），位置参数保持可选、默认值不变。
+
+## 四、范围是量出来的，不是猜的
+
+11 个脚本没有 argparse。全加是 churn，所以按**实测后果**筛：
+
+| 脚本 | `--help` 的实际行为 | 处理 |
+| --- | --- | --- |
+| `accept_tool_discovery` | **ModuleNotFoundError**（路径错） | 修 |
+| `bench_history` / `bench_layout` / `bench_ui` | **ValueError traceback** | 修（加 argparse） |
+| `bench_stream` / `bench_stream_codeblocks` / `profile_desktop` | 直接开始跑（慢，但不崩） | 不动 |
+| `ab_startup` | `CalledProcessError`（跑了真子进程） | 不动（要改得先想清楚它的参数语义） |
+| `profile_memory` | 无输出（等着？） | 不动 |
+
+后三个"直接开始跑"的，`--help` 会白跑几分钟——但那不是错误路径，加 argparse 是
+体验改进而非修 bug。记下来，不顺手做。
+
+## 五、守卫
+
+`test_scripts_portable.py` 两条：
+
+1. **静态**：`scripts/*.py` 里不许有 `sys.path.insert(<相对字面量>)`。验证过会红——
+   把 `bench_ui.py` 的写法临时改回 `'src'`，测试立刻指出 `bench_ui.py:13 'src'`；
+2. **子进程**：三个基准脚本在临时 cwd + 清空 `PYTHONPATH` 下跑 `--help`，要求
+   `returncode == 0` 且输出里有 `usage:`。
+
+第 1 条比第 2 条重要：它拦的是**这一类**（任何人新写脚本时顺手打字面量 `'src'`），
+而第 2 条只覆盖已知的三个。
+
+全量 3544 passed / 3 skipped。

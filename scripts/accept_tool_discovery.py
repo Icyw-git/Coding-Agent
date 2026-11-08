@@ -11,10 +11,14 @@
 import os
 import sys
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, 'src')
-sys.path.insert(0, '.')
+# 必须相对 `__file__`：用相对路径 `'src'` / `'.'` 只在 cwd 恰好是仓库根时成立，
+# 换个目录跑就 ModuleNotFoundError（entrypoint.py 踩过同一个坑）。
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / 'src'))
+sys.path.insert(0, str(_ROOT))
 
 os.environ.setdefault('HARNESS_HOME', tempfile.mkdtemp(prefix='acceptance-'))
 

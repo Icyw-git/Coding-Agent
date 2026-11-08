@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import sys
 import time
@@ -59,8 +60,11 @@ def run(blocks: int, width: int, limit: int | None) -> dict:
 
 
 def main() -> int:
-    blocks = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
-    width = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    parser = argparse.ArgumentParser(description='布局行缓存对比：完整 vs 有界')
+    parser.add_argument('blocks', nargs='?', type=int, default=10_000)
+    parser.add_argument('width', nargs='?', type=int, default=100)
+    args = parser.parse_args()
+    blocks, width = args.blocks, args.width
     rows = []
     for label, limit in (('full', None), ('bounded', 6000)):
         gc.collect()

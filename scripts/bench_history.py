@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import gc
 import sys
@@ -65,7 +66,10 @@ async def main_async(count: int) -> list[dict]:
 
 
 def main() -> int:
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
+    parser = argparse.ArgumentParser(description='历史重建基准：全量 vs 分页')
+    parser.add_argument('count', nargs='?', type=int, default=10_000,
+                        help='消息条数（默认 10000）')
+    count = parser.parse_args().count
     rows = asyncio.run(main_async(count))
     print(f'messages={count}')
     print(f"{'mode':<8} {'blocks':>7} {'lines':>7} {'ready':>9} "

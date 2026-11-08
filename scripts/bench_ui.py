@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -15,9 +16,12 @@ from ui.transcript import ConversationModel, TranscriptLayout  # noqa: E402
 
 
 def main() -> int:
-    blocks = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
-    width = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    frames = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+    parser = argparse.ArgumentParser(description='TUI 性能基准：布局/切片/流式增量')
+    parser.add_argument('blocks', nargs='?', type=int, default=10_000)
+    parser.add_argument('width', nargs='?', type=int, default=100)
+    parser.add_argument('frames', nargs='?', type=int, default=100)
+    args = parser.parse_args()
+    blocks, width, frames = args.blocks, args.width, args.frames
 
     model = ConversationModel()
     for index in range(blocks):
