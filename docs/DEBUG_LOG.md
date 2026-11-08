@@ -15664,3 +15664,83 @@ rm -rf /tmp/zzz  ask  destructive
 怀疑探针**，走真实入口跑通之前不当缺陷报。
 
 全量 3541 passed / 3 skipped。
+
+---
+
+# 第 120 部分：README 让人跑的那条命令，从来没跑通过
+
+## 一、怎么发现的
+
+想跑一下用户真正会用的诊断入口 `--doctor`，于是按 README 的做法：
+
+```
+python entrypoint.py --doctor
+→ ModuleNotFoundError: No module named 'console'
+```
+
+`console.py` 在 `src/` 下，而 `entrypoint.py` **没有**把 `src` 放进 `sys.path`。
+
+## 二、为什么一直没人发现
+
+三个入口模块里只有它漏了：
+
+| 文件 | 文件头有没有插 `src` |
+| --- | --- |
+| `harness.py:46` | 有 |
+| `api.py:6` | 有 |
+| **`entrypoint.py`** | **没有** |
+
+而 **pytest 把这件事盖住了**：`pytest.ini` 里 `pythonpath = . src tests`，
+于是 `import entrypoint` 在测试里永远成功，`tests/test_entrypoint.py` 也一直是绿的。
+
+这就是「测试环境与真实环境差一个隐式前提」的典型：pytest 替你把路径配好了，
+真实命令行没人配。
+
+## 三、README 的两句承诺都被打破
+
+```
+第 843 行   python entrypoint.py
+第 619 行   在任意目录运行 `python <repo>/entrypoint.py`，看到的都是同一批会话
+```
+
+实测两种方式都立刻失败：
+
+```
+$ cd /d/harness-agent && python entrypoint.py --doctor
+ModuleNotFoundError: No module named 'console'
+$ cd /tmp && python /d/harness-agent/entrypoint.py --doctor
+ModuleNotFoundError: No module named 'console'
+```
+
+## 四、修法与守卫
+
+按 `api.py` 的现成写法补三行，位置在 `import console` 之前（`console.harden_stdio()`
+在导入期就跑）：
+
+```python
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
+```
+
+守卫用**子进程**跑，而不是 `import`：
+
+```python
+subprocess.run([sys.executable, str(ROOT / 'entrypoint.py'), '--help'],
+               cwd=tmp_path, env={k: v for k, v in os.environ.items()
+                                  if k != 'PYTHONPATH'})
+```
+
+三个细节都是必要的：子进程（绕开 pytest 的 `pythonpath`）、临时 cwd（验证 README
+的"任意目录"）、清掉 `PYTHONPATH`（否则 CI 里设过的环境又会盖住它）。
+
+修完 `--doctor` 在任意目录正常输出：模型、密钥、工作区、四类可写目录、档位、
+OS 沙箱、可选依赖、缓存、屏幕/剪贴板开关、目录授权、存储占用。
+
+## 五、教训
+
+**「测试全绿」不能证明「用户跑得起来」。** 这一条比前面几轮的文案问题都重要：
+之前修的是"跑起来之后不好看"，这次是"根本跑不起来"，而且被测试配置挡了 119 轮。
+
+判据很简单：**凡是文档里出现的命令，都应该有一条用子进程跑的测试**，而不是
+`import` 它。
+
+全量 3542 passed / 3 skipped。

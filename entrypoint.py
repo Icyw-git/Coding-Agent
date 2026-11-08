@@ -7,6 +7,11 @@ import sys
 import threading
 from pathlib import Path
 
+# 与 harness.py / api.py 一致：把 src 放进搜索路径。README 让人跑的是
+# `python entrypoint.py`（而且说任意目录都行），不插这一行就只能靠 PYTHONPATH。
+# pytest 的 pythonpath 配置会把这个问题盖掉——测试里永远 import 得到。
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'src'))
+
 import console
 import harness
 import ps_worker
