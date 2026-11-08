@@ -19,6 +19,6 @@ dependencies = [
 mcp = ["mcp>=1.0,<2"]
 dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
 
-[tool.pytest.ini_options]
-testpaths = ["test_*.py"]
-addopts = "-ra"
+# pytest 配置只在 pytest.ini：两份并存时 pytest 会忽略这里的并逐次告警
+# （`WARNING: ignoring pytest config in pyproject.toml!`）。原来这里还写了
+# testpaths = ["test_*.py"]，与 pytest.ini 的 tests 直接矛盾。

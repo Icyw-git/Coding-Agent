@@ -15817,3 +15817,63 @@ ValueError: invalid literal for int() with base 10: '--help'
 而第 2 条只覆盖已知的三个。
 
 全量 3544 passed / 3 skipped。
+
+---
+
+# 第 122 部分：文档写的默认值全对；但 pytest 配置有两份在打架
+
+这轮按「改善要谨慎」的调子，先只核实、不急着改。
+
+## 一、文档里的默认值：8/8 与代码一致
+
+清空所有 `HARNESS_*` / `FEISHU_*` 后读代码的真实默认值：
+
+| 变量 | 文档 | 代码 |
+| --- | --- | --- |
+| `HARNESS_APPROVAL_POLICY` | `on-request` | `on-request` |
+| `HARNESS_SANDBOX_MODE` | `workspace-write` | `workspace-write` |
+| `HARNESS_APPROVAL_SCOPE` | `once` | `once` |
+| `HARNESS_NEVER_DO` | `1` | `True` |
+| `HARNESS_UNTRUSTED_MARK` | `1` | `True` |
+| `HARNESS_TAINT_EGRESS` | `1` | `True` |
+| `HARNESS_REDACT_MEMORY_SECRETS` | `1` | `True` |
+| `HARNESS_MEMORY_CONTRIBUTE` | `1` | `True` |
+
+这几条都是**安全**标记，文档写错会让人以为关掉了实际开着（或反过来）。全部对。
+
+## 二、文档里的入口命令：都通了
+
+- `python entrypoint.py`（上轮修好）
+- `python harness.py` / `--ui ansi`：`__main__` 委托给 `entrypoint.main()`
+- `uvicorn api:create_app --factory`：`create_app()` 缺 `HARNESS_API_TOKEN` 时是**硬失败**
+  （fail-closed，设计如此），给了 token 就正常返回 FastAPI 实例
+- `python src/feishu_gateway.py --check`：正常输出四步引导
+- `--ui` 的三个选项（`ansi` / `textual` / `textual-next`）都有实现，
+  `textual-next` 是文档化的兼容别名（两处都做了分支）
+- `pytest test_ui.py test_mcp_ui_regression.py -q`（`DEVELOPMENT_WORKFLOW.md` 要求合并前跑）：
+  41 passed，1.6 秒
+
+## 三、真问题：pytest 配置有两份，pytest 每次都在警告
+
+```
+configfile: pytest.ini (WARNING: ignoring pytest config in pyproject.toml!)
+```
+
+`pytest.ini` 说 `testpaths = tests`，`pyproject.toml` 说 `testpaths = ["test_*.py"]`
+（**互相矛盾**：一个只看 `tests/`，一个只看根目录）。pytest 的优先级是 `pytest.ini` 赢，
+所以 pyproject 那份是死配置——但每个跑测试的人都会看到那行告警，而读 pyproject 的人会
+以为根目录的测试在收集范围里。
+
+删掉 `pyproject.toml` 里的 `[tool.pytest.ini_options]`，并在原位留一行注释说明为什么
+只能有一份。删完告警消失，收集数不变（3547）。
+
+## 四、刻意没做的
+
+`test_ui.py` / `test_mcp_ui_regression.py` 在仓库根、不在 `testpaths` 里，只有照
+`DEVELOPMENT_WORKFLOW.md` 手动跑才会执行——**存在静默腐化的可能**。
+
+没把它们并进主套件：`pytest.ini` 的 `testpaths = tests` 是有意的（根目录那两个是
+「旧 UI/MCP 回归」，历史包袱，混进主套件会改变默认测试面）。也没加一条「壳里再跑
+pytest」的守卫——嵌套 pytest 既慢又难诊断。这条留给流程，记在这里。
+
+全量 3544 passed / 3 skipped；根级回归 41 passed；`git diff --check` 干净。
