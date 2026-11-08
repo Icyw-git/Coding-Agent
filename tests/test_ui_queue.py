@@ -16,6 +16,26 @@ def _busy(app, messages: list[tuple[str, str]]) -> None:
         app.submit_text(text, mode=mode)
 
 
+async def _press_until_highlight(pilot, app, target: int, *, tries: int = 200):
+    """按一次 down，并等高亮*真的*走到 target 再返回。
+
+    按键与“高亮已变”是两件事：`pilot.press` 返回不等于事件已被处理。全线跑时
+    （前 3500 个用例之后）偶发只走一步——所以每按一次就等一次，失败时能看出
+    停在哪一步，而不是笼统地“highlighted == 1”。
+    """
+    from textual.widgets import OptionList
+
+    await pilot.press('down')
+    for _ in range(tries):
+        if app.screen.query_one('#queue-list', OptionList).highlighted >= target:
+            return
+        await pilot.pause()
+        await asyncio.sleep(0.005)      # pause() 在负载下可能只让出几毫秒
+    raise AssertionError(
+        f'按 down 之后高亮停在 '
+        f'{app.screen.query_one("#queue-list", OptionList).highlighted}，期望 {target}')
+
+
 def test_enter_queues_next_and_alt_enter_steers_immediately():
     async def scenario():
         app = HarnessApp([])
@@ -66,14 +86,9 @@ def test_queue_picker_restores_selected_message_only():
             assert isinstance(app.screen, QueueModal)
             app.screen.query_one('#queue-list', OptionList).focus()
             await pilot.pause()
-            await pilot.press('down')
-            await pilot.press('down')              # steer one -> next two
-            # 等**高亮真的到 2**再断言：原来两个 press 之后直接 assert，
-            # 负载高时第二个按键还没被处理，`highlighted` 停在 1（全线跑时踩到）。
-            for _ in range(50):
-                if app.screen.query_one('#queue-list', OptionList).highlighted == 2:
-                    break
-                await pilot.pause()
+            # 每按一次都等它到位：原来两个 press 之后直接 assert，全线跑时偶发只走一步。
+            await _press_until_highlight(pilot, app, 1)
+            await _press_until_highlight(pilot, app, 2)   # steer one -> next two
             options = app.screen.query_one('#queue-list', OptionList)
             assert options.highlighted == 2
             await pilot.press('enter')

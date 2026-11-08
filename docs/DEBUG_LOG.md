@@ -15877,3 +15877,60 @@ configfile: pytest.ini (WARNING: ignoring pytest config in pyproject.toml!)
 pytest」的守卫——嵌套 pytest 既慢又难诊断。这条留给流程，记在这里。
 
 全量 3544 passed / 3 skipped；根级回归 41 passed；`git diff --check` 干净。
+
+---
+
+# 第 123 部分：归档/恢复没有内容断言；以及那条竞态测试我上次没修对
+
+## 一、归档 → 恢复：搬文件最典型的失败是「少搬一部分」
+
+`SessionArchive.archive()` 会把会话日志、快照目录、子代理日志一起挪进归档目录，
+`restore()` 再挪回来。这是**动真实数据**的操作，而之前只测了删除和几条拒绝路径
+（`test_session_delete.py`），**没有一条断言「恢复之后内容还在」**。
+
+实测往返是通的（临时 HOME：建会话 → 写消息 → 归档 → 恢复 → 读回消息）。补了一条断言
+日志、快照、子代理日志三者都回来的测试。
+
+**验证过它会红**：把 `restore()` 里搬快照目录那段临时改成 `if False and ...`，
+测试立刻失败（`WinError 145 目录不是空的`——因为快照没搬走，原位置被占住）。
+
+## 二、上轮那条「修好」的竞态测试，其实没修对
+
+第 117 部分我给 `test_queue_picker_restores_selected_message_only` 加了个等待循环
+（`for _ in range(50): if highlighted == 2: break; await pilot.pause()`），当时连跑 5 次全绿。
+这轮全量又红了，还是 `assert 1 == 2`。
+
+说明那个循环**没解决根因**：50 次 `pilot.pause()` 在负载下可能只让出几毫秒，第二次
+按键始终没被处理。改成**每按一次就等它到位**：
+
+```python
+await _press_until_highlight(pilot, app, 1)
+await _press_until_highlight(pilot, app, 2)
+```
+
+`_press_until_highlight` 里是 `pause()` + `asyncio.sleep(0.005)` 的有界循环，
+超时就报「按 down 之后高亮停在 N，期望 M」——比笼统的 `1 == 2` 能看出是哪一步丢的。
+
+之后连续两次全量（331s / 333s）都绿。**但我要说清楚：这是两次观测，不是证明。**
+这条测试的失败率大约 1/2（4 次全量里红过 2 次），两次绿还不足以排除偶发。
+
+## 三、排查过程中被否掉的两个假设
+
+1. **`ui_events.bus` 残留事件**：它是模块级单例，conftest 没重置。但读代码发现
+   `emit()` 是**同步分发、没有队列**，所以不存在"残留事件被下一个 app 抽干"。
+2. **前面的 UI 测试拖慢事件循环**：`pytest tests/test_harness_app.py tests/test_ui_queue.py`
+   连跑 88 个用例全绿；再加 4 个 CPU 燃烧进程也全绿。要复现必须跑完整个套件。
+
+所以"为什么只有全量时红"这个问题**我没有答案**。我改的是「不要假设一次 pause 就够」，
+这能让测试更耐受；但如果根因是别的（比如某个模块级状态让第二次按键被吃掉），
+这条测试以后还会偶发。**记在这里，不假装已经修好。**
+
+## 四、顺带查过、没有问题的
+
+| 检查 | 结果 |
+| --- | --- |
+| 会话事件「写了但重放不处理」的 13 个类型 | 除 `todos` 外都是遥测/元数据；`todos` 有 `read_todos()` 从事件流兜底恢复，链路通 |
+| `model_request_failed` / `mcp_call` 无读取方 | 诊断数据留 jsonl 供离线分析，**不加界面**（加了才是过度防御） |
+| `archive` → `restore` 往返 | 通，已补断言 |
+
+全量 3545 passed / 3 skipped（连续两次）。
