@@ -15595,3 +15595,72 @@ for _ in range(50):
 "一个前缀全部覆盖"。
 
 全量 3533 passed / 3 skipped。
+
+---
+
+# 第 119 部分：四个策略路径没有任何测试；其中一条还根本到不了
+
+## 一、判据：每个 `Decision(...)` 的码在不在测试里
+
+扫 `exec_policy` / `hooks` / `rules` 里所有 `Decision(<动作>, '<码>')`，再去 tests 里找
+这个字符串。37 个码，**4 个没人提**：
+
+| 码 | 为什么重要 |
+| --- | --- |
+| `forget_memory` | 删记忆不可逆（没有回收站），影响之后每个会话 |
+| `remember_memory` | 写长期记忆是长期副作用 |
+| `rule_ask` | 用户规则强制「先问」 |
+| `rule_denied` | 用户规则拒；收窄永远允许 |
+
+`exec_policy` 里 `forget` 那段注释写着「**即使 `approval_policy=never` 也不该默默
+删掉用户的记忆**」——这是条不变量，之前没有断言。改错了不报错，只会静默删数据。
+
+## 二、实测三档，不变量确实成立
+
+```
+on-request  forget/remember/delete_paths  → ask
+never       forget/remember/delete_paths  → deny   ← 「不问」不等于「照做」
+untrusted   forget/remember/delete_paths  → ask
+```
+
+补了参数化测试钉住：任何档位下都不能 `allow`。
+
+## 三、写测试时发现：`rule_ask` 这一支根本到不了
+
+`rules.apply()` 只在 `RULEABLE_CODES = {destructive, opaque_command, external_tool}`
+上生效，而这三个**默认就判 ASK**：
+
+```python
+if verdict == ASK:
+    if decision.action == 'ask':
+        return decision            # ← 先命中这里
+    return Decision('ask', 'rule_ask', ...)   # ← 永远走不到
+```
+
+也就是说我第 111 部分分析过的「`rule_ask` 没有中文原因、要不要补映射」整件事
+**是空转**——那一支不会产出任何一个 `rule_ask` 决策。
+
+处理方式不是删掉（「可被规则作用、但默认放行」是合理形状，将来加那种 code 它会活过来），
+而是**把现状钉住**：
+
+- `rules.py` 里就地注释：这一支目前到不了，以及真活过来时要补什么
+  （`_REASON_ZH['rule_ask']` + 这个分支自己的测试，现在两样都没有）；
+- 测试 `test_ask_rule_on_an_already_asking_decision_keeps_the_original_code`：
+  ask 规则打在已经是 ask 的判定上时，**原判定不被改写**。
+
+## 四、我自己的一次误判，也是测试的误判
+
+我一度以为 `rm -rf ..` 被判成 `allow`（越界删除放行？）。查下去是**我的探针少传了
+`destructive` 列表**——`Policy.evaluate` 的 `destructive=()` 默认是空，真实调用链
+（`hooks.evaluate_call`）注入的是 `_h().DESTRUCTIVE`。走真实入口重测：
+
+```
+rm -rf ..        ask  destructive
+rm -rf ../other  ask  destructive
+rm -rf /tmp/zzz  ask  destructive
+```
+
+这是这一轮第二次「探针错误看起来像产品缺陷」。结论按上次那条纪律执行：**单边异常先
+怀疑探针**，走真实入口跑通之前不当缺陷报。
+
+全量 3541 passed / 3 skipped。

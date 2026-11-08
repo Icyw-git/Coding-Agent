@@ -358,6 +358,11 @@ def apply(decision, ruleset: RuleSet, tool: str, args: dict, *,
     if verdict == ASK:
         if decision.action == 'ask':
             return decision      # 已经是询问，不必改文案
+        # ⚠ 目前到不了：`apply()` 只对 RULEABLE_CODES 生效，而这三个
+        # （destructive / opaque_command / external_tool）默认就判 ASK，
+        # 上面那行已经返回了。留着是因为「可被规则作用、但默认放行」是合理
+        # 形状——真加了那种 code，这一支就会活过来（同时要补
+        # approval_view._REASON_ZH['rule_ask'] 与测试，现在两样都没）。
         return Decision('ask', 'rule_ask', f'must ask by rule: {reason}')
     # ALLOW：只把「本来会询问」的调用改成放行，且必须当前档位允许放宽。
     if not allow_permitted:
