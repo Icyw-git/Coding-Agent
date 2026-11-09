@@ -16,12 +16,15 @@ def _busy(app, messages: list[tuple[str, str]]) -> None:
         app.submit_text(text, mode=mode)
 
 
-async def _press_until_highlight(pilot, app, target: int, *, tries: int = 200):
+async def _press_until_highlight(pilot, app, target: int, *, tries: int = 400):
     """按一次 down，并等高亮*真的*走到 target 再返回。
 
     按键与“高亮已变”是两件事：`pilot.press` 返回不等于事件已被处理。全线跑时
     （前 3500 个用例之后）偶发只走一步——所以每按一次就等一次，失败时能看出
     停在哪一步，而不是笼统地“highlighted == 1”。
+
+    预算给到约 4 秒：二分过，把套件按文件名劈成两半各自都复现不了，所以这不是
+    某个泄漏的全局变量，而是整个进程的负载（事件循环被拖慢）。宁可等，不要假绿。
     """
     from textual.widgets import OptionList
 
@@ -30,7 +33,7 @@ async def _press_until_highlight(pilot, app, target: int, *, tries: int = 200):
         if app.screen.query_one('#queue-list', OptionList).highlighted >= target:
             return
         await pilot.pause()
-        await asyncio.sleep(0.005)      # pause() 在负载下可能只让出几毫秒
+        await asyncio.sleep(0.01)       # pause() 在负载下可能只让出几毫秒
     raise AssertionError(
         f'按 down 之后高亮停在 '
         f'{app.screen.query_one("#queue-list", OptionList).highlighted}，期望 {target}')
