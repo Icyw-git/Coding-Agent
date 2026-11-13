@@ -16396,3 +16396,80 @@ data['pending'] = data['pending'][-OUTBOX_LIMIT:]     # ← 一句话丢掉最�
 没在溢出时重新执行原任务。容量与保留策略仍是原样——本轮只让**已经发生的丢失可见**。
 
 全量 3576 passed / 3 skipped。
+
+---
+
+# 第 131 部分：R0-b1 —— 诊断脚本会覆盖用户的规则与域名白名单
+
+## 一、缺陷
+
+`scripts/profile_new_tools.py` 的 `profile_policy()`：
+
+```python
+rules.write(rules.parse({'version': 1, 'rules': [          # ← 覆盖真实规则文件
+    {'decision': 'allow', 'prefixes': ['npm test']},
+    {'decision': 'deny',  'prefixes': ['npm publish']},
+]}))
+net_grants.add('*.example.com')                            # ← 往真实账本塞一条 allow
+```
+
+而脚本开头自称「只做**只读**操作」。**跑一次性能基准，用户自定义的规则被换成脚本里那两条，
+域名白名单里永久多出一个 `*.example.com`**——后者是实打实的授权放宽。
+
+`DURABLE_PATH` 是模块级常量、导入时绑定真实路径，所以隔离点必须在**写入之前**改指。
+
+## 二、改法
+
+```python
+@contextlib.contextmanager
+def isolated_ledgers():
+    saved = (rules.DURABLE_PATH, net_grants.DURABLE_PATH, net_grants.LOCK_PATH)
+    with tempfile.TemporaryDirectory(prefix='profile-ledgers-') as tmp:
+        rules.DURABLE_PATH = base / 'rules.yaml'
+        net_grants.DURABLE_PATH = base / 'net_grants.json'
+        net_grants.LOCK_PATH = base / 'net_grants.lock'
+        try:
+            yield base
+        finally:
+            (rules.DURABLE_PATH, ...) = saved      # 原值恢复
+```
+
+两个模块都按 `(路径, mtime, 大小)` 缓存，换路径后缓存自然失效，不需要手动清。
+
+顺带按 §9.3 R0-b1 的另一条要求把**计时与 tracer 分开**：原来 `tracemalloc.start()`
+罩着整个 20 次循环，追踪开销算进了墙钟；现在只对单次判定取峰值内存。
+
+## 三、端到端验证
+
+跑一次 `profile_policy()`，比对真实账本：
+
+```
+[policy] 每次工具调用的判定开销
+  evaluate_call(bash)                first=167.6ms  p50=0.26ms  p95=0.49ms
+  ...
+（单次判定峰值内存 0.00 MB；规则与域名账本只写临时副本）
+
+rules.yaml 未变
+net_grants.json 未变
+```
+
+## 四、守卫（2 条，都验证过改前红）
+
+| 测试 | 改前 |
+| --- | --- |
+| `test_policy_stage_does_not_touch_the_real_rule_file` | 红：真实规则文件被改写、域名账本被塞记录 |
+| `test_module_paths_are_restored_after_the_stage` | 红：哨兵目录里留下了文件（且常量未还原） |
+
+测试把 `rules.DURABLE_PATH` 等指到临时哨兵文件，跑一次 `profile_policy()`，断言哨兵
+**一个字节都没变**。
+
+## 五、刻意没做
+
+- **没有给三个 profile 脚本造统一的隔离辅助**。查过：`profile_memory.py` 已经用
+  `TemporaryDirectory`，`profile_desktop.py` / `profile_storage.py` 不写任何东西。
+  只有这一个脚本会污染，抽公共模块属于为单一消费者造框架。
+- **没有隔离截屏落盘**。它写的是 `.cache/screenshots`（缓存，不是授权），且已由
+  `--skip-screen` 显式声明。顺手把 docstring 里「不截屏落盘」这句与代码矛盾的话改准了。
+- **没有给 `audit` 阶段做隔离**。它只读真实会话——读真实数据才是有意义的基准。
+
+全量 3578 passed / 3 skipped。
