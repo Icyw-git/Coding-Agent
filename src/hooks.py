@@ -486,6 +486,34 @@ def register_external_tools(names) -> None:
     EXTERNAL_TOOLS.update(name for name in names if name)
 
 
+def needs_write_grants(tool: str, args: dict, path_zone: str) -> bool:
+    """这次判定会不会用到目录写授权（R1-b：不值得读账本的就别读）。
+
+    账本只在两处真正被消费（见 `exec_policy`）：
+
+    - bash：命令可能写到工作区外时（`_outside_write_targets` 非空）；
+    - 文件工具：`path_zone == PATH_OUTSIDE` 时。
+
+    其余调用读它纯属白花时间。**为什么少传是安全的**：`write_grants` 只能把
+    ASK 放宽成 ALLOW（`path_grant`），永远不可能收紧——所以漏判的后果是
+    “本来可以放宽的没放宽”（更严），而不会变成“本来该问的没问”。
+
+    这条不变量有测试守着（`test_omitting_grants_can_only_make_the_decision_stricter`）。
+    """
+    if tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
+        # 读工具永远不需要：它不会写；写工具只在越界时才需要授权来放宽。
+        return path_zone == PATH_OUTSIDE
+    if tool == 'bash':
+        # 只读命令没有越界写目标。用与并行调度同一份只读白名单（policy_bash），
+        # 两条路径不会因为两份名单而漂移。
+        import policy_bash
+
+        command = str((args or {}).get('command') or '')
+        return not policy_bash.is_readonly_command(command)
+    # worktree / web / 屏幕 / 剪贴板 / 桌面 / 其它：都不看目录写授权。
+    return False
+
+
 def evaluate_call(tool: str, args: dict, policy=None):
     """纯策略判定（黑名单 / 档位 / 越界），不问人。测试与 /sandbox 预览用它。
 
@@ -512,8 +540,11 @@ def evaluate_call(tool: str, args: dict, policy=None):
     policy = policy or load_policy()
     # 持久授权只在默认档参与判定：read-only 仍要审批，danger 本来全放行。
     # 账本损坏时 active_write_paths 返回空元组（fail-closed），不会误放行。
+    # 只有会用到授权的调用才去读：read 是最频繁的工具，账本 200 条时每次判定
+    # 多花 39–54ms（profile 第 8 节），而这笔开销对只读调用是纯浪费。
     write_grants = (grants.active_write_paths()
-                    if policy.sandbox_mode == 'workspace-write' else ())
+                    if (policy.sandbox_mode == 'workspace-write'
+                        and needs_write_grants(tool, eval_args, zone)) else ())
     # 域名名单与执行档位无关：deny 是硬拒，连 danger-full-access 也绕不过。
     # 账本损坏时返回空元组，等价于「未知域名逐个审批」。
     net_rules = net_grants.active_rules()

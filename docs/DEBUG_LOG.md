@@ -16777,3 +16777,91 @@ def exec_tool_call(...):                # 门面：从 _h() 装配，签名与�
 导致复制 60 行"是同一类错误（第 102 部分）。两次都因为没验证边界。
 
 全量 3612 passed / 3 skipped。
+
+---
+
+# 第 136 部分：R1-b —— read 每次判定都在读授权账本
+
+## 一、缺陷
+
+`hooks.evaluate_call` 无条件读账本：
+
+```python
+write_grants = (grants.active_write_paths()
+                if policy.sandbox_mode == 'workspace-write' else ())
+```
+
+但账本只在两处真正被消费：bash 可能越界写时、文件工具的 `PATH_OUTSIDE` 分支。
+read 是最频繁的工具，它一个字节都不会写，却每次判定都把整份账本读一遍 + 解析 JSON。
+
+设计文档 profile 第 8 节实测：20 条授权下 read 判定 5.79–6.54ms，200 条下 39.42–53.74ms，
+0 条 1.32–1.66ms。
+
+## 二、为什么「少读」是安全的
+
+这是本轮能做的**前提**，写进了实现注释和测试：
+
+> `write_grants` 只能把 ASK 放宽成 ALLOW（`path_grant`），**永远不可能收紧**。
+
+所以漏判的后果是「本来能放宽的没放宽」（更严），而不是「本来该问的没问」。
+反向风险为零——这条性质比"我记得它只在两处用到"可靠得多，所以单独用测试钉住：
+拿真实授权分别算「传」与「不传」，断言 `allow` 序不下降、`ask/deny` 不变。
+
+## 三、改法（三行 + 一个判定函数）
+
+```python
+def needs_write_grants(tool, args, path_zone) -> bool:
+    if tool in READ_WRITE_TOOLS or tool in READ_ONLY_FILE_TOOLS:
+        return path_zone == PATH_OUTSIDE      # 读写都走同一条 PATH_OUTSIDE 分支
+    if tool == 'bash':
+        return not policy_bash.is_readonly_command(command)
+    return False                              # worktree/web/屏幕/剪贴板/桌面
+```
+
+`evaluate_call` 里把条件从「档位是 workspace-write」收紧成「档位 + 这次判定需要」。
+
+**复用 `policy_bash.is_readonly_command`**（并行调度用的同一份只读白名单），不另写一份
+——两份名单一定会漂移，而这条路径恰好是"少问一次"还是"多问一次"的分界。
+
+## 四、同机对照实测（`scripts/bench_grants.py`）
+
+§9.4 要求「200 条无关 read 的每组 p50 均应优于同机改前对照、p95 不退化」。
+脚本带 `--before` 开关，在同一次运行里跑两个口径（不跨机器比历史数字）：
+
+| 场景 | 改前 p50 | 改后 p50 | 倍数 |
+| --- | --- | --- | --- |
+| read @ 0 条 | 1.108ms | 0.882ms | 1.3× |
+| read @ 200 条 | **25.06ms** | **0.844ms** | **~30×** |
+| bash 只读 @ 200 条 | 24.83ms | 0.129ms | ~192× |
+| write 越界 @ 200 条 | 28.3ms | 30.1ms | 持平（仍读账本，符合预期） |
+
+`ledger` 列是每次判定读账本的平均次数：read/只读 bash 全是 **0.00**，write 越界是
+**1.00**——按需求读，不多不少。
+
+计时与 tracemalloc **分开跑**（同 R0-b1 的教训：tracer 会把分配追踪开销算进墙钟）。
+
+## 五、守卫（20 条）
+
+| 组 | 覆盖 |
+| --- | --- |
+| spy（10 条） | read / grep / ls / glob / view_image / recall / web_fetch / screen_ocr / 只读 bash / 工作区内 write → 账本调用 **0 次**；越界 write、可能越界写的 bash → **1 次** |
+| 决策矩阵（4 条） | 四种分区下「按需传」与「一律传」的 `(action, code)` 必须一致 |
+| 不变量（1 条） | 「少传只会更严」 |
+| 到期/撤销（2 条） | 到期授权不复活；撤销后下一次判定立刻收紧（不缓存） |
+| 归类收口（1 条） | 声明成文件工具的必须都在 `needs_write_grants` 里被正确归类——新增文件工具忘记归类时会红 |
+
+最后一条是防"硬编码名单"腐化的关键：它遍历 `READ_WRITE_TOOLS + READ_ONLY_FILE_TOOLS`，
+而不是相信我记得写全。
+
+## 六、刻意没做
+
+- **没给账本加缓存**。设计文档明确：「即使以后缓存 JSON 解析，也必须在真正越界写入时
+  重新判断撤销、到期及路径目标」。加缓存就要面对失效语义（账本被外部原子替换、
+  junction 改指向），收益远小于「大部分调用压根不需要读」这个更彻底的解法。
+- **没动 `_grant_covers` / `_file_paths_granted` 的语义**：allow/ask/deny、默认授权、
+  规则优先级、TTL、symlink/junction 判断、账本格式一律未改。
+- **没把 `needs_write_grants` 放进 `exec_policy`**：它需要 `policy_bash.is_readonly_command`，
+  而 `exec_policy` 已经 import `policy_bash`——放哪儿都行，但放 `hooks`（调用方）能让
+  「谁决定读不读账本」这件事留在编排层，`exec_policy` 继续只做纯判定。
+
+全量 3632 passed / 3 skipped。
