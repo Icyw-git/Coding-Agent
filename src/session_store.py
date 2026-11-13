@@ -125,11 +125,18 @@ class SessionEventStore:
         self._history_cache = None
         self._history_has_rewind = False
         self._history_partial_tail = False
+        # 先取 size、再读 seq，与 `append()` 里的顺序一致。反过来的话，两次读之间
+        # 别的写者追加一条，`_known_size` 就记成了「追加之后」的大小，而下一次
+        # `append()` 看到 size 没变就不再重读 seq——于是**写出重复 seq**。
+        # 这个方向上即使读到的 seq 更新也是安全的：size 旧了会被下一次 append 发现。
+        try:
+            self._known_size = self.path.stat().st_size
+        except OSError:
+            self._known_size = 0
         self._next_seq = self._read_last_seq() + 1
         # 锁在初始化时解析一次（每次 append 都 resolve 约 10ms 开销）；
         # 同路径的多实例仍从类级 _locks 取到同一把锁
         self._lock = self._path_lock(self.path)
-        self._known_size = self.path.stat().st_size if self.path.exists() else 0
 
     @classmethod
     def open(cls, path: Path):

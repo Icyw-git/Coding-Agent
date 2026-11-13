@@ -56,17 +56,32 @@ def _summary_cached(path, stat) -> dict | None:
 
 
 def _cached_summary(store) -> dict:
-    stat = store.path.stat()
-    hit = _summary_cached(store.path, stat)
+    """带缓存的会话摘要。
+
+    缓存键必须是**读取之前**的版本，且读取期间版本不能变：键取「读完之后」的 stat
+    会把旧摘要挂到新版本上，之后同版本的读取都会命中这个陈旧值（看起来还有缓存）。
+    变过就不缓存，下次重算。
+    """
+    try:
+        before = store.path.stat()
+    except OSError:
+        return dict(store.session_summary())
+    hit = _summary_cached(store.path, before)
     if hit is not None:
         return hit
-    hit = store.session_summary()
-    stat = store.path.stat()
-    # 逐条淘汰而不是 clear()：整体清空在会话文件版本数接近上限时会让缓存失效。
-    bounded_cache.put(_summary_cache,
-                      (str(store.path), stat.st_size, stat.st_mtime_ns),
-                      hit, _SUMMARY_CACHE_MAX)
-    return dict(hit)  # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
+    summary = store.session_summary()
+    try:
+        after = store.path.stat()
+    except OSError:
+        after = None
+    same = after is not None and (
+        (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns))
+    if same:
+        # 逐条淘汰而不是 clear()：整体清空在会话文件版本数接近上限时会让缓存失效。
+        bounded_cache.put(_summary_cache,
+                          (str(store.path), before.st_size, before.st_mtime_ns),
+                          summary, _SUMMARY_CACHE_MAX)
+    return dict(summary)  # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
 
 
 class AgentRuntime:

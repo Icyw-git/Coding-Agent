@@ -16281,3 +16281,68 @@ finally:
 没有新增缺口。
 
 全量 3569 passed / 3 skipped。
+
+---
+
+# 第 129 部分：R0-f（其一）——「读了旧内容，记了新版本号」
+
+两处同一种形状：**内容先读、版本号后取**，于是旧内容被挂在最新版本上。
+
+## 一、seq 复用：构造器的两次读不在同一个快照里
+
+```python
+self._next_seq = self._read_last_seq() + 1      # 读 1：seq
+...
+self._known_size = self.path.stat().st_size     # 读 2：size
+```
+
+中间另一个写者追加一条时：`_known_size` 记成**追加之后**的大小，而 `_next_seq` 还是旧的。
+下一次 `append()` 看到「size 没变」就不重读 seq → **写出重复 seq**。
+
+实测（barrier 式注入，不靠 sleep）：会话直接变成不可读的状态——
+
+```
+SessionReplayError: event sequence mismatch at line 3: expected 3, got 2
+```
+
+修法不是加锁，而是**把顺序跟 `append()` 对齐**：先 stat size、再读 seq。这个方向上即使
+读到的 seq 更新也是安全的——size 旧了会被下一次 append 发现并重读。
+
+## 二、摘要缓存挂到错版本上
+
+```python
+hit = store.session_summary()          # 读 → 旧内容
+stat = store.path.stat()               # 版本号 → 新版本（中间追加过）
+bounded_cache.put(_summary_cache, (path, stat.st_size, stat.st_mtime_ns), hit, …)
+```
+
+缓存键取的是「读完之后」的版本。之后同版本的读取都会命中这条**陈旧**摘要——而且它看起来
+完全正常（有缓存、可用），只是少一条消息。
+
+修法：键用**读之前**的 stat；读完再 stat 一次，两次一致才缓存，不一致就不缓存（下次重算）。
+
+## 三、守卫（2 条，都验证过改前红）
+
+| 测试 | 改前 |
+| --- | --- |
+| `test_constructor_snapshot_cannot_reuse_a_sequence_number` | 红：`expected 3, got 2`（seq 被复用、会话不可读） |
+| `test_summary_cache_is_not_poisoned_by_a_racing_append` | 红：`events` 停在 1，实际已是 2 |
+
+两条都用「在函数返回前插入一次写」的确定性注入，不用随机 sleep 猜竞态。
+
+## 四、刻意没做：R0-f 的第三条（损坏尾部阻止追加）
+
+§9.3 要求：「写入发现损坏尾部时默认阻止追加并返回 `recovery_required`；保留原字节供诊断；
+显式恢复必须持会话写锁、保存原件、区分完整但无换行与真正损坏的尾部」。
+
+这是**写路径的行为改变**：现在遇到损坏尾部是跳过脏行继续追加，改完之后同样的输入会
+**拒绝写入**。落地需要三样现在没有的东西：
+
+1. 一个 `recovery_required` 的返回形态与所有调用方的处理分支；
+2. 一个显式的恢复入口（谁调、怎么让用户确认、原件存哪）；
+3. 「完整但无换行」与「中间损坏」两条路径各自的验收。
+
+按 §9.2「行为确需变化的批次必须列旧行为→新行为」，这应该单独一批、单独 review，
+不塞进本轮。本轮只做两处「同版本快照」的修正——它们不改变任何对外的写入语义。
+
+全量 3571 passed / 3 skipped。
