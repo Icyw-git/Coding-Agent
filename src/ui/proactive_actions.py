@@ -160,6 +160,12 @@ class ProactiveActionsMixin:
         mode = proactive.mode()
         if mode == proactive.MODE_OFF:
             return
+        # 自动建议是可选工作：预算不够就跳过，并记一笔（用户能看出"今天为什么没建议"）。
+        import budget
+
+        if not budget.allows('proactive'):
+            budget.note_skip('proactive')
+            return
         due, _reason = proactive.should_run(harness.CACHE_DIR)
         if not due:
             return

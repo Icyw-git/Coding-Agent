@@ -17556,3 +17556,66 @@ overflow 明细（`{count, recent, last_at}` 带 job_id 来源，而契约的
 `next-design` 也写着「先契约后逐消费者迁移」，所以本批只立契约。
 
 全量 3712 passed / 3 skipped。
+
+---
+
+# 第 147 部分：R2-b2 —— 副通道的 token 一直是隐形的；以及一个日预算
+
+## 一、缺口：一半的模型调用没有任何记录
+
+副通道（记忆整理、标题、压缩、审批、建议）都走 `llm_route.completion(role=...)`，
+**没有任何一处记录用量**。于是「每天花了多少」只能看到主回合那一半——而记忆整理这类
+后台调用恰恰是容易被忘记、又确实花钱的那一半。
+
+## 二、记录点放在唯一入口
+
+`src/llm_calls.py` + `llm_route.completion` 里的埋点。放在这里而不是各调用方，
+才能保证**一次 SDK 请求只记一条**——否则主回合与副通道会各记一遍，统计翻倍。
+
+字段：`role / purpose / provider / model / attempt / duration_ms / tokens /
+usage_available / outcome / error / model_request_id`。两个边界写清楚：
+
+- `model_request_id` 是**模型逻辑请求**的 id，与用户入站的 `request_id` 不是一回事
+  （一次用户回合可能含多次模型请求）；
+- `attempt` 只数本进程可见的尝试。**SDK 内部重试不可观测**，不假装数清了供应商那边
+  打了几次。
+
+## 三、未知 ≠ 0
+
+供应商没回 usage 时 `tokens` 落 `None`、`usage_available=False`。汇总时单独计
+`unknown`——把未知当 0 会让成本看起来比实际低。`/status` 也因此会说
+「另有 N 次请求用量未知」。
+
+## 四、预算：拦可选工作，绝不拦审批
+
+```python
+PROTECTED_ROLES = {'approval', 'safety'}       # 永远允许
+OPTIONAL_ROLES  = {'memory','title','summary','proactive','improve'}
+```
+
+> 省预算是为了少花钱，**不是为了少拦一次危险命令**。那两类如果因为"预算用完"被跳过，
+> 等于用省钱换安全，方向就错了。
+
+接线两处：回合收尾的记忆整理、启动时的自动建议。跳过时 `budget.note_skip()` 记账，
+`/status` 会说「今天因预算跳过：记忆整理×2」——**只报预算不报跳过，用户会以为功能坏了**。
+
+阈值（`DAILY_TOKENS = 200_000`）是保守起点，不是账单：文档里写明"具体值由短期采样后
+调整，不承诺某个未经测量的数字"。
+
+## 五、10 条守卫
+
+一次请求只记一条 / 失败有 outcome / 缺 usage 是 unknown 不是 0 / 主副通道分开计数 /
+日预算按自然日结算（假时钟）/ 耗尽后 `allows('approval')` 仍为真 / 跳过可见 /
+`/status` 同时报用量与跳过 / 生产接线（记忆整理被跳过）。
+
+## 六、第五次同一个坑
+
+`llm_calls.LOG_PATH` 又是模块级路径常量。这次我在**跑全量之前**就把它加进 conftest 和
+泄漏清单了，但**已经晚了**——全量跑过一次，`.cache/llm_calls.jsonl` 已经被写出来
+（守卫当场抓到，这正是它的用处）。
+
+规律已经重复五次（profile 脚本 → 墓碑 → 去重 → 建议 → 模型调用）：**加一个模块级
+路径常量，就多一个污染面**。清单现在覆盖 6 个：tombstones / dedup / suggestions /
+llm_calls / budget / cron。
+
+全量 3722 passed / 3 skipped。

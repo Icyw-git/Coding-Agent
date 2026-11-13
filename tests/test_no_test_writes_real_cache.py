@@ -26,7 +26,7 @@ def test_conftest_isolates_process_level_paths():
     """
     source = (ROOT / 'tests' / 'conftest.py').read_text(encoding='utf-8')
     for name in ('memory_tombstone', 'request_dedup', 'proactive_suggestions',
-                 'cron_scheduler'):
+                 'llm_calls', 'budget', 'cron_scheduler'):
         assert name in source, f'conftest 没有隔离 {name} 的模块级路径'
 
 
@@ -36,6 +36,8 @@ def test_no_state_file_leaked_into_the_real_cache():
         ROOT / '.cache' / 'memories_tombstones.json',
         ROOT / '.cache' / 'requests' / 'dedup.jsonl',
         ROOT / '.cache' / 'proactive_suggestions.json',
+        ROOT / '.cache' / 'llm_calls.jsonl',
+        ROOT / '.cache' / 'budget.json',
     ) if path.exists()]
     assert not leaked, (
         f'测试写进了真实数据目录：{leaked}。删掉它们，并在 conftest 里隔离该路径。')

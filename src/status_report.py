@@ -105,6 +105,32 @@ def _origin_label(origin: str) -> str:
     return _ORIGIN_LABELS.get(key, origin.strip())
 
 
+#: 可选工作被预算跳过时的中文名（`/status` 用）。
+_SKIP_LABELS = {'memory': '记忆整理', 'title': '会话标题', 'summary': '摘要',
+                'proactive': '主动建议', 'improve': '自改进'}
+
+
+def _budget_note() -> str:
+    """`/status` 里的背景预算行（拿不到就空串）。
+
+    两件事必须让人看见：今天花了多少（含"未知"的请求数），以及**今天跳过了什么**。
+    只报预算不报跳过，用户会以为功能坏了。
+    """
+    try:
+        import budget
+
+        line = budget.describe()
+        skipped = budget.skipped_today()
+    except Exception:
+        return ''
+    parts = [budget_line_value for budget_line_value in [line] if budget_line_value]
+    if skipped:
+        detail = '、'.join(f'{_SKIP_LABELS.get(role, role)}×{count}'
+                          for role, count in sorted(skipped.items()))
+        parts.append(f'（今天因预算跳过：{detail}）')
+    return chr(10) + '  ' + ''.join(parts)
+
+
 def _pending_requests_note() -> str:
     """`/status` 里的「待核对请求」行（没有则空串）。
 
@@ -290,6 +316,7 @@ def format_status(session_store) -> str:
                             f'（文件 {user_rules.path_for_display()}）')
     overflow_note = _cron_overflow_note()
     pending_note = _pending_requests_note()
+    budget_note = _budget_note()
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -306,6 +333,7 @@ def format_status(session_store) -> str:
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
         f'{overflow_note}'
         f'{pending_note}'
+        f'{budget_note}'
         f'{capability_lines}'
         f'{usage_line}'
     )

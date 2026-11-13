@@ -38,6 +38,8 @@ def _isolate_process_level_state(tmp_path, monkeypatch):
 
     以后再加模块级路径（`xxx_path()` / `DURABLE_PATH`）都应该在这里登记。
     """
+    import budget
+    import llm_calls
     import memory_tombstone
     import proactive_suggestions
     import request_dedup
@@ -48,6 +50,9 @@ def _isolate_process_level_state(tmp_path, monkeypatch):
                         tmp_path / 'request_dedup.jsonl')
     monkeypatch.setattr(proactive_suggestions, 'STATE_PATH',
                         tmp_path / 'proactive_suggestions.json')
+    monkeypatch.setattr(llm_calls, 'LOG_PATH', tmp_path / 'llm_calls.jsonl')
+    monkeypatch.setattr(budget, 'LOG_PATH', tmp_path / 'llm_calls.jsonl')
+    monkeypatch.setattr(budget, 'STATE_PATH', tmp_path / 'budget.json')
     request_dedup.reset_cache()
 
 
