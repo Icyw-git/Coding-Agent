@@ -17482,3 +17482,77 @@ reply = self.api.send(row['proposed_action'], session_id=..., request_id=request
 - 停止线照做：没新增 cron 自动执行副作用、没改默认 `off`。
 
 全量 3702 passed / 3 skipped。
+
+---
+
+# 第 146 部分：R2-b1 其一 —— 投递契约（先立契约，逐消费者迁移）
+
+## 一、现状：三份形状相似的待发队列
+
+```
+cron_delivery: id / chat_id / job_id / text / created_at   （条数上限 20）
+heartbeat:     occurrence_id / text / created_at            （条数上限 20）
+watcher:       直接发，没有队列
+```
+
+共同的缺口：
+
+| 缺口 | 后果 |
+| --- | --- |
+| 失败只是「留在 pending」 | 一个永久失效的接收人（机器人被踢出群、chat 解绑）**每轮被重试**，永远重试 |
+| 上限只有条数 | 字节与保留时长没人管，也没有「为什么被裁」的记录 |
+| 逐接收人确认靠调用方写 for 循环 | 「A 成功、B 失败」容易漏 |
+
+## 二、契约（`src/delivery.py`）
+
+一条记录：`delivery_id / recipient / text / source_ref / kind / state / attempts /
+next_retry_at / created_at / bytes / last_error`。
+
+```
+pending ──fail──▶ retrying ──fail×N──▶ dead
+   │                  │                 │
+   └──────ack─────────┴─────────────────┴──▶ 移出队列
+```
+
+三条刻意的选择：
+
+- **`source_ref` 是契约的一部分**。发送与 ack 之间崩溃仍会重发一次（不承诺外部
+  恰好一次），但重发的是**同一份结果**——`source_ref` 指向生成它的回合/occurrence，
+  任务本身不会重跑。
+- **退避 1/2/4/8… 分钟，5 次后进死信**。没有死信的队列等于「永远重试」。
+- **三条上限各自记账**：`overflow: {items, bytes, ttl}`。淘汰顺序是「过期 → 死信 →
+  最旧」——过期本来就不该再发；死信先于 pending 被淘汰，因为它已放弃发送，
+  反过来会让「还能发出去的内容」先丢。
+
+## 三、10 条守卫（照 §9.5 的验收条目）
+
+| 验收要求 | 测试 |
+| --- | --- |
+| 两接收人 A 成功 / B 失败，下轮只重试 B | `test_per_recipient_ack_only_drops_that_recipient` |
+| 发送后 ack 前崩溃允许重复但不重跑任务 | `test_crash_between_send_and_ack_keeps_the_item`（凭 `source_ref` 找回） |
+| fake clock 验退避 | `test_failure_backs_off_then_becomes_a_dead_letter` |
+| 死信可查可重发 | `test_dead_letter_can_be_requeued`（重发后尝试次数归零） |
+| 条数 / 字节 / 期限各自超限可见 | 三个独立测试，断言**reason 不串**（超字节不能记成 `items`） |
+| 过期不投递 | `test_expired_items_are_not_delivered` |
+
+## 四、两次被自己的粗心挡住
+
+**① 假时钟与真时钟混用。** 测试里 `enqueue(now=clock())` 和 `enqueue()`（默认
+`time.time()`）混在一起，于是「是否过期」「是否到点」随机器时间漂。改成全程用同一个
+假时钟——这和上一批 R1-a 的 Windows 时间精度是同一类问题：**只要断言涉及时间，
+就必须只有一处时钟**。
+
+**② `_evict` 用一个循环管两个条件**，把「超字节」记成了 `items`，统计上分不清是哪个
+上限在起作用。改成条数与字节各跑自己的循环，并用测试钉住
+`overflow['items'] == 0` 当只超字节时。
+
+## 五、刻意没做：消费者迁移单独一批
+
+写了一条「cron 结果走契约」的测试，然后**撤掉了**。原因：完整迁移会牵动 R0-c 刚做的
+overflow 明细（`{count, recent, last_at}` 带 job_id 来源，而契约的
+`{items, bytes, ttl}` 是分类计数），两种形状不能靠映射糊过去——要么扩展契约，
+要么改 `/status` 的展示。那是一次独立的、需要单独 review 的改动。
+
+`next-design` 也写着「先契约后逐消费者迁移」，所以本批只立契约。
+
+全量 3712 passed / 3 skipped。
