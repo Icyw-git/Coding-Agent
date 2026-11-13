@@ -67,6 +67,11 @@ def remember(text: str, *, mem_type: str = 'preference', name: str = '',
             confidence=_confidence_for(kind))
     except Exception as exc:
         return f'Error: could not save memory: {type(exc).__name__}: {exc}'
+    if action == 'blocked':
+        # 命中墓碑：这个名字/来源被忘过。**不能**返回一条假路径，也不能
+        # 静默当作已保存——用户会以为新内容生效了。
+        return (f'Error: not saved — "{label}" was forgotten earlier. '
+                'Only an explicit "remember this again" clears that.')
     if action == 'update':
         return (f'Updated memory "{label}" (type={kind}) in {path.name}: '
                 'an existing note was close enough to merge into.')

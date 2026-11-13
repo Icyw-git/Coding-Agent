@@ -271,6 +271,11 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
     h = _h()
     h.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 墓碑守卫：被遗忘的名字/来源不许任何路径写回来。放在**唯一写入口**，
+    # 所以 remember 工具、抽取、合并三条路都过它——只拦其中一条等于没拦。
+    if not memory_tombstone.may_revive(_slug(name) or str(name), source):
+        return None, 'blocked'
+
     draft = {
         'name': name,
         'description': description,
@@ -766,6 +771,35 @@ def load_memories(messages: list) -> str:  # 加载相关记忆文件内容
     return '\n\n'.join(parts)
 
 
+def _current_source() -> str:
+    """当前会话 id，作记忆的来源。取不到就返回空串（不影响写入）。
+
+    惰性导入 hooks（同 `_audit`）：memory 是更底层的模块，顶层 import 会成环。
+    来源是"遗忘抑制"的依据之一——同一段会话里被忘掉的内容，换个名字抽回来
+    也要能拦住；没有来源时只能按名字拦。
+    """
+    try:
+        import hooks
+        return hooks.current_session_id() or ''
+    except Exception:
+        return ''
+
+
+def _stale_candidate(name: str, supersedes: str, captured: dict) -> bool:
+    """这条候选是不是「模型调用期间已经过期」。
+
+    比两样：自己那个文件名、以及它声明要替换的那条。任一版本变了就放弃——
+    这正是「忘掉一条之后又被写回来」与「旧候选盖掉新内容」两个缺陷的判据。
+    """
+    targets = [f'{_slug(name)}.md']
+    if supersedes:
+        targets.append(supersedes if supersedes.endswith('.md')
+                       else f'{_slug(supersedes)}.md')
+    current = {item['filename']: item['revision'] for item in list_memory_files()}
+    return any(key in captured and current.get(key) != captured[key]
+               for key in targets)
+
+
 def extract_memories(messages: list):  # 提取用户偏好、约束、项目事实等记忆
     # `/memories readonly|off` 时本会话不产生新记忆（Codex 的 chat-level
     # contribute 开关）。放在最前面：后面要调一次模型，能省就省。
@@ -805,6 +839,9 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
         feedback_block = ''
 
     existing = list_memory_files()
+    # 模型调用可能要几十秒。这期间用户可能忘掉或改写某条，而模型手里是**改之前**的
+    # 清单——不比对就会把旧内容盖回去。记下当时的版本，回来再核一次。
+    captured = {item['filename']: item['revision'] for item in existing}
     existing_desc = '\n'.join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
 
     prompt = (
@@ -867,7 +904,7 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             return
         if not items:
             return
-        count = 0
+        count = stale = blocked = 0
         for mem in items:
             if not isinstance(mem, dict):
                 continue
@@ -878,14 +915,29 @@ def extract_memories(messages: list):  # 提取用户偏好、约束、项目事
             desc = ' '.join(str(mem.get('description') or '').split())
             body = str(mem.get('body') or '').strip()
             if desc and body:
-                write_memory_file(
+                supersedes = str(mem.get('supersedes') or '')
+                if _stale_candidate(name, supersedes, captured):
+                    stale += 1
+                    continue
+                _path, action = write_memory_file(
                     name, mem_type, desc, body,
                     keywords=mem.get('keywords'),
-                    supersedes=str(mem.get('supersedes') or ''))
+                    supersedes=supersedes, source=_current_source())
+                if action == 'blocked':
+                    blocked += 1
+                    continue
                 count += 1
         if count:
             print(f"\n\033[33m[记忆] 新记住 {count} 条\033[0m")
-        else:
+        if stale or blocked:
+            # 说清为什么丢弃：否则用户会以为“记了但没生效”。
+            reasons = []
+            if stale:
+                reasons.append(f'{stale} 条在等模型期间已被改动或遗忘')
+            if blocked:
+                reasons.append(f'{blocked} 条命中已遗忘的记录')
+            print(f"  [记忆] 另有 {'，'.join(reasons)}，已放弃。")
+        if not count and not stale and not blocked:
             print(f"  [记忆] 模型给了 {len(items)} 条，但没有一条同时有描述和正文，本轮跳过。")
     except Exception as e:
         print(f"  [记忆] 抽取出错，本轮跳过：{e}")

@@ -16935,3 +16935,79 @@ $ cat .cache/memories_tombstones.json
   路径：前者是"被新版替代"，后者是"用户要求忘掉"。
 
 全量 3645 passed / 3 skipped。
+
+---
+
+# 第 138 部分：R1-c 其二 —— 模型调用期间被遗忘的内容，回来又写了一遍
+
+## 一、缺陷
+
+抽取要调一次模型，可能要几十秒。这期间用户说"忘掉那条"，而模型手里是**改之前**的记忆
+清单——回来后原样写回。用户看到的是「我明明让它忘了，它又记回来了」。
+
+上一批做好的 `generation` / `revision` / 墓碑只是**字段**，没有接进这条链路，
+所以一点用都没有。
+
+## 二、两条拦截
+
+**① 写入层（墓碑）**：放在**唯一写入口** `_write_memory_file_unlocked` 的最前面。
+
+```python
+if not memory_tombstone.may_revive(_slug(name) or str(name), source):
+    return None, 'blocked'
+```
+
+放这里的理由：`remember` 工具、抽取、合并三条路都过它。只拦其中一条等于没拦。
+
+**② 抽取层（版本冲突）**：抽取开始时记 `{filename: revision}`，模型返回后逐条比对
+自己那个文件名与它声明要替换的那条：
+
+```python
+if _stale_candidate(name, supersedes, captured):
+    stale += 1; continue
+```
+
+两条都必要：墓碑拦"被忘掉的"，revision 拦"被改过的"（没忘、但别人先写了新版，
+旧候选盖上去就是覆盖别人的更新）。
+
+## 三、来源谱系也得能用
+
+`extract_memories` 原来写记忆时**不传 source**，所以"同来源换名字"这条拦不住。
+补 `_current_source()`（惰性 import hooks，同 `_audit` 的理由），抽取写回时带上会话 id。
+
+测试也改成更真实的场景：**同一段会话**里忘掉 → 该会话的抽取回来想写同名/新名，被拒。
+（没有会话上下文时只能按名字拦——这一点在 docstring 里写清楚了。）
+
+## 四、用户能看到原因
+
+```
+[记忆] 另有 1 条在等模型期间已被改动或遗忘，已放弃。
+```
+
+不说这句，用户会以为"记了但没生效"。`remember` 工具被墓碑拦时也返回明确错误
+（`not saved — "x" was forgotten earlier`），而不是塞一个 `None` 路径进去崩掉。
+
+## 五、守卫（5 条，3 条改前红）
+
+| 测试 | 改前 |
+| --- | --- |
+| `test_forget_during_extraction_blocks_the_stale_candidate` | 绿但**假绿**：文件写进去了、只是被 `list_memory_files` 过滤（改成写入层拦截后才真的不落盘） |
+| `test_plain_update_during_extraction_also_invalidates_the_candidate` | **红**：旧候选把「第二版说明」盖回「第一版说明」 |
+| `test_candidate_from_a_forgotten_source_is_rejected_under_a_new_name` | **红**：`deploy-v2` 被写了进去 |
+| `test_fresh_candidate_still_lands_normally` | 绿（正常路径不受影响） |
+| `test_remember_tool_reports_a_blocked_write_instead_of_crashing` | **红**：`AttributeError`（`None.name`） |
+
+第一条值得单说：它一开始是**假绿**——断言看的是 `list_memory_files()`，而墓碑让这条
+被过滤掉了，于是"看不见"被当成了"没写"。把拦截移到写入层之后，磁盘上才真的干净。
+**"不可见"和"不存在"是两件事。**
+
+## 六、刻意没做
+
+- **没有按 workspace 过滤召回**。字段与保真已就位，启用过滤会改变现有召回结果，
+  需要先定「当前工作区 id」的定义与 `/memories` 的展示口径，以及旧 global 条目的
+  待确认标注。单独一批做。
+- **没有用 `generation` 一刀切**。一次遗忘会让代际 +1，若据此丢弃整批候选，
+  "忘掉一条无关的记忆"就会连带把本轮所有新记忆一起丢掉。改成逐条判（名字/来源/版本），
+  更精确且同样安全。
+
+全量 3650 passed / 3 skipped。

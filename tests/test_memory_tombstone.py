@@ -135,3 +135,16 @@ def test_tombstone_store_is_bounded_and_error_tolerant(home, monkeypatch):
 
     memory_tombstone.STORE_PATH.write_text('{not json', encoding='utf-8')
     assert memory_tombstone.may_revive('anything', '') is True
+
+
+def test_remember_tool_reports_a_blocked_write_instead_of_crashing(home):
+    """被遗忘的名字再 remember：要说清"没有重新记住"，不能返回一个假路径。"""
+    import tool_memory
+
+    tool_memory.remember('temporary thing', name='temp')
+    assert tool_memory.forget('temp').startswith('Forgotten')
+
+    out = tool_memory.remember('temporary thing again', name='temp')
+    assert out.startswith('Error:'), out
+    assert 'forgotten' in out.lower() or '遗忘' in out, out
+    assert memory.list_memory_files() == []
