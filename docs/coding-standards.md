@@ -81,6 +81,23 @@ stdout 打印诊断；进度展示只暴露 `phase / tool / elapsed`，工具内
 `tests/test_cli_input.py` 的 SlashCompleter 前缀断言；改工具行为必须同步
 `tool_schemas.py` 与相关文档；顺序由 `tests/test_tool_schemas.py` 锁定。
 
+## 测试里的时间单位
+
+**要判断"过了多久"就用显式偏移，不要把常量设成 0 再指望时间往前走。**
+
+Windows 上 `time.time()` 的精度约 15ms：同一个测试里连续两次取值可能**完全相等**。
+于是 `created_at < now - 0` 不成立，"保留期 0 秒"这种写法在小数据上偶然通过、
+在有负载时随机失败。
+
+```python
+real_now = store._now()
+monkeypatch.setattr(store, '_now',
+                    lambda: real_now + store.RETENTION_SECONDS + 1)
+```
+
+注入时钟比"把阈值调小"确定得多；也和「墙钟不可信」那条一致——测试不该依赖
+操作系统时钟的分辨率。
+
 ## 测试里的等待条件
 
 **等"你要用的那个东西"，不要等它的前序信号。** 轮询循环里的 `if X: break` 决定的是
