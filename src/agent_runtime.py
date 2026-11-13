@@ -7,6 +7,7 @@ runtime 只负责会话编排，实际回合执行由调用方注入；CLI、SDK
 from __future__ import annotations
 
 import collections
+import contextlib
 import inspect
 import threading
 import uuid
@@ -105,6 +106,15 @@ def _cached_summary(store) -> dict:
                           (str(store.path), before.st_size, before.st_mtime_ns),
                           summary, _SUMMARY_CACHE_MAX)
     return dict(summary)  # 浅拷贝：调用方（如 search_all 加 matched）不得污染缓存
+
+
+def _proactive_scope(flag: bool):
+    """建议回合里打开只读白名单；其余回合是空操作。"""
+    if not flag:
+        return contextlib.nullcontext()
+    from hooks import proactive_scope
+
+    return proactive_scope()
 
 
 class AgentRuntime:
@@ -273,6 +283,7 @@ class AgentRuntime:
         source: str = 'api',
         origin_chat: str | None = None,
         request_id: str | None = None,
+        proactive: bool = False,
     ) -> AgentResult:
         """追加一条用户消息，执行一个回合，返回 assistant 内容。
 
@@ -282,6 +293,11 @@ class AgentRuntime:
         ``origin_chat`` 是消息来源聊天：回合内创建的定时任务继承它作为投递目标。
         ``request_id`` 是可选的入站去重键：同 id 同内容只执行一次，重复请求返回
         ``duplicate=True`` 与原 ``turn_id``（见 ``request_dedup``）。
+
+        ``proactive=True`` 是一个**只读回合**：工具面裁到
+        ``proactive.read_only_schemas()``，并在钩子里开白名单（两道一起才算只读，
+        见 `ui/proactive_actions.py` 的说明）。飞书建议入口用它——点了"建议"
+        不该有任何副作用能力。
         """
         if not isinstance(content, str) or not content.strip():
             raise ValueError('message content must be a non-empty string')
@@ -340,6 +356,11 @@ class AgentRuntime:
                         turn_kwargs['on_event'] = on_event
                     if not housekeeping:
                         turn_kwargs['housekeeping'] = False
+                    if proactive:
+                        # 裁剪工具面 + 钩子白名单，两道一起才算只读。
+                        import proactive as proactive_mod
+
+                        turn_kwargs['tools'] = list(proactive_mod.read_only_schemas())
                     pending = collections.deque()
                     with self._steer_lock:
                         self._steer_queues[session_id] = pending
@@ -367,7 +388,8 @@ class AgentRuntime:
                                            turn_id=token.turn_id)
                     try:
                         with use_workspace(workspace), \
-                                hooks.use_origin_chat(origin_chat):
+                                hooks.use_origin_chat(origin_chat), \
+                                _proactive_scope(proactive):
                             result = self._run_turn(messages, session_store=store,
                                                     **turn_kwargs)
                     except KeyboardInterrupt as exc:

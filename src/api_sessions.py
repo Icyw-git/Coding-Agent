@@ -180,7 +180,8 @@ def build_router(client, runtime):
             response = client.messages.create(
                 session_id, request.content,
                 origin_chat=request.origin_chat,
-                request_id=request.request_id)
+                request_id=request.request_id,
+                proactive=bool(getattr(request, 'proactive', False)))
         except TurnCancelled as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except TurnBusy as exc:

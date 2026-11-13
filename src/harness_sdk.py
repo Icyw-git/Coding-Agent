@@ -88,7 +88,8 @@ class Messages:
 
     def create(self, session_id: str, content: str, on_delta=None,
                origin_chat: str | None = None,
-               request_id: str | None = None) -> MessageResponse:
+               request_id: str | None = None,
+               proactive: bool = False) -> MessageResponse:
         kwargs = {}
         if on_delta is not None:
             kwargs['on_delta'] = on_delta
@@ -96,6 +97,8 @@ class Messages:
             kwargs['origin_chat'] = origin_chat
         if request_id:
             kwargs['request_id'] = request_id
+        if proactive:
+            kwargs['proactive'] = True
         result = self._runtime.send(session_id, content, **kwargs)
         # `getattr` 而不是直接取：测试与旧实现返回的结果对象没有这两个字段，
         # 让它们照样能跑（新字段只是附加信息）。

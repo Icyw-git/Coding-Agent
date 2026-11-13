@@ -2508,3 +2508,136 @@ def test_message_without_an_id_still_works(gateway):
     gw, fake = gateway
     gw.on_message('chat-1', '没有事件 id 的消息')
     assert 'agent-reply-ok' in fake.last()
+
+
+# ============================================================
+# R2-a：飞书建议卡（点开始才执行）
+# ============================================================
+
+
+def _seed_suggestion(tmp_path, monkeypatch, *, recipient='chat-1',
+                     action='补一下失败测试的日志'):
+    """在**网关实际会读的位置**放一条建议。
+
+    网关用的是 `paths.cache_dir()`（进程级），不是测试的 tmp_path——两边不一致的话
+    测试会以为"点不动"，实际只是没读到同一条。conftest 已把 HARNESS_HOME 指到临时
+    目录，所以这里显式用 paths.cache_dir() 与网关保持一致。
+    """
+    import paths
+    import proactive_suggestions as store
+
+    return store.record(paths.cache_dir(), [action], workspace='/repo/a',
+                        recipient=recipient)[0]
+
+
+def test_suggestion_card_renders_with_buttons(gateway, tmp_path, monkeypatch):
+    gw, fake = gateway
+    row = _seed_suggestion(tmp_path, monkeypatch)
+
+    gw._send_suggestions('chat-1', [row])
+
+    card = json.loads(json.dumps(fake.cards[-1][1], ensure_ascii=False))
+    text = json.dumps(card, ensure_ascii=False)
+    assert '补一下失败测试的日志' in text
+    assert '开始' in text and '不用了' in text
+    values = [action.get('value', {})
+              for element in card['elements'] if element.get('tag') == 'action'
+              for action in element.get('actions', [])]
+    assert {'suggest_action': 'start', 'suggestion_id': row['id']} in values
+    assert {'suggest_action': 'skip', 'suggestion_id': row['id']} in values
+
+
+def test_wrong_recipient_cannot_start_a_suggestion(gateway, tmp_path, monkeypatch):
+    """卡片被转发到别的聊天：按钮点了也不该生效。"""
+    gw, fake = gateway
+    row = _seed_suggestion(tmp_path, monkeypatch, recipient='chat-1')
+
+    toast, ok = gw.handle_card_action('ou_me',
+                                      {'suggest_action': 'start',
+                                       'suggestion_id': row['id']},
+                                      'om_card', chat_id='chat-2')
+    assert ok is False
+    assert '不属于本聊天' in toast or '过期' in toast, toast
+
+
+def test_start_button_runs_the_suggestion_and_marks_it_accepted(
+        gateway, tmp_path, monkeypatch):
+    gw, fake = gateway
+    gw.on_message('chat-1', '你好')          # 建立绑定
+    row = _seed_suggestion(tmp_path, monkeypatch, recipient='chat-1')
+
+    gw._handle_suggest_action('chat-1', {'suggest_action': 'start',
+                                         'suggestion_id': row['id']})
+
+    import paths
+    import proactive_suggestions as store
+
+    assert store.open_items(paths.cache_dir()) == [], '采纳后建议不该还开着'
+    followed = [text for _chat, text in fake.sent]
+    assert any('开始执行' in text for text in followed), followed
+    # 采纳计数应当落到节奏状态里（反馈回路真的接上了）
+    import proactive
+
+    assert proactive._read_state(paths.cache_dir()).get('accepted_total', 0) >= 1
+
+
+def test_skip_button_only_records_feedback(gateway, tmp_path, monkeypatch):
+    gw, fake = gateway
+    row = _seed_suggestion(tmp_path, monkeypatch, recipient='chat-1')
+    turns_before = len(fake.sent)
+
+    gw._handle_suggest_action('chat-1', {'suggest_action': 'skip',
+                                         'suggestion_id': row['id']})
+
+    import paths
+    import proactive
+
+    assert proactive._read_state(paths.cache_dir()).get('ignored_streak', 0) == 1
+    # 只回一句话，不开回合
+    assert len(fake.sent) == turns_before + 1
+
+
+def test_busy_accept_keeps_the_suggestion_open(gateway, tmp_path, monkeypatch):
+    """受理失败（busy）：建议必须留着，界面不能显示成已采纳。"""
+    gw, fake = gateway
+    gw.on_message('chat-1', '你好')
+    row = _seed_suggestion(tmp_path, monkeypatch, recipient='chat-1')
+
+    import request_dedup
+    monkeypatch.setattr(request_dedup, 'MAX_RECORDS', 0)   # 满容量 → 受理失败
+
+    gw._handle_suggest_action('chat-1', {'suggest_action': 'start',
+                                         'suggestion_id': row['id']})
+
+    import paths
+    import proactive_suggestions as store
+
+    texts = [text for _c, text in fake.sent]
+    assert [item['id'] for item in store.open_items(paths.cache_dir())] == [row['id']], texts
+    assert any('还留着' in text or '没受理' in text for text in texts), texts
+
+
+def test_suggestion_accept_passes_the_stable_request_id(gateway, tmp_path, monkeypatch):
+    """采纳必须把派生的 request_id 传给受理层。
+
+    不传的话，重复点击只能靠本地状态拦——而且受理失败（满容量/冲突）会被当成成功
+    （实测踩到：MAX_RECORDS=0 时仍回了「开始执行了」）。
+    """
+    gw, fake = gateway
+    gw.on_message('chat-1', '你好')
+    row = _seed_suggestion(tmp_path, monkeypatch, recipient='chat-1')
+
+    seen = {}
+    real_send = gw.api.send
+
+    # 显式写出 request_id：`_accepts_kwarg` 看的是签名，用 **kwargs 包着会被判成
+    # "不支持"，于是这条测试就测不到东西了。
+    def spy(content, session_id=None, request_id=None, **kwargs):
+        seen['request_id'] = request_id
+        return real_send(content, session_id=session_id, **kwargs)
+
+    monkeypatch.setattr(gw.api, 'send', spy)
+    gw._handle_suggest_action('chat-1', {'suggest_action': 'start',
+                                         'suggestion_id': row['id']})
+
+    assert seen.get('request_id', '').startswith('suggestion:'), seen

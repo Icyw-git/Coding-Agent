@@ -17411,3 +17411,74 @@ proposed → accepted / dismissed / expired
 `R2-a` 的停止线也照做：没新增 cron 自动执行副作用、没改默认 `off`、调度扩展另批。
 
 全量 3695 passed / 3 skipped。
+
+---
+
+# 第 145 部分：R2-a 其二 —— 手机端建议卡（点开始才执行）
+
+## 一、要解决的用户问题
+
+建议发到手机上，用户得能**当场决定**：开始，还是别烦我。原来飞书连 `/suggest` 都没有，
+建议只能从 TUI 看。
+
+## 二、只读是两道一起
+
+`AgentRuntime.send(proactive=True)` 现在同时做两件事：
+
+```python
+turn_kwargs['tools'] = list(proactive.read_only_schemas())   # 模型看不到写工具
+with _proactive_scope(proactive):                            # 钩子里真拒绝
+```
+
+只做前者是"提示"，只做后者是"浪费回合"。测试断言两者都生效（`hooks.proactive_turn()`
+为真，工具名集合等于只读白名单且不含 write/bash）。
+
+## 三、卡片与按钮
+
+`feishu_suggestion_card` 每条建议两个按钮：**开始** / **不用了**。token 只带建议 id，
+接收人由网关按当前聊天校验——**卡片被转发到别的聊天，按钮点不动**。
+
+`/suggest` 在飞书上：先摆出没处理的，再跑一轮只读回合，`parse_suggestions` 解析后
+`store.record(...)` 落成实体并发新卡。
+
+## 四、采纳走的是"用户自己发一条消息"同一条路
+
+```python
+reply = self.api.send(row['proposed_action'], session_id=..., request_id=request_id)
+```
+
+**不带任何工具许可**——该问的照旧问。`request_id` 由建议 id 派生，所以重复点击在
+受理层也幂等。
+
+## 五、实测踩到一个真 bug
+
+第一版 accept 回调**忘了传 `request_id`**。后果不是"重复执行"（store 里的 accepted
+状态会短路），而是更隐蔽的一个：**满容量/冲突时会被当成成功**——测试用
+`MAX_RECORDS=0` 复现，界面仍回「开始执行了」。
+
+补了守卫 `test_suggestion_accept_passes_the_stable_request_id`（spy 住 `api.send`
+断言收到 `suggestion:` 前缀的 request_id）。
+
+顺带一个坑：spy 用 `**kwargs` 包着会被 `_accepts_kwarg` 判成"不支持"，测试就成了
+空转——签名要显式写出来。
+
+## 六、守卫（6 条）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| 卡片渲染 | 有「开始/不用了」，按钮 value 带正确 id |
+| 错误接收人 | 转发到 chat-2 点击 → 拒绝，建议不被消费 |
+| 开始按钮 | 跑完标记 accepted、回「开始执行」、`accepted_total` +1 |
+| 忽略按钮 | 只记反馈（`ignored_streak` =1），不开回合 |
+| busy / 满容量 | 建议仍开着、界面说"还留着" |
+| request_id 透传 | spy 断言 |
+
+## 七、刻意没做
+
+- **`/suggest` 不收集素材**：网关与 API 通常不同进程，`scan_sources` 读不到工作区与
+  会话目录。所以提示里**不提**那几行（原来会写成「工作区：None」，已一并修），
+  让模型用只读工具自己看——回合本来就是只读的。
+- **没给"忽略"加确认**：一次点击就是明确表态；过期/未送达不算忽略（store 里判）。
+- 停止线照做：没新增 cron 自动执行副作用、没改默认 `off`。
+
+全量 3702 passed / 3 skipped。

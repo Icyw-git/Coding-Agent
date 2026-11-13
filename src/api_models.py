@@ -25,6 +25,8 @@ if BaseModel is not None:
         origin_chat: str | None = Field(default=None, max_length=200)
         # 入站去重键（可选）：同 id 同内容只受理一次。旧客户端不传，行为不变。
         request_id: str | None = Field(default=None, max_length=120)
+        # 只读建议回合：工具面裁到只读白名单，并在钩子里开白名单（两道一起）。
+        proactive: bool = False
 
     class CreateCronRequest(BaseModel):
         cron: str = Field(min_length=1, max_length=120)

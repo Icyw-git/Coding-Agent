@@ -109,6 +109,7 @@ def build_router(client, runtime, logger):
                     on_delta=lambda text: deltas.put(("delta", text)),
                     origin_chat=request.origin_chat,
                     request_id=getattr(request, 'request_id', None),
+                    proactive=bool(getattr(request, 'proactive', False)),
                 )
                 duration_ms = round((time.monotonic() - started) * 1000)
                 deltas.put(("done", {"session_id": response.session_id,

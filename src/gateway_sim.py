@@ -205,7 +205,7 @@ class GatewayClient:
 
     def send(self, content: str, session_id: str | None = None,
              origin_chat: str | None = None, on_screenshots=None,
-             request_id: str | None = None) -> str:
+             request_id: str | None = None, proactive: bool = False) -> str:
         session_id = session_id or self.session_id
         if not session_id:
             raise RuntimeError('no active session; use /new first')
@@ -214,6 +214,8 @@ class GatewayClient:
             payload['origin_chat'] = origin_chat
         if request_id:
             payload['request_id'] = request_id
+        if proactive:
+            payload['proactive'] = True
         response = self.http.post(
             f'/v1/sessions/{session_id}/messages',
             json=payload,
@@ -228,7 +230,8 @@ class GatewayClient:
     def send_stream(self, content: str, session_id: str | None = None,
                     on_delta=None, on_progress=None,
                     origin_chat: str | None = None,
-                    on_screenshots=None, request_id: str | None = None) -> str:
+                    on_screenshots=None, request_id: str | None = None,
+                    proactive: bool = False) -> str:
         """Run a turn over the message SSE endpoint and return final text."""
         session_id = session_id or self.session_id
         if not session_id:
@@ -238,6 +241,8 @@ class GatewayClient:
             payload['origin_chat'] = origin_chat
         if request_id:
             payload['request_id'] = request_id
+        if proactive:
+            payload['proactive'] = True
         final = ''
         self.last_duration_ms = None
         self.last_duration = None

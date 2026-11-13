@@ -2140,6 +2140,131 @@ class FeishuGateway:
             return
         self._show_audit(chat_id, page=target, message_id=message_id)
 
+    def _handle_suggest_command(self, chat_id: str, argument: str) -> None:
+        """/suggest：给几条建议（只读回合），或列出/处理已有的建议。
+
+        只读是**两道一起**：`AgentRuntime.send(proactive=True)` 同时裁工具面与开钩子
+        白名单。建议本身不携带任何工具许可——点「开始」走的是正常受理，照旧审批。
+        """
+        import proactive_suggestions as store
+
+        argument = (argument or '').strip()
+        if argument == 'list':
+            self._send_suggestions(chat_id, store.open_items(paths.cache_dir()))
+            return
+        if argument != '':
+            self._reply(chat_id, '用法：/suggest 想几条（或 /suggest list 看没处理的）')
+            return
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            self._reply(chat_id, '当前聊天没有绑定会话；先发一条消息再试。')
+            return
+        # 先摆出没处理的（如果有），再跑一轮新的只读建议回合。
+        existing = store.open_items(paths.cache_dir())
+        if existing:
+            self._send_suggestions(chat_id, existing, header='还有这些没处理')
+        import proactive
+
+        # 素材只在**这个网关进程**能拿到的范围内收集：`scan_sources` 要读工作区与
+        # 会话目录，而网关通常和 API 不同进程。拿不到就不传（prompt 会按 0 处理），
+        # 让模型自己用只读工具去看——回合本来就是只读的，它能看到真实状态。
+        text = proactive.prompt({}, limit=proactive.max_suggestions())
+        try:
+            answer = self.api.send(text, session_id=session_id, proactive=True)
+        except Exception as exc:
+            self._reply(chat_id, f'要建议失败：{friendly_error(exc) or exc}')
+            return
+        suggestions = proactive.parse_suggestions(
+            answer or '', limit=proactive.max_suggestions())
+        rows = store.record(paths.cache_dir(), suggestions,
+                            workspace='', recipient=chat_id)
+        self._send_suggestions(chat_id, rows or [], header='新想出来的')
+
+    def _send_suggestions(self, chat_id: str, rows, *, header: str = '',
+                          message_id: str | None = None) -> None:
+        import feishu_suggestion_card as card
+
+        payload = card.suggestions_card(rows, header=header)
+        fallback = card.suggestions_text(rows)
+        self._send_suggestion_view(chat_id, payload, fallback, message_id=message_id)
+
+    def _send_suggestion_view(self, chat_id: str, payload: dict, fallback: str,
+                              *, message_id: str | None = None) -> None:
+        sender = getattr(self.transport, 'send_session_card', None)
+        if sender is not None:
+            try:
+                sender(chat_id, payload)
+                return
+            except Exception as exc:
+                print(f'[feishu] suggestion card failed, fallback to text: {exc}')
+        self._reply(chat_id, fallback)
+
+    def _handle_suggest_action(self, chat_id: str, value: dict,
+                               message_id: str | None = None) -> None:
+        """卡片按钮：开始 / 不用了。开始才执行，而且走正常受理。"""
+        import proactive_suggestions as store
+
+        action = str((value or {}).get('suggest_action') or '')
+        if action == 'refresh':
+            self._send_suggestions(chat_id, store.open_items(paths.cache_dir()),
+                                   header='重新想了一遍', message_id=message_id)
+            return
+        suggestion_id = str((value or {}).get('suggestion_id') or '')
+        row = next((item for item in store.all_items(paths.cache_dir())
+                    if item.get('id') == suggestion_id), None)
+        if row is None:
+            self._reply(chat_id, '这条建议已经不在了。')
+            return
+
+        if action == 'skip':
+            result = store.dismiss(paths.cache_dir(), suggestion_id,
+                                   recipient=chat_id)
+            if result.get('status') == 'dismissed':
+                self._reply(chat_id, '好的，这条不用了（连续忽略会少打扰你）。')
+            elif result.get('status') == 'expired':
+                self._reply(chat_id, '这条建议已经过期了。')
+            else:
+                self._reply(chat_id, '这条建议已经处理过了。')
+            return
+
+        if action != 'start':
+            return
+        session_id = self.bindings.get(chat_id)
+        if not session_id:
+            self._reply(chat_id, '当前聊天没有绑定会话；先发一条消息再试。')
+            return
+        started = {'turn_id': ''}
+
+        def accept(request_id: str) -> dict:
+            # 采纳 = 走**正常受理**：和用户自己发一条消息同一条路，照旧审批。
+            # request_id 由建议 id 派生，必须**传下去**：否则重复点击只能靠本地
+            # 状态拦，“受理层幂等”没生效（受理失败时也看不出来）。
+            kwargs = {}
+            if _accepts_kwarg(self.api.send, 'request_id'):
+                kwargs['request_id'] = request_id
+            try:
+                reply = self.api.send(str(row.get('proposed_action') or ''),
+                                      session_id=session_id, **kwargs)
+            except Exception as exc:
+                # 忙/冲突/满容量：都不是“已受理”，建议要保持可重试。
+                print(f'[feishu] suggestion accept failed: {exc}')
+                return {'status': 'busy'}
+            started['turn_id'] = ''
+            return {'status': 'accepted', 'turn_id': started['turn_id'],
+                    'reply': reply}
+
+        result = store.accept(paths.cache_dir(), suggestion_id, accept=accept,
+                              recipient=chat_id)
+        status = result.get('status')
+        if status == 'accepted':
+            self._reply(chat_id, '开始执行了（该确认的照旧会问你）。')
+        elif status == 'busy':
+            self._reply(chat_id, '刚才那个回合还没结束，这条建议还留着，稍后再点。')
+        elif status == 'expired':
+            self._reply(chat_id, '这条建议已经过期了。')
+        else:
+            self._reply(chat_id, f'没受理成功（{status}），建议还留着。')
+
     def _handle_audit_command(self, chat_id: str, argument: str) -> None:
         """/audit [类型过滤]：查看最近的安全相关事件。"""
         import audit
@@ -2592,6 +2717,8 @@ class FeishuGateway:
                 self._handle_domain_command(chat_id, argument, sender_id)
             elif command == '/audit':
                 self._handle_audit_command(chat_id, argument)
+            elif command == '/suggest':
+                self._handle_suggest_command(chat_id, argument)
             elif command == '/fork':
                 sid = self.bindings.get(chat_id)
                 if not sid:
@@ -2849,6 +2976,28 @@ class FeishuGateway:
             except queue.Full:
                 return '当前消息较多，请稍后重试', False
             return '正在处理…', True
+        if (value or {}).get('suggest_action'):
+            # token 只带建议 id；**接收人按当前聊天校验**（卡片被转发也点不动）。
+            import proactive_suggestions as store
+
+            action = str(value.get('suggest_action'))
+            if action == 'refresh':
+                try:
+                    self._events.put_nowait((chat_id, value, open_id, None,
+                                             message_id))
+                except queue.Full:
+                    return '当前消息较多，请稍后重试', False
+                return '正在刷新…', True
+            suggestion_id = str(value.get('suggestion_id') or '')
+            if not store.check_token(paths.cache_dir(), suggestion_id,
+                                     recipient=chat_id):
+                return '这条建议已过期或不属于本聊天', False
+            try:
+                self._events.put_nowait((chat_id, value, open_id, None,
+                                         message_id))
+            except queue.Full:
+                return '当前消息较多，请稍后重试', False
+            return ('正在开始…' if action == 'start' else '已忽略'), True
         if (value or {}).get('cron_action'):
             if not self._cron_view_ok(chat_id, value):
                 return '定时任务卡片已过期，请重新打开', False
@@ -3347,6 +3496,9 @@ class FeishuGateway:
                                 elif text.get('audit_action'):
                                     self._handle_audit_action(chat_id, text, sender_id,
                                                               message_id)
+                                elif text.get('suggest_action'):
+                                    self._handle_suggest_action(chat_id, text,
+                                                                message_id)
                                 elif text.get('task_action'):
                                     self._handle_task_action(chat_id, text, sender_id,
                                                              message_id)

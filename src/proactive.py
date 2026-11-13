@@ -306,16 +306,23 @@ def prompt(material: dict, *, limit: int = 3) -> str:
     即使工具面已经裁了，提示里也再说一次：少一次无效尝试总归更好。
     建议会直接显示给用户，所以要求用中文、一条一行。
     """
+    # 素材可以为空（网关与 API 不同进程时拿不到工作区/会话目录）：那就**不提**
+    # 这几行，而不是写成「工作区：None」——那样只会让模型困惑。
+    facts = []
+    if material.get('workspace'):
+        facts.append(f"工作区：{material.get('workspace')}")
+    if material.get('todos') is not None:
+        facts.append(f"未完成的待办：{material.get('todos')}")
     recent = material.get('recent_sessions') or []
-    recent_text = '、'.join(
-        str(item.get('title') or '') for item in recent) or '（无）'
+    if recent:
+        facts.append('最近的会话：' + '、'.join(
+            str(item.get('title') or '') for item in recent))
+    facts_block = (chr(10).join(facts) + chr(10) + chr(10)) if facts else ''
     return (
-        '你看看我本机的状态，给几条今天值得做的事。\n'
-        '你只有只读工具，不要尝试改动任何东西。\n\n'
-        f"工作区：{material.get('workspace')}\n"
-        f"未完成的待办：{material.get('todos')}\n"
-        f"最近的会话：{recent_text}\n\n"
-        f'最多给 {limit} 条，一条一行，用中文，要具体到能直接动手；'
+        '你看看我本机的状态，给几条今天值得做的事。' + chr(10)
+        + '你只有只读工具，不要尝试改动任何东西。' + chr(10) + chr(10)
+        + facts_block
+        + f'最多给 {limit} 条，一条一行，用中文，要具体到能直接动手；'
         '每条都要能从上面看到的状态里说清理由，没把握的不要写。'
         '如果确实没有值得做的事，只输出：NONE'
     )

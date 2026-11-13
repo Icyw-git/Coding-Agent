@@ -220,3 +220,37 @@ def test_tui_start_while_busy_keeps_the_suggestion(cache, monkeypatch):
 
     assert '回合进行中' in notices[-1], notices[-1]
     assert len(store.open_items(cache)) == 1, '忙的时候建议必须还在'
+
+
+# ============================================================
+# 只读回合：`proactive=True` 时工具面被裁到白名单
+# ============================================================
+
+
+def test_proactive_turn_is_read_only_and_wrapped(tmp_path):
+    """飞书建议入口走的就是这条：裁 schema + 开钩子白名单，两道一起。"""
+    import hooks
+    from agent_runtime import AgentRuntime
+    from session_store import SessionEventStore
+
+    seen = {}
+
+    def run_turn(messages, session_store, **kwargs):
+        import proactive
+
+        seen['tools'] = kwargs.get('tools')
+        seen['scope'] = hooks.proactive_turn()
+        seen['allowed'] = {item['function']['name']
+                           for item in proactive.read_only_schemas()}
+        return '建议一二三'
+
+    runtime = AgentRuntime(run_turn=run_turn,
+                           session_store_cls=SessionEventStore,
+                           sessions_dir=tmp_path / 'sessions')
+    session_id = runtime.create_session('sess')
+    runtime.send(session_id, '给点建议', proactive=True)
+
+    assert seen['scope'] is True, '没有开钩子白名单，模型仍可能调到写工具'
+    names = {item['function']['name'] for item in seen['tools']}
+    assert names == seen['allowed'], names
+    assert 'write' not in names and 'bash' not in names, names
