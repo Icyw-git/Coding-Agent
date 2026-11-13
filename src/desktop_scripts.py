@@ -20,6 +20,99 @@
 from __future__ import annotations
 
 # worker 模式下只执行一次的装配部分（Add-Type 编译在这里，代价只付一次）。
+# 键序列的编排单独成段：先全量校验→按下→try/finally 逆序释放。
+# 它不直接调 `[HarnessDesktopNative]::VirtualKey`，而是接收一个 `$Send` scriptblock，
+# 所以离线测试能传一个记账用的假 sender，把“哪个键没释放”验清楚。
+KEY_STEP_SCRIPT = r'''
+function Resolve-KeySpec($KeyText) {
+    # 一次把修饰键与主键都解析完：调用方拿到结果再去按，避免“按了一半才发现
+    # 键名不认得”（那样已按下的修饰键会留在按下状态）。
+    $parts = ([string]$KeyText).ToLowerInvariant().Split('+')
+    $base = $parts[$parts.Length - 1]
+    $mods = @()
+    if ($parts.Length -gt 1) { $mods = $parts[0..($parts.Length - 2)] }
+    $modMap = @{ 'ctrl' = 17; 'alt' = 18; 'shift' = 16; 'win' = 91 }
+    $map = @{ 'enter' = 13; 'return' = 13; 'tab' = 9; 'escape' = 27; 'esc' = 27;
+              'backspace' = 8; 'delete' = 46; 'home' = 36; 'end' = 35;
+              'left' = 37; 'up' = 38; 'right' = 39; 'down' = 40; 'space' = 32;
+              'pageup' = 33; 'pagedown' = 34; 'insert' = 45 }
+    $modVks = @()
+    foreach ($mod in $mods) {
+        if (-not $modMap.ContainsKey($mod)) {
+            return [ordered]@{ code = 'invalid_key'; message = "不认识的修饰键：$mod" }
+        }
+        $modVks += [int]$modMap[$mod]
+    }
+    $vk = 0
+    if ($base -match '^f([1-9]|1[0-2])$') { $vk = 111 + [int]$Matches[1] }
+    elseif ($map.ContainsKey($base)) { $vk = [int]$map[$base] }
+    elseif ($base.Length -eq 1 -and [int][char]$base -lt 128) {
+        $vk = [int][char]$base.ToUpperInvariant()
+    }
+    else { return [ordered]@{ code = 'invalid_key'; message = '不认识的键名' } }
+    return [ordered]@{ ok = $true; mods = $modVks; vk = $vk }
+}
+
+function Invoke-KeyStep($KeyText, $Send) {
+    # “按下→放开”必须成对：任何一步抛异常，已按下的键都要逆序尽力释放，否则
+    # Ctrl/Shift 会粘在按下状态，之后所有输入都变形。
+    # 返回 $null 表示成功；否则返回失败回包（含已完成/失败的释放信息）。
+    $spec = Resolve-KeySpec $KeyText
+    if (-not $spec.ok) { return $spec }
+
+    $pressed = New-Object System.Collections.ArrayList
+    $released = New-Object System.Collections.ArrayList
+    $cleanupError = ''
+
+    $releaseAll = {
+        for ($i = $pressed.Count - 1; $i -ge 0; $i--) {
+            $vk = [int]$pressed[$i]
+            try {
+                & $Send $vk $false
+                [void]$released.Add($vk)
+            } catch {
+                # 一个键释放失败不阻止剩下的：能放多少放多少
+                if (-not $cleanupError) { $cleanupError = $_.Exception.Message }
+            }
+        }
+    }
+
+    try {
+        foreach ($vk in $spec.mods) {
+            # 先登记再按：按下调用自己抛异常时，这个键可能已经生效也可能没有。
+            # 对一个没按下的键发 key-up 是无害的，漏掉却会粘住——所以宁可多放一次。
+            [void]$pressed.Add($vk)
+            & $Send $vk $true
+        }
+        [void]$pressed.Add($spec.vk)
+        & $Send $spec.vk $true
+        & $Send $spec.vk $false
+        [void]$pressed.Remove($spec.vk)
+        for ($i = $spec.mods.Count - 1; $i -ge 0; $i--) {
+            & $Send $spec.mods[$i] $false
+            [void]$pressed.Remove($spec.mods[$i])
+        }
+        return $null
+    } catch {
+        & $releaseAll
+        return [ordered]@{
+            code = 'key_interrupted'
+            message = "按键过程中出错：$($_.Exception.Message)"
+            vk = [int]$spec.vk
+            completed = [int]$released.Count
+            release_failed = $(if ($cleanupError) { $cleanupError } else { '' })
+        }
+    } finally {
+        # 正常路径也会有残余（上面的 Remove 只抵消已配对的键）；这里兼底且不抛。
+        if ($pressed.Count -gt 0) { & $releaseAll }
+        if ($cleanupError) {
+            [Console]::Error.WriteLine("key cleanup failed: " + $cleanupError)
+        }
+    }
+}
+'''
+
+
 CONTROL_SETUP = r'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName UIAutomationClient
@@ -1181,29 +1274,14 @@ function Invoke-Step($step, $state) {
             [HarnessDesktopNative]::Unicode([uint16][char]$ch,$true)
         }
     } elseif ($action -eq 'key') {
-        # "ctrl+v" / "ctrl+shift+s": hold modifiers, tap the base key, release.
-        $parts = ([string]$step.key).ToLowerInvariant().Split('+')
-        $base = $parts[$parts.Length - 1]
-        $mods = @()
-        if ($parts.Length -gt 1) { $mods = $parts[0..($parts.Length - 2)] }
-        $modMap=@{'ctrl'=17;'alt'=18;'shift'=16;'win'=91}
-        $map=@{'enter'=13;'return'=13;'tab'=9;'escape'=27;'esc'=27;'backspace'=8;'delete'=46;'home'=36;'end'=35;'left'=37;'up'=38;'right'=39;'down'=40;'space'=32;'pageup'=33;'pagedown'=34;'insert'=45}
-        $vk=0
-        if ($base -match '^f([1-9]|1[0-2])$') { $vk=111+[int]$Matches[1] }
-        elseif ($map.ContainsKey($base)) { $vk=$map[$base] }
-        elseif ($base.Length -eq 1 -and [int][char]$base -lt 128) { $vk=[int][char]$base.ToUpperInvariant() }
-        else { return [ordered]@{ code='invalid_key'; message='不认识的键名' } }
-        foreach ($mod in $mods) {
-            if (-not $modMap.ContainsKey($mod)) {
-                return [ordered]@{ code='invalid_key'; message="不认识的修饰键：$mod" }
-            }
-            [HarnessDesktopNative]::VirtualKey([uint16]$modMap[$mod],$false)
+        # 键序列编排在 KEY_STEP_SCRIPT 里：先全量校验、再按下，任何异常都在
+        # 逆序释放之后才上报。直接写在这里的话，`ctrl+不存在的键` 会把 Ctrl
+        # 留在按下状态（校验发生在按下之后，且没有 finally）。
+        $keyFailure = Invoke-KeyStep ([string]$step.key) {
+            param($vk, $down)
+            [HarnessDesktopNative]::VirtualKey([uint16]$vk, [bool]$down)
         }
-        [HarnessDesktopNative]::VirtualKey([uint16]$vk,$false)
-        [HarnessDesktopNative]::VirtualKey([uint16]$vk,$true)
-        for ($i = $mods.Length - 1; $i -ge 0; $i--) {
-            [HarnessDesktopNative]::VirtualKey([uint16]$modMap[$mods[$i]],$true)
-        }
+        if ($null -ne $keyFailure) { return $keyFailure }
     } elseif ($action -eq 'wait') {
         $ms=[int]$step.ms
         if ($ms -lt 50 -or $ms -gt 3000) {

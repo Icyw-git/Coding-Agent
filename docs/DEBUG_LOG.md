@@ -16543,3 +16543,84 @@ total_in += int(usage.get('prompt_tokens') or 0)    # ② 字段名也不对
   台账上会明确标出来。
 
 全量 3588 passed / 3 skipped。
+
+---
+
+# 第 133 部分：R0-a ③ —— `key=ctrl+不存在的键` 会把 Ctrl 粘住
+
+## 一、上次判断错了
+
+我在第 127 部分说这项「离线无法验证，必须真机」。**这个判断是错的**：缺的不是可测性，
+而是**可替换的注入点**。
+
+原代码把发送动作直接写死在分支里（`[HarnessDesktopNative]::VirtualKey(...)`），所以只能
+靠真键盘验。但发送动作本身可以做成参数：
+
+```powershell
+function Invoke-KeyStep($KeyText, $Send) { … }
+```
+
+生产调用传真实的 `VirtualKey`，测试传一个只记账的假 sender——同一份源码，两个消费者。
+
+## 二、缺陷（两处，都会留下按下的修饰键）
+
+```powershell
+foreach ($mod in $mods) {
+    if (-not $modMap.ContainsKey($mod)) { return … }      # ① 校验在按下之后
+    [HarnessDesktopNative]::VirtualKey($mod, $false)      #    已按下前一个修饰键
+}
+[HarnessDesktopNative]::VirtualKey($vk,$false)            # ② 按下与释放间没有 finally
+[HarnessDesktopNative]::VirtualKey($vk,$true)
+```
+
+`key=ctrl+bogus` → 先把 Ctrl 按下去，再发现键名不认得，直接 return。**Ctrl 粘住**，
+之后所有键盘输入都变形。中间任何异常同理。
+
+## 三、改法
+
+1. **`Resolve-KeySpec`**：一次把修饰键与主键**全部**解析完，不认识就返回错误——
+   调用方拿到结果才去按。
+2. **`Invoke-KeyStep`**：按下序列包在 `try` 里，`catch` 与 `finally` 都做**逆序逐键释放**；
+   一个键释放失败不阻止剩余（记进 `release_failed`，不吞成成功）。
+3. **先登记再按**：`$pressed.Add($vk)` 放在发送之前。发送调用自己抛异常时，这个键可能
+   已经生效也可能没有——对没按下的键发 key-up 是无害的，漏掉却会粘住。
+4. 失败回包新增 `vk / completed / release_failed`，让上游能说清「哪一步、放了几个」。
+
+生产侧只改了两行（分支改为调 `Invoke-KeyStep`）；`KEY_STEP_SCRIPT` 同时拼进
+`CONTROL_SCRIPT`（独立进程）与 `worker_script()`（常驻 worker）。
+
+## 四、离线测试怎么写的
+
+`tests/test_desktop_key_release.py` 把 `KEY_STEP_SCRIPT` 原样加载，传一个记账的假 sender，
+用 `fail_at=N` 安排「第 N 次发送时抛异常」。**不碰真实键盘**。
+
+中途踩了两个编码坑，都记在这里：
+
+- **`-File` 读无 BOM 文件按 ANSI(GBK) 解释**，脚本里的中文字面量被拆成乱码，甚至破坏
+  引号配对。改用 `-EncodedCommand`（base64 UTF-16LE）——PS5/PS7 上行为一致的唯一入口；
+- **stdout 编码跟控制台代码页走**，中文消息解不出来。改成 `Out-File -Encoding utf8`
+  写文件再按 `utf-8-sig` 读。
+
+## 五、守卫（7 条）
+
+| 测试 | 断言 |
+| --- | --- |
+| `test_normal_key_is_pressed_and_released` | `ctrl+v` → down `[17,86]`、up `[86,17]`（逆序） |
+| `test_unknown_modifier_presses_nothing` | `ctrl+bogus` → **一个键都没按**（原来会先按 Ctrl） |
+| `test_unknown_base_key_presses_nothing` | `shift+nope` → 同上 |
+| `test_interrupted_sequence_releases_every_pressed_key[1/2/3]` | 在第 1/2/3 次发送抛异常 → 每个按下的键都出现在释放序列里 |
+| `test_double_click_style_repeat_is_not_used_for_keys` | `enter` 单键路径仍正常 |
+
+验证过会红：把 `$releaseAll` 改成空循环 → 3 条异常注入用例立刻失败。
+
+**注**：第一次验证时我只删了 `catch` 里的释放，测试没红——因为 `finally` 里还有一道
+兜底。这说明两层释放都在工作，但也说明那次注入没验到东西。换成「让释放整体失效」才
+真的红。
+
+## 六、仍然需要真机的那部分
+
+本轮验的是**编排逻辑**（校验顺序、释放顺序、异常路径），不是 UIA/SendInput 本身。
+真正的键鼠效果仍需按 §9.3「真实键鼠只在用户点名的测试应用内另行验收」——但那是另一件事，
+不该被当成"这段逻辑没法测"的理由。
+
+全量 3595 passed / 3 skipped。

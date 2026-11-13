@@ -18,10 +18,10 @@ import time
 from dataclasses import dataclass
 
 # PowerShell 源码在 desktop_scripts（1622 行纯文本）；这里只剩 Python 逻辑。
-from desktop_scripts import CONTROL_BODY, CONTROL_MAIN, CONTROL_SETUP
+from desktop_scripts import CONTROL_BODY, CONTROL_MAIN, CONTROL_SETUP, KEY_STEP_SCRIPT
 
 #: 独立进程模式的完整脚本。worker 模式在 worker_script() 里另外拼 PRELUDE + LOOP。
-CONTROL_SCRIPT = CONTROL_SETUP + CONTROL_BODY + CONTROL_MAIN
+CONTROL_SCRIPT = KEY_STEP_SCRIPT + CONTROL_SETUP + CONTROL_BODY + CONTROL_MAIN
 
 DEFAULT_TIMEOUT = 10.0
 MAX_TYPE_CHARS = 1000
@@ -294,7 +294,7 @@ def worker_script() -> str:
     """
     import ps_worker
 
-    return (ps_worker.PRELUDE + CONTROL_SETUP
+    return (ps_worker.PRELUDE + KEY_STEP_SCRIPT + CONTROL_SETUP
             + CONTROL_BODY + ps_worker.LOOP)
 
 
