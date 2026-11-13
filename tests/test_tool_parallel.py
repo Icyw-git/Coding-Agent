@@ -2,8 +2,10 @@
 
 运行: python test_tool_parallel.py
 """
+import contextvars
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -175,3 +177,164 @@ def test_single_tool_call_unchanged(tmp_path, monkeypatch):
                        session_store=store)
     harness.wait_for_housekeeping(30)
     assert _tool_results(store) == [('c1', 'out:{"path": "only"}')]
+
+
+# ============================================================
+# R0-d：并行工具必须继承父回合的执行上下文
+# ============================================================
+# 缺陷：`_run_tool_batch` 的 worker 里调 `contextvars.copy_context()`——那时线程
+# 上下文是**空**的，父回合的 workspace / session / turn / taint / 一次性授权都丢。
+# 设计文档 §2.2 / §10 的探针记录：两个 read 都从 B 退到了全局回退值。
+
+
+def _tool_call(call_id, name='read'):
+    return type('TC', (), {
+        'id': call_id,
+        'function': type('F', (), {'name': name, 'arguments': '{}'})(),
+    })()
+
+
+def test_parallel_tools_inherit_the_turn_workspace(tmp_path, monkeypatch):
+    """父回合 workspace=B、全局回退=A → 两个并行工具都必须读到 B。
+
+    同时用一个自定义 ContextVar 验证「非 workspace 的上下文」也传到了线程里
+    （设计文档要求分别验收 workspace / session / taint / 取消）。
+    """
+    import tool_dispatch
+    import workspace_context
+
+    fallback = tmp_path / 'A'
+    selected = tmp_path / 'B'
+    fallback.mkdir()
+    selected.mkdir()
+
+    marker = contextvars.ContextVar('probe_marker', default='-')
+    barrier = threading.Barrier(2, timeout=10)
+    seen = []
+
+    def fake_exec(tool_call, **_kwargs):
+        barrier.wait()      # 两个必须同时在跑：证明这是并行批，且没被串行化
+        seen.append((tool_call.id,
+                     workspace_context.current_workspace(fallback),
+                     marker.get()))
+        return ('read', {}, {'role': 'tool', 'tool_call_id': tool_call.id,
+                             'content': 'ok'}, [])
+
+    monkeypatch.setattr(harness, 'exec_tool_call', fake_exec)
+    monkeypatch.setattr(tool_dispatch, 'PARALLEL_SAFE_TOOLS', frozenset({'read'}))
+    store = SessionEventStore(tmp_path / 'sessions', session_id='par-ctx')
+    messages = []
+    calls = [_tool_call('c1'), _tool_call('c2')]
+
+    token = marker.set('set-by-parent')
+    try:
+        with workspace_context.use_workspace(selected):
+            tool_dispatch._run_tool_batch(calls, store, messages)
+    finally:
+        marker.reset(token)
+
+    assert sorted(row[0] for row in seen) == ['c1', 'c2'], seen   # 并行完成顺序不定
+    for call_id, workspace, mark in seen:
+        assert workspace == selected, (
+            f'{call_id} 读到 {workspace}，退回了全局回退值 {fallback}')
+        assert mark == 'set-by-parent', f'{call_id} 丢失自定义上下文（{mark}）'
+
+
+def test_parallel_reads_merge_their_taint_back_into_the_turn(tmp_path, monkeypatch):
+    """worker 内新产生的污点必须回流到回合上下文。
+
+    并发时每个工具跑在自己的上下文副本里，`taint.mark()` 只改副本。不回收的话
+    串行与并行两种路径行为不一致：读了敏感文件之后，同一回合的出网检查看不见它。
+    """
+    import taint
+    import tool_dispatch
+
+    barrier = threading.Barrier(2, timeout=10)
+
+    def fake_exec(tool_call, **_kwargs):
+        barrier.wait()
+        taint.mark(f'sensitive-{tool_call.id}')
+        return ('read', {}, {'role': 'tool', 'tool_call_id': tool_call.id,
+                             'content': 'ok'}, [])
+
+    monkeypatch.setattr(harness, 'exec_tool_call', fake_exec)
+    monkeypatch.setattr(tool_dispatch, 'PARALLEL_SAFE_TOOLS', frozenset({'read'}))
+    store = SessionEventStore(tmp_path / 'sessions', session_id='par-taint')
+
+    taint.reset()
+    tool_dispatch._run_tool_batch([_tool_call('c1'), _tool_call('c2')], store, [])
+
+    merged = set(taint.sources())
+    assert {'sensitive-c1', 'sensitive-c2'} <= merged, merged
+    taint.reset()
+
+
+def test_one_shot_grant_is_not_broadcast_to_siblings(tmp_path, monkeypatch):
+    """一次性凭据不能随上下文快照复制给兄弟调用。
+
+    修上下文传播时发现：`copy_context()` 会把 `hooks._GRANTS`（一次性授权）也复制
+    过去，于是两个并行工具各消费同一份凭据——“批准一次”变成“放行两次”。
+    设计契约：parallel worker 从空凭据集开始，各自走本次调用的正常审批。
+    """
+    import hooks
+    import tool_dispatch
+
+    barrier = threading.Barrier(2, timeout=10)
+    seen = []
+
+    def fake_exec(tool_call, **_kwargs):
+        barrier.wait()
+        seen.append((tool_call.id, hooks.take_grant('read', {'path': 'x'})))
+        return ('read', {}, {'role': 'tool', 'tool_call_id': tool_call.id,
+                             'content': 'ok'}, [])
+
+    monkeypatch.setattr(harness, 'exec_tool_call', fake_exec)
+    monkeypatch.setattr(tool_dispatch, 'PARALLEL_SAFE_TOOLS', frozenset({'read'}))
+    store = SessionEventStore(tmp_path / 'sessions', session_id='par-grant')
+
+    hooks.issue_grant('read', {'path': 'x'})
+    try:
+        tool_dispatch._run_tool_batch([_tool_call('c1'), _tool_call('c2')], store, [])
+        assert [took for _, took in seen] == [False, False], seen
+        # 父回合那份凭据要留着：它属于父上下文的调用，不该被并行批吃掉
+        assert hooks.take_grant('read', {'path': 'x'}) is True
+    finally:
+        hooks.take_grants()
+
+
+def test_parallel_tools_inherit_turn_restrictions_and_do_not_cross_talk(tmp_path, monkeypatch):
+    """回合限制（会话/定时只读/主动性）要带进去；兄弟之间的写入不能互相串。
+
+    「工作区对了」不等于全通过：设计文档要求这几项分别验收。
+    """
+    import hooks
+    import tool_dispatch
+
+    barrier = threading.Barrier(2, timeout=10)
+    probe = contextvars.ContextVar('sibling_probe', default='untouched')
+    seen = {}
+
+    def fake_exec(tool_call, **_kwargs):
+        seen[tool_call.id] = (hooks.current_session_id(),
+                              hooks.scheduled_read_only(),
+                              hooks.proactive_turn())
+        if tool_call.id == 'c1':
+            probe.set('written-by-c1')      # 只改自己那份上下文
+        barrier.wait()
+        seen[f'{tool_call.id}-probe'] = probe.get()
+        return ('read', {}, {'role': 'tool', 'tool_call_id': tool_call.id,
+                             'content': 'ok'}, [])
+
+    monkeypatch.setattr(harness, 'exec_tool_call', fake_exec)
+    monkeypatch.setattr(tool_dispatch, 'PARALLEL_SAFE_TOOLS', frozenset({'read'}))
+    store = SessionEventStore(tmp_path / 'sessions', session_id='par-restrict')
+
+    with hooks.use_session('sess-42'), hooks.use_scheduled_turn(read_only=True), \
+            hooks.proactive_scope(True):
+        tool_dispatch._run_tool_batch([_tool_call('c1'), _tool_call('c2')], store, [])
+
+    assert seen['c1'] == ('sess-42', True, True), seen['c1']
+    assert seen['c2'] == ('sess-42', True, True), seen['c2']
+    assert seen['c1-probe'] == 'written-by-c1', 'c1 自己的写入应当可见'
+    assert seen['c2-probe'] == 'untouched', 'c1 的写入不该串到 c2 的上下文'
+    assert probe.get() == 'untouched', 'worker 的写入不该影响父上下文'

@@ -15983,3 +15983,68 @@ pytest tests/test_ui_*.py tests/test_harness_app.py …  273 passed（1:14）
 而不是让人从头再猜一遍。
 
 全量 3545 passed / 3 skipped。
+
+---
+
+# 第 125 部分：R0-d —— 并行工具丢失执行上下文（按 next-design 实施）
+
+读了 `docs/PERSONAL_AGENT_NEXT_DESIGN.md`（693 行）。其 §9.1 推荐的首批是 R0-a / R0-d，
+R0-d 范围最小、且文档 §2.2 / §10 已给出复现证据（"2 个 read 都从 SYNTHETIC_SELECTED
+退到 SYNTHETIC_DEFAULT，额外上下文标记也丢失"）。本轮只做 R0-d，不动 R0-a。
+
+## 一、先复现，再改
+
+按文档 §9.3 R0-d 的验收条件写测试：父回合 `use_workspace(B)`、全局回退 `A`，两个 `read`
+用 `threading.Barrier(2)` 保证同时执行。**改之前这条是红的**：
+
+```
+c2 读到 .../A，退回了全局回退工作区      ← 期望 .../B
+```
+
+根因在 `_run_tool_batch`：
+
+```python
+def run_parallel(tc):
+    with _mcp_telemetry_scope(session_store):
+        return contextvars.copy_context().run(_h().exec_tool_call, ...)   # ← 在 worker 里复制
+```
+
+`copy_context()` 写在 **worker 内部**，那时线程自己的上下文是空的——父回合的
+workspace / session / turn / origin / 只读限制 / 主动性限制 / taint / 一次性授权全丢。
+
+## 二、三处改动（都只改传播，不改策略判定）
+
+1. **在调用线程里、提交之前**为每个工具各捕获一份上下文快照（`contexts[tc.id]`），
+   在 worker 里 `contexts[tc.id].run(call)`。每个 call 单独一份——`Context` 不能被两个
+   线程同时进入。
+2. **一次性凭据不随快照广播**。修完第 1 条后实测发现问题：同一个 grant 被两个兄弟
+   各消费一次（探针输出 `[('c2', True), ('c1', True)]`），"批准一次"变成"放行两次"。
+   按设计契约"parallel worker 从空凭据集开始"，在副本上 `take_grants()` 清空；
+   父回合那份不动（它属于父上下文的调用）。
+3. **worker 内新产生的污点回流**。并发时 `taint.mark()` 只改副本，不回收就等于
+   "读了敏感文件、但同一回合的出网检查看不见"。
+
+## 三、守卫（三条都验证过会红）
+
+| 测试 | 拦什么 | 验证方式 |
+| --- | --- | --- |
+| `test_parallel_tools_inherit_the_turn_workspace` | 工作区与自定义 ContextVar 丢失 | 改前红（已复现） |
+| `test_parallel_tools_inherit_turn_restrictions_and_do_not_cross_talk` | 会话/只读/主动性限制丢失；兄弟写入串扰；worker 写入污染父上下文 | 同一机制，改前红 |
+| `test_one_shot_grant_is_not_broadcast_to_siblings` | 凭据被复制 | 临时去掉清空那段 → `[True, True]` 失败 |
+| `test_parallel_reads_merge_their_taint_back_into_the_turn` | 污点不回流 | 临时禁用回流 → `set()` 失败 |
+
+## 四、边界（照 §9.2 / §9.3 的"不改"清单执行）
+
+- 没动并行白名单、`PARALLEL_MAX_WORKERS`、后台自动判定、审批范围、task/teammate 调度；
+- 没动工具 schema/描述、权限决策、模型请求形状、结果原序（`executed` 仍按原序写回，
+  活动行仍按原序补打）；
+- 串行路径一行未动——它天然是同一个上下文，本来就对；
+- 纯传播修复，没有引入文档 §3.3 里 A1 的 `ExecutionContext` 类型（那是 R1-0）。
+
+全量 3549 passed / 3 skipped。
+
+## 五、下一批建议
+
+按 §9.1：R0-a（桌面不重复执行 + 审批摘要保留标量）是另一条独立小批，与 R0-d 不共享
+文件。R0-e（回合生命周期）与 R0-f（日志/缓存版本绑定）随后。R1-0（窄端口 + 兼容门面）
+必须等 R0-d/e 的契约固定后再做。

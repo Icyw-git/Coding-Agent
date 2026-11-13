@@ -302,13 +302,31 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
             for tool_call in tool_calls:
                 session_store.append_tool_started(tool_call)   # 原序登记全部 started
 
+            # 每个并行工具一份**调用线程**的上下文快照，在提交前捕获：
+            # workspace / session / turn / origin / taint / 一次性授权都活在 ContextVar 里，
+            # 而原来 `copy_context()` 写在 worker 内部——那时线程自己的上下文是空的，
+            # 父回合的东西全部丢掉（实测两个 read 都退回了全局回退工作区）。
+            # 每个 call 单独一份：同一个 Context 不能被两个线程同时进入。
+            contexts = {tc.id: contextvars.copy_context() for tc in tool_calls}
+            # 一次性凭据**不随快照广播**：同一个 grant 若被两个兄弟各消费一次，
+            # 「批准一次」就变成了「放行两次」。设计契约是 parallel worker 从空
+            # 凭据集开始，各自在本次调用的正常策略/审批中取得自己的那份。
+            # take_grants() 只改当前（副本）上下文，父回合那份不动。
+            import hooks as _hooks
+            for _ctx in contexts.values():
+                _ctx.run(_hooks.take_grants)
+
             def run_parallel(tc):
                 started = time.perf_counter()
-                try:
+
+                def call():
                     with _mcp_telemetry_scope(session_store):
-                        return contextvars.copy_context().run(
-                            _h().exec_tool_call, tc, on_event=on_event,
+                        return _h().exec_tool_call(
+                            tc, on_event=on_event,
                             on_activity=lambda *activity: activities.__setitem__(tc.id, activity))
+
+                try:
+                    return contexts[tc.id].run(call)
                 finally:
                     tool_timings[tc.id] = round(
                         (time.perf_counter() - started) * 1000, 3)
@@ -316,6 +334,14 @@ def _run_tool_batch(tool_calls, session_store, tool_messages, on_event=None):
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(PARALLEL_MAX_WORKERS, len(tool_calls))) as pool:
                 executed = list(pool.map(run_parallel, tool_calls))
+            # worker 里新产生的污点要回流：并发时每个工具在自己的上下文副本里
+            # `taint.mark()`，不回收就等于「读了敏感文件、但出网检查看不见」。
+            # 串行路径天然是同一个上下文，这里是为了两种路径行为一致。
+            from taint import mark as _taint_mark
+            from taint import sources as _taint_sources
+            for tool_call in tool_calls:
+                for source in contexts[tool_call.id].run(_taint_sources):
+                    _taint_mark(source)
             for tool_call in tool_calls:   # 并行完成顺序不定，按原序补打活动行
                 activity = activities.get(tool_call.id)
                 if activity is not None:
