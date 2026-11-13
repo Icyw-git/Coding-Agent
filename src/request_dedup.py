@@ -43,6 +43,13 @@ STORE_PATH = paths.cache_path('requests', 'dedup.jsonl')
 RETENTION_SECONDS = 7 * 24 * 3600
 #: 每状态根最多多少条。见模块文档的容量推导。
 MAX_RECORDS = 10_000
+#: 待核对列表里显示的预览长度。
+#:
+#: 为什么存预览（与墓碑"不存正文"不同）：待核对的那条消息**根本没进会话历史**——
+#: 受理之后、追加用户消息之前就崩了。没有预览，界面只能说"有 1 条待核对"，
+#: 用户无从判断是哪一条、要不要重发。预览是这条记录唯一的人可读痕迹。
+#: 但仍然有界（80 字）并过脱敏，不复制整段正文。
+PREVIEW_CHARS = 80
 
 _LOCK = threading.RLock()
 #: request_id → 记录。**只在内存里**建索引；文件是追加的事实源。
@@ -131,6 +138,38 @@ def _latest(rows: list[dict]) -> dict[str, dict]:
     return merged
 
 
+def _preview(text: str) -> str:
+    """待核对列表里那一行：折叠空白、脱敏、截断。
+
+    消息可能贴过凭据——记忆写入已经在这个位置脱敏过一次，这里保持一致。
+    """
+    collapsed = ' '.join(str(text or '').split())
+    if not collapsed:
+        return ''
+    try:
+        import memory_redact
+
+        collapsed = memory_redact.redact(collapsed)[0]
+    except Exception:
+        pass
+    if len(collapsed) > PREVIEW_CHARS:
+        return collapsed[:PREVIEW_CHARS - 1] + '…'
+    return collapsed
+
+
+def pending(*, limit: int = 10) -> list[dict]:
+    """已受理、但回合没绑上的请求（最近的在前）。
+
+    这些是**需要人核对**的：可能上一次受理之后进程崩了。界面据此提示"可能已受理"，
+    调用方据此决定是查询还是重发——但**不能自动重播**。
+    """
+    with _LOCK:
+        rows = [dict(row) for row in _index().values()
+                if not str(row.get('turn_id') or '')]
+    rows.sort(key=lambda row: float(row.get('created_at') or 0), reverse=True)
+    return rows[:max(0, limit)]
+
+
 def _append(row: dict) -> None:
     path = Path(STORE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +180,7 @@ def _append(row: dict) -> None:
 
 
 def claim(request_id: str, *, fingerprint: str, session_id: str = '',
-          origin: str = '') -> dict:
+          origin: str = '', preview: str = '') -> dict:
     """尝试受理一次入站请求。
 
     返回 ``{status, turn_id, reason}``，``status`` 是：
@@ -173,6 +212,7 @@ def claim(request_id: str, *, fingerprint: str, session_id: str = '',
                                'not evicted to make room')}
         row = {'request_id': request_id, 'fingerprint': str(fingerprint),
                'session_id': str(session_id or ''), 'origin': str(origin or ''),
+               'preview': _preview(preview),
                'turn_id': '', 'status': 'accepted', 'created_at': _now()}
         _append(row)
         index[request_id] = row

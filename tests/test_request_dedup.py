@@ -127,3 +127,75 @@ def test_compaction_drops_expired_rows_only(store):
 
     assert store.compact(now=store._now() + store.RETENTION_SECONDS + 1) == 0
     assert store.STORE_PATH.read_text(encoding='utf-8').strip() == ''
+
+
+# ============================================================
+# 待核对：用户至少要能认出"是哪条消息"
+# ============================================================
+
+
+def test_pending_records_carry_a_recognizable_preview(store):
+    """崩溃时消息根本没进历史，只有预览能让用户认出是哪条。
+
+    没有预览的话 `/status` 只能说「有 1 条待核对」——用户无法判断要不要重发。
+    """
+    store.claim('r1', fingerprint=_fp(), session_id='s1', origin='feishu',
+                preview='帮我跑一下测试然后总结失败原因')
+
+    pending = store.pending()
+    assert len(pending) == 1
+    assert pending[0]['preview'] == '帮我跑一下测试然后总结失败原因'
+    assert pending[0]['origin'] == 'feishu'
+    assert pending[0]['created_at'] > 0
+
+
+def test_preview_is_clipped_and_redacted(store):
+    secret = 'sk-abcdefghijklmnopqrstuvwxyz012345'
+    store.claim('r1', fingerprint=_fp(), session_id='s1', origin='feishu',
+                preview='key 是 ' + secret + ' 请记下来' + 'x' * 200)
+
+    preview = store.pending()[0]['preview']
+    assert secret not in preview, f'预览里带出了凭据：{preview}'
+    assert len(preview) <= store.PREVIEW_CHARS
+
+
+def test_bound_records_are_no_longer_pending(store):
+    store.claim('r1', fingerprint=_fp(), session_id='s1', origin='feishu',
+                preview='跑测试')
+    store.bind('r1', turn_id='turn-1')
+    assert store.pending() == []
+
+
+def test_expired_pending_is_not_listed(store, monkeypatch):
+    store.claim('r1', fingerprint=_fp(), session_id='s1', origin='feishu',
+                preview='跑测试')
+    real_now = store._now()
+    monkeypatch.setattr(store, '_now',
+                        lambda: real_now + store.RETENTION_SECONDS + 1)
+    store.reset_cache()
+    assert store.pending() == []
+
+
+# ============================================================
+# /status 的待核对行
+# ============================================================
+
+
+def test_status_lists_pending_with_a_recognizable_line(store, monkeypatch):
+    """一行里要能看到：几条、几点、哪条消息（预览）。"""
+    import status_report
+
+    store.claim('feishu:chat-1:om_x', fingerprint=_fp(), session_id='s1',
+                origin='feishu', preview='帮我跑一下测试')
+    note = status_report._pending_requests_note()
+
+    assert '待核对' in note, note
+    assert '帮我跑一下测试' in note, note
+    assert '没有重复执行' in note or '不要重发' in note, (
+        f'要说明下一步怎么办，而不是只报数字：{note}')
+
+
+def test_status_says_nothing_when_there_is_nothing_pending(store):
+    import status_report
+
+    assert status_report._pending_requests_note() == ''

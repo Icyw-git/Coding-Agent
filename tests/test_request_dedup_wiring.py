@@ -158,3 +158,68 @@ def test_feishu_uses_message_id_as_the_dedup_key():
     assert key.startswith('feishu:') and 'om_abc' in key
     assert key != feishu_gateway._message_request_id('chat-2', 'om_abc'), (
         '不同聊天里的同号 message_id 不该撞')
+
+
+# ============================================================
+# 四种动作的执行计数（§9.4 R1-a 验收第 4 条）
+# ============================================================
+
+
+def test_query_and_status_never_execute(tmp_path):
+    """查询 / 看状态：执行 0 次。"""
+    calls, run_turn = _counting_turn()
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('sess')
+    request_dedup.claim('req-q', fingerprint='f', session_id=session_id,
+                        origin='api', preview='跑测试')
+
+    import status_report
+
+    for _ in range(3):
+        request_dedup.lookup('req-q')
+        request_dedup.pending()
+        status_report._pending_requests_note()
+    assert calls == [], '查询动作触发了执行'
+
+
+def test_resending_the_same_request_does_not_execute(tmp_path):
+    """重发同一个请求（同 id）：仍然 0 次。"""
+    calls, run_turn = _counting_turn()
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('sess')
+
+    from agent_runtime import RequestPending
+    workspace = runtime._workspace_for(runtime._open_session(session_id))
+    request_dedup.claim(
+        'req-p',
+        fingerprint=request_dedup.fingerprint(text='跑测试',
+                                              workspace=str(workspace), mode='api'),
+        session_id=session_id, origin='api', preview='跑测试')
+
+    for _ in range(3):
+        with pytest.raises(RequestPending):
+            runtime.send(session_id, '跑测试', request_id='req-p')
+    assert calls == [], '待核对的请求被自动重播了'
+
+
+def test_a_new_request_id_executes_exactly_once(tmp_path):
+    """再执行：必须用**新** request_id，且只跑一次（走正常审批/执行）。"""
+    calls, run_turn = _counting_turn()
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('sess')
+
+    runtime.send(session_id, '跑测试', request_id='req-new')
+    runtime.send(session_id, '跑测试', request_id='req-new')
+    assert len(calls) == 1, calls
+
+
+def test_pending_note_disappears_once_the_turn_is_bound(tmp_path):
+    """绑上回合之后就不该再出现在「待核对」里。"""
+    calls, run_turn = _counting_turn()
+    runtime = _runtime(tmp_path, run_turn)
+    session_id = runtime.create_session('sess')
+    runtime.send(session_id, '跑测试', request_id='req-b')
+
+    import status_report
+
+    assert status_report._pending_requests_note() == ''

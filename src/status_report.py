@@ -95,6 +95,52 @@ def apply_sandbox_tier(argument: str) -> str:
             f'（当前 {policy.sandbox_mode} · {policy.approval_policy}）')
 
 
+#: 请求来源的中文名。原始值是 ``feishu`` / ``api`` 这类标识符——给用户看等于没写。
+_ORIGIN_LABELS = {'feishu': '飞书', 'api': '接口', 'cli': '命令行', 'tui': '界面',
+                  'sdk': '脚本', 'cron': '定时任务'}
+
+
+def _origin_label(origin: str) -> str:
+    key = origin.strip().casefold()
+    return _ORIGIN_LABELS.get(key, origin.strip())
+
+
+def _pending_requests_note() -> str:
+    """`/status` 里的「待核对请求」行（没有则空串）。
+
+    这些是受理了、但回合没开始的请求——通常是上一次受理之后进程崩了。
+    设计要点（用户视角）：
+
+    - 必须能认出**是哪一条**：崩溃时消息没进会话历史，只有预览是痕迹；
+    - 必须说清**下一步**：「不要直接重发」，以及怎么重发（换个说法再发一次即可，
+      那是新请求、走正常审批）；
+    - 不在这里提供"重跑"按钮：重跑要么是重发（新请求），要么是查询（只读），
+      两个都不该由一条状态行隐式触发。
+    """
+    try:
+        import request_dedup
+
+        rows = request_dedup.pending(limit=3)
+        total = len(request_dedup.pending(limit=1000))
+    except Exception:
+        return ''
+    if not rows:
+        return ''
+    lines = ['', f'  待核对请求：{total} 条（收到过，但没能开始执行）']
+    for row in rows:
+        stamp = time.strftime('%m-%d %H:%M', time.localtime(
+            float(row.get('created_at') or 0)))
+        preview = str(row.get('preview') or '').strip() or '（无预览）'
+        who = _origin_label(str(row.get('origin') or ''))
+        lines.append(f'    {stamp} 「{preview}」'
+                     + (f' · 来自{who}' if who else ''))
+    if total > len(rows):
+        lines.append(f'    … 另有 {total - len(rows)} 条')
+    lines.append('    这些没有重复执行过。要它再跑一次，重新发一遍就行'
+                 '（算新请求，照旧审批）。')
+    return chr(10).join(lines)
+
+
 def _cron_overflow_note() -> str:
     """定时结果超容量被裁时的提示行（没有则空串）。
 
@@ -243,6 +289,7 @@ def format_status(session_store) -> str:
                             '—— 全部规则当前不生效，看 /rules'
                             f'（文件 {user_rules.path_for_display()}）')
     overflow_note = _cron_overflow_note()
+    pending_note = _pending_requests_note()
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -258,6 +305,7 @@ def format_status(session_store) -> str:
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
         f'{overflow_note}'
+        f'{pending_note}'
         f'{capability_lines}'
         f'{usage_line}'
     )

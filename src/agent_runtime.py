@@ -301,7 +301,7 @@ class AgentRuntime:
                         text=content, workspace=str(workspace), mode=source,
                         attachments=[str(a.get('name') or '')
                                      for a in (attachments or [])]),
-                    session_id=session_id, origin=source)
+                    session_id=session_id, origin=source, preview=content)
                 if claim['status'] == 'conflict':
                     raise RequestConflict(
                         f'request {request_id} was already accepted with '
