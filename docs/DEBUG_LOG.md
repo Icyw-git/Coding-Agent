@@ -16624,3 +16624,82 @@ foreach ($mod in $mods) {
 不该被当成"这段逻辑没法测"的理由。
 
 全量 3595 passed / 3 skipped。
+
+---
+
+# 第 134 部分：R0-f ③ —— 尾部损坏时继续写，会把半行变成文件中间的损坏
+
+## 一、缺陷
+
+`append()` 完全不看尾部。崩溃留下的半行会被新事件接在后面：
+
+```
+{"seq":1,...}          ← 完整
+{"seq":2,"ty           ← 崩溃写的半行
+{"seq":3,...}          ← 新事件接上来
+```
+
+于是从「尾部有个不完整尾巴（可以安全截掉）」变成「**文件中间**有坏行」——下次
+`read_events()` 直接抛 `SessionReplayError`，而那时已经分不清哪一行是用户数据、
+哪一行是拼接出来的。
+
+## 二、改法
+
+**读取容忍 ≠ 准许继续写。** 这是设计文档的原话，也是这一条的分界线：
+
+| 路径 | 行为 |
+| --- | --- |
+| `read_events()` | 仍容忍尾部不完整（既有契约不变，不截断、不删字节） |
+| `append()` | 尾部不完整 → 抛 `SessionRecoveryRequired`（`code='recovery_required'`），**原文件字节不变** |
+| `recover_tail()` | 显式恢复：持会话写锁、**先存原件**、再按类型处理 |
+
+`tail_state()` 区分三种情况（恢复动作不同，不能合并）：
+
+- `partial_line`：最后一行不是合法 JSON → 截掉；
+- `complete_no_newline`：最后一行完整但缺换行 → **只补一个换行，内容一字不丢**；
+- `midfile`：坏行不在末尾 → **拒绝恢复**。截断会让会话「能读了」，但连着丢掉中间之后
+  所有事件——比报错危险得多。
+
+## 三、不留死路
+
+拒绝追加会让会话卡住。所以配了两处用户可见的出口：
+
+```
+$ python entrypoint.py --doctor
+[sessions-damaged] 1 个会话尾部不完整：
+  demo  partial_line
+  修复（会先另存原件）：python entrypoint.py --repair-session demo
+
+$ python entrypoint.py --repair-session demo
+[recover] 截掉了损坏的尾部：18 字节。
+[recover] 原件另存在 …/.cache/recovery/session_demo.1794548853265.jsonl
+```
+
+恢复是**有损**的，所以必须是人的明确动作，而不是读的时候默默截掉——这正是设计文档
+「不在普通查询中自动截断」的意思。
+
+## 四、守卫（8 条，改前红 4 条）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `test_partial_tail_can_still_be_read` | 读取容忍（既有契约没被误伤） |
+| `test_append_refuses_and_leaves_the_file_untouched` | 拒绝追加 + 原文件字节不变 |
+| `test_recover_truncates_a_partial_line_and_keeps_a_copy` | 截断 + 原件留档 + 之后能继续写 |
+| `test_recover_only_adds_a_newline_for_a_complete_last_line` | 只补换行，内容不丢 |
+| `test_midfile_corruption_is_not_treated_as_a_tail_problem` | 中间坏 + 尾部坏 → 拒绝恢复且不动文件 |
+| `test_valid_tail_with_a_broken_middle_is_left_to_the_reader` | 中间坏、尾部好 → 无尾部可恢复，交给读取侧报错 |
+| `test_healthy_store_appends_without_any_recovery` | 正常路径零开销（不误报） |
+| `test_doctor_reports_and_repair_unblocks_the_session` | doctor 报出来 → repair → 能继续写 |
+
+## 五、R0 全部完成
+
+| 批次 | 提交 |
+| --- | --- |
+| R0-a ①②③④ | `6f96813` `004c28f` `737d553` |
+| R0-b1 / b2 | `ecceb41` `4876467` |
+| R0-c | `1703b91` |
+| R0-d | `cd5a5d7` |
+| R0-e | `0a68ec0` |
+| R0-f ①②③ | `aea14f3` `（本条）` |
+
+全量 3603 passed / 3 skipped。

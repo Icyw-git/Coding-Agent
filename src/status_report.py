@@ -314,6 +314,64 @@ def format_storage_profile(*, deep: bool = True) -> str:
     return storage_profile.format_profile(storage_profile_data(deep=deep))
 
 
+def _tail_problems(limit: int = 20) -> list[tuple[str, str]]:
+    """扫会话文件里尾部不完整的：``[(session_id, kind)]``。
+
+    只读尾部 64KB、不解析全文——doctor 要快。
+    """
+    import session_store
+
+    h = _h()
+    problems = []
+    try:
+        paths = sorted(Path(h.SESSIONS_DIR).glob('session_*.jsonl'))
+    except OSError:
+        return []
+    for path in paths[:limit]:
+        try:
+            state = session_store.tail_state(path)
+        except Exception:
+            continue
+        if state['kind'] != 'ok':
+            problems.append((path.stem.removeprefix('session_'), state['kind']))
+    return problems
+
+
+def repair_session(session_id: str) -> int:
+    """显式恢复一个尾部损坏的会话：持会话写锁、先存原件、再动文件。
+
+    为什么需要单独的入口：一旦写入侧拒绍追加（`recovery_required`），这个会话就
+    不能继续用了。恢复是有损的，所以必须是人的明确选择，而不是读的时候就默默截了。
+    """
+    import session_locks
+    import session_store
+
+    h = _h()
+    path = Path(h.SESSIONS_DIR) / f'session_{session_id}.jsonl'
+    if not path.is_file():
+        print(f'[recover] 找不到会话：{session_id}')
+        return 1
+    try:
+        with session_locks.session_write(h.SESSIONS_DIR, session_id,
+                                        timeout=5.0, action='恢复会话尾部'):
+            result = session_store.recover_tail(path)
+    except session_locks.SessionBusy as exc:
+        print(f'[recover] {exc}')
+        return 1
+    except session_store.SessionRecoveryRequired as exc:
+        print(f'[recover] 拒绝恢复（{exc.kind}）：{exc}')
+        return 1
+    if result['action'] == 'none':
+        print('[recover] 尾部已经是完整的，没有改动。')
+        return 0
+    if result['action'] == 'newline_added':
+        print('[recover] 补上了缺失的换行（内容未丢）。')
+    else:
+        print(f'[recover] 截掉了损坏的尾部：{result["dropped_bytes"]} 字节。')
+    print(f'[recover] 原件另存在 {result["saved_to"]}')
+    return 0
+
+
 def run_doctor() -> int:
     """Report startup prerequisites without contacting the model provider."""
     import llm_config
@@ -378,6 +436,14 @@ def run_doctor() -> int:
         print(storage_profile.format_summary(storage_profile_data(deep=False)))
     except Exception as exc:
         print(f'[storage] unavailable: {exc}')
+    # 尾部不完整的会话：写入会被拒（recovery_required），必须让人看得到怎么办。
+    damaged = _tail_problems()
+    if damaged:
+        print(f'[sessions-damaged] {len(damaged)} 个会话尾部不完整：')
+        for session_id, kind in damaged:
+            print(f'  {session_id}  {kind}')
+        print('  修复（会先另存原件）：python entrypoint.py '
+              f'--repair-session {damaged[0][0]}')
     return 0 if all(passed for _, passed in checks) else 1
 
 

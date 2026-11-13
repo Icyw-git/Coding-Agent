@@ -15,6 +15,27 @@ class SessionReplayError(ValueError):
     """Raised when a session event stream is invalid before its final line."""
 
 
+class SessionRecoveryRequired(RuntimeError):
+    """写入被拒：文件尾部不是一条完整事件，接着写会变成文件中部的损坏。
+
+    读取可以容忍尾部不完整（崩溃时写了一半），**但容忍读不等于准写**——新事件接在
+    半行后面，下一条就无法区分「哪一行是用户数据」与「哪一行是拼接的」。
+
+    ``kind`` 区分三种情况，恢复动作不同：
+
+    - ``partial_line``：最后一行不是合法 JSON（写了半行）→ 截掉它；
+    - ``complete_no_newline``：最后一行完整但缺换行 → 只补一个换行；
+    - ``midfile``：**中间**有坏行，不是尾部问题 → 拒绝恢复，交人工。
+    """
+
+    code = 'recovery_required'
+
+    def __init__(self, message: str, *, kind: str, path=None):
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+
 # 纯确认语不配当会话标题（generate_session_title 的忽略清单同源）
 _GENERIC_ACKS = {'go', 'ok', 'okay', 'yes', 'y', '嗯', '行', '好的',
                  '继续', 'continue', 'do it', 'start'}
@@ -55,6 +76,99 @@ def is_injected_user_content(text) -> bool:
             if isinstance(part, dict) and part.get('type') == 'text')
     stripped = ' '.join(str(text or '').split()).casefold()
     return stripped.startswith(_INJECTED_USER_PREFIXES)
+
+
+def tail_state(path: Path) -> dict:
+    """会话文件尾部的状态：``{'kind': ok|partial_line|complete_no_newline|midfile}``。
+
+    只读末尾 64KB（与 `_read_last_seq` 同一取舍）：打开会话就走这里，全量解析一个 10MB
+    文件要上百毫秒，而这里只关心最后一行完不完整。
+
+    三种异常分开，因为恢复动作不同：
+
+    - ``partial_line``：最后一行不是合法 JSON（写了半行）——截掉；
+    - ``complete_no_newline``：最后一行完整但缺换行——**内容不能丢**，只补换行；
+    - ``midfile``：坏行不在末尾——不是崩溃尾巴，拒绝恢复。
+    """
+    path = Path(path)
+    if not path.exists():
+        return {'kind': 'ok'}
+    try:
+        size = path.stat().st_size
+        with path.open('rb') as handle:
+            handle.seek(max(0, size - 65536))
+            data = handle.read()
+    except OSError:
+        return {'kind': 'ok'}          # 读不到就不阻拦写（与旧行为一致）
+    if not data.strip():
+        return {'kind': 'ok'}
+
+    lines = data.split(b'\n')
+    if data.endswith(b'\n'):
+        lines = lines[:-1]              # 末尾换行造成的空元素
+        if not lines or not lines[-1].strip():
+            return {'kind': 'ok'}
+    tail = lines[-1]
+    try:
+        parsed = json.loads(tail)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # 末行不是合法 JSON：先看前面有没有坏行——有就是中间损坏，不是尾巴问题
+        earlier = lines[:-1] if len(lines) > 1 else []
+        if size > 65536 and earlier:
+            earlier = earlier[1:]       # 首行是被截断的上文半行
+        for raw in earlier:
+            if not raw.strip():
+                continue
+            try:
+                json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return {'kind': 'midfile', 'size': size}
+        return {'kind': 'partial_line', 'size': size}
+    if not isinstance(parsed, dict):
+        return {'kind': 'midfile', 'size': size}
+    return {'kind': 'ok'} if data.endswith(b'\n') \
+        else {'kind': 'complete_no_newline', 'size': size}
+
+
+def recover_tail(path, *, backups_dir=None) -> dict:
+    """显式恢复一个损坏尾部。返回 ``{kind, action, saved_to, dropped_bytes}``。
+
+    两件必须做的事：
+
+    1. **先存原件**：恢复是有损的，诊断需要原始字节；
+    2. **区分两种情况**：“完整但没换行”只补一个换行（内容一字不丢）；只有真正的
+       半行才截断。中间损坏直接拒绝——那是另一类问题，不归恢复管。
+
+    调用方必须已持有会话写锁（`session_locks.session_write`）：这里是裸文件操作。
+    """
+    path = Path(path)
+    state = tail_state(path)
+    kind = state['kind']
+    if kind == 'ok':
+        return {'kind': 'ok', 'action': 'none', 'saved_to': '', 'dropped_bytes': 0}
+    if kind == 'midfile':
+        raise SessionRecoveryRequired(
+            'session has a corrupt event in the middle, not at the tail; '
+            'refusing to truncate user data',
+            kind=kind, path=path)
+
+    raw = path.read_bytes()
+    backups = Path(backups_dir) if backups_dir else path.parent.parent / 'recovery'
+    backups.mkdir(parents=True, exist_ok=True)
+    saved = backups / f'{path.stem}.{int(time.time() * 1000)}.jsonl'
+    saved.write_bytes(raw)
+
+    if kind == 'complete_no_newline':
+        path.write_bytes(raw + b'\n')
+        return {'kind': kind, 'action': 'newline_added',
+                'saved_to': str(saved), 'dropped_bytes': 0}
+
+    # partial_line：截到最后一条完整事件（末尾那个换行之后）
+    cut = raw.rfind(b'\n')
+    kept = raw[:cut + 1] if cut >= 0 else b''
+    path.write_bytes(kept)
+    return {'kind': kind, 'action': 'truncated',
+            'saved_to': str(saved), 'dropped_bytes': len(raw) - len(kept)}
 
 
 def normalize_snip_bounds(messages: list[dict], head_end: int,
@@ -189,6 +303,13 @@ class SessionEventStore:
             current_size = previous_stat.st_size if previous_stat else 0
             if current_size != self._known_size:
                 self._next_seq = self._read_last_seq() + 1
+            # 尾部不完整就**不写**：接着写会把崩溃留下的半行变成文件中部的损坏。
+            state = tail_state(self.path)
+            if state['kind'] != 'ok':
+                raise SessionRecoveryRequired(
+                    f'session tail is not a complete event ({state["kind"]}); '
+                    'run recover_tail() before appending',
+                    kind=state['kind'], path=self.path)
             next_seq = self._next_seq
             event = {
                 "v": 1,

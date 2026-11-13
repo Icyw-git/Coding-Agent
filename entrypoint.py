@@ -22,6 +22,9 @@ console.harden_stdio()
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Harness Agent')
     parser.add_argument('--doctor', action='store_true', help='check local configuration and exit')
+    parser.add_argument('--repair-session', metavar='SESSION_ID',
+                        help='repair a session whose tail was left incomplete '
+                             '(saves the original first)')
     parser.add_argument(
         '--ui',
         choices=('ansi', 'textual', 'textual-next'),
@@ -99,6 +102,8 @@ def main(argv=None) -> int:
     if args.ui:  # 显式参数优先于 .env：TUI 卡住时可以直接 --ui ansi 救场
         os.environ['HARNESS_UI'] = args.ui
 
+    if args.repair_session:
+        return harness.repair_session(args.repair_session)
     if args.doctor:
         return harness.run_doctor()
     if _headless_requested(args):

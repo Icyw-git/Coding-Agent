@@ -176,6 +176,7 @@ from status_report import (
     format_status,
     format_storage_profile,
     format_workspace_diff,
+    repair_session,
     run_doctor,
     storage_profile_data,
 )
