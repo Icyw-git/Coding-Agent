@@ -169,3 +169,79 @@ def test_runtime_send_propagates_origin_chat(tmp_path):
 
     assert seen == ['chat-9']
     assert hooks.current_origin_chat() == ''
+
+
+# ============================================================
+# R0-c：超容量裁剪必须可见（next-design §9.3 R0-c）
+# ============================================================
+
+
+def test_overflow_is_recorded_with_a_bounded_source_ref():
+    """21 条唯一通知、容量 20：留 20 条，并记下「1 条被裁」与它来自哪个任务。
+
+    原来 `data['pending'] = data['pending'][-LIMIT:]` 是**静默**截断——用户只会发现
+    某次任务结果没收到，且没有任何地方能查。
+    """
+    limit = cron_delivery.OUTBOX_LIMIT
+    for index in range(limit + 1):
+        cron_delivery.queue('chat-1', f'item-{index}', job_id=f'job-{index}',
+                            occurrence=f'o{index}')
+
+    pending = cron_delivery.pending()
+    assert len(pending) == limit
+    assert pending[-1]['text'] == f'item-{limit}'      # 保留最新的
+
+    overflow = cron_delivery.overflow()
+    assert overflow['count'] == 1, overflow
+    assert overflow['recent'][-1]['job_id'] == 'job-0'  # 被裁的是最旧那条
+    assert overflow['recent'][-1]['created_at'] > 0
+    # 明细不带正文：被裁的是通知，不是第二份内容副本
+    assert 'text' not in overflow['recent'][-1]
+
+
+def test_overflow_count_accumulates_and_detail_stays_bounded():
+    limit = cron_delivery.OUTBOX_LIMIT
+    for index in range(limit * 3):
+        cron_delivery.queue('chat-1', f'item-{index}', job_id=f'job-{index}',
+                            occurrence=f'o{index}')
+    overflow = cron_delivery.overflow()
+    assert overflow['count'] == limit * 2, overflow           # 40 条被裁
+    assert len(overflow['recent']) <= cron_delivery.OVERFLOW_DETAIL_LIMIT
+    assert len(cron_delivery.pending()) == limit
+
+
+def test_overflow_survives_a_restart(_isolated_outbox):
+    """重启后仍可诊断：计数写在 outbox 文件里，不是内存态。"""
+    limit = cron_delivery.OUTBOX_LIMIT
+    for index in range(limit + 2):
+        cron_delivery.queue('chat-1', f'item-{index}', job_id=f'job-{index}',
+                            occurrence=f'o{index}')
+    raw = cron_delivery._read_outbox()
+    assert raw['overflow']['count'] == 2, raw.get('overflow')
+    assert raw['overflow']['recent'][-1]['job_id'] == 'job-1'
+
+
+def test_ack_does_not_touch_the_overflow_record():
+    limit = cron_delivery.OUTBOX_LIMIT
+    for index in range(limit + 1):
+        cron_delivery.queue('chat-1', f'item-{index}', job_id=f'job-{index}',
+                            occurrence=f'o{index}')
+    before = cron_delivery.overflow()['count']
+    cron_delivery.ack(cron_delivery.pending()[-1]['id'])
+    assert cron_delivery.overflow()['count'] == before
+
+
+def test_status_line_reports_overflow_and_says_it_cannot_be_resent():
+    """用户能在 /status 里看到「有几条没送达」，并且知道它们不能重发。"""
+    import status_report
+
+    limit = cron_delivery.OUTBOX_LIMIT
+    for index in range(limit + 3):
+        cron_delivery.queue('chat-1', f'item-{index}', job_id=f'job-{index}',
+                            occurrence=f'o{index}')
+
+    assert '定时结果' in status_report._cron_overflow_note()
+    note = status_report._cron_overflow_note()
+    assert '3' in note, note
+    assert '无法重发' in note, note
+    assert 'job-0' in note or 'job-1' in note or 'job-2' in note, note

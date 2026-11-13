@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import approval_view
@@ -92,6 +93,31 @@ def apply_sandbox_tier(argument: str) -> str:
         _h().hooks.GATE.revoke_session()
     return (f'  已切换 {changed}'
             f'（当前 {policy.sandbox_mode} · {policy.approval_policy}）')
+
+
+def _cron_overflow_note() -> str:
+    """定时结果超容量被裁时的提示行（没有则空串）。
+
+    原来是**静默**截断——用户只会发现某次结果没收到，查无可查。这里只报数字与来源，
+    并明说不可重发：被裁的没有可信正文，留下的只是「谁的结果」。
+    """
+    try:
+        import cron_delivery
+
+        dropped = cron_delivery.overflow()
+    except Exception:
+        return ''
+    if not dropped.get('count'):
+        return ''
+    recent = [item for item in (dropped.get('recent') or []) if item]
+    source = ''
+    if recent:
+        last = recent[-1]
+        stamp = time.strftime('%m-%d %H:%M', time.localtime(
+            float(last.get('created_at') or 0)))
+        source = f"（最近：{last.get('job_id') or '未知任务'} · {stamp}）"
+    return (f'\n  定时结果：有 {dropped["count"]} 条因超出上限未保留'
+            f'{source}；只可诊断，无法重发')
 
 
 def format_status(session_store) -> str:
@@ -216,6 +242,7 @@ def format_status(session_store) -> str:
         capability_lines += (f'\n  ⚠ 用户规则加载失败（{reason}）'
                             '—— 全部规则当前不生效，看 /rules'
                             f'（文件 {user_rules.path_for_display()}）')
+    overflow_note = _cron_overflow_note()
     usage_line = (f'\n  tokens：{h._fmt_tokens(usage["total"])}'
                   f'（输入 {h._fmt_tokens(usage["prompt"])} · 输出 {h._fmt_tokens(usage["completion"])}）'
                   f'{h._cache_hit_rate_line(usage)}'
@@ -230,6 +257,7 @@ def format_status(session_store) -> str:
         f'{h.hooks.GATE.judge_summary() if h.hooks.llm_approval_enabled() else " · LLM 审查官：关"}\n'
         f'  快照：{len(manager.list(limit=10_000))} 个\n'
         f'  任务概况：{" · ".join(activity) if activity else "暂无任务"}'
+        f'{overflow_note}'
         f'{capability_lines}'
         f'{usage_line}'
     )

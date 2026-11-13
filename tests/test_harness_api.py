@@ -781,3 +781,12 @@ def test_api_cron_results_outbox_and_ack(api_client, tmp_path, monkeypatch):
     assert client.post(f"/v1/cron-results/{entry['id']}/ack",
                        headers=headers).status_code == 404
     assert client.get('/v1/cron-results', headers=headers).json()['pending'] == []
+
+    # 超容量被裁的条数也要能从 API 查到（原来静默截断，无从诊断）
+    for index in range(cron_delivery.OUTBOX_LIMIT + 2):
+        cron_delivery.queue('oc_chat_1', f'item-{index}', job_id=f'j{index}',
+                            occurrence=f'o{index}')
+    payload = client.get('/v1/cron-results', headers=headers).json()
+    assert len(payload['pending']) == cron_delivery.OUTBOX_LIMIT
+    assert payload['overflow']['count'] == 2, payload.get('overflow')
+    assert payload['overflow']['recent'][-1]['job_id'] == 'j1'

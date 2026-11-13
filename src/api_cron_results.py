@@ -15,7 +15,10 @@ def build_router():
 
     @router.get('/v1/cron-results')
     def list_results():
-        return {'pending': cron_delivery.pending()}
+        # overflow 是新增的（旧客户端取 pending 不受影响）：给用户一个能查到的
+        # “有 N 条没送达”的入口，原来超容量是**静默截断**。
+        return {'pending': cron_delivery.pending(),
+                'overflow': cron_delivery.overflow()}
 
     @router.post('/v1/cron-results/{item_id}/ack')
     def ack_result(item_id: str):

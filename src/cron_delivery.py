@@ -26,6 +26,9 @@ import paths
 
 OUTBOX_PATH = paths.cache_path('cron_results', 'outbox.json')
 OUTBOX_LIMIT = 20
+#: 溢出明细保留多少条。只留**来源**（哪个任务、发往哪、什么时候），不留正文——
+#: 被裁的是通知，再存一份正文等于另建内容副本，而且照样不保证能重发。
+OVERFLOW_DETAIL_LIMIT = 20
 # 飞书文本消息远小于这个量级；截断而不是让发送端报错，用户至少能看到开头。
 MAX_TEXT_CHARS = 12000
 
@@ -70,9 +73,42 @@ def queue(chat_id: str, text: str, *, job_id: str = '',
         if any(item.get('id') == entry['id'] for item in data['pending']):
             return dict(entry)
         data['pending'].append(entry)
+        dropped = (data['pending'][:-OUTBOX_LIMIT]
+                   if len(data['pending']) > OUTBOX_LIMIT else [])
+        if dropped:
+            _record_overflow(data, dropped)
         data['pending'] = data['pending'][-OUTBOX_LIMIT:]
         _write_outbox(data)
     return dict(entry)
+
+
+def overflow() -> dict:
+    """因超容量被裁掉的投递：``{count, recent, last_at}``。
+
+    记在 outbox 文件里，所以**重启之后仍能诊断**（原来是静默截断，什么痕迹都不留）。
+    ``recent`` 有界且只含来源；这些条没有可信可重发的正文，保留来源只为让用户知道
+    「谁的结果没收到」。
+    """
+    with _LOCK:
+        return dict(_read_outbox().get('overflow') or _empty_overflow())
+
+
+def _empty_overflow() -> dict:
+    return {'count': 0, 'recent': [], 'last_at': 0.0}
+
+
+def _record_overflow(data: dict, dropped: list[dict]) -> None:
+    """记下被裁的投递：计数不封顶，明细有界。"""
+    record = data.setdefault('overflow', _empty_overflow())
+    record['count'] = int(record.get('count') or 0) + len(dropped)
+    record['last_at'] = time.time()
+    recent = list(record.get('recent') or [])
+    recent.extend({'id': item.get('id', ''),
+                   'job_id': item.get('job_id', ''),
+                   'chat_id': item.get('chat_id', ''),
+                   'created_at': item.get('created_at', 0.0)}
+                  for item in dropped)
+    record['recent'] = recent[-OVERFLOW_DETAIL_LIMIT:]
 
 
 def pending() -> list[dict]:
@@ -120,12 +156,34 @@ def _read_outbox() -> dict:
     data = _read_json(OUTBOX_PATH)
     items = data.get('pending')
     if not isinstance(items, list):
-        return {'version': 1, 'pending': []}
+        return {'version': 1, 'pending': [], 'overflow': _empty_overflow()}
     cleaned = [item for item in items
                if isinstance(item, dict) and item.get('id')
                and item.get('chat_id') and item.get('text')]
-    return {'version': 1, 'pending': cleaned}
+    return {'version': 1, 'pending': cleaned,
+            'overflow': _clean_overflow(data.get('overflow'))}
+
+
+def _clean_overflow(value) -> dict:
+    """容错读：文件可能是旧版本（无 overflow）、被手改、或字段类型不对。"""
+    if not isinstance(value, dict):
+        return _empty_overflow()
+    try:
+        count = max(0, int(value.get('count') or 0))
+    except (TypeError, ValueError):
+        count = 0
+    raw_recent = value.get('recent')
+    recent = ([item for item in raw_recent if isinstance(item, dict)]
+              if isinstance(raw_recent, list) else [])
+    try:
+        last_at = float(value.get('last_at') or 0.0)
+    except (TypeError, ValueError):
+        last_at = 0.0
+    return {'count': count,
+            'recent': recent[-OVERFLOW_DETAIL_LIMIT:],
+            'last_at': last_at}
 
 
 def _write_outbox(data: dict) -> None:
-    _write_json(OUTBOX_PATH, {'version': 1, 'pending': data['pending']})
+    _write_json(OUTBOX_PATH, {'version': 1, 'pending': data['pending'],
+                              'overflow': data.get('overflow') or _empty_overflow()})

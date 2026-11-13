@@ -16346,3 +16346,53 @@ bounded_cache.put(_summary_cache, (path, stat.st_size, stat.st_mtime_ns), hit, �
 不塞进本轮。本轮只做两处「同版本快照」的修正——它们不改变任何对外的写入语义。
 
 全量 3571 passed / 3 skipped。
+
+---
+
+# 第 130 部分：R0-c —— outbox 超容量是静默截断
+
+## 一、缺陷
+
+```python
+data['pending'].append(entry)
+data['pending'] = data['pending'][-OUTBOX_LIMIT:]     # ← 一句话丢掉最旧的，不留痕迹
+```
+
+网关长期离线或任务密集时，结果被静默裁掉。用户只会发现「某次结果没收到」，而**没有任何
+地方能查**——outbox 里没有计数、没有来源、日志里也没有一行。
+
+## 二、改法（照 §9.3 R0-c 的允许面）
+
+1. **裁剪时记账**：`_record_overflow()` 累加 `count`、追加有界明细 `recent`
+   （`id / job_id / chat_id / created_at`）、更新 `last_at`，写在 outbox 文件里。
+   **不留正文**——被裁的是通知，再存一份正文等于另建内容副本，而且照样不保证能重发。
+2. **暴露**：`cron_delivery.overflow()`；`GET /v1/cron-results` 增加 `overflow` 字段
+   （纯增量，旧客户端取 `pending` 不受影响）。
+3. **展示**：`/status` 多一行
+
+```
+定时结果：有 3 条因超出上限未保留（最近：job-2 · 11-13 13:14）；只可诊断，无法重发
+```
+
+最后半句是刻意写的：**不要让用户以为还能补发**。设计文档要求「缺源结果显示不可重发」。
+
+4. **容错读**：`_clean_overflow()` 处理「旧版本文件没有这个字段」「被手改」
+   「字段类型不对」三种情况，不让一个坏字段把整个 outbox 变成空的。
+
+## 三、守卫（6 条）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `test_overflow_is_recorded_with_a_bounded_source_ref` | 21 条 → 留 20、溢出 1、来源是**被裁的那条**、明细不含正文 |
+| `test_overflow_count_accumulates_and_detail_stays_bounded` | 60 条 → 计数 40、明细 ≤ 上限、pending 仍 20 |
+| `test_overflow_survives_a_restart` | 计数写在文件里（重启可诊断），不是内存态 |
+| `test_ack_does_not_touch_the_overflow_record` | ack 不影响溢出计数 |
+| `test_status_line_reports_overflow_and_says_it_cannot_be_resent` | `/status` 那行含条数、来源、"无法重发" |
+| API 侧（扩 `test_api_cron_results_outbox_and_ack`） | `/v1/cron-results` 返回 `overflow`，条数与来源正确 |
+
+## 四、刻意没做
+
+§9.3 R0-c 的「禁止顺带修改」：没扩大 `OUTBOX_LIMIT`、没统一 watcher/heartbeat/定时三套投递、
+没在溢出时重新执行原任务。容量与保留策略仍是原样——本轮只让**已经发生的丢失可见**。
+
+全量 3576 passed / 3 skipped。
