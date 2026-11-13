@@ -25,7 +25,8 @@
 - ``pytest_pass``：`pytest -q -m "not slow"` 全绿（方向 higher）
 - ``ruff_errors``：`ruff check .` 错误数（方向 lower）
 - ``correction_rate``：审计里的用户纠正次数占比（方向 lower）
-- ``tokens_per_turn``：usage 事件的平均 token（方向 lower）
+- ``tokens_per_request``：usage 事件的平均 token（方向 lower）。
+  usage 事件没有 turn 关联，所以只能报「每条请求」，不冒充「每回合」。
 
 前两项是硬门槛：任何一项变差，本轮直接 discard，不看其他指标。
 """
@@ -108,7 +109,7 @@ def measure_tokens(*, workdir) -> dict:
     cache = Path(workdir) / '.cache' / 'sessions'
     if not cache.is_dir():
         return {}
-    total_in = total_out = turns = 0
+    total_in = total_out = requests = 0
     for path in cache.glob('session_*.jsonl'):
         try:
             with path.open('r', encoding='utf-8') as handle:
@@ -120,17 +121,28 @@ def measure_tokens(*, workdir) -> dict:
                         event = json.loads(line)
                     except ValueError:
                         continue
-                    usage = event.get('usage') or {}
-                    if not isinstance(usage, dict):
-                        continue
-                    total_in += int(usage.get('prompt_tokens') or 0)
-                    total_out += int(usage.get('completion_tokens') or 0)
-                    turns += 1
+                    # usage 事件是**顶层**字段（`store.append('usage', **detail)`）：
+                    # `prompt` / `completion` / `cached`。原来读的是嵌套的
+                    # `event['usage']['prompt_tokens']`——两层都不存在，于是这个指标
+                    # 永远是 0，"token 翻了三倍"会被判成"无变化"。
+                    prompt = event.get('prompt')
+                    completion = event.get('completion')
+                    if not isinstance(prompt, (int, float)) and not isinstance(
+                            completion, (int, float)):
+                        continue      # 没有用量的事件不进分母
+                    # `cached` 是 `prompt` 的子集，不能再加一次。
+                    total_in += int(prompt or 0)
+                    total_out += int(completion or 0)
+                    requests += 1
         except OSError:
             continue
-    if not turns:
+    if not requests:
         return {}
-    return {'tokens_per_turn': round((total_in + total_out) / turns, 1)}
+    # 只报**每条请求**的平均：usage 事件没有 turn 关联，叫 per_turn 是在冒充精度。
+    # 要报回合均值得先让 usage 带上 turn_id，那是另一件事。
+    return {'total_tokens': total_in + total_out,
+            'requests': requests,
+            'tokens_per_request': round((total_in + total_out) / requests, 1)}
 
 
 def measure_wall_time(*, workdir) -> dict:
@@ -224,7 +236,7 @@ METRICS = {
     # 「测试全绿但 token 翻三倍」在我们的判据里会是"无变化"。
     # 不做硬门槛：机器负载抖动会把好改动误杀。
     'tokens': {'direction': 'lower', 'measure': measure_tokens,
-               'key': 'tokens_per_turn', 'hard': False},
+               'key': 'tokens_per_request', 'hard': False},
     'wall_time': {'direction': 'lower', 'measure': measure_wall_time,
                   'key': 'wall_time_s', 'hard': False},
     # 质量维度：机械指标看不到"变得更准了没有"。软指标，证据不足时返回 {}

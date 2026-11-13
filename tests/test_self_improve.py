@@ -236,9 +236,9 @@ def test_soft_metrics_are_registered():
 
 def test_soft_drift_is_reported_but_not_blocking():
     hard = {'pytest_pass': {'pass': 1}, 'ruff_errors': {'errors': 0}}
-    before = {**hard, 'tokens': {'tokens_per_turn': 100.0},
+    before = {**hard, 'tokens': {'tokens_per_request': 100.0},
               'wall_time': {'wall_time_s': 10.0}}
-    after = {**hard, 'tokens': {'tokens_per_turn': 300.0},
+    after = {**hard, 'tokens': {'tokens_per_request': 300.0},
              'wall_time': {'wall_time_s': 10.0}}
     drift = si.soft_drift(before, after)
     assert any('tokens' in item for item in drift)
@@ -247,8 +247,8 @@ def test_soft_drift_is_reported_but_not_blocking():
 
 
 def test_small_soft_drift_is_ignored():
-    before = {'tokens': {'tokens_per_turn': 100.0}}
-    after = {'tokens': {'tokens_per_turn': 105.0}}
+    before = {'tokens': {'tokens_per_request': 100.0}}
+    after = {'tokens': {'tokens_per_request': 105.0}}
     assert si.soft_drift(before, after) == []
 
 

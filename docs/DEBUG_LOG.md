@@ -16473,3 +16473,73 @@ net_grants.json 未变
 - **没有给 `audit` 阶段做隔离**。它只读真实会话——读真实数据才是有意义的基准。
 
 全量 3578 passed / 3 skipped。
+
+---
+
+# 第 132 部分：R0-b2 —— `tokens` 指标永远是 0；"改前快照"拍的是改后
+
+## 一、指标读错了事件形状，永远是 0
+
+```python
+usage = event.get('usage') or {}                    # ① 事件里没有嵌套 usage
+total_in += int(usage.get('prompt_tokens') or 0)    # ② 字段名也不对
+```
+
+真实事件是 `{"type": "usage", "prompt": 100, "completion": 20, "cached": 30, …}`
+（`store.append('usage', **detail)` 写顶层字段）。**两层都不存在 → 这个指标恒为 0**。
+后果不是"少一个数字"，而是「token 翻了三倍」被判成「无变化」——软指标形同虚设。
+
+修法：读顶层 `prompt` / `completion`；`cached` 是 `prompt` 的子集不重复加；
+没有用量的事件不进分母；一条 usage 都没有时返回 `{}`（不可测）而不是 `0`。
+
+**顺手把名字改准**：usage 事件没有 turn 关联，报的是**每条请求**的平均，
+所以键从 `tokens_per_turn` 改成 `tokens_per_request`。设计文档明确要求
+「不能仍把 90 命名为 tokens_per_turn」——改名不是洁癖，是防止把请求均值当回合均值
+去和旧基线比。
+
+## 二、改前快照：`record()` 在改完之后跑
+
+`ledger.record()` 的 docstring 写着「登记前把它们**先快照**，这样即使进程崩在回滚
+之前，原件也还在磁盘上」。但它的调用点是 `Session.evaluate()`，而 evaluate 是
+**改完之后**才跑的——拍下来的是**改后**的文件。
+
+于是：台账上有 `snapshotted: ['a.py']`，看起来可回滚；真回滚只是把改后的内容再写一遍，
+**等于空操作**，而界面会说「已恢复 1 个文件」。
+
+修法：拆出显式的 `prepare()`（**改之前**调用）与 `finish()`：
+
+| 调用方式 | `snapshot_stage` | 行为 |
+| --- | --- | --- |
+| `prepare()` → `finish(prepared)` | `pre` | 复用改前快照，回滚真的回到原件 |
+| 直接 `finish(None, paths=…)` | `post` | 标明"拍的是改后"、写 `rollback_note`，`rollback()` **返回空** |
+
+`prepare()` 还如实区分三种情况：`snapshotted`（拍到了）、`missing`（改动前不存在，
+所以没有 pre-image）、`failed`（COPY 失败，真正的问题）。
+
+## 三、守卫（10 条）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `test_reads_top_level_prompt_and_completion` | 180 总 / 90 每条（设计文档给定数字） |
+| `test_cached_is_not_added_again` | `cached` 不重复计入 |
+| `test_events_without_usage_do_not_count` | 空 usage 不进分母 |
+| `test_no_usage_at_all_is_unknown_not_zero` | 不可测返回 `{}` 不是 0 |
+| `test_turn_correlation_is_reported_as_unknown` | 不冒充 `tokens_per_turn` |
+| `test_prepare_captures_the_pre_image_before_the_edit` | 改前拍、改后回滚真的回到 `original\n` |
+| `test_prepare_reports_files_that_did_not_exist` | 新建文件报 `missing`，不算已快照 |
+| `test_finish_without_prepare_is_marked_post_and_says_so` | 标 `post` + `rollback_note` |
+| `test_rollback_refuses_to_pretend_for_post_snapshots` | `post` 记录回滚返回 `[]` |
+| `test_missing_mechanism_never_runs_the_measurers` | 缺机制时测量器调用 0 次 |
+
+前 5 条 + 后 4 条改前均红。
+
+## 四、刻意没做
+
+- **没让 `prepare()` 成为 `evaluate()` 的强制前置**。那会改 `/improvements check` 的
+  调用语义（agent 是先改文件再 check，中间没有天然时机调 prepare）。现在的做法是
+  **让缺失可见**（`snapshot_stage='post'` + 回滚返回空 + `rollback_note`），而不是
+  假装有事务。真正把 prepare 接进流程、以及 apply 前的 baseline 冲突检测，属于 R3。
+- **没动 `evaluate()` 内部**：它仍然调 `ledger.record()`（即 post 快照），只是现在
+  台账上会明确标出来。
+
+全量 3588 passed / 3 skipped。

@@ -38,6 +38,97 @@ def _snapshots(cache_dir) -> Path:
     return Path(cache_dir) / SNAPSHOT_DIR
 
 
+def prepare(cache_dir, paths, *, summary: str = '', workdir=None) -> dict:
+    """在**改动之前**调用：把这些文件的原件拍下来，返回 ``{change_id, snapshotted, missing, failed}``。
+
+    为什么需要单独一步：`finish()` 在 `evaluate()` 里执行，而 evaluate 是改完才跑的。
+    在那里拍快照，拍到的就是**改后**的文件——回滚等于空操作，而台账上看起来
+    “有快照、可回滚”。
+
+    已经有记录时才重新拍（同一次改动重复调用幂等）。
+    """
+    root = Path(workdir) if workdir else Path.cwd()
+    change_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    return _snapshot_paths(cache_dir, change_id, paths, summary=summary, root=root)
+
+
+def _snapshot_paths(cache_dir, change_id: str, paths, *, summary: str,
+                    root: Path) -> dict:
+    snapshot_root = _snapshots(cache_dir) / change_id
+    saved, missing, failed = [], [], []
+    for rel in paths:
+        source = (root / rel).resolve()
+        if not source.is_file():
+            missing.append(rel)      # 新建的文件没有 pre-image，不能算作已快照
+            continue
+        target = snapshot_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target)
+            saved.append(rel)
+        except OSError:
+            failed.append(rel)       # 拍不下来要看得见（磁盘满/被占用）
+    return {'change_id': change_id, 'snapshotted': saved,
+            'missing': missing, 'failed': failed,
+            'summary': summary, 'workdir': str(root)}
+
+
+def finish(cache_dir, prepared: dict | None, *, summary: str = 'x',
+           paths=None, metric: dict | None = None,
+           decision: str = 'pending', reason: str = '',
+           workdir=None) -> dict:
+    """写一条台账记录，返回 entry（含 change_id）。
+
+    - 传入 `prepare()` 的结果：复用它的快照与 id，标 ``snapshot_stage='pre'``；
+    - 不传：就现在拍（拍的是**改后**文件），标 ``snapshot_stage='post'``，并在
+      ``rollback_note`` 里说明。不能让台账上看起来“有快照、可回滚”。
+    """
+    root = Path(workdir) if workdir else Path.cwd()
+    if prepared is not None:
+        change_id = prepared['change_id']
+        saved = list(prepared.get('snapshotted') or [])
+        missing = list(prepared.get('missing') or [])
+        failed = list(prepared.get('failed') or [])
+        stage = 'pre'
+    else:
+        snapshot = _snapshot_paths(
+            cache_dir, f"{int(time.time())}-{uuid.uuid4().hex[:8]}",
+            paths or [], summary=summary, root=root)
+        change_id = snapshot['change_id']
+        saved, missing, failed = (snapshot['snapshotted'], snapshot['missing'],
+                                  snapshot['failed'])
+        stage = 'post'
+
+    entry = {
+        'change_id': change_id,
+        'ts': time.time(),
+        'paths': list(paths if paths is not None else
+                      ((prepared or {}).get('snapshotted') or [])),
+        'snapshotted': saved,
+        'snapshot_stage': stage,
+        'not_snapshotted': missing,
+        'snapshot_failed': failed,
+        'summary': summary,
+        'metric': metric or {},
+        'decision': decision,
+        'reason': reason,
+        'workdir': str(root),
+    }
+    if stage != 'pre':
+        entry['rollback_note'] = (
+            'no pre-image: snapshot was taken after the change, so rollback '
+            'cannot restore the original content')
+    if failed:
+        entry['rollback_note'] = (
+            'partial pre-image: these files could not be snapshotted: '
+            + ', '.join(failed))
+    path = _ledger(cache_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    return entry
+
+
 def record(cache_dir, *, paths, summary: str, metric: dict | None = None,
            decision: str = 'pending', reason: str = '', workdir=None) -> str:
     """登记一次改动，返回 change id。
@@ -155,14 +246,17 @@ def entries(cache_dir, limit: int = 100) -> list[dict]:
 
 
 def rollback(cache_dir, change_id: str) -> list[str]:
-    """把这次改动碰过的文件恢复成快照版本。返回恢复的路径。
+    """把这次改动碰过的文件恢复成快照版本。返回**真正恢复**的路径。
 
     只恢复**快照里有的**文件：新建的文件没有快照（改动前不存在），删掉它们
     由调用方决定——自动删有风险（可能是别的进程刚写的）。
+
+    ``snapshot_stage='post'`` 的记录直接返回空：那个快照拍的是**改后**的文件，
+    拿它覆盖回去等于什么都没做，却会让界面报出让用户安心的“已恢复”。
     """
     row = next((item for item in entries(cache_dir, limit=10_000)
                 if item.get('change_id') == change_id), None)
-    if row is None:
+    if row is None or row.get('snapshot_stage') == 'post':
         return []
     root = Path(row.get('workdir') or Path.cwd())
     snapshot_root = _snapshots(cache_dir) / change_id
