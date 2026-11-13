@@ -17332,3 +17332,82 @@ SyntaxError。已改用 `chr(10).join(...)`——**这个写法不依赖任何�
 更可靠。
 
 全量 3684 passed / 3 skipped。
+
+---
+
+# 第 144 部分：R2-a 其一 —— 建议终于有了"身份"，反馈也接回了生产
+
+## 一、缺陷：`record_accepted` / `record_ignored` 只有测试在调
+
+设计文档点名的就是这个：`proactive.record_ignored` / `record_accepted` **没有任何生产
+消费者**。于是：
+
+- 用户点了「忽略」，降频不会发生——承诺了却没实现；
+- 「点开始才执行」没有可绑定的对象，说不清这次执行对应哪条建议；
+- 同一条建议重复点击会变成两次执行。
+
+根因：建议在系统里只是**一段文字**。文字没有 id、没有归属、没有状态，就没有任何东西
+可以被"采纳"或"忽略"。
+
+## 二、实体化（`src/proactive_suggestions.py`）
+
+```
+id / workspace / evidence_refs / proposed_action / created_at / recipient / status
+proposed → accepted / dismissed / expired
+```
+
+几条刻意的选择：
+
+| 选择 | 理由 |
+| --- | --- |
+| 接受走**正常受理**，不携带任何工具许可 | 「点开始」不是扩大权限；该问的照旧问 |
+| `request_id` 由建议 id 派生 | 重复点击天然幂等（`suggestion:<sha1>`） |
+| 过期 → `expired`，**不记忽略** | 用户根本没看到，拿它降频等于把沉默当拒绝 |
+| busy / 未受理 → 保持 `proposed` | 能重试；只有真受理上了才标 accepted |
+| token 绑定 `recipient` | 防止把卡片转给别人点（里面带着项目路径与证据引用） |
+
+## 三、TUI 是第一个生产消费者
+
+`/suggest` 的用法从 `[--last]` 扩成 `[--last | list | start <编号> | skip <编号>]`：
+
+```
+待处理的建议：
+  1. 补一下失败测试的日志
+  2. 把超时的用例标出来
+开始：/suggest start <编号>　不用了：/suggest skip <编号>
+```
+
+- `start` → `store.accept(..., accept=…)`，回调里用**建议文字**跑一个普通回合
+  （`_begin_turn`），所以照旧审批；
+- `skip` → `store.dismiss()` → 内部调 `proactive.record_ignored` → **降频真的会发生**；
+- busy 时点 start：建议**留在列表里**，不标成已采纳。
+
+同时 `record_proactive_run` 生成建议后会 `store.record(...)` 落成实体——原来只打了一段
+文字，这就是反馈链路断掉的源头。
+
+## 四、守卫（11 条）
+
+| 组 | 覆盖 |
+| --- | --- |
+| 实体化 | 字段齐全、`open_items` 能捞回 |
+| 幂等 | 同一条点两次只受理一次、返回同一 `request_id` |
+| 反馈 | 采纳把忽略计数清零；连续忽略让 `should_run` 进入 `next run in …` |
+| 过期 | 过期不记忽略、状态落到 `expired`、从开放列表消失 |
+| 拒绝 | 未知 id / 错误接收人（且不消费建议） |
+| 未受理 | busy / pending 都保持 `proposed` |
+| 生产入口 | `/suggest list|start|skip` 端到端；busy 时点 start 建议还在 |
+
+## 五、第四次同一个坑
+
+`proactive_suggestions.STATE_PATH` 又是模块级路径常量——这次**先**把它加进 conftest
+隔离和泄漏检查清单，没有等测试红。清单现在覆盖：tombstones、dedup、suggestions、cron。
+
+## 六、刻意没做（下一批）
+
+**飞书建议卡**。设计要求的按钮、`suggest_action` 回调分支、以及"错误接收人/过期版本
+拒绝"在飞书侧的落点都还没接——卡片渲染与回调分发是另一块，单独一批做，免得和这批
+的语义改动混在一起 review。
+
+`R2-a` 的停止线也照做：没新增 cron 自动执行副作用、没改默认 `off`、调度扩展另批。
+
+全量 3695 passed / 3 skipped。

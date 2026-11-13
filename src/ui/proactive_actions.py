@@ -35,12 +35,19 @@ class ProactiveActionsMixin:
         return TurnRequest(text=text, tools=tools, proactive=True, silent=silent)
 
     def start_suggestions(self, argument: str = '') -> None:
-        """`/suggest` 跑一轮；`/suggest --last` 读 observation 台账。
+        """`/suggest` 跑一轮；`--last` 看台账；`list/start/skip` 处理已有建议。
 
         手动触发不看档位：`HARNESS_PROACTIVE_MODE` 管的是"它自己会不会来"。
         """
-        if str(argument or '').strip() == '--last':
+        arg = str(argument or '').strip()
+        if arg == '--last':
             self._show_observations()
+            return
+        if arg == 'list':
+            self._list_suggestions()
+            return
+        if arg.startswith('start') or arg.startswith('skip'):
+            self._act_on_suggestion(arg)
             return
         if self._busy:
             self._notice('等这一回合结束再要建议——建议本身也是一轮。')
@@ -51,6 +58,70 @@ class ProactiveActionsMixin:
         if not self._begin_turn(request, echo_text=False):
             return
         self._notice('只读建议回合：这次只给读工具，不会改动任何文件。')
+
+    def _list_suggestions(self) -> None:
+        """列出还没处理的建议（编号按最近排序，供 start/skip 用）。"""
+        import harness
+        import proactive_suggestions as store
+
+        rows = store.open_items(harness.CACHE_DIR)
+        if not rows:
+            self._notice('没有待处理的建议。说「/suggest」要几条。')
+            return
+        lines = ['待处理的建议：']
+        for index, row in enumerate(rows, 1):
+            lines.append(f"  {index}. {row.get('proposed_action')}")
+        lines.append('开始：/suggest start <编号>　不用了：/suggest skip <编号>')
+        self._notice(chr(10).join(lines))
+
+    def _act_on_suggestion(self, argument: str) -> None:
+        """`start`/`skip`。**采纳才执行**，忽略只记账——这是同一条建议的两种结局。"""
+        import harness
+        import proactive_suggestions as store
+
+        verb, _, raw = argument.partition(' ')
+        number = raw.strip()
+        rows = store.open_items(harness.CACHE_DIR)
+        try:
+            index = int(number)
+        except (TypeError, ValueError):
+            self._notice(f'用法：/suggest {verb} <编号>（先 /suggest list 看编号）')
+            return
+        if not 1 <= index <= len(rows):
+            self._notice(f'没有编号 {index} 的建议（当前 {len(rows)} 条）。')
+            return
+        row = rows[index - 1]
+
+        if verb == 'skip':
+            result = store.dismiss(harness.CACHE_DIR, row['id'])
+            if result['status'] == 'dismissed':
+                self._notice('这条不再提醒（连续忽略会降低建议频率）。')
+            elif result['status'] == 'expired':
+                self._notice('这条已经过期了。')
+            else:
+                self._notice(f'没处理成功（{result["status"]}）。', level='error')
+            return
+
+        if self._busy:
+            # busy 时**不**标成已采纳：建议还留在列表里，等这回合结束再点。
+            self._notice('回合进行中，等结束了再开始这条建议。')
+            return
+
+        def accept(request_id):
+            # 采纳 = 走正常受理：用建议文字当提示词跑一个普通回合（照旧审批）。
+            # request_id 由建议 id 派生，所以重复点击天然幂等。
+            if not self._begin_turn(TurnRequest(text=row['proposed_action']),
+                                    echo_text=True):
+                return {'status': 'busy'}
+            return {'status': 'accepted', 'turn_id': ''}
+
+        result = store.accept(harness.CACHE_DIR, row['id'], accept=accept)
+        if result['status'] == 'accepted':
+            self._notice('开始执行这条建议（该问的照旧会问）。')
+        elif result['status'] == 'busy':
+            self._notice('回合进行中，这条建议还留着。')
+        else:
+            self._notice(f'没受理成功（{result["status"]}）。', level='error')
 
     def _show_observations(self) -> None:
         """把 observe 档最近的记录打出来。
@@ -111,12 +182,20 @@ class ProactiveActionsMixin:
 
         try:
             count = proactive.record_answer(harness.CACHE_DIR, answer)
+            suggestions = proactive.parse_suggestions(
+                answer or '', limit=max(1, count))
             if silent:
-                suggestions = proactive.parse_suggestions(
-                    answer or '', limit=max(1, count))
                 proactive.record_observation(
                     harness.CACHE_DIR, suggestions,
                     workspace=harness.get_workdir(),
                     limit=proactive.max_suggestions())
+            else:
+                # 手动/自动档：把建议**落成实体**，这样它才有 id 可以被采纳或忽略。
+                # 原来这里只打了一段文字，`record_accepted/ignored` 因此永远没人调用。
+                import proactive_suggestions as store
+
+                store.record(harness.CACHE_DIR, suggestions,
+                             workspace=str(harness.get_workdir()),
+                             evidence=('recent sessions',))
         except Exception:
             pass        # 记账失败不该影响已经给出的建议
