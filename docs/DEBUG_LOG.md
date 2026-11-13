@@ -17011,3 +17011,65 @@ if _stale_candidate(name, supersedes, captured):
   更精确且同样安全。
 
 全量 3650 passed / 3 skipped。
+
+---
+
+# 第 139 部分：R1-c 其三 —— workspace 作用域存下来了，却没生效
+
+## 一、缺陷
+
+上一批把 `scope='workspace'` 与 `owner` 存进了文件，但 **`local_relevant_memories`
+不过滤**——A 项目的「部署走 make ship-prod」到 B 项目照样被注入。字段有了、行为没变，
+等于没做。
+
+## 二、召回契约
+
+| scope | 何时召回 |
+| --- | --- |
+| `global` | 总是（个人偏好） |
+| `workspace` | `owner` 与当前工作区一致时 |
+| `session` | 写入它的那次会话里（`source_session` 相同） |
+| `workspace` 但 owner 为空 | **不召回**——归属不明时不猜，宁可少一条 |
+
+**过滤放在打分之前**：否则被排除的条目会占掉 `max_items` 的名额，召回结果莫名变少。
+
+## 三、owner 用「规范根路径」而不是「工作区 id」
+
+id 只存在于已登记的列表里，而用户可以在任意目录开会话（`/new <路径>`、临时 checkout）。
+路径对两者都成立，而且能直接比较。规范化（`resolve` + `normcase`）是为了同一个目录的
+不同写法不会变成两个 owner。
+
+## 四、旧数据怎么办
+
+`scope=global` 但内容像项目事实（`type` 是 `fact`/`context`）的条目，是 workspace 作用域
+出现之前写下的。按 §6.1：**不自动搬移、不自动改 scope**，只在 `/memories` 里标出来：
+
+```
+已存记忆：9 条
+  · project-deploy (fact) · 待确认归属
+  …
+  其中 3 条看起来是项目事实（归到全局）。只想给某个项目用的话，在那个项目里重新记一次即可。
+```
+
+判据函数是 `workspace_pending_owner(entry)`，单独可测。
+
+## 五、守卫（5 条，改前全红）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `test_alpha_does_not_recall_beta_entries` | A 不召回 B 的项目事实；全局偏好照旧 |
+| `test_beta_symmetrically` | 反向同样成立（不是单向特例） |
+| `test_session_scope_is_only_recalled_in_its_own_session` | `session` 作用域跟着会话走 |
+| `test_legacy_global_entries_still_recall_and_are_marked_pending` | 旧 global 照旧召回 + 可标待确认 |
+| `test_workspace_entry_without_owner_is_not_recalled_elsewhere` | 归属不明**不猜** |
+
+## 六、一处测试自身的坑
+
+第一版测试给两个项目写了**措辞相同**的事实（都是「部署走 make ship-prod」），结果被
+`memory_write.decide` 判成同一件事合并了——于是 `alpha-deploy` 从头就没写进去，
+测试红在了一个与本次改动无关的地方。
+
+改成不同措辞后才真正测到作用域过滤。**测试数据的措辞一样会被既有去重逻辑吃掉**，
+这一点在 memory 相关的测试里要当心。
+
+全量 3655 passed / 3 skipped。

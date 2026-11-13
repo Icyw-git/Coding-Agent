@@ -346,10 +346,18 @@ class CommandActionsMixin:
         lines = [f'本会话记忆：{memory_scope.describe()}',
                  f'已存记忆：{len(entries)} 条']
         if entries:
+            pending = [item for item in entries
+                       if memory.workspace_pending_owner(item)]
             for item in entries[:8]:
-                lines.append(f"  · {item.get('name')} ({item.get('type')})")
+                mark = ' · 待确认归属' if memory.workspace_pending_owner(item) else ''
+                lines.append(f"  · {item.get('name')} ({item.get('type')}){mark}")
             if len(entries) > 8:
                 lines.append(f'  … 还有 {len(entries) - 8} 条（用 recall 查全部）')
+            if pending:
+                # 不自动搬移、不自动改 scope（§6.1）：只告诉人这些看起来像项目事实，
+                # 想只给某个项目用就自己重新记一次。
+                lines.append(f'  其中 {len(pending)} 条看起来是项目事实（归到全局）。'
+                             '只想给某个项目用的话，在那个项目里重新记一次即可。')
         # 归档目录：淘汰不删除，用户要能看到并找回。
         try:
             import llm_route

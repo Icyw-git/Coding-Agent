@@ -617,8 +617,60 @@ def _expand_tokens(tokens) -> set[str]:
     return expanded
 
 
+def workspace_owner(workdir=None) -> str:
+    """工作区归属标识：规范化的根路径。
+
+    为什么用路径而不是"工作区 id"：id 只存在于已登记的列表里，而用户可以在任意
+    目录下开会话（`/new <路径>`、临时 checkout）。路径对两者都成立，且能直接比较。
+    规范化（resolve + normcase）是为了同一个目录的不同写法（大小写/相对路径
+    已在调用前解析）不会变成两个 owner。
+    """
+    try:
+        root = Path(workdir) if workdir is not None else _h().get_workdir()
+        resolved = Path(root).expanduser().resolve()
+    except Exception:
+        return ''
+    return os.path.normcase(str(resolved))
+
+
+def workspace_pending_owner(entry: dict) -> bool:
+    """这条记忆的归属是否需要人确认。
+
+    判据：`scope=global` 但内容长得像项目事实（type=fact/context）。这类条目是
+    workspace 作用域出现之前写下的——**不自动搬移、不自动改 scope**，只在界面上
+    标出来让人决定（§6.1）。
+    """
+    if memory_schema.normalize_scope(entry.get('scope')) != 'global':
+        return False
+    return memory_schema.canonical_type(entry.get('type')) in ('fact', 'context')
+
+
+def _recallable(entry: dict, *, workspace: str, session_id: str) -> bool:
+    """这条记忆在当前工作区/会话里能不能被召回。"""
+    scope = memory_schema.normalize_scope(entry.get('scope'))
+    if scope == 'global':
+        return True
+    if scope == 'workspace':
+        owner = str(entry.get('owner') or '')
+        # 归属不明（空 owner）**不猜**：宁可少召回一条，也不要把别的项目的规矩
+        # 安到当前项目头上。
+        return bool(owner) and bool(workspace) and             os.path.normcase(owner) == os.path.normcase(workspace)
+    if scope == 'session':
+        source = str(entry.get('source_session') or '')
+        return bool(source) and source == session_id
+    return False
+
+
+def _current_session_id() -> str:
+    try:
+        import hooks
+        return hooks.current_session_id() or ''
+    except Exception:
+        return ''
+
+
 def local_relevant_memories(messages: list, files: list | None = None,
-                            max_items: int = 5) -> list:
+                            max_items: int = 5, workspace: str | None = None) -> list:
     """本地记忆筛选：零网络往返。
 
     打分按**字段强度**分层，而不是数命中词个数：
@@ -639,6 +691,14 @@ def local_relevant_memories(messages: list, files: list | None = None,
     """
     if files is None:
         files = list_memory_files()
+    if not files:
+        return []
+    # 作用域过滤：别的项目的事实不注入当前项目（§6.1）。**在打分之前**过滤——
+    # 否则被排除的条目会占掉 max_items 的名额，召回结果会莫名变少。
+    current = workspace if workspace is not None else workspace_owner()
+    session_id = _current_session_id()
+    files = [item for item in files
+             if _recallable(item, workspace=current, session_id=session_id)]
     if not files:
         return []
     recent = _recent_user_text(messages)
