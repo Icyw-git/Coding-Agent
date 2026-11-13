@@ -31,6 +31,10 @@ class Session:
 class MessageResponse:
     session_id: str
     content: str
+    #: 与之前某次同 request_id 的请求完全相同、**没有真的执行**。
+    duplicate: bool = False
+    #: 那次原回合（duplicate 时用于核对）。
+    turn_id: str = ''
 
 
 class Sessions:
@@ -83,14 +87,21 @@ class Messages:
         self._runtime = runtime
 
     def create(self, session_id: str, content: str, on_delta=None,
-               origin_chat: str | None = None) -> MessageResponse:
+               origin_chat: str | None = None,
+               request_id: str | None = None) -> MessageResponse:
         kwargs = {}
         if on_delta is not None:
             kwargs['on_delta'] = on_delta
         if origin_chat:
             kwargs['origin_chat'] = origin_chat
+        if request_id:
+            kwargs['request_id'] = request_id
         result = self._runtime.send(session_id, content, **kwargs)
-        return MessageResponse(session_id=result.session_id, content=result.content)
+        # `getattr` 而不是直接取：测试与旧实现返回的结果对象没有这两个字段，
+        # 让它们照样能跑（新字段只是附加信息）。
+        return MessageResponse(session_id=result.session_id, content=result.content,
+                               duplicate=bool(getattr(result, 'duplicate', False)),
+                               turn_id=str(getattr(result, 'turn_id', '') or ''))
 
 
 class HarnessClient:

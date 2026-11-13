@@ -23,6 +23,8 @@ if BaseModel is not None:
         content: str = Field(min_length=1)
         # 来源聊天：模型在本回合创建的定时任务继承它作为结果推送目标。
         origin_chat: str | None = Field(default=None, max_length=200)
+        # 入站去重键（可选）：同 id 同内容只受理一次。旧客户端不传，行为不变。
+        request_id: str | None = Field(default=None, max_length=120)
 
     class CreateCronRequest(BaseModel):
         cron: str = Field(min_length=1, max_length=120)

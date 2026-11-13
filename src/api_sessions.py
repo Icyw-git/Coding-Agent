@@ -167,7 +167,7 @@ def build_router(client, runtime):
 
     @router.post("/v1/sessions/{session_id}/messages")
     def send_message(session_id: str, request: SendMessageRequest):
-        from agent_runtime import TurnCancelled
+        from agent_runtime import RequestConflict, RequestPending, TurnCancelled
         from turn_coordinator import TurnBusy
 
         store = None
@@ -177,11 +177,18 @@ def build_router(client, runtime):
             if opener is not None:
                 store = opener(session_id)
                 before = turn_screenshots.offset(store)
-            response = client.messages.create(session_id, request.content,
-                                              origin_chat=request.origin_chat)
+            response = client.messages.create(
+                session_id, request.content,
+                origin_chat=request.origin_chat,
+                request_id=request.request_id)
         except TurnCancelled as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except TurnBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RequestConflict as exc:
+            # 同 id 异内容 / 去重存储满：这是客户端用法问题，不是服务端故障
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RequestPending as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

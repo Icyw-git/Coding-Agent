@@ -17140,3 +17140,68 @@ id 合并。
 compaction 只删过期行。
 
 全量 3663 passed / 3 skipped。
+
+---
+
+# 第 141 部分：R1-a 其三 —— 去重接进执行入口
+
+存储层上一批做完了，但**没人调用它**。这一批接进 `AgentRuntime.send`——所有渠道
+（API / SDK / 飞书 / TUI）最终都走它，所以接一处等于全接。
+
+## 一、放在哪一步
+
+```
+_session_lock → 打开会话 → 算工作区 → 【去重判定】 → turn_slot → session_write → 执行
+```
+
+去重放在**拿回合槽之前**：重复请求本来就不需要执行，不该因为"另一个回合在跑"而报 busy。
+
+指纹用 `content + workspace + source + 附件名`：同一条消息换个工作区**不算**重复
+（用户的意图变了）。
+
+## 二、五种结果
+
+| claim | 行为 |
+| --- | --- |
+| `passthrough`（无 id） | 旧客户端行为完全不变 |
+| `accepted` | 正常执行；开回合后 `bind(turn_id)` |
+| `duplicate`（同 id 同内容） | **不执行**，返回 `duplicate=True` + 原 `turn_id` |
+| `conflict`（同 id 异内容 / 满容量） | 抛 `RequestConflict` → API 409 |
+| `pending`（已受理、回合没绑上） | 抛 `RequestPending` → API 409，**不重播** |
+
+`pending` 是最要紧的一条：记录在、回合没绑上，意味着**上一次受理之后进程崩了**。
+自动重播可能在用户不知情的情况下再跑一遍副作用。
+
+## 三、重复请求返回「关联」而不是「结果」
+
+`AgentResult` 多了 `duplicate` / `turn_id` 两个字段。重复请求返回 `content=''`——
+要存原结果就得额外保留正文与容量，而调用方本来就能按 `turn_id` 去查。
+
+这个取舍写进了 `AgentResult` 的 docstring，免得下一个人以为"content 为空是 bug"。
+
+## 四、老实现兼容
+
+SDK 的 `Messages.create` 用 `getattr(result, 'duplicate', False)` 而不是直接取字段：
+测试与旧实现的 `Result` 没有这两个字段，让它们照常能跑。**新字段只是附加信息，
+不该让旧实现报错。**
+
+## 五、守卫（6 条）
+
+| 测试 | 覆盖 |
+| --- | --- |
+| 无 id 行为不变 | 两次都真的执行 |
+| 同 id 同内容 | 只执行一次、不重复追加用户消息、返回 `duplicate` + `turn_id` |
+| 同 id 异内容 | `RequestConflict`，且**一个用户消息都没追加** |
+| 已受理未绑回合 | `RequestPending`，调用次数 0 |
+| 满容量 | `RequestConflict`（不再受理新 id） |
+| API 接线 | 请求模型有 `request_id`、路由透传、冲突映射 409 |
+
+## 六、还没做的
+
+- **飞书入口没传 request_id**：它有自己的消息去重（`_steer_results` 那套按
+  `(session, request_id)`），要不要收敛到这一套需要先看两边的语义差异（飞书是
+  "同一条消息重投"，这里是"同一次请求重试"）。单独一批。
+- **崩溃窗口只做到"不重播"**，还没做"查询显示待核对"的展示（`/status` 或运行卡）。
+  这属于 §9.4 R1-a 验收第 3–4 条里"四种动作分别测试"的部分。
+
+全量 3669 passed / 3 skipped。

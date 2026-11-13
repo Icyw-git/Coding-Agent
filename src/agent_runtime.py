@@ -28,10 +28,17 @@ from workspace_context import resolve_workspace, use_workspace
 
 @dataclass(frozen=True)
 class AgentResult:
-    """一个已完成用户回合的结果。"""
+    """一个已完成用户回合的结果。
+
+    ``duplicate`` 为真时表示这次请求与之前某次同 ``request_id`` 的请求完全相同，
+    **没有真的执行**：``content`` 为空，``turn_id`` 指向原来那次回合。
+    要不要把原结果找出来由调用方决定（它可能已经不在内存里了）。
+    """
 
     session_id: str
     content: str
+    duplicate: bool = False
+    turn_id: str = ''
 
 
 class SessionAlreadyExistsError(ValueError):
@@ -40,6 +47,22 @@ class SessionAlreadyExistsError(ValueError):
 
 class TurnCancelled(RuntimeError):
     """回合被 /interrupt 或本地取消请求终止。"""
+
+
+class RequestRejected(RuntimeError):
+    """入站请求没被受理（去重相关的拒绝）。"""
+
+
+class RequestConflict(RequestRejected):
+    """同 `request_id` 已受理、但内容不同；或去重存储已满。"""
+
+
+class RequestPending(RequestRejected):
+    """同 `request_id` 已受理（记录已落盘）、但回合还没绑上。
+
+    最大的可能是上一次受理之后进程崩了。**不自动重播**：那可能在用户不知情的
+    情况下再跑一遍副作用。调用方应告知"可能已受理、请核对"。
+    """
 
 
 # 会话摘要缓存 (path, size, mtime_ns) → summary：飞书 /sessions 每次列表都要
@@ -249,6 +272,7 @@ class AgentRuntime:
         housekeeping: bool = True,
         source: str = 'api',
         origin_chat: str | None = None,
+        request_id: str | None = None,
     ) -> AgentResult:
         """追加一条用户消息，执行一个回合，返回 assistant 内容。
 
@@ -256,12 +280,44 @@ class AgentRuntime:
         的独立用户消息存放，与 view_image 结果的回放方式一致。``on_event`` 接收
         ``(event_type, payload)``，供 JSONL 等一次性传输使用。
         ``origin_chat`` 是消息来源聊天：回合内创建的定时任务继承它作为投递目标。
+        ``request_id`` 是可选的入站去重键：同 id 同内容只执行一次，重复请求返回
+        ``duplicate=True`` 与原 ``turn_id``（见 ``request_dedup``）。
         """
         if not isinstance(content, str) or not content.strip():
             raise ValueError('message content must be a non-empty string')
         with self._session_lock(session_id):
             store = self._open_session(session_id)
             workspace = self._workspace_for(store)
+            # 去重放在**拿回合槽之前**：重复请求不该因为"另一个回合在跑"而报 busy，
+            # 它本来就不需要执行。指纹包含执行相关输入（工作区/来源/附件名），
+            # 所以"同一条消息换个工作区"不会被当成重复。
+            claim = None
+            if request_id:
+                import request_dedup
+
+                claim = request_dedup.claim(
+                    request_id,
+                    fingerprint=request_dedup.fingerprint(
+                        text=content, workspace=str(workspace), mode=source,
+                        attachments=[str(a.get('name') or '')
+                                     for a in (attachments or [])]),
+                    session_id=session_id, origin=source)
+                if claim['status'] == 'conflict':
+                    raise RequestConflict(
+                        f'request {request_id} was already accepted with '
+                        'different content')
+                if claim['status'] == 'full':
+                    raise RequestConflict(claim['reason'])
+                if claim['status'] == 'duplicate':
+                    turn_id = str(claim.get('turn_id') or '')
+                    if not turn_id:
+                        # 记录在、回合没绑上：上一次受理之后进程崩了。
+                        # 不重播——那可能在用户不知情下再跑一遍副作用。
+                        raise RequestPending(
+                            f'request {request_id} was accepted earlier but its '
+                            'turn never started; check before retrying')
+                    return AgentResult(session_id=store.session_id, content='',
+                                       duplicate=True, turn_id=turn_id)
             store.record_workspace(workspace)
             # 全局单回合：与 TUI / cron / 其他进程互斥。竞争立即失败，且不写入任何
             # 会话事件——不能让被拒绝的消息看起来像已发送。
@@ -304,6 +360,11 @@ class AgentRuntime:
                     # token，只补全身份，不会生成第二个）。
                     token = turn_control.begin_turn(session_id=session_id,
                                                     source=source)
+                    if claim is not None and claim['status'] == 'accepted':
+                        # 绑上之后，重复请求能查到"原来是哪一次"；
+                        # 没绑上就崩的话，下次会报 pending 而不是重播。
+                        request_dedup.bind(str(request_id),
+                                           turn_id=token.turn_id)
                     try:
                         with use_workspace(workspace), \
                                 hooks.use_origin_chat(origin_chat):
