@@ -47,6 +47,12 @@ def _compact_value(value, depth: int):
         if len(value) <= PREVIEW_CHARS:
             return value
         return value[:PREVIEW_CHARS] + f'…（共 {len(value)} 字）'
+    # 标量（bool / int / float / None）原样保留：审批人要看的正是「点几下、点在哪、
+    # 等多久」。它们原来和深层结构一样在 depth<=0 时被折成 '…'，于是 sequence 里
+    # `count=2` 显示成单击、坐标与等待时长丢失——**看着被批准的计划与实际执行的
+    # 不是同一个**（R0-a 验收第 4 条）。
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
     if depth <= 0:
         return '…'
     if isinstance(value, dict):

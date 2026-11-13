@@ -330,3 +330,69 @@ def test_unknown_operation_falls_back_without_crashing():
     assert approval_view.element_operation_label('nope') == '操作'
     assert approval_view.element_operation_label('nope', long=True) == '操作'
     assert approval_view.element_operation_label(None) == '点击'   # 默认 invoke
+
+
+# ============================================================
+# R0-a：审批摘要必须保留数字/布尔标量
+# ============================================================
+# 缺陷：`_compact_value` 在 `depth <= 0` 时无条件返回 '…'，而嵌套结构里的**标量**
+# （int / bool / float）也走这条路。于是 sequence 里 `count=2`、`x=12`、`ms=150`
+# 全部变成 '…'：审批卡把「双击」显示成「单击」，坐标与等待时长也丢了。
+# 审批人看到的是被削平的计划，而实际执行的是完整计划——这是 approve 错东西。
+
+
+def _sequence_args():
+    return {'action': 'sequence', 'steps': [
+        {'action': 'click', 'x': 12, 'y': 34, 'count': 2},
+        {'action': 'wait', 'ms': 150},
+    ]}
+
+
+def test_summary_keeps_numeric_scalars_inside_steps():
+    summarized = approval_view.summarize('desktop_action', _sequence_args())
+    steps = summarized['steps']
+    assert steps[0]['count'] == 2, steps[0]
+    assert steps[0]['x'] == 12 and steps[0]['y'] == 34, steps[0]
+    assert steps[1]['ms'] == 150, steps[1]
+
+
+def test_card_shows_double_click_and_coordinates_after_summarize():
+    """走真实链路：注册时 summarize，展示时 detail。"""
+    args = _sequence_args()
+    detail = approval_view.detail('desktop_action',
+                                  approval_view.summarize('desktop_action', args))
+    assert '双击' in detail, detail
+    assert '12' in detail and '34' in detail, detail
+    assert '150' in detail, detail
+    assert '…' not in detail, detail
+
+
+def test_summary_still_truncates_deep_structures():
+    """保留标量不等于取消深度限制：更深的嵌套仍然折叠。"""
+    deep = {'a': {'b': {'c': {'d': 1}}}}
+    summarized = approval_view.summarize('desktop_action', deep)
+    assert summarized['a']['b'] == {'c': '…'}, summarized
+
+
+def test_summary_keeps_falsey_scalars():
+    """0 与 False 也是信息：`0` 不是「没填」，`False` 不是「省略」。"""
+    summarized = approval_view.summarize('desktop_action', {
+        'action': 'sequence',
+        'steps': [{'action': 'click', 'x': 0, 'y': 0, 'count': 1}],
+        'dry_run': False,
+    })
+    assert summarized['steps'][0]['x'] == 0, summarized
+    assert summarized['dry_run'] is False, summarized
+    detail = approval_view.detail('desktop_action', summarized)
+    assert '(0,0)' in detail, detail
+
+
+def test_summary_still_marks_long_text_truncation():
+    """保留标量不等于放宽长文本：超长字符串仍要截断并明确标出。"""
+    long_text = 'x' * (approval_view.PREVIEW_CHARS + 50)
+    summarized = approval_view.summarize('desktop_action', {
+        'action': 'sequence', 'steps': [{'action': 'type', 'text': long_text}],
+    })
+    value = summarized['steps'][0]['text']
+    assert len(value) < len(long_text)
+    assert '共' in value and '字' in value, value

@@ -16048,3 +16048,80 @@ workspace / session / turn / origin / 只读限制 / 主动性限制 / taint / �
 按 §9.1：R0-a（桌面不重复执行 + 审批摘要保留标量）是另一条独立小批，与 R0-d 不共享
 文件。R0-e（回合生命周期）与 R0-f（日志/缓存版本绑定）随后。R1-0（窄端口 + 兼容门面）
 必须等 R0-d/e 的契约固定后再做。
+
+---
+
+# 第 126 部分：R0-a（其一）——审批摘要把「双击」削成了「单击」
+
+继续按 next-design §9.1：R0-a 的第二项是审批摘要丢标量。这条最独立（纯函数），先做。
+
+## 一、缺陷与根因
+
+`approval.py:159` 登记时存的是 `approval_view.summarize(tool, args)` 的结果，卡片和
+CLI 提示都渲染**这份摘要**；执行用的是原始 args。所以摘要失真 = **批准的计划与实际
+执行的计划不是同一个**。
+
+根因在 `_compact_value`：
+
+```python
+if depth <= 0:
+    return '…'          # ← 非字符串的标量也走这条
+```
+
+`MAX_DEPTH = 2`，于是 `steps[i]` 里的 `count=2` / `x=12` / `ms=150` 全部被折成 `'…'`。
+下游 `_desktop_step_summary` 拿到 `count='…'`：`'…' == 2` 为假 → 显示「单击」，
+坐标变成 `(…,…)`，等待时长也没了。
+
+实测（真实链路 `summarize → detail`，修之前）：
+
+```
+1. 左键单击 (…,…)
+2. 等 … 毫秒
+```
+
+## 二、改法：标量原样保留
+
+```python
+if value is None or isinstance(value, (bool, int, float)):
+    return value          # 放在 depth<=0 之前
+if depth <= 0:
+    return '…'
+```
+
+修完两条路径逐字一致：
+
+```
+原始 args 直接渲染:   1. 左键双击 (12,34)
+经 summarize 后渲染:  1. 左键双击 (12,34)
+```
+
+## 三、守卫（5 条，验证过会红）
+
+| 测试 | 拦什么 |
+| --- | --- |
+| `test_summary_keeps_numeric_scalars_inside_steps` | `count/x/y/ms` 在摘要后仍是数字 |
+| `test_card_shows_double_click_and_coordinates_after_summarize` | 真实链路里没有 `…`、有「双击 / 12 / 34 / 150」 |
+| `test_summary_keeps_falsey_scalars` | `0` 与 `False` 不被当空值丢掉 |
+| `test_summary_still_marks_long_text_truncation` | 保留标量不等于放宽长文本（仍截断并标出字数） |
+| `test_summary_still_truncates_deep_structures` | 深度限制仍在 |
+
+把标量保留那两行去掉 → 3 条立刻红。
+
+## 四、R0-a 还剩三项（未做）
+
+按 §9.3，R0-a 的四项分别是：①worker 故障结构化 phase；②`Fail` 单一回包出口；
+③按键逆序释放；④审批摘要保留标量。**本轮只做④**（纯函数、不碰 PowerShell 与键鼠路径）。
+
+①②③ 都在 `ps_worker.py` / `desktop_scripts.py`，要动 PowerShell 脚本与回包协议，
+按 §9.2「行为确需变化的批次必须列旧行为→新行为」和「不碰真实桌面」的要求，需要单独的
+一批：先补 fake backend + 可控时钟的故障注入测试，再改。**本轮不动。**
+
+全量 3554 passed / 3 skipped。
+
+## 五、一次自己造成的误操作
+
+验证守卫是否真会红时，我为了"还原"用了 `git checkout -- src/approval_view.py`，
+把刚写好的修复也一起撤了。发现后重新应用并复跑（40 passed）。
+
+教训：验证「移除修复会红」应该用**临时副本**（`cp` 到 `/tmp` 再改回），不要用
+`git checkout` —— 那条命令撤的是整个文件，不是"我刚改的那一处"。
