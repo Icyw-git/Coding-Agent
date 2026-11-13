@@ -1471,64 +1471,65 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
                                     source=turn_source)
     session_store.append('turn_started', turn_id=token.turn_id,
                          source=token.source)
+    # 从这里到主循环全都是「已取得资源」之后的事：`turn_started` 事件已经落盘，
+    # token 也已经登记。所以**必须都在同一个 try 里**——原来准备段在外面，任何一步
+    # 抛错（MCP 等待、记忆加载、快照管理器、_TurnState 构造）都会跳过收尾，
+    # 留下「有回合」但已无人执行的会话。〔R0-e〕
+    channel = None
+    outcome = {'status': 'completed'}
     try:
         channel = turn_files.TurnChannel(SESSIONS_DIR.parent,
                                          session_store.session_id, token).start()
-    except BaseException:
-        turn_control.end_turn(token)   # 启动失败也要释放 token，不能让会话卡成“有回合”
-        raise
-    wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
-    set_session(session_store.session_id)
-    set_agent('lead')   # 子代理会临时覆盖，退出后恢复
-    context = update_context({}, messages)   # 循环前更新上下文，包含所有对话记录
-    if messages:
-        trigger_hooks('UserPromptSubmit', messages[-1]['content'])
-    system = get_system_prompt(context)
-    turn_started = time.monotonic()   # 本回合起始（tokens 行显示总用时）
-    # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
-    # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
-    #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
-    memory_load_started = time.perf_counter()
-    with perf_segment('mem.load'):
-        memories_content = load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
-    memory_load_ms = round((time.perf_counter() - memory_load_started) * 1000, 3)
-    checkpoint_manager = get_checkpoint_manager(session_store)
-    _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
-    restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
-    # 记忆开关也随会话恢复：ContextVar 不跨进程，重启后要继续生效
-    memory_scope.restore_from_session(session_store)
-    def combined_steer():
-        texts = []
-        if steer_provider is not None:
-            try:
-                texts.extend(steer_provider() or [])
-            except Exception:
-                pass
-        texts.extend(channel.drain_steer())
-        return texts
+        wait_for_mcp_tools()   # 交互模式：MCP 在后台连接，首轮请求前确保工具面完整
+        set_session(session_store.session_id)
+        set_agent('lead')   # 子代理会临时覆盖，退出后恢复
+        context = update_context({}, messages)   # 循环前更新上下文，包含所有对话记录
+        if messages:
+            trigger_hooks('UserPromptSubmit', messages[-1]['content'])
+        system = get_system_prompt(context)
+        turn_started = time.monotonic()   # 本回合起始（tokens 行显示总用时）
+        # 记忆加载：整个 Loop 只在此处加载一次（LLM 从 .cache/memories 目录筛选相关记忆）。
+        # ⚠️ 提醒：循环中途不会再次刷新 —— 本轮新产生的信息不会进入 memories_content；
+        #    要等会话结束 extract_memories 落盘后，下一次会话的 load_memories 才能召回。
+        memory_load_started = time.perf_counter()
+        with perf_segment('mem.load'):
+            memories_content = load_memories(messages)   # 相关记忆块（空串 = 无相关记忆）
+        memory_load_ms = round((time.perf_counter() - memory_load_started) * 1000, 3)
+        checkpoint_manager = get_checkpoint_manager(session_store)
+        _checkpoint_manager.set(checkpoint_manager)  # Only this turn's tools capture pre-images.
+        restore_todos(session_store)   # 会话恢复后 todo 仍可读（事件流是唯一持久源）
+        # 记忆开关也随会话恢复：ContextVar 不跨进程，重启后要继续生效
+        memory_scope.restore_from_session(session_store)
+        def combined_steer():
+            texts = []
+            if steer_provider is not None:
+                try:
+                    texts.extend(steer_provider() or [])
+                except Exception:
+                    pass
+            texts.extend(channel.drain_steer())
+            return texts
 
-    state = _TurnState(
-        messages=messages,
-        session_store=session_store,
-        on_delta=on_delta,
-        on_event=on_event,
-        steer_provider=combined_steer if steer_provider is not None else channel.drain_steer,
-        file_channel=channel,
-        recovery_state=recovery.RecoveryState(),
-        context=context,
-        system=system,
-        checkpoint_manager=checkpoint_manager,
-        turn_workspace=get_workdir(),
-        memories_content=memories_content,
-        memory_load_ms=memory_load_ms,
-        turn_started=turn_started,
-        # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
-        turn_cp_start=_safe_checkpoint(checkpoint_manager.head),
-        tools=tools,
-    )
+        state = _TurnState(
+            messages=messages,
+            session_store=session_store,
+            on_delta=on_delta,
+            on_event=on_event,
+            steer_provider=combined_steer if steer_provider is not None else channel.drain_steer,
+            file_channel=channel,
+            recovery_state=recovery.RecoveryState(),
+            context=context,
+            system=system,
+            checkpoint_manager=checkpoint_manager,
+            turn_workspace=get_workdir(),
+            memories_content=memories_content,
+            memory_load_ms=memory_load_ms,
+            turn_started=turn_started,
+            # 基线延迟到首个工具批次：纯文本回合不需要扫一遍 git status。
+            turn_cp_start=_safe_checkpoint(checkpoint_manager.head),
+            tools=tools,
+        )
 
-    outcome = {'status': 'completed'}
-    try:
         while True:
             if _turn_cancelled(state):   # TUI/REPL 的 Esc、Ctrl-C 取消
                 raise KeyboardInterrupt
@@ -1674,11 +1675,29 @@ def agent_loop(messages:list, session_store=None, on_delta=None, *,
         outcome['error_type'] = type(exc).__name__
         raise
     finally:
+        _finish_turn(session_store, token, channel, outcome)
+
+
+def _finish_turn(session_store, token, channel, outcome: dict) -> None:
+    """回合收尾：终态事件 → channel → token，三步彼此独立。
+
+    两件不能颠倒的事：
+
+    - 终态事件写失败不能**跳过** `channel.close()` / `end_turn()`。原来终态写在
+      `try` 外面，一次磁盘错误就会把 owner 文件留在磁盘上，会话永久显示「有回合」。
+    - 收尾自身不能**掩盖**原始异常。终态写失败的诊断打印出来，但让原来的异常继续
+      向上传——否则用户看到的是「写事件失败」而不是「模型调用失败」。
+    """
+    try:
         if outcome['status'] != 'completed':
             _append_turn_terminal(session_store, token, outcome['status'],
                                   error_type=outcome.get('error_type'))
+    except Exception as exc:   # 终态没落盘要看得见，但不能假报完成，也不能盖住原错
+        print(f'  \033[33m[turn] 终态事件写入失败（{type(exc).__name__}: {exc}）\033[0m')
+    finally:
         try:
-            channel.close()
+            if channel is not None:
+                channel.close()
         finally:
             turn_control.end_turn(token)
 

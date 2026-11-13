@@ -18,6 +18,7 @@ from session_store import SessionEventStore
 def _stub_side_channels(monkeypatch):
     """主循环里的副通道与后台线程一律打桩，脚本响应队列才不会被消费错位。"""
     monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
+    assert harness.turn_control.active() is False, '上一回合的 token 还挂着'
     monkeypatch.setattr(harness, 'extract_memories', lambda pre_compress: None)
     monkeypatch.setattr(harness, 'consolidate_memories', lambda: None)
     monkeypatch.setattr(harness, 'generate_session_title', lambda messages: 'invariants')
@@ -287,3 +288,81 @@ def test_agent_loop_can_run_with_a_tool_subset(tmp_path, monkeypatch):
     assert {schema['function']['name'] for schema in sent} == {'read', 'ls'}
     # 指纹：默认表与实际表必须能区分开，否则归因会误判成"工具表变了"
     assert harness._tools_fingerprint(subset) != harness._tools_fingerprint()
+
+
+# ============================================================
+# R0-e：回合生命周期——所有失败出口都要释放已取得的资源
+# ============================================================
+
+
+def _boom(*_args, **_kwargs):
+    raise RuntimeError('injected: setup failed')
+
+
+def _boom_terminal(*_args, **_kwargs):
+    raise RuntimeError('injected: terminal write failed')
+
+
+def _owner_path(store):
+    import turn_files
+
+    return turn_files.control_dir(harness.SESSIONS_DIR.parent,
+                                 store.session_id) / 'owner.json'
+
+
+def test_setup_failure_releases_token_and_channel(tmp_path, monkeypatch):
+    """turn_started 之后、主循环之前的准备步骤抛异常，也必须释放 token 与 channel。
+
+    原来这些步骤（wait_for_mcp_tools / load_memories / _TurnState …）在主 try **之外**：
+    一旦抛错，`channel.close()` 与 `turn_control.end_turn(token)` 都不会执行，
+    会话就卡在「有回合」状态，owner 文件也留在磁盘上。
+    """
+    monkeypatch.setattr(harness, 'load_memories', _boom)
+    store = SessionEventStore(tmp_path, session_id='lifecycle-setup')
+
+    with pytest.raises(RuntimeError, match='injected'):
+        harness.agent_loop([{'role': 'user', 'content': 'hi'}],
+                           session_store=store)
+
+    assert harness.turn_control.active() is False, 'token 泄漏：会话仍显示有回合'
+    assert not _owner_path(store).exists(), 'owner 文件没清掉（下一回合会被当成有人在跑）'
+
+
+def test_terminal_write_failure_still_closes_the_channel(tmp_path, monkeypatch):
+    """终态事件写失败不能跳过 channel.close / end_turn，也不能假报完成。"""
+    scripted = _Scripted([_response('不会走到这里')])
+
+    def create(**kwargs):
+        raise RuntimeError('injected: model fell over')
+
+    scripted.create = create
+    monkeypatch.setattr(harness.client.chat.completions, 'create', create)
+    monkeypatch.setattr(harness, '_append_turn_terminal', _boom_terminal)
+
+    store = SessionEventStore(tmp_path, session_id='lifecycle-terminal')
+
+    with pytest.raises(RuntimeError) as excinfo:
+        harness.agent_loop([{'role': 'user', 'content': 'hi'}],
+                           session_store=store)
+
+    # 收尾自身的失败不能盖住原始异常：用户要知道是模型挂了，不是写事件失败
+    assert 'model fell over' in str(excinfo.value), excinfo.value
+    assert harness.turn_control.active() is False, 'token 泄漏'
+    assert not _owner_path(store).exists(), 'owner 文件没清掉'
+
+
+def test_next_turn_can_start_after_a_setup_failure(tmp_path, monkeypatch):
+    """失败之后下一回合必须能开始：token 不残留、owner 不悬挂。"""
+    scripted = _Scripted([_response('好的')])
+    monkeypatch.setattr(harness.client.chat.completions, 'create', scripted.create)
+    store = SessionEventStore(tmp_path, session_id='lifecycle-next')
+
+    monkeypatch.setattr(harness, 'load_memories', _boom)
+    with pytest.raises(RuntimeError, match='injected'):
+        harness.agent_loop([{'role': 'user', 'content': 'one'}],
+                           session_store=store)
+
+    monkeypatch.setattr(harness, 'load_memories', lambda messages: '')
+    assert harness.turn_control.active() is False, '上一回合的 token 还挂着'
+    assert harness.agent_loop([{'role': 'user', 'content': 'two'}],
+                              session_store=store) == '好的'

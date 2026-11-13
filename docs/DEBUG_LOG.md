@@ -16195,3 +16195,89 @@ foreach ($mod in $mods) { VirtualKey($mod, $false) }     # 先按下修饰键
 的测试应用内另行验收；离线通过不能写成'真机已通过'」，这一项需要你点名测试应用后再做。
 
 全量 3566 passed / 3 skipped。
+
+---
+
+# 第 128 部分：R0-e —— 两个出口会把会话永久卡成「有回合」
+
+## 一、两个缺陷
+
+**① 准备段在主 try 之外。** `turn_started` 事件已落盘、token 已登记之后的这些步骤
+（`wait_for_mcp_tools` / `set_session` / `get_system_prompt` / `load_memories` /
+`get_checkpoint_manager` / `restore_todos` / `_TurnState(...)`）全在主 try **之前**：
+
+```python
+token = turn_control.begin_turn(...)
+session_store.append('turn_started', ...)
+try:
+    channel = TurnChannel(...).start()
+except BaseException:
+    turn_control.end_turn(token)     # ← 只保护了这一行
+    raise
+wait_for_mcp_tools()                 # ← 之后全裸奔
+...  load_memories(messages)  ...     # ← 抛异常就什么都不收尾
+```
+
+任何一步抛错 → `channel.close()` 与 `end_turn(token)` 都不执行 → 会话卡在「有回合」，
+owner 文件留在磁盘上，下一回合被当成「有人在跑」。
+
+**② 终态落盘在 `channel.close()` 之外。**
+
+```python
+finally:
+    if outcome['status'] != 'completed':
+        _append_turn_terminal(...)    # ← 抛错（磁盘满/权限）
+    try:
+        channel.close()               # ← 就永远轮不到
+    finally:
+        turn_control.end_turn(token)
+```
+
+一次写事件失败 = 同样的卡死。而且它写在 `finally` 里，异常会**盖住**原始错误——
+用户看到「写事件失败」而不是「模型调用失败」。
+
+## 二、改法
+
+把准备段整体并入主 try（`channel = None` 兜底），收尾抽成 `_finish_turn()`：
+
+```python
+finally:
+    try:
+        if outcome['status'] != 'completed':
+            _append_turn_terminal(...)
+    except Exception as exc:            # 看得见，但不假报完成、也不盖住原错
+        print(f'  [turn] 终态事件写入失败（{type(exc).__name__}: {exc}）')
+    finally:
+        try:
+            if channel is not None:
+                channel.close()
+        finally:
+            turn_control.end_turn(token)
+```
+
+`harness.py` 的 diff 有 129 行，但**绝大部分是缩进**——逻辑上只多了一个 `_finish_turn`
+函数和两个 `try` 层次。
+
+## 三、守卫（3 条，2 条改前红）
+
+| 测试 | 改前 |
+| --- | --- |
+| `test_setup_failure_releases_token_and_channel`（`load_memories` 抛错 → token 已释放、owner 文件已清） | **红**（`turn_control.active()` 仍为 True） |
+| `test_terminal_write_failure_still_closes_the_channel`（终态写抛错 → 仍收尾，且**原始异常不被掩盖**） | **红** |
+| `test_next_turn_can_start_after_a_setup_failure` | 绿（`begin_turn` 本身不拦），作为回归记录保留 |
+
+把收尾改回「终态写在 try 之外」→ 第 2 条立刻红，且报出的是
+`injected: terminal write failed` 而不是 `model fell over`——正好证明它在测「不掩盖原错」。
+
+## 四、刻意没做的
+
+§9.3 提到「若停止/join 本身不可完成，必须标 degraded/cleanup_failed 并阻止与残留执行
+冲突的新回合」。查过 `TurnChannel.close()` 与 `turn_control.end_turn()`：前者只删两个
+文件并吞 OSError，后者是字典清理 + `Event.clear()`，**都没有 join、不会阻塞**。为不存在的
+阻塞风险造一套 degraded 状态机是过度设计，本轮不做。
+
+§9.3 还要求「验证 runtime→loop 复用同一 turn_id、早期取消不被清除」——这部分现有测试
+已经在守（`test_turn_coordinator.py`、`test_ui_lifecycle.py` 等 95 条相关测试全绿），
+没有新增缺口。
+
+全量 3569 passed / 3 skipped。
