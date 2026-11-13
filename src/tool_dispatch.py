@@ -12,7 +12,9 @@ import json
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Mapping
 
 import checkpoints
 import tool_activity
@@ -83,17 +85,36 @@ def _tool_diff(before):
     return chr(10).join(chunks)[:_DIFF_MAX_CHARS]
 
 
-def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
-                   on_event=None, on_activity=None):
-    """执行单个 tool_call：PreToolUse 权限 hook → 后台/直接执行 → PostToolUse → 异常兜底。
+@dataclass(frozen=True)
+class ToolExecutionDeps:
+    """执行一个工具需要的全部外部能力（窄接口，就这四样）。
+
+    组合根（`exec_tool_call` 门面）负责从 harness 装配；核心只认这个对象。
+    刻意**不**把所有东西都塞进来：配置、client、UI、存储、授权各有归属，
+    混成一个万能 context 之后「核心到底依赖什么」就没法回答了。
+    """
+
+    registry: Mapping[str, Callable]
+    #: ``(phase, name, args) -> 拦截语或 None``。None 表示不跑策略 hook。
+    trigger_hooks: Callable | None
+    #: 事件出口（ui_emit）。可空：无头/测试场景不关心展示。
+    emit: Callable | None
+    #: 指标计数（METRICS.record_tool）。可空。
+    record_tool: Callable | None
+
+
+def execute_tool_core(tool_call, deps: ToolExecutionDeps, *, background=True,
+                      on_event=None, on_activity=None):
+    """执行单个 tool_call 的核心：不 import harness、不碰全局配置。
+
     返回 (name, args, tool 消息 dict, images)。images 是 view_image 的附件引用，
     由调用方作为独立 user 消息追加（tool 角色里放图片各家支持不一致）。
-    主循环与 teammate 共用同一条安全/兜底路径。
-    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。
+
     on_event：无头 JSONL 的事件出口，按 ``(类型, 载荷)`` 回调。
     on_activity：交互终端的工具活动行出口，参数为
-    ``(name, args, elapsed, failed, background)``。"""
-    h = _h()
+    ``(name, args, elapsed, failed, background, hint, output)``。
+    """
+    registry = deps.registry
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments)
@@ -114,10 +135,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     if on_event:
         on_event('tool.started', {'name': name, 'call_id': tool_call.id,
                                   'arguments': args})
-    if registry is None:
-        registry = h.tool_registry
-    if hooks:
-        blocked = h.trigger_hooks("PreToolUse", name, args)
+    if deps.trigger_hooks is not None:
+        blocked = deps.trigger_hooks("PreToolUse", name, args)
     else:
         blocked = None
     images = []
@@ -125,7 +144,8 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     diff_before = (_capture_tool_files(name, args)
                    if name in _DIFF_TOOLS else {})
     started = time.perf_counter()
-    h.ui_emit('tool_start', name=name, args=args, call_id=tool_call.id)
+    if deps.emit is not None:
+        deps.emit('tool_start', name=name, args=args, call_id=tool_call.id)
     if blocked:
         output = blocked
     elif name not in registry:
@@ -150,22 +170,24 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
     text_output = str(output)
     # 唯一实现在 tool_activity：这份判定原本抄了三份、规则还各不相同
     failed = tool_activity.is_failure(text_output)
-    h.ui_emit('tool_end', name=name, args=args, call_id=tool_call.id,
-              output_preview=text_output[:2000], output_len=len(text_output),
-              diff=_tool_diff(diff_before) if diff_before else '',
-              ok=not (blocked or failed),
-              outcome=('denied' if blocked else
-                       'queued' if background_started else
-                       'failed' if failed else 'completed'),
-              background=background_started,
-              duration_ms=round(elapsed * 1000))
-    h.METRICS.record_tool()
+    if deps.emit is not None:
+        deps.emit('tool_end', name=name, args=args, call_id=tool_call.id,
+                  output_preview=text_output[:2000], output_len=len(text_output),
+                  diff=_tool_diff(diff_before) if diff_before else '',
+                  ok=not (blocked or failed),
+                  outcome=('denied' if blocked else
+                           'queued' if background_started else
+                           'failed' if failed else 'completed'),
+                  background=background_started,
+                  duration_ms=round(elapsed * 1000))
+    if deps.record_tool is not None:
+        deps.record_tool()
     if on_activity is not None:
         on_activity(name, args, elapsed, failed,
                     background_started, tool_activity.result_hint(output),
                     str(output))
-    if hooks:
-        h.trigger_hooks("PostToolUse", name, args, output)
+    if deps.trigger_hooks is not None:
+        deps.trigger_hooks("PostToolUse", name, args, output)
     # 入口 middle-out 截断：历史里从此不存在超大工具结果（事件流存的即最终
     # 形态，前缀天然稳定；全量已落盘可恢复）。hooks 拿到的仍是全量输出。
     content = _bound_tool_output(tool_call.id, output)
@@ -180,6 +202,28 @@ def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
         })
     return name, args, {"role": "tool", "tool_call_id": tool_call.id,
                         "content": content}, images
+
+
+def exec_tool_call(tool_call, registry=None, *, hooks=True, background=True,
+                   on_event=None, on_activity=None):
+    """兼容门面：从 harness 装配依赖，再转到 `execute_tool_core`。
+
+    保留原签名与语义（主循环与 teammate 共用）。四样依赖都在**调用期**从 `_h()`
+    读，所以既有 patch 点（tool_registry / trigger_hooks / ui_emit / METRICS）
+    仍然命中真实调用，不会因为提取而静默失效。
+
+    hooks=False：teammate 线程无法交互询问，跳过 hook（由工具集内层安全检查兜底）。
+    """
+    h = _h()
+    return execute_tool_core(
+        tool_call,
+        ToolExecutionDeps(
+            registry=registry if registry is not None else h.tool_registry,
+            trigger_hooks=h.trigger_hooks if hooks else None,
+            emit=h.ui_emit,
+            record_tool=h.METRICS.record_tool,
+        ),
+        background=background, on_event=on_event, on_activity=on_activity)
 
 
 # 无副作用工具白名单：模型一轮返回多个 tool_call 时这些可以并行执行（Codex 行为）。

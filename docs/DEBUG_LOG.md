@@ -16703,3 +16703,77 @@ $ python entrypoint.py --repair-session demo
 | R0-f ①②③ | `aea14f3` `（本条）` |
 
 全量 3603 passed / 3 skipped。
+
+---
+
+# 第 135 部分：R1-0 —— 工具执行核心与组合根解耦
+
+## 一、做什么
+
+设计契约（§9.4 R1-0）：「`tool_dispatch` 执行核心及门面、`harness` 装配、必要的小型
+context/deps 类型」，**不改**工具协议、提示词、hooks 决策、LLM、后台状态机、持久格式。
+
+原来 `exec_tool_call` 一个函数里同时干两件事：**装配**（从 `_h()` 取 registry / hooks /
+ui_emit / METRICS）和**执行**。于是想单测执行语义，就得先把整个 harness 立起来。
+
+拆成两半：
+
+```python
+@dataclass(frozen=True)
+class ToolExecutionDeps:
+    registry: Mapping[str, Callable]
+    trigger_hooks: Callable | None      # (phase, name, args[, output]) → 拦截语或 None
+    emit: Callable | None               # ui_emit
+    record_tool: Callable | None        # METRICS.record_tool
+
+def execute_tool_core(tool_call, deps, *, background=True,
+                      on_event=None, on_activity=None): ...   # 不 import harness
+
+def exec_tool_call(...):                # 门面：从 _h() 装配，签名与语义不变
+    h = _h()
+    return execute_tool_core(tool_call, ToolExecutionDeps(...), ...)
+```
+
+**关键约束：门面必须保持"调用期读"**。四个依赖都在 `exec_tool_call` 里现取，
+所以既有 patch 点（测试里 `monkeypatch.setattr(harness, 'tool_registry', …)` 之类）
+仍然命中真实调用——提取不能让补丁静默失效，否则几十个测试会以最坏的方式"变绿"。
+
+## 二、验收（9 条守卫）
+
+| 测试 | 证明什么 |
+| --- | --- |
+| `test_core_runs_with_fake_deps_and_no_harness` | 假 deps 就能跑完一次调用；hook 相位、事件、计数都对 |
+| `test_core_reports_a_blocked_call_without_running_it` | 被拒时工具**未执行**，`outcome='denied'`、`ok=False` |
+| `test_core_reports_an_unknown_tool` | 未知工具仍返回 `Error: unknown tool x`，记 `failed` |
+| `test_core_reports_invalid_arguments` | 参数解析失败仍成对上报 `tool.started`/`tool.completed` |
+| `test_core_queues_a_background_task` | 后台被接受时 `outcome='queued'`（不是完成） |
+| `test_core_unwraps_image_results` | `ImageResult` 解包契约不变 |
+| `test_facade_still_honours_harness_patch_points` | 四个 patch 点仍命中实际调用 |
+| `test_facade_with_hooks_disabled_skips_pre_tool_use` | teammate 的 `hooks=False` 语义不变 |
+| `test_core_function_does_not_reference_the_composition_root` | **静态**：核心里没有 `_h` / `import harness` |
+
+前 8 条用「把 `tool_dispatch._h` 换成抛异常的函数」动态证明——核心路径上只要还剩
+一处 `_h()` 就会炸。第 9 条从源码层面钉住，防止将来有人在核心函数里加一行 `_h()`
+而某条测试恰好没走到那个分支。
+
+## 三、刻意没做
+
+- **没有搬 `_print_tool_activity` / `TOOL_OUTPUTS`**。设计文档说「**可**提取到展示模块」，
+  而它连着 `/expand` 编号与 `ACTIVE_TICKER` 两条出口，搬走是纯 churn，收益是"文件短一点"。
+  这不是本批要解决的问题。
+- **没有引入 `ExecutionContext`**（§3.3 的另一个类型）。它服务于 R0-d 之后的身份/限制
+  显式化，而 R0-d 用"捕获父上下文快照"已经解决了丢上下文的问题；为一个已经解决的问题
+  再造一层值对象属于过度设计。
+- **没有改 `_run_tool_batch`**。它仍然调 `_h().exec_tool_call`（门面），所以并行/串行、
+  上下文传播、taint 回流、凭据不广播这些 R0-d 建立的行为**一行未动**。
+
+## 四、一处自己的失误
+
+重构过程中我为了删一个临时占位函数，用 `str.index` 切片，把 `execute_tool_core` 的
+**整个函数体**一起删掉了（匹配到了后面的锚点）。发现后从 `git show HEAD:` 取回原始
+函数体，重新做依赖替换，再一次成型的。
+
+教训：**用 `index()` 切源码时必须先断言边界是预期的那一行**——这和之前"切片顺序反了
+导致复制 60 行"是同一类错误（第 102 部分）。两次都因为没验证边界。
+
+全量 3612 passed / 3 skipped。
