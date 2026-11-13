@@ -28,6 +28,23 @@ _TIER_KEYS = ('HARNESS_SANDBOX_MODE', 'HARNESS_APPROVAL_POLICY',
 
 
 @pytest.fixture(autouse=True)
+def _isolate_process_level_state(tmp_path, monkeypatch):
+    """进程级状态一律指到临时目录：任何一条用例都不该写进真实的 .cache。
+
+    漏掉的代价不是“测试互相影响”，而是**用户的真实数据被测试改写**。
+    记忆墓碑就掞过：新增模块级路径常量后忘了隔离，一次全量跑把
+    `.cache/memories_tombstones.json` 写进真实目录，而那个文件会让
+    同名记忆在之后所有会话里都召不回来。
+
+    以后再加模块级路径（`xxx_path()` / `DURABLE_PATH`）都应该在这里登记。
+    """
+    import memory_tombstone
+
+    monkeypatch.setattr(memory_tombstone, 'STORE_PATH',
+                        tmp_path / 'memories_tombstones.json')
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cron_durable_path(tmp_path, monkeypatch):
     """cron 是进程级单例：用例之间清空任务/队列，并把 crons.json 指到临时目录。"""
     import cron_scheduler

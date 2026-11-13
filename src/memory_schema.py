@@ -45,7 +45,10 @@ LEGACY_ALIASES = {
 }
 
 #: 作用域。session 内的笔记不跨会话，合并时判 durability 才提升。
-SCOPES = ('global', 'session')
+#: 作用域。session 内的笔记不跨会话；workspace 是「这块工作区的事实」，不该被
+#: 另一个项目当成自己的约定；global 才是跨项目的个人偏好。
+#: 旧文件没有这个字段时按 global 读（**不自动猜归属**，§6.1）。
+SCOPES = ('global', 'workspace', 'session')
 DEFAULT_SCOPE = 'global'
 
 #: 默认置信度。抽取推测按 0.5，用户明确要求按 0.9（见 memory_write）。
@@ -184,6 +187,15 @@ def normalize_scope(value) -> str:
     return text if text in SCOPES else DEFAULT_SCOPE
 
 
+def normalize_revision(value) -> int:
+    """写入版本：非负整数，读不懂就当 0（旧文件没这个字段）。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
 def derive_keywords(text: str) -> list[str]:
     """从描述里抽关键词（描述为空时调用方传名字）。
 
@@ -231,6 +243,12 @@ def normalize_entry(meta: dict, body: str, filename: str) -> dict:
         'last_update_date': normalize_date(meta.get('last_update_date')),
         'supersedes': str(meta.get('supersedes') or '').strip(),
         'superseded_by': str(meta.get('superseded_by') or '').strip(),
+        # 归属：workspace 作用域指哪块工作区（已登记的 id 或规范根路径）。
+        # 旧文件里没有 = 空串（不猜）。
+        'owner': str(meta.get('owner') or '').strip(),
+        # 写入版本：每次改写 +1。旧候选写回前比它，被覆盖就放弃（§6.2）。
+        # 旧文件没有 = 0。
+        'revision': normalize_revision(meta.get('revision')),
         'source_session': str(meta.get('source_session') or '').strip(),
         'source_quote': ' '.join(str(meta.get('source_quote') or '').split()),
         'body': body,
@@ -256,10 +274,13 @@ def render_frontmatter(entry: dict) -> str:
     stamp = normalize_date(entry.get('last_update_date')) or today()
     lines.append(f'last_update_date: {stamp}')
     for field in ('supersedes', 'superseded_by', 'source_session',
-                  'source_quote'):
+                  'source_quote', 'owner'):
         value = one_line(entry.get(field))
         if value:
             lines.append(f'{field}: {_yaml_scalar(value[:200])}')
+    revision = normalize_revision(entry.get('revision'))
+    if revision:
+        lines.append(f'revision: {revision}')
     lines.append('---')
     return '\n'.join(lines) + '\n'
 

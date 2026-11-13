@@ -27,6 +27,7 @@ import memory_feedback
 import memory_redact
 import memory_schema
 import memory_scope
+import memory_tombstone
 import memory_write
 from file_lock import FileLockTimeout, exclusive_file_lock
 from llm_route import harness as _h
@@ -238,7 +239,8 @@ def _record_redaction(kinds: list[str]) -> None:
 def write_memory_file(name: str, mem_type: str, description: str, body: str,
                       *, source: str = '', quote: str = '', scope: str = None,
                       confidence: float | None = None,
-                      supersedes: str = '', keywords=None) -> tuple[Path, str]:
+                      supersedes: str = '', keywords=None,
+                      owner: str = '') -> tuple[Path, str]:
     """写一条记忆，返回 ``(路径, 动作)``。动作是 add / update / supersede。
 
     写入前决定怎么落盘（``memory_write.decide``）：同一个偏好的多个措辞版本在
@@ -254,7 +256,7 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str,
         result = _write_memory_file_unlocked(
             name, mem_type, description, body, source=source, quote=quote,
             scope=scope, confidence=confidence, supersedes=supersedes,
-            keywords=keywords)
+            keywords=keywords, owner=owner)
     _audit('memory_written', {'name': str(name), 'type': str(mem_type),
                               'chars': len(str(body or ''))})
     return result
@@ -264,7 +266,8 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
                                body: str, *, source: str = '',
                                quote: str = '', scope: str = None,
                                confidence: float | None = None,
-                               supersedes: str = '', keywords=None):
+                               supersedes: str = '', keywords=None,
+                               owner: str = ''):
     h = _h()
     h.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -281,6 +284,7 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
         'last_update_date': memory_schema.today(),
         'source_session': source,
         'source_quote': quote,
+        'owner': owner,
     }
     draft['keywords'] = (memory_schema.normalize_keywords(keywords)
                          or memory_schema.derive_keywords(description or name))
@@ -297,10 +301,15 @@ def _write_memory_file_unlocked(name: str, mem_type: str, description: str,
         action = memory_write.UPDATE
     if action == memory_write.UPDATE:
         entry = memory_write.merge(draft, target)
+        # 版本递增：并发/异步的候选写回前要比这个值（§6.2）。合并不递增会让
+        # “先算好的候选”在别人改过之后仍然通过检查。
+        entry['revision'] = memory_schema.normalize_revision(
+            target.get('revision')) + 1
         filepath = h.MEMORY_DIR / target['filename']
         _atomic_write(filepath, _render_entry(entry))
     else:
         entry = dict(draft)
+        entry['revision'] = 1
         if action == memory_write.SUPERSEDE:
             entry['supersedes'] = target['filename']
         filepath = h.MEMORY_DIR / target_name
@@ -390,6 +399,17 @@ def delete_memory_file(name: str) -> bool:
     resolved = _memory_path(f'{target}.md')
     if resolved is None or not resolved.is_file():
         return False
+    # **先落墓碑，再删文件**：反过来就是“文件没了、复活拦截也没记下”，
+    # 下次抽取能把同一条原样写回来。墓碑失败就抛 TombstoneError，让调用方
+    # 报“遗忘未完成”，而不是宣称成功。
+    entry = None
+    cached = _cached_entry(resolved)
+    if cached is not None:
+        meta, body, _raw = cached
+        entry = memory_schema.normalize_entry(meta, body, resolved.name)
+    sources = [str(entry.get('source_session') or '')] if entry else []
+    memory_tombstone.block(str(name), sources=[s for s in sources if s],
+                          reason='user forget')
     with _write_guard():
         resolved.unlink(missing_ok=True)
         _cache_drop(resolved)
@@ -406,9 +426,13 @@ def list_memory_files() -> list:  # 列出所有记忆文件
     `/memories archived` 看到。
     """
     h = _h()
+    blocked = memory_tombstone.blocked_names()
     results = []
     for f in sorted(h.MEMORY_DIR.glob('*.md')):
         if f.name == 'MEMORY.md':
+            continue
+        if f.name.rsplit('.md', 1)[0] in blocked:
+            # 被遗忘的不再参与召回/列表（墓碑先落盘才删文件，所以这里两者一致）。
             continue
         entry = _cached_entry(f)
         if entry is None:

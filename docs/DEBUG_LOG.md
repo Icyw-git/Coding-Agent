@@ -16865,3 +16865,73 @@ def needs_write_grants(tool, args, path_zone) -> bool:
   「谁决定读不读账本」这件事留在编排层，`exec_policy` 继续只做纯判定。
 
 全量 3632 passed / 3 skipped。
+
+---
+
+# 第 137 部分：R1-c（其一）—— 记忆有了 workspace 作用域、版本号与墓碑
+
+## 一、三件事
+
+**① scope 增加 `workspace`**。原来只有 `global` / `session`：一台机器上所有项目共享
+同一批「项目事实」，改了 A 项目的约定，B 项目下次会话就照着 A 做——而用户不知道。
+旧文件没有这个字段仍按 `global` 读（**不自动猜归属**，§6.1）。
+
+**② `revision` 写入版本**。每次 UPDATE/合并 +1。旧候选写回前比它，被覆盖就放弃——
+这比「逐条比对内容」便宜，也比「只拦同名」准确。旧文件没有 = 0。
+
+**③ 墓碑（`memory_tombstone`）**。遗忘从 `unlink` 变成一条写入协议：
+
+| 契约 | 实现 |
+| --- | --- |
+| 先落墓碑、再删文件 | `delete_memory_file()` 里墓碑写在 `unlink` 之前 |
+| 墓碑失败 = 遗忘未完成 | `_write_store` 抛 `TombstoneError`，文件不动 |
+| 换名字不能绕过 | `may_revive(name, source)` 同时按名字**和来源谱系**判 |
+| 清缓存/重建索引不解除 | 墓碑是独立文件，`list_memory_files()` 每次都查 |
+| 只留最小标识 | 名字、来源引用、代际、时间、原因——**不存正文** |
+| 只有显式重新记住才能解除 | `revive(name, reason=…)` 记下新依据 |
+
+## 二、我踩到的坑：新模块级路径常量 = 新的污染面
+
+加完墓碑后跑全量，`test_forget_removes_memory` 红了（`recall('')` 是空的）。
+查下去发现**我的测试把墓碑写进了真实 `.cache/`**：
+
+```
+$ cat .cache/memories_tombstones.json
+{"generation": 1, "entries": [{"name": "temp", ...}]}
+```
+
+`STORE_PATH = paths.cache_path(...)` 在导入期就绑定了真实路径，而 conftest 没有隔离它。
+于是 `temp` 被永久拉黑，之后所有会话都召不回这个名字。
+
+这和 R0-b1（诊断脚本写真实 rules/net_grants）是**同一类**：新增一个模块级路径常量，
+就多一个污染面。处理：
+
+1. 删掉被污染的真实文件；
+2. conftest 加 `_isolate_process_level_state()` autouse fixture 统一隔离；
+3. 新增 `tests/test_no_test_writes_real_cache.py`：断言 conftest 里登记了这些路径，
+   并断言真实 `.cache` 里不出现墓碑文件。
+
+（第 3 条不能完全自动化——"跑完才知道有没有写"没法在单条用例里断言，所以做成
+清单式提醒 + 跑完全量后的一致性检查。）
+
+## 三、守卫（10 条）
+
+| 组 | 覆盖 |
+| --- | --- |
+| scope/revision（3 条） | `workspace` 存在；旧文件按 global 读；owner/revision 落盘并在列表里读回；每次写入 +1 |
+| 墓碑（6 条） | 先墓碑后删；召回与索引都过滤；旧快照不能复活；墓碑失败则文件不动；清缓存+重建索引不解除；显式 revive 解除并记下依据；同来源换名字也被拦；明细有界 + 坏文件不致命 |
+| 污染（2 条） | conftest 隔离清单；真实 `.cache` 无墓碑 |
+
+## 四、刻意没做（留给下一批）
+
+- **没有按 workspace 过滤召回**。字段与保真先落地，`local_relevant_memories` 拿到的
+  仍是全部条目——启用过滤会改变现有召回结果，需要先有"当前工作区 id"的定义与
+  `/memories` 的展示口径。
+- **没有做 generation 与「模型调用期间」的并发拦截**。`revision` 与墓碑都在，
+  但「抽取开始时记 generation → 调模型 → 写回前比对」这条链路要动 `memory.py`
+  的抽取/合并主体（`extract_memories` / `consolidate_memories`），
+  按 §9.2「一个批次只改点名模块」放到下一批。
+- **没动 `_retire()` 的归档语义**（supersede 走 `.archive/`），它和墓碑是两条不同的
+  路径：前者是"被新版替代"，后者是"用户要求忘掉"。
+
+全量 3645 passed / 3 skipped。
