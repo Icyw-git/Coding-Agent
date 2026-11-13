@@ -138,3 +138,23 @@ def test_api_layer_accepts_request_id_and_maps_conflict_to_409():
     schema = inspect.getsource(__import__('api_sessions'))
     assert 'request.request_id' in schema, '路由没有把 request_id 传下去'
     assert 'RequestConflict' in schema and '409' in schema
+
+
+def test_stream_route_also_passes_request_id():
+    """流式与非流式两条路由都必须透传：飞书走的是流式那条。"""
+    import inspect
+
+    import api_streams
+
+    source = inspect.getsource(api_streams)
+    assert 'request_id' in source, '流式路由没透传 request_id'
+
+
+def test_feishu_uses_message_id_as_the_dedup_key():
+    """飞书重投时 message_id 不变——它天然是"同一次请求"的标识。"""
+    import feishu_gateway
+
+    key = feishu_gateway._message_request_id('chat-1', 'om_abc')
+    assert key.startswith('feishu:') and 'om_abc' in key
+    assert key != feishu_gateway._message_request_id('chat-2', 'om_abc'), (
+        '不同聊天里的同号 message_id 不该撞')

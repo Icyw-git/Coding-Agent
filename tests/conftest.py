@@ -39,9 +39,13 @@ def _isolate_process_level_state(tmp_path, monkeypatch):
     以后再加模块级路径（`xxx_path()` / `DURABLE_PATH`）都应该在这里登记。
     """
     import memory_tombstone
+    import request_dedup
 
     monkeypatch.setattr(memory_tombstone, 'STORE_PATH',
                         tmp_path / 'memories_tombstones.json')
+    monkeypatch.setattr(request_dedup, 'STORE_PATH',
+                        tmp_path / 'request_dedup.jsonl')
+    request_dedup.reset_cache()
 
 
 @pytest.fixture(autouse=True)

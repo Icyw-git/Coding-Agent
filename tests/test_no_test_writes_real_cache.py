@@ -25,12 +25,15 @@ def test_conftest_isolates_process_level_paths():
     新增模块级路径时，把名字加进这个清单——它会提醒你同时加隔离。
     """
     source = (ROOT / 'tests' / 'conftest.py').read_text(encoding='utf-8')
-    for name in ('memory_tombstone', 'cron_scheduler'):
+    for name in ('memory_tombstone', 'request_dedup', 'cron_scheduler'):
         assert name in source, f'conftest 没有隔离 {name} 的模块级路径'
 
 
-def test_no_tombstone_file_leaked_into_the_real_cache():
-    """真实 .cache 里出现墓碑文件，说明某条用例没被隔离。"""
-    leaked = ROOT / '.cache' / 'memories_tombstones.json'
-    assert not leaked.exists(), (
-        f'测试写进了真实数据目录：{leaked}。把它删掉，并在 conftest 里隔离该路径。')
+def test_no_state_file_leaked_into_the_real_cache():
+    """真实 .cache 里出现这些文件，说明某条用例没被隔离。"""
+    leaked = [path for path in (
+        ROOT / '.cache' / 'memories_tombstones.json',
+        ROOT / '.cache' / 'requests' / 'dedup.jsonl',
+    ) if path.exists()]
+    assert not leaked, (
+        f'测试写进了真实数据目录：{leaked}。删掉它们，并在 conftest 里隔离该路径。')

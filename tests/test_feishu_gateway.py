@@ -2468,3 +2468,43 @@ def test_panel_rules_action_reports_rule_status(gateway):
     gw, fake = gateway
     gw._handle_panel_action('chat-panel-rules', 'rules')
     assert '规则文件' in fake.last()
+
+
+# ============================================================
+# R1-a：飞书重投的消息要真正被去重（message_id 作 request_id）
+# ============================================================
+
+
+def test_resent_message_is_not_executed_twice(gateway, monkeypatch):
+    """同一条飞书消息被重投（同一个 message_id）不能开两个回合。
+
+    飞书在网关没及时 ack 时会重投同一条事件，`message_id` 不变——它天然就是
+    "同一次请求"的标识，拿它当 request_id 即可。
+    """
+    import request_dedup
+
+    gw, fake = gateway
+    gw.on_message('chat-1', '帮我跑一下测试', message_id='om_dup_1')
+    first = fake.last()
+    assert 'agent-reply-ok' in first
+
+    # 重投同一条（message_id 相同）
+    gw.on_message('chat-1', '帮我跑一下测试', message_id='om_dup_1')
+
+    # 第二次不该再产生一条"新回合成功"的回复；应当明确说明没有重复执行
+    assert '已经在处理' in fake.last() or '没有重复' in fake.last(), fake.last()
+    assert request_dedup.count() >= 1
+
+
+def test_different_message_ids_run_separately(gateway):
+    gw, fake = gateway
+    gw.on_message('chat-1', '第一条', message_id='om_a')
+    gw.on_message('chat-1', '第二条', message_id='om_b')
+    assert 'agent-reply-ok' in fake.last()
+
+
+def test_message_without_an_id_still_works(gateway):
+    """没有 message_id（模拟器/测试）时行为不变。"""
+    gw, fake = gateway
+    gw.on_message('chat-1', '没有事件 id 的消息')
+    assert 'agent-reply-ok' in fake.last()

@@ -282,6 +282,31 @@ def _attachment_filename(kind: str, key: str, name: str | None,
     return (safe or f'file_{key[-8:]}')[:80]
 
 
+def _request_rejection_text(exc: BaseException) -> str:
+    """去重相关的拒绝要翻成用户能照做的话。
+
+    这两类都不是"出错了"，而是"这次不该重跑"：直接说清区别，用户才不会反复重发。
+    """
+    try:
+        from agent_runtime import RequestConflict, RequestPending
+    except Exception:
+        return ''
+    if isinstance(exc, RequestPending):
+        return '这条消息之前已受理但回合没开始，为避免重复执行没有重跑。'
+    if isinstance(exc, RequestConflict):
+        return '这条消息与之前同一条的内容不一致（或受理已满），未执行。'
+    return ''
+
+
+def _message_request_id(chat_id: str, message_id: str) -> str:
+    """飞书事件 → 去重键。
+
+    只用 `message_id` 不够：不同聊天/不同应用的 message_id 理论上可能撞，
+    拼上 chat_id 更稳。加上前缀是为了让它和 SDK 自带的 request_id 一眼可分。
+    """
+    return f'feishu:{chat_id}:{message_id}'
+
+
 def _accepts_kwarg(fn, name: str) -> bool:
     """传输层是否支持某个可选参数（测试替身/旧实现可能没有 reply_to）。"""
     try:
@@ -813,6 +838,10 @@ class FeishuGateway:
                        + '· 我们上次聊到哪了'))
         try:
             kwargs = {'reply_to': message_id} if message_id else {}
+            # 飞书重投同一条事件时 message_id 不变，它天然就是"同一次请求"的标识。
+            # 传下去让 AgentRuntime 去重：重投不会再开一个回合。
+            if message_id:
+                kwargs['request_id'] = _message_request_id(chat_id, message_id)
             self._send_agent_reply(chat_id, session_id, text, **kwargs)
         except Exception as exc:
             self._reply(chat_id, friendly_error(exc) or f'[error] {exc}')
@@ -830,9 +859,39 @@ class FeishuGateway:
         raw = (os.getenv('FEISHU_STEP_CARD') or '').strip().lower()
         return raw not in ('0', 'false', 'no', 'off')
 
+    def _already_handled(self, chat_id: str, request_id: str) -> bool:
+        """这条飞书消息是不是已经受理过（重投）。
+
+        飞书没收到 ack 会重投同一事件，`message_id` 不变。**先查台账再调用**，
+        这样重复消息能拿到一句明确的话；真正的原子去重仍在 `AgentRuntime.send` 里
+        （查完到调用之间仍有窗口，那边兜底）。
+        """
+        try:
+            import request_dedup
+
+            record = request_dedup.lookup(request_id)
+        except Exception:
+            return False
+        if record is None:
+            return False
+        turn_id = str(record.get('turn_id') or '')
+        if turn_id:
+            self._reply(chat_id,
+                        '这条消息已经受理过了（回合 ' + turn_id + '），没有重复执行。'
+                        + chr(10) + '要看结果直接说「刚才那条怎么样了」。')
+        else:
+            # 记录在、回合没绑上：上一次受理之后进程没了。不重播，让用户核对。
+            self._reply(chat_id,
+                        '这条消息之前已经受理，但回合没能开始（可能中途重启）。'
+                        + chr(10) + '没有重复执行；请确认状态后再决定是否重发。')
+        return True
+
     def _send_agent_reply(self, chat_id: str, session_id: str, text: str,
-                          reply_to: str | None = None) -> None:
+                          reply_to: str | None = None,
+                          request_id: str | None = None) -> None:
         """每个回合一张可编辑卡片：默认 schema 2.0 过程卡，可退回 Markdown 卡。"""
+        if request_id and self._already_handled(chat_id, request_id):
+            return
         self._last_user[chat_id] = {'text': text, 'session_id': session_id,
                                     'at': time.monotonic()}
         perf_reset()
@@ -967,6 +1026,8 @@ class FeishuGateway:
                          if _accepts_kwarg(streamer, 'origin_chat') else {})
                 if _accepts_kwarg(streamer, 'on_screenshots'):
                     extra['on_screenshots'] = screenshots.extend
+                if request_id and _accepts_kwarg(streamer, 'request_id'):
+                    extra['request_id'] = request_id
                 return streamer(text, session_id=target_session,
                                 on_delta=on_delta, on_progress=on_progress,
                                 **extra)
@@ -974,6 +1035,8 @@ class FeishuGateway:
                      if _accepts_kwarg(self.api.send, 'origin_chat') else {})
             if _accepts_kwarg(self.api.send, 'on_screenshots'):
                 extra['on_screenshots'] = screenshots.extend
+            if request_id and _accepts_kwarg(self.api.send, 'request_id'):
+                extra['request_id'] = request_id
             return self.api.send(text, session_id=target_session, **extra)
 
         try:
@@ -995,7 +1058,7 @@ class FeishuGateway:
             # 直接当主文案——那是给开发者看的。给一句人话打头，原始信息留在
             # 「技术细节」里供反馈；两者都截断，避免整屏堆栈。
             detail = ' '.join(str(exc or '').split())[:300]
-            head = hint or '模型或服务返回了意外错误。'
+            head = hint or _request_rejection_text(exc) or '模型或服务返回了意外错误。'
             failed = ('处理未完成：' + head + chr(10)
                       + ('技术细节：' + detail + chr(10) if detail else '')
                       + '请先核实任务状态，再决定是否重试。' + chr(10) + chr(10)
