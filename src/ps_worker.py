@@ -143,8 +143,30 @@ while ($true) {
 '''
 
 
+#: 一次请求走到了哪一步。上层据此决定「能不能重试」，而不是猜异常文案。
+#:
+#: - ``not_sent``       请求没交给 worker（没启动 / 没就绪 / stdin 不可用）
+#: - ``partial_write``  写请求时出错，可能已部分提交
+#: - ``sent_unknown``   已经写出，但没拿到合法回包（超时 / EOF / 非 JSON）
+#: - ``answered``       worker 正常回答了 ``ok: false``（结构性拒绝，重跑也一样）
+#:
+#: 只有 ``not_sent`` 能证明「什么都没发生」。其余三种对**有副作用**的操作一律按结果
+#: 未知处理，不自动重放——桌面应用没有和本地日志共同提交的事务，「已输入但回执没
+#: 落盘」永远可能存在。
+WORKER_ERROR_PHASES = frozenset(
+    {'not_sent', 'partial_write', 'sent_unknown', 'answered'})
+
+
 class WorkerError(RuntimeError):
-    """worker 不可用或响应不合法。"""
+    """worker 不可用或响应不合法；``phase`` 说明请求走到了哪一步。
+
+    默认取最保守的 ``sent_unknown``：新增 raise 点如果忘了标注，行为是「不重试」，
+    而不是「悄悄重放一次副作用」。
+    """
+
+    def __init__(self, message: str, *, phase: str = 'sent_unknown'):
+        super().__init__(message)
+        self.phase = phase if phase in WORKER_ERROR_PHASES else 'sent_unknown'
 
 
 def _powershell_exe() -> str | None:
@@ -170,7 +192,7 @@ class Worker:
     def _start(self) -> None:
         exe = _powershell_exe()
         if exe is None:
-            raise WorkerError('PowerShell is not available')
+            raise WorkerError('PowerShell is not available', phase='not_sent')
         flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
         try:
             self._proc = subprocess.Popen(
@@ -181,7 +203,8 @@ class Worker:
                 errors='replace', bufsize=1, creationflags=flags,
             )
         except OSError as exc:
-            raise WorkerError(f'cannot start PowerShell worker: {exc}') from exc
+            raise WorkerError(f'cannot start PowerShell worker: {exc}',
+                              phase='not_sent') from exc
         self._send_script()
 
     def _send_script(self) -> None:
@@ -192,7 +215,7 @@ class Worker:
         """
         proc = self._proc
         if proc is None or proc.stdin is None:
-            raise WorkerError(f'{self.name} worker is not running')
+            raise WorkerError(f'{self.name} worker is not running', phase='not_sent')
         encoded = base64.b64encode(self.script.encode('utf-8')).decode('ascii')
         try:
             proc.stdin.write(encoded + chr(10))
@@ -200,7 +223,7 @@ class Worker:
         except (OSError, ValueError) as exc:
             raise WorkerError(
                 f'cannot hand the script to {self.name} worker: {exc} '
-                f'{self._stderr_tail()}') from exc
+                f'{self._stderr_tail()}', phase='not_sent') from exc
 
     def _stop(self) -> None:
         proc, self._proc = self._proc, None
@@ -225,7 +248,7 @@ class Worker:
 
     def _ensure(self) -> None:
         if self._broken:
-            raise WorkerError(f'{self.name} worker is unavailable')
+            raise WorkerError(f'{self.name} worker is unavailable', phase='not_sent')
         if self._proc is None or self._proc.poll() is not None:
             self._stop()
             self._start()
@@ -248,11 +271,13 @@ class Worker:
                 last = str(exc)
                 if self._proc is None or self._proc.poll() is not None:
                     raise WorkerError(
-                        f'{self.name} worker exited during startup: {self._stderr_tail()}') from exc
+                        f'{self.name} worker exited during startup: {self._stderr_tail()}',
+                        phase='not_sent') from exc
                 continue
             if reply.get('pong'):
                 return
-        raise WorkerError(f'{self.name} worker did not become ready: {last}')
+        raise WorkerError(f'{self.name} worker did not become ready: {last}',
+                          phase='not_sent')
 
     def _stderr_tail(self, limit: int = 400) -> str:
         proc = self._proc
@@ -284,13 +309,15 @@ class Worker:
                    kill_on_timeout: bool = True) -> dict:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.stdout is None:
-            raise WorkerError(f'{self.name} worker is not running')
+            raise WorkerError(f'{self.name} worker is not running', phase='not_sent')
         payload = self._encode(request)
         try:
             proc.stdin.write(payload)
             proc.stdin.flush()
         except (OSError, ValueError) as exc:
-            raise WorkerError(f'{self.name} worker stdin closed: {exc}') from exc
+            # 写/刷盘时报错：可能已经送出去一部分，不能假定「没发」
+            raise WorkerError(f'{self.name} worker stdin closed: {exc}',
+                              phase='partial_write') from exc
         result: dict = {}
 
         def read() -> None:
@@ -311,21 +338,26 @@ class Worker:
             if kill_on_timeout:
                 self._stop()
                 raise WorkerError(
-                    f'{self.name} worker timed out after {timeout:g}s')
+                    f'{self.name} worker timed out after {timeout:g}s',
+                    phase='sent_unknown')
             raise WorkerError(
-                f'{self.name} worker still starting after {timeout:g}s')
+                f'{self.name} worker still starting after {timeout:g}s',
+                phase='not_sent')
         line = result.get('line') or ''
         if not line.strip():
             self._stop()
-            raise WorkerError(f'{self.name} worker closed unexpectedly: {self._stderr_tail()}')
+            raise WorkerError(f'{self.name} worker closed unexpectedly: {self._stderr_tail()}',
+                              phase='sent_unknown')
         try:
             reply = json.loads(line)
         except ValueError as exc:
             self._stop()
             raise WorkerError(
-                f'{self.name} worker returned non-JSON: {line[:200]}') from exc
+                f'{self.name} worker returned non-JSON: {line[:200]}',
+                phase='sent_unknown') from exc
         if not isinstance(reply, dict):
-            raise WorkerError(f'{self.name} worker returned {type(reply).__name__}')
+            raise WorkerError(f'{self.name} worker returned {type(reply).__name__}',
+                              phase='sent_unknown')
         return reply
 
     def call(self, request: dict, *, timeout: float = DEFAULT_TIMEOUT) -> dict:
@@ -409,8 +441,27 @@ def run(name: str, script, request: dict, *, fallback=None,
         # 失败回包带的不只是 error 代码：能力模块还会给 message（含 step i/total
         # 之类的重试提示）与 steps_done。只把代码抛给上层，模型就只能看到
         # 「out_of_window」这种没法照做的词，所以这里把可读信息拼进去。
-        raise WorkerError(failure_text(reply))
+        raise WorkerError(failure_text(reply), phase='answered')
     return reply
+
+
+def may_retry(exc: BaseException, *, side_effecting: bool) -> bool:
+    """worker 故障后能不能重跑一遍（降级到独立进程）。
+
+    **判据是请求走到哪一步，不是异常文案。** 同一句「timed out」对只读查询是
+    “重查一次就行”，对键鼠输入却是“可能已经点下去了”。按文案分流必然两头出错。
+
+    - `not_sent`：能证明没发出去 → 可以重跑；
+    - 有副作用 + 其余阶段：可能已执行 → **不重跑**；
+    - 只读 + `sent_unknown`：重查不产生副作用 → 可以重跑；
+    - 只读 + `answered`：worker 正常回答了 ok=false，重跑得到同样的答案 → 不重跑。
+    """
+    phase = getattr(exc, 'phase', 'sent_unknown')
+    if phase == 'not_sent':
+        return True
+    if side_effecting:
+        return False
+    return phase == 'sent_unknown'
 
 
 def failure_text(reply: dict) -> str:

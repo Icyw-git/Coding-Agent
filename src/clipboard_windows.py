@@ -209,6 +209,12 @@ def read(*, runner=None, timeout: float = DEFAULT_TIMEOUT) -> ClipboardRead:
         try:
             text, total, truncated = _read_via_worker(timeout=timeout)
         except Exception as exc:
+            # 读剪贴板不产生副作用：worker 故障时重做一次没关系（answered 除外，
+            # 那是 worker 正经拒绝，重跑得到同样的答案）。
+            import ps_worker
+
+            if not ps_worker.may_retry(exc, side_effecting=False):
+                raise ClipboardError(str(exc)) from exc
             print(f'  \033[33m[clipboard] worker unavailable, falling back: {exc}\033[0m')
         else:
             return ClipboardRead(text=text, total_bytes=total,
@@ -245,6 +251,12 @@ def write(text: str, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> Clipbo
                            'data': base64.b64encode(encoded).decode('ascii')},
                           timeout=max(timeout, ps_worker.DEFAULT_TIMEOUT))
         except Exception as exc:
+            import ps_worker as _ps
+
+            # 写剪贴板**有副作用**：已发出却没拿到回包的，不能重写一遍。
+            if not _ps.may_retry(exc, side_effecting=True):
+                raise ClipboardError(
+                    f'{exc}（写入已发出，结果未知，未自动重试）') from exc
             print(f'  \033[33m[clipboard] worker unavailable, falling back: {exc}\033[0m')
         else:
             return ClipboardWrite(chars=len(text), bytes=len(encoded),

@@ -125,3 +125,52 @@ def test_write_allows_clearing_and_rejects_non_strings():
 
     with pytest.raises(clipboard_windows.ClipboardError, match='must be a string'):
         clipboard_windows.write(None, runner=runner)
+
+
+# ============================================================
+# R0-a：写剪贴板有副作用，不能按异常文案决定"重跑一遍"
+# ============================================================
+
+
+def _patch_worker_exc(monkeypatch, exc, *, stdout=b''):
+    import ps_worker
+
+    monkeypatch.setattr(clipboard_windows, '_worker_enabled', lambda: True)
+    monkeypatch.setattr(ps_worker, 'run', lambda *a, **k: (_ for _ in ()).throw(exc))
+    ran = []
+    monkeypatch.setattr(clipboard_windows, '_run',
+                        lambda script, payload, **kw:
+                        ran.append(payload) or Result(stdout=stdout))
+    return ran
+
+
+def test_clipboard_write_does_not_rewrite_after_a_timeout(monkeypatch):
+    """已发出、结果未知：再写一遍可能把用户复制的东西覆盖两次。"""
+    import ps_worker
+
+    ran = _patch_worker_exc(monkeypatch, ps_worker.WorkerError(
+        'clipboard worker timed out after 5s', phase='sent_unknown'))
+    with pytest.raises(clipboard_windows.ClipboardError) as excinfo:
+        clipboard_windows.write('hello')
+    assert ran == [], f'不应降级重跑：{ran}'
+    assert '未知' in str(excinfo.value), excinfo.value
+
+
+def test_clipboard_write_still_falls_back_when_nothing_was_sent(monkeypatch):
+    import ps_worker
+
+    ran = _patch_worker_exc(monkeypatch, ps_worker.WorkerError(
+        'clipboard worker is not running', phase='not_sent'))
+    clipboard_windows.write('hello')
+    assert len(ran) == 1, ran
+
+
+def test_clipboard_read_may_requery_after_a_timeout(monkeypatch):
+    """读没有副作用：超时后重查一次是允许的。"""
+    import ps_worker
+
+    ran = _patch_worker_exc(monkeypatch, ps_worker.WorkerError(
+        'clipboard worker timed out after 5s', phase='sent_unknown'),
+        stdout=fake_output('hi'))
+    clipboard_windows.read()
+    assert len(ran) == 1, ran

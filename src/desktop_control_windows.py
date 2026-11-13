@@ -312,15 +312,13 @@ def _run(payload: dict, *, runner=None, timeout: float = DEFAULT_TIMEOUT) -> dic
         try:
             return _run_worker(payload, timeout=timeout)
         except ps_worker_error_types() as exc:
-            if not _worker_fallback_allowed():
-                raise DesktopControlError(str(exc)) from exc
+            if not _worker_fallback_allowed() or not _may_retry(exc, payload):
+                raise DesktopControlError(_refuse_note(exc)) from exc
             # 结构化失败（窗口变了、坐标越界）不是 worker 故障：重跑一次独立进程
             # 只会得到同样的结果，还会把可读的 message 换成「unexpected output」。
             # 只有 worker 真的不可用（启动失败/超时/协议错）才降级。
             if _is_worker_failure(exc):
                 print(f'  \033[33m[desktop] worker unavailable, falling back: {exc}\033[0m')
-            else:
-                raise DesktopControlError(str(exc)) from exc
     return _run_standalone(payload, runner=runner, timeout=timeout)
 
 
@@ -332,6 +330,9 @@ def ps_worker_error_types():
 
 
 # 这些关键字说明是 worker 本身不可用，而不是「请求被正确拒绝」。
+# ⚠ 只用于控制台提示语，**不再参与“要不要降级重跑”的判定**——那个只看请求走到
+# 哪一步（`WorkerError.phase`），因为按文案分流会把“响应超时”（可能已执行）
+# 也当成“worker 不可用”而重跑一遍。
 _WORKER_FAILURE_HINTS = (
     'not available', 'cannot start', 'did not become ready', 'closed unexpectedly',
     'stdin closed', 'non-JSON', 'not running', 'is unavailable', 'timed out',
@@ -339,9 +340,38 @@ _WORKER_FAILURE_HINTS = (
 )
 
 
+#: 只读动作：重查不会产生副作用，worker 故障时可以降级重跑。
+_READ_ONLY_ACTIONS = frozenset({'snapshot', 'list', 'inspect', 'wait', 'displays'})
+
+
+def _may_retry(exc: BaseException, payload: dict) -> bool:
+    """worker 故障后能不能降级重跑一次独立进程（判据在 `ps_worker.may_retry`）。
+
+    这里只负责把「这个动作有没有副作用」告诉它：只读的能重查，其余不行。
+    """
+    import ps_worker
+
+    action = str(payload.get('action') or '')
+    return ps_worker.may_retry(exc, side_effecting=action not in _READ_ONLY_ACTIONS)
+
+
 def _is_worker_failure(exc: BaseException) -> bool:
     text = str(exc).casefold()
     return any(hint in text for hint in _WORKER_FAILURE_HINTS)
+
+
+def _refuse_note(exc: BaseException) -> str:
+    """不降级时给调用方的文案。
+
+    已发出却拿不到回包的，对用户必须说“可能已经执行、结果未知”——否则他以为没做成，
+    会再让它做一次。``answered`` 是 worker 正经回答的结构性拒绝，保持原文（那是
+    给模型的拒绍语，首句是契约）。
+    """
+    text = str(exc)
+    phase = getattr(exc, 'phase', 'sent_unknown')
+    if phase in ('sent_unknown', 'partial_write'):
+        return f'{text}（请求已发出，结果未知，未自动重试）'
+    return text
 
 
 def _worker_enabled() -> bool:

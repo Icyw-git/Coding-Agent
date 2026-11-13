@@ -16125,3 +16125,73 @@ if depth <= 0:
 
 教训：验证「移除修复会红」应该用**临时副本**（`cp` 到 `/tmp` 再改回），不要用
 `git checkout` —— 那条命令撤的是整个文件，不是"我刚改的那一处"。
+
+---
+
+# 第 127 部分：R0-a ①②——按「请求走到哪一步」决定能不能重跑
+
+设计契约（next-design §4.1）：「副作用重试必须按'是否可能已发送'分类，**不按异常文案分类**」。
+
+## 一、缺陷：按关键字猜，超时也重跑
+
+`desktop_control_windows._is_worker_failure()` 拿异常文本去匹配关键字，而名单里有
+`'timed out'`。于是一次**响应超时**（请求可能已经执行）被判成"worker 不可用"，降级到
+独立进程把整批动作**再跑一遍**。
+
+剪贴板更宽：`clipboard_windows.write` 是 `except Exception` 一律降级——读超时会**再写
+一次剪贴板**，覆盖用户刚复制的东西。
+
+## 二、改法：结构化阶段 + 一处判据
+
+`ps_worker.WorkerError` 增加 `phase`，四个取值：
+
+| phase | 含义 | 能重跑吗 |
+| --- | --- | --- |
+| `not_sent` | 请求没交给 worker（没启动 / 没就绪 / stdin 不可用） | 能 |
+| `partial_write` | 写请求时出错，可能已部分提交 | 只读能 |
+| `sent_unknown` | 已写出，没拿到合法回包（超时 / EOF / 非 JSON） | 只读能 |
+| `answered` | worker 正常回答 `ok: false`（结构性拒绝） | 不能（答案一样） |
+
+**默认值取最保守的 `sent_unknown`**：新增 raise 点忘了标注，行为是"不重试"，
+而不是"悄悄重放一次副作用"。15 个 raise 点逐个标注。
+
+判据收在 `ps_worker.may_retry(exc, *, side_effecting)` 一处：
+
+```python
+if phase == 'not_sent':  return True
+if side_effecting:       return False
+return phase == 'sent_unknown'
+```
+
+桌面侧只需回答"这个动作有没有副作用"（`_READ_ONLY_ACTIONS`）；剪贴板写传
+`side_effecting=True`，读传 False。
+
+不降级时的文案明确说明后果：`（请求已发出，结果未知，未自动重试）`。`answered`
+保持原文——那是给模型的结构性拒绝语，首句是契约。
+
+## 三、守卫（12 条，改前全红/或针对旧行为）
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `tests/test_worker_failure_phase.py`（9 条） | phase 默认值与归一化；有副作用遇 `sent_unknown`/`partial_write` **不降级**且文案含"未知"；`not_sent` 仍降级；只读超时可重查；`answered` 永不重跑 |
+| `tests/test_clipboard_windows.py`（+3 条） | 写超时**不重写**；写 `not_sent` 仍降级；读超时可重查 |
+
+拿掉 `_may_retry` 的 phase 判定 → 9 条立刻红；拿掉剪贴板那条 → 写会被重跑一次。
+
+## 四、R0-a 第③项（按键逆序释放）刻意没做
+
+`desktop_scripts.py` 的按键路径确实有缺陷，而且比文档说的更容易触发：
+
+```powershell
+foreach ($mod in $mods) { VirtualKey($mod, $false) }     # 先按下修饰键
+    if (-not $modMap.ContainsKey($mod)) { return invalid_key }   # ← 之后才校验
+```
+
+`key=ctrl+不存在的键` 会**先把 Ctrl 按下去**，再发现键名不认识并直接返回——Ctrl 卡在
+按下状态。而且按下与释放之间没有 `try/finally`，中间任何异常都会留下同样的残留。
+
+**没改的原因**：`VirtualKey` 是 Add-Type 生成的静态方法，无法在离线测试里桩替；改完
+只能做语法检查 + 代码审查，行为要真机验收。按 next-design §9.3「真实键鼠只在用户点名
+的测试应用内另行验收；离线通过不能写成'真机已通过'」，这一项需要你点名测试应用后再做。
+
+全量 3566 passed / 3 skipped。
